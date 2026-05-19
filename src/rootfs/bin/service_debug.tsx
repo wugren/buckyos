@@ -8,7 +8,7 @@
 //   - pkg_list.script => HostScript
 //   - pkg_list.agent  => Agent / OpenDan
 //
-//   service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--detach]
+//   service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--worksession-test <json>] [--detach]
 
 type JsonValue =
   | string
@@ -28,6 +28,7 @@ type StartupOptions = {
   detach: boolean
   systemConfigUrl: string
   agentPackageRoot?: string
+  opendanArgs: string[]
 }
 
 const DEFAULT_BUCKYOS_ROOT = '/opt/buckyos'
@@ -91,13 +92,14 @@ function printUsage(): never {
   console.error(
     [
       'Usage:',
-      '  service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--detach]',
+      '  service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--worksession-test <json>] [--detach]',
       '',
       'Example:',
       '  service_debug jarvis alice',
       '  service_debug buckyos_systest devtest',
       '  service_debug jarvis alice --port 14060',
       '  service_debug jarvis alice --agent-package-root ./rootfs/bin/buckyos_jarvis',
+      '  service_debug jarvis alice --worksession-test ./case.json',
     ].join('\n'),
   )
   Deno.exit(1)
@@ -119,6 +121,7 @@ function parseArgs(args: string[]): StartupOptions {
   let detach = false
   let systemConfigUrl = 'http://127.0.0.1:3200/kapi/system_config'
   let agentPackageRoot: string | undefined
+  const opendanArgs: string[] = []
 
   for (let index = 2; index < args.length; index += 1) {
     const arg = args[index]
@@ -160,7 +163,21 @@ function parseArgs(args: string[]): StartupOptions {
         agentPackageRoot = raw
         break
       }
+      case '--worksession-test':
+      case '--work-session-test': {
+        const raw = args[index + 1]?.trim()
+        index += 1
+        if (!raw) {
+          throw new Error(`missing value for ${arg}`)
+        }
+        opendanArgs.push(arg, raw)
+        break
+      }
       default: {
+        if (arg.startsWith('--worksession-test=') || arg.startsWith('--work-session-test=')) {
+          opendanArgs.push(arg)
+          break
+        }
         throw new Error(`unknown argument: ${arg}`)
       }
     }
@@ -174,6 +191,7 @@ function parseArgs(args: string[]): StartupOptions {
     detach,
     systemConfigUrl,
     agentPackageRoot,
+    opendanArgs,
   }
 }
 
@@ -582,6 +600,7 @@ type AgentLaunchContext = {
   agentEnvRoot: string
   agentPackageRoot: string
   servicePort: number
+  opendanArgs: string[]
   env: Record<string, string>
 }
 
@@ -721,6 +740,7 @@ async function buildLaunchContext(options: StartupOptions) {
       agentEnvRoot,
       agentPackageRoot: agentPackage.fullPath,
       servicePort,
+      opendanArgs: options.opendanArgs,
       env: {
         ...env,
         app_media_info: JSON.stringify({
@@ -744,6 +764,7 @@ async function runForeground(
   agentEnvRoot: string,
   agentPackageRoot: string,
   servicePort: number,
+  opendanArgs: string[],
   env: Record<string, string>,
 ): Promise<number> {
   const child = new Deno.Command(opendanBinary, {
@@ -756,6 +777,7 @@ async function runForeground(
       agentPackageRoot,
       '--service-port',
       `${servicePort}`,
+      ...opendanArgs,
     ],
     env,
     stdin: 'inherit',
@@ -957,6 +979,7 @@ async function runDetached(
   agentEnvRoot: string,
   agentPackageRoot: string,
   servicePort: number,
+  opendanArgs: string[],
   env: Record<string, string>,
 ): Promise<void> {
   const child = new Deno.Command(opendanBinary, {
@@ -969,6 +992,7 @@ async function runDetached(
       agentPackageRoot,
       '--service-port',
       `${servicePort}`,
+      ...opendanArgs,
     ],
     env,
     stdin: 'null',
@@ -1006,6 +1030,7 @@ async function main() {
           launch.agentEnvRoot,
           launch.agentPackageRoot,
           launch.servicePort,
+          launch.opendanArgs,
           launch.env,
         )
       } else {
@@ -1025,6 +1050,7 @@ async function main() {
         launch.agentEnvRoot,
         launch.agentPackageRoot,
         launch.servicePort,
+        launch.opendanArgs,
         launch.env,
       )
       : await runHostScriptForeground(

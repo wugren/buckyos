@@ -16,6 +16,7 @@ __ENV($session.objective)
 <<PROCESS_RULES>>
 ## Current Behavior: plan
 You are in a durable work session. Your job is 结合OBJECTIVE + 当前TaskList (尤其是已完成的部分）做出决策:
+
 - TaskList为空:更新计划
 - 判断Objectvie是否已经实现
 - TaskList不为空:
@@ -79,7 +80,7 @@ __ENV($skill_lists)
 
 on_switch = """
 ## 当前TodoList:
-{{current_todo_list}}
+{{$session.current_todo_list}}
 """
 
 on_input_event = """
@@ -104,7 +105,7 @@ max_rounds = 16
 max_consecutive_errors = 3
 
 [model]
-preferred = "llm.plan"
+preferred = "llm.code"
 
 [on_context_limit_reached]
 mode = "compress_then_continue"

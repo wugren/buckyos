@@ -131,10 +131,11 @@ fn load_language_file(i18n_dir: &Path, language: &str) -> BTreeMap<String, Strin
     let Ok(content) = std::fs::read_to_string(path) else {
         return BTreeMap::new();
     };
-    let Ok(value) = content.parse::<toml::Value>() else {
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
         return BTreeMap::new();
     };
     let mut out = BTreeMap::new();
+    let value = toml::Value::Table(table);
     flatten_toml("", &value, &mut out);
     out
 }

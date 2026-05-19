@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use buckyos_api::{
@@ -21,9 +22,10 @@ use sha2::{Digest, Sha256};
 use std::fs as sync_fs;
 use tokio::fs;
 
-use opendan::agent::AIAgent;
+use opendan::agent::{AIAgent, CreateWorkSessionParams};
 use opendan::agent_config::AgentTomlFile;
 use opendan::ai_runtime::AgentRuntime;
+use opendan::session_model::{SessionStatus, SessionSummary};
 use opendan::worklog::{WorklogService, WorklogToolConfig};
 
 const WORKLOG_DB_ENV: &str = "OPENDAN_WORKLOG_DB";
@@ -46,6 +48,7 @@ struct StartupArgs {
     owner_id: Option<String>,
     agent_root: Option<PathBuf>,
     agent_bin: Option<PathBuf>,
+    worksession_test: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -58,6 +61,44 @@ struct RootfsSyncManifest {
 struct RootfsSyncEntry {
     source_sha256: String,
     installed_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct WorkSessionQuickTestSpec {
+    title: String,
+    objective: String,
+    workspace_id: Option<String>,
+    behavior: Option<String>,
+    created_by_session_id: String,
+    #[serde(alias = "reason_message")]
+    reason_messages: Vec<String>,
+}
+
+impl Default for WorkSessionQuickTestSpec {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            objective: String::new(),
+            workspace_id: None,
+            behavior: None,
+            created_by_session_id: "worksession-test".to_string(),
+            reason_messages: Vec::new(),
+        }
+    }
+}
+
+impl WorkSessionQuickTestSpec {
+    fn into_params(self) -> CreateWorkSessionParams {
+        CreateWorkSessionParams {
+            title: self.title,
+            objective: self.objective,
+            workspace_id: self.workspace_id,
+            behavior: self.behavior,
+            created_by_session_id: self.created_by_session_id,
+            reason_messages: self.reason_messages,
+        }
+    }
 }
 
 fn parse_startup_args_from_iter<I, S>(args: I) -> Result<StartupArgs>
@@ -98,6 +139,13 @@ where
                         .ok_or_else(|| anyhow!("missing value for {arg}"))?,
                 ));
             }
+            "--worksession-test" | "--work-session-test" => {
+                parsed.worksession_test = Some(PathBuf::from(
+                    args.next()
+                        .map(|value| value.as_ref().to_string())
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                ));
+            }
             other if other.starts_with("--appid=") => {
                 parsed.appid = Some(other["--appid=".len()..].to_string());
             }
@@ -121,6 +169,14 @@ where
             }
             other if other.starts_with("--agent-bin=") => {
                 parsed.agent_bin = Some(PathBuf::from(&other["--agent-bin=".len()..]));
+            }
+            other if other.starts_with("--worksession-test=") => {
+                parsed.worksession_test =
+                    Some(PathBuf::from(&other["--worksession-test=".len()..]));
+            }
+            other if other.starts_with("--work-session-test=") => {
+                parsed.worksession_test =
+                    Some(PathBuf::from(&other["--work-session-test=".len()..]));
             }
             other if !other.starts_with('-') && parsed.appid.is_none() => {
                 parsed.appid = Some(other.to_string());
@@ -553,6 +609,66 @@ async fn bootstrap(appid: &str, owner_id: Option<String>) -> Result<Arc<AgentRun
     Ok(Arc::new(runtime))
 }
 
+async fn run_worksession_quick_test(agent: Arc<AIAgent>, json_path: PathBuf) -> Result<()> {
+    let result = async {
+        let raw = fs::read_to_string(&json_path)
+            .await
+            .with_context(|| format!("read worksession test json {}", json_path.display()))?;
+        let spec = serde_json::from_str::<WorkSessionQuickTestSpec>(&raw)
+            .with_context(|| format!("parse worksession test json {}", json_path.display()))?;
+        let outcome = agent
+            .clone()
+            .create_work_session(spec.into_params())
+            .await
+            .context("create worksession for quick test failed")?;
+        info!(
+            "opendan.worksession_test: created session_id={} workspace_id={} workspace_status={} behavior={}",
+            outcome.session_id, outcome.workspace_id, outcome.workspace_status, outcome.behavior
+        );
+        let summary = wait_worksession_to_finish(agent.clone(), &outcome.session_id).await?;
+        info!(
+            "opendan.worksession_test: finished session_id={} status={:?}",
+            summary.session_id, summary.status
+        );
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = &result {
+        error!("opendan.worksession_test: failed: {err:#}");
+    }
+    agent.shutdown().await;
+    result
+}
+
+async fn wait_worksession_to_finish(
+    agent: Arc<AIAgent>,
+    session_id: &str,
+) -> Result<SessionSummary> {
+    let mut last_status = None;
+    loop {
+        let session = agent
+            .get_session(session_id)
+            .await
+            .ok_or_else(|| anyhow!("worksession `{session_id}` disappeared"))?;
+        let summary = session.summary().await;
+        if last_status != Some(summary.status) {
+            info!(
+                "opendan.worksession_test: session_id={} status={:?}",
+                summary.session_id, summary.status
+            );
+            last_status = Some(summary.status);
+        }
+        match summary.status {
+            SessionStatus::Ended => return Ok(summary),
+            SessionStatus::Error => {
+                return Err(anyhow!("worksession `{session_id}` entered Error status"));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
 async fn run() -> Result<()> {
     let startup = parse_startup_args().context("parse opendan startup args failed")?;
     let appid = resolve_appid(&startup)?;
@@ -581,6 +697,10 @@ async fn run() -> Result<()> {
     );
 
     let agent = AIAgent::open(agent_root, runtime)?;
+    let worksession_test_handle = startup
+        .worksession_test
+        .clone()
+        .map(|path| tokio::spawn(run_worksession_quick_test(agent.clone(), path)));
     let agent_for_signal = agent.clone();
     tokio::spawn(async move {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -592,6 +712,17 @@ async fn run() -> Result<()> {
     });
 
     agent.run().await?;
+    if let Some(mut handle) = worksession_test_handle {
+        match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
+            Ok(joined) => {
+                joined.map_err(|err| anyhow!("worksession test task join failed: {err}"))??;
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
     info!("opendan: AIAgent::run returned cleanly");
     Ok(())
 }
@@ -639,6 +770,37 @@ mod tests {
             parsed.agent_bin.unwrap(),
             std::path::PathBuf::from("/pkg/jarvis")
         );
+    }
+
+    #[test]
+    fn parses_worksession_test_flag() {
+        let parsed =
+            parse_startup_args_from_iter(["--appid=jarvis", "--worksession-test", "/tmp/ws.json"])
+                .expect("parse args");
+        assert_eq!(
+            parsed.worksession_test.unwrap(),
+            std::path::PathBuf::from("/tmp/ws.json")
+        );
+    }
+
+    #[test]
+    fn parses_worksession_test_json() {
+        let spec: super::WorkSessionQuickTestSpec = serde_json::from_value(serde_json::json!({
+            "title": "quick check",
+            "objective": "run one complete task",
+            "workspace_id": "ws-existing",
+            "behavior": "work_default",
+            "created_by_session_id": "ui-source",
+            "reason_message": ["requested by cli"]
+        }))
+        .expect("parse spec");
+
+        assert_eq!(spec.title, "quick check");
+        assert_eq!(spec.objective, "run one complete task");
+        assert_eq!(spec.workspace_id.as_deref(), Some("ws-existing"));
+        assert_eq!(spec.behavior.as_deref(), Some("work_default"));
+        assert_eq!(spec.created_by_session_id, "ui-source");
+        assert_eq!(spec.reason_messages, vec!["requested by cli"]);
     }
 
     #[tokio::test]

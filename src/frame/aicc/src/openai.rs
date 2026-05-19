@@ -3280,7 +3280,7 @@ impl OpenAIGptTier {
     fn role_mounts(self) -> &'static [&'static str] {
         match self {
             Self::Pro => &["llm.plan", "llm.reason"],
-            Self::General => &["llm.chat"],
+            Self::General => &["llm.chat", "llm.code"],
             Self::Mini => &["llm.chat", "llm.summarize"],
             Self::Nano => &["llm.swift"],
         }
@@ -3547,6 +3547,7 @@ fn is_openai_gpt_auto_mount(mount: &str) -> bool {
             | "llm.swift"
             | "llm.plan"
             | "llm.reason"
+            | "llm.code"
     )
 }
 
@@ -4612,18 +4613,22 @@ data: [DONE]
         );
 
         assert_model_mount(&inventory, "gpt-5.5", "llm.chat", true);
+        assert_model_mount(&inventory, "gpt-5.5", "llm.code", true);
         assert_model_mount(&inventory, "gpt-5.5", "llm.openai.gpt-5-5", true);
         assert_model_mount(&inventory, "gpt-5.5", "llm.gpt", false);
         assert_model_mount(&inventory, "gpt-5.4", "llm.chat", false);
+        assert_model_mount(&inventory, "gpt-5.4", "llm.code", false);
         assert_model_mount(&inventory, "gpt-5.4", "llm.openai.gpt-5-4", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.plan", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.reason", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.chat", false);
+        assert_model_mount(&inventory, "gpt-5.5-pro", "llm.code", false);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.gpt-pro", false);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.openai.gpt-5-5-pro", true);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.plan", false);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.reason", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", true);
+        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.code", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.summarize", true);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", false);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.chat", false);
@@ -4663,6 +4668,18 @@ data: [DONE]
                 "inventory_revision": "remote-r1",
                 "models": [
                     {
+                        "provider_model_id": "gpt-5.4",
+                        "exact_model": "gpt-5.4@remote-openai",
+                        "api_types": ["llm.chat"],
+                        "logical_mounts": ["llm.code", "llm.remote-general-old"]
+                    },
+                    {
+                        "provider_model_id": "gpt-5.5",
+                        "exact_model": "gpt-5.5@remote-openai",
+                        "api_types": ["llm.chat"],
+                        "logical_mounts": ["llm.chat"]
+                    },
+                    {
                         "provider_model_id": "gpt-5.4-pro",
                         "exact_model": "gpt-5.4-pro@remote-openai",
                         "api_types": ["llm.chat"],
@@ -4701,6 +4718,11 @@ data: [DONE]
             .models
             .iter()
             .any(|model| model.exact_model == "gpt-5.5-pro@openai-primary"));
+        assert_model_mount(&inventory, "gpt-5.5", "llm.chat", true);
+        assert_model_mount(&inventory, "gpt-5.5", "llm.code", true);
+        assert_model_mount(&inventory, "gpt-5.4", "llm.chat", false);
+        assert_model_mount(&inventory, "gpt-5.4", "llm.code", false);
+        assert_model_mount(&inventory, "gpt-5.4", "llm.remote-general-old", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.plan", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.reason", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.gpt-pro", false);
