@@ -552,7 +552,7 @@ impl ActiveServer {
                 session: None,
                 sub: Some(sn_username.clone()),
                 aud: Some("sn".to_string()), //sudo token MUST have aud filed
-                exp: Some(buckyos_get_unix_timestamp() + 60),
+                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username),
                 token: None,
                 extra: HashMap::new(),
@@ -688,7 +688,7 @@ impl ActiveServer {
                 session: None,
                 sub: Some(sn_username.to_string()),
                 aud: Some("sn".to_string()),
-                exp: Some(buckyos_get_unix_timestamp() + 60),
+                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username.to_string()),
                 token: None,
                 extra: HashMap::new(),
