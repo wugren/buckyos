@@ -29,6 +29,7 @@ pub struct LlmInferenceRequest {
     pub force_json: bool,
     pub json_schema: Option<Value>,
     pub provider_options: Option<Value>,
+    pub disable_capabilities: Vec<String>,
     /// Tool catalogue the adapter may advertise to the provider. Empty when
     /// `tool_policy.mode == None` or no tools are available.
     pub tool_specs: Vec<ToolSpecLite>,

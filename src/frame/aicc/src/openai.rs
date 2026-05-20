@@ -3281,7 +3281,7 @@ impl OpenAIGptTier {
         match self {
             Self::Pro => &["llm.plan", "llm.reason"],
             Self::General => &["llm.chat", "llm.code"],
-            Self::Mini => &["llm.chat", "llm.summarize"],
+            Self::Mini => &["llm.gpt-mini", "llm.summarize"],
             Self::Nano => &["llm.swift"],
         }
     }
@@ -3403,7 +3403,9 @@ fn openai_llm_logical_mounts(provider_driver: &str, provider_model_id: &str) -> 
         format!("llm.{}", logical_mount_segment(provider_driver)),
         format!("llm.openai.{}", logical_mount_segment(provider_model_id)),
     ];
-    if classify_openai_gpt_model(provider_model_id).is_none() {
+    if classify_openai_gpt_model(provider_model_id).is_none()
+        && !is_openai_gpt_named_model(provider_model_id)
+    {
         add_unique_mount(&mut mounts, "llm.gpt".to_string());
     }
     mounts
@@ -3450,6 +3452,9 @@ fn classify_openai_gpt_model(provider_model_id: &str) -> Option<(OpenAIGptTier, 
     if !normalized.contains("gpt") {
         return None;
     }
+    if has_openai_snapshot_date_suffix(normalized.as_str()) {
+        return None;
+    }
 
     let tokens = normalized
         .split(|ch: char| ch == '-' || ch == '.' || ch == '/')
@@ -3476,6 +3481,39 @@ fn classify_openai_gpt_model(provider_model_id: &str) -> Option<(OpenAIGptTier, 
             model_id: normalized,
         },
     ))
+}
+
+fn is_openai_gpt_named_model(provider_model_id: &str) -> bool {
+    !is_text2image_model_name(provider_model_id)
+        && provider_model_id
+            .trim()
+            .to_ascii_lowercase()
+            .replace('_', "-")
+            .contains("gpt")
+}
+
+fn has_openai_snapshot_date_suffix(normalized_model_id: &str) -> bool {
+    let mut parts = normalized_model_id.rsplitn(4, '-');
+    let Some(day) = parts.next() else {
+        return false;
+    };
+    let Some(month) = parts.next() else {
+        return false;
+    };
+    let Some(year) = parts.next() else {
+        return false;
+    };
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+
+    !prefix.is_empty()
+        && year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && year.chars().all(|ch| ch.is_ascii_digit())
+        && month.chars().all(|ch| ch.is_ascii_digit())
+        && day.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_gpt_version(normalized_model_id: &str) -> Vec<u64> {
@@ -3538,17 +3576,25 @@ fn remove_openai_gpt_auto_mounts(mounts: &mut Vec<String>) {
 fn is_openai_gpt_auto_mount(mount: &str) -> bool {
     matches!(
         mount,
-        "llm.gpt"
-            | "llm.gpt-pro"
-            | "llm.gpt-mini"
-            | "llm.gpt-nano"
-            | "llm.chat"
-            | "llm.summarize"
-            | "llm.swift"
-            | "llm.plan"
-            | "llm.reason"
-            | "llm.code"
-    )
+        "llm.gpt" | "llm.gpt-pro" | "llm.gpt-mini" | "llm.gpt-nano"
+    ) || is_openai_gpt_role_mount(mount)
+}
+
+fn is_openai_gpt_role_mount(mount: &str) -> bool {
+    const ROLE_MOUNTS: &[&str] = &[
+        "llm.chat",
+        "llm.summarize",
+        "llm.swift",
+        "llm.plan",
+        "llm.reason",
+        "llm.code",
+    ];
+    ROLE_MOUNTS.iter().any(|role| {
+        mount == *role
+            || mount
+                .strip_prefix(*role)
+                .is_some_and(|tail| tail.starts_with('.'))
+    })
 }
 
 fn add_unique_mount(mounts: &mut Vec<String>, mount: String) {
@@ -4595,6 +4641,7 @@ data: [DONE]
             "gpt-5.5-pro".to_string(),
             "gpt-5-mini".to_string(),
             "gpt-5.4-mini".to_string(),
+            "gpt-5.4-mini-2026-03-17".to_string(),
             "gpt-5-nano".to_string(),
             "gpt-5.4-nano".to_string(),
             "o1-2024-12-17".to_string(),
@@ -4627,12 +4674,26 @@ data: [DONE]
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.openai.gpt-5-5-pro", true);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.plan", false);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.reason", false);
-        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", true);
+        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.code", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.summarize", true);
-        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", false);
+        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", true);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.summarize", false);
+        assert_model_mount(&inventory, "gpt-5.4-mini-2026-03-17", "llm.chat", false);
+        assert_model_mount(
+            &inventory,
+            "gpt-5.4-mini-2026-03-17",
+            "llm.summarize",
+            false,
+        );
+        assert_model_mount(
+            &inventory,
+            "gpt-5.4-mini-2026-03-17",
+            "llm.openai.gpt-5-4-mini-2026-03-17",
+            true,
+        );
+        assert_model_mount(&inventory, "gpt-5.4-mini-2026-03-17", "llm.gpt", false);
         assert_model_mount(&inventory, "gpt-5.4-nano", "llm.swift", true);
         assert_model_mount(&inventory, "gpt-5.4-nano", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5.4-nano", "llm.gpt-nano", false);
@@ -4704,6 +4765,12 @@ data: [DONE]
                         "logical_mounts": ["llm.gpt-mini"]
                     },
                     {
+                        "provider_model_id": "gpt-5.4-mini-2026-03-17",
+                        "exact_model": "gpt-5.4-mini-2026-03-17@remote-openai",
+                        "api_types": ["llm.chat"],
+                        "logical_mounts": ["llm.chat"]
+                    },
+                    {
                         "provider_model_id": "o1-2024-12-17",
                         "exact_model": "o1-2024-12-17@remote-openai",
                         "api_types": ["llm.chat"],
@@ -4732,9 +4799,23 @@ data: [DONE]
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.gpt-pro", false);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.openai.gpt-5-4-pro", true);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.remote-old", true);
-        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", true);
+        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.summarize", true);
-        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", false);
+        assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", true);
+        assert_model_mount(&inventory, "gpt-5.4-mini-2026-03-17", "llm.chat", false);
+        assert_model_mount(
+            &inventory,
+            "gpt-5.4-mini-2026-03-17",
+            "llm.summarize",
+            false,
+        );
+        assert_model_mount(
+            &inventory,
+            "gpt-5.4-mini-2026-03-17",
+            "llm.openai.gpt-5-4-mini-2026-03-17",
+            true,
+        );
+        assert_model_mount(&inventory, "gpt-5.4-mini-2026-03-17", "llm.gpt", false);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.summarize", false);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.remote-mini-old", true);
         assert_model_mount(&inventory, "o1-2024-12-17", "llm.gpt", true);

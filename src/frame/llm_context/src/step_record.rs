@@ -8,9 +8,9 @@
 //!
 //! - **Assistant message**: the verbatim text the LLM emitted last turn
 //!   (the parsed XML lives inside `step.assistant_text`).
-//! - **User message**: an `<action_result>` XML block carrying the
+//! - **User message**: a `<step_action_results>` wrapper carrying the
 //!   dispatcher-side echo (success body / error message / pending marker),
-//!   or `<step_ack/>` when the step had no action.
+//!   or an ack when the step had no action.
 //!
 //! ## History compression
 //!
@@ -23,7 +23,7 @@
 //! - Older entries collapse to a compact form: assistant text truncated to
 //!   [`XmlStepRenderer::summary_chars`], action result body truncated to
 //!   [`XmlStepRenderer::summary_chars`] / 2, success bodies replaced with
-//!   `<action_result status="ok"/>` once truncated to zero.
+//!   `Success` once truncated to zero.
 //!
 //! Schedulers needing more sophisticated tiering (e.g. the four-level
 //! Min/Mini/Medium/Full scheme from the legacy opendan renderer) should
@@ -183,11 +183,11 @@ impl StepRenderer for XmlStepRenderer {
 
 /// Render the dispatcher echo for one step. v2 supports zero or more
 /// actions per step plus a `<report>` echo (Self Report) plus zero or more
-/// SendMessage echoes. Renders as a `<step_results>` wrapper containing one
-/// `<action_result>` per action (index-aligned with `step.actions` and
-/// `step.action_results`), followed by `<report_ack/>` and
-/// `<message_sent .../>` markers. When the step had nothing, emits
-/// `<step_ack/>` so the assistant→user alternation stays well-formed.
+/// SendMessage echoes. Renders as a `<step_action_results>` wrapper containing
+/// one plain-text action result per action (index-aligned with `step.actions`
+/// and `step.action_results`), followed by report / message acks. When the
+/// step had nothing, emits an ack so the assistant→user alternation stays
+/// well-formed.
 fn render_action_results_full(step: &StepRecord, max_body_chars: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -205,23 +205,17 @@ fn render_action_results_full(step: &StepRecord, max_body_chars: usize) -> Strin
     // in the assistant message). Helps the next inference notice "we did
     // already report".
     if step.self_report.is_some() {
-        parts.push("<report_ack/>".to_string());
+        parts.push("Report acknowledged.".to_string());
     }
     // SendMessage echoes.
     for msg in &step.messages_sent {
-        parts.push(format!(
-            "<message_sent target=\"{}\"/>",
-            xml_escape(&msg.target)
-        ));
+        parts.push(format!("Message sent to {}.", msg.target));
     }
 
     if parts.is_empty() {
-        return "<step_ack/>".to_string();
+        parts.push("Step acknowledged.".to_string());
     }
-    if parts.len() == 1 {
-        return parts.into_iter().next().unwrap();
-    }
-    format!("<step_results>{}</step_results>", parts.join(""))
+    render_step_action_results_wrapper(step, parts)
 }
 
 fn render_action_results_compact(step: &StepRecord, max_body_chars: usize) -> String {
@@ -235,21 +229,24 @@ fn render_action_results_compact(step: &StepRecord, max_body_chars: usize) -> St
         ));
     }
     if step.self_report.is_some() {
-        parts.push("<report_ack/>".to_string());
+        parts.push("Report acknowledged.".to_string());
     }
     for msg in &step.messages_sent {
-        parts.push(format!(
-            "<message_sent target=\"{}\"/>",
-            xml_escape(&msg.target)
-        ));
+        parts.push(format!("Message sent to {}.", msg.target));
     }
     if parts.is_empty() {
-        return "<step_ack/>".to_string();
+        parts.push("Step acknowledged.".to_string());
     }
-    if parts.len() == 1 {
-        return parts.into_iter().next().unwrap();
-    }
-    format!("<step_results>{}</step_results>", parts.join(""))
+    render_step_action_results_wrapper(step, parts)
+}
+
+fn render_step_action_results_wrapper(step: &StepRecord, parts: Vec<String>) -> String {
+    format!(
+        "<step_action_results behavior=\"{}\" step=\"{}\">\n{}\n</step_action_results>",
+        xml_escape(&step.meta.behavior_name),
+        step.meta.step_index,
+        parts.join("\n\n")
+    )
 }
 
 fn render_one_action_result_full(
@@ -257,38 +254,23 @@ fn render_one_action_result_full(
     obs: &Observation,
     max_body_chars: usize,
 ) -> String {
-    let tool = action.name.as_str();
+    let command = action_command_text(action);
     match obs {
         Observation::Success {
-            call_id,
-            content,
-            truncated,
-            ..
+            content, truncated, ..
         } => {
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
-            let attrs = action_result_attrs(tool, call_id, "ok", *truncated || body_truncated);
-            format!(
-                "<action_result{attrs}>{}</action_result>",
-                xml_escape(&body)
-            )
+            format_action_result_block(&command, &body, *truncated || body_truncated)
         }
-        Observation::Error { call_id, message } => {
+        Observation::Error { message, .. } => {
             let (msg, _) = clip(message.as_str(), max_body_chars.max(1024));
-            let attrs = action_result_attrs(tool, call_id, "error", false);
-            format!("<action_result{attrs}>{}</action_result>", xml_escape(&msg))
+            format!("Run {command}:\nError: {msg}")
         }
-        Observation::Pending { call_id } => {
-            let attrs = action_result_attrs(tool, call_id, "pending", false);
-            format!("<action_result{attrs}/>")
-        }
-        Observation::Cancelled { call_id, reason } => {
+        Observation::Pending { .. } => format!("Run {command}:\nPending"),
+        Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars.max(512));
-            let attrs = action_result_attrs(tool, call_id, "cancelled", false);
-            format!(
-                "<action_result{attrs}>{}</action_result>",
-                xml_escape(&body)
-            )
+            format!("Run {command}:\nCancelled: {body}")
         }
     }
 }
@@ -298,56 +280,129 @@ fn render_one_action_result_compact(
     obs: &Observation,
     max_body_chars: usize,
 ) -> String {
-    let tool = action.name.as_str();
+    let command = action_command_text(action);
     match obs {
         Observation::Success {
-            call_id, content, ..
+            content, truncated, ..
         } => {
             let body = stringify_content(content);
-            let (body, _) = clip(body.as_str(), max_body_chars);
+            let (body, body_truncated) = clip(body.as_str(), max_body_chars);
             let body = body.trim();
-            let attrs = action_result_attrs(tool, call_id, "ok", true);
             if body.is_empty() {
-                format!("<action_result{attrs}/>")
+                format!("Run {command}:\nSuccess")
             } else {
-                format!("<action_result{attrs}>{}</action_result>", xml_escape(body))
+                format_action_result_block(&command, body, *truncated || body_truncated)
             }
         }
-        Observation::Error { call_id, message } => {
+        Observation::Error { message, .. } => {
             let (msg, _) = clip(message.as_str(), max_body_chars);
-            let attrs = action_result_attrs(tool, call_id, "error", false);
-            format!("<action_result{attrs}>{}</action_result>", xml_escape(&msg))
+            format!("Run {command}:\nError: {msg}")
         }
-        Observation::Pending { call_id } => {
-            let attrs = action_result_attrs(tool, call_id, "pending", false);
-            format!("<action_result{attrs}/>")
-        }
-        Observation::Cancelled { call_id, reason } => {
+        Observation::Pending { .. } => format!("Run {command}:\nPending"),
+        Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars);
-            let attrs = action_result_attrs(tool, call_id, "cancelled", false);
             let body = body.trim();
             if body.is_empty() {
-                format!("<action_result{attrs}/>")
+                format!("Run {command}:\nCancelled")
             } else {
-                format!("<action_result{attrs}>{}</action_result>", xml_escape(body))
+                format!("Run {command}:\nCancelled: {body}")
             }
         }
     }
 }
 
-fn action_result_attrs(tool: &str, call_id: &str, status: &str, truncated: bool) -> String {
-    let mut s = String::new();
-    if !tool.is_empty() {
-        s.push_str(&format!(" tool=\"{}\"", xml_escape(tool)));
-    }
-    if !call_id.is_empty() {
-        s.push_str(&format!(" call_id=\"{}\"", xml_escape(call_id)));
-    }
-    s.push_str(&format!(" status=\"{status}\""));
+fn format_action_result_block(command: &str, body: &str, truncated: bool) -> String {
+    let body = body.trim_end();
+    let mut s = if body.is_empty() {
+        format!("Run {command}:\nSuccess")
+    } else {
+        format!("Run {command}:\n{body}")
+    };
     if truncated {
-        s.push_str(" truncated=\"true\"");
+        s.push_str("\n[truncated]");
     }
     s
+}
+
+fn action_command_text(action: &buckyos_api::AiToolCall) -> String {
+    match action.name.as_str() {
+        "exec_bash" => action
+            .args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(action.name.as_str())
+            .to_string(),
+        "read" => {
+            let target = string_arg(action, "path")
+                .or_else(|| string_arg(action, "uri"))
+                .unwrap_or_else(|| "target".to_string());
+            let mut parts = vec!["read".to_string(), target];
+            push_optional_arg(&mut parts, action, "first_chunk");
+            push_optional_arg(&mut parts, action, "range");
+            parts.join(" ")
+        }
+        "write_file" => {
+            let path = string_arg(action, "path").unwrap_or_else(|| "target".to_string());
+            let mode = string_arg(action, "mode").unwrap_or_else(|| "write".to_string());
+            format!("write_file {path} mode={mode}")
+        }
+        "edit_file" => {
+            let path = string_arg(action, "path").unwrap_or_else(|| "target".to_string());
+            let mode = string_arg(action, "mode").unwrap_or_else(|| "replace".to_string());
+            let mut command = format!("edit_file {path} mode={mode}");
+            if let Some(anchor) = string_arg(action, "pos_chunk") {
+                command.push_str(" anchor=\"");
+                command.push_str(compact_inline_value(&anchor, 80).as_str());
+                command.push('"');
+            }
+            command
+        }
+        name => {
+            let mut parts = vec![name.to_string()];
+            let mut keys: Vec<&String> = action.args.keys().collect();
+            keys.sort();
+            for key in keys {
+                if matches!(key.as_str(), "content" | "new_content" | "from_user_did") {
+                    continue;
+                }
+                if let Some(value) = action.args.get(key) {
+                    parts.push(format!("{key}={}", value_arg_text(value)));
+                }
+            }
+            parts.join(" ")
+        }
+    }
+}
+
+fn string_arg(action: &buckyos_api::AiToolCall, key: &str) -> Option<String> {
+    action
+        .args
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn push_optional_arg(parts: &mut Vec<String>, action: &buckyos_api::AiToolCall, key: &str) {
+    if let Some(value) = action.args.get(key) {
+        parts.push(format!("{key}={}", value_arg_text(value)));
+    }
+}
+
+fn value_arg_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => compact_inline_value(s, 160),
+        other => compact_inline_value(&other.to_string(), 160),
+    }
+}
+
+fn compact_inline_value(value: &str, max_chars: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (value, _) = clip(value.as_str(), max_chars);
+    value
 }
 
 fn stringify_content(content: &Value) -> String {
@@ -434,6 +489,17 @@ mod tests {
         }
     }
 
+    fn tool_call_with_args(name: &str, id: &str, args: &[(&str, Value)]) -> AiToolCall {
+        AiToolCall {
+            name: name.to_string(),
+            args: args
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+            call_id: id.to_string(),
+        }
+    }
+
     fn assistant_text_of(msg: &AiMessage) -> String {
         assert_eq!(msg.role, AiRole::Assistant);
         plain_text(msg)
@@ -472,10 +538,10 @@ mod tests {
         let (a, u) = renderer.render(&step);
         assert!(assistant_text_of(&a).contains("<thinking>plan</thinking>"));
         let user_text = user_text_of(&u);
-        assert!(user_text.contains("tool=\"exec_bash\""));
-        assert!(user_text.contains("call_id=\"c-1\""));
-        assert!(user_text.contains("status=\"ok\""));
-        assert!(user_text.contains(">ok</action_result>"));
+        assert!(user_text.starts_with("<step_action_results"));
+        assert!(user_text.contains("behavior=\"\""));
+        assert!(user_text.contains("step=\"0\""));
+        assert!(user_text.contains("Run exec_bash:\nok"));
     }
 
     #[test]
@@ -484,11 +550,13 @@ mod tests {
         let mut step = StepRecord::default();
         step.assistant_text = "just words".into();
         let (_, u) = renderer.render(&step);
-        assert_eq!(user_text_of(&u), "<step_ack/>");
+        let text = user_text_of(&u);
+        assert!(text.starts_with("<step_action_results"));
+        assert!(text.contains("Step acknowledged."));
     }
 
     #[test]
-    fn multiple_actions_render_as_step_results_wrapper() {
+    fn multiple_actions_render_as_step_action_results_wrapper() {
         let renderer = XmlStepRenderer::new();
         let mut step = StepRecord::default();
         step.actions = vec![
@@ -511,12 +579,44 @@ mod tests {
         ];
         let (_, u) = renderer.render(&step);
         let text = user_text_of(&u);
-        assert!(text.starts_with("<step_results>"));
-        assert!(text.ends_with("</step_results>"));
-        // Both action_results present, in order.
-        let i1 = text.find("call_id=\"c-1\"").expect("c-1");
-        let i2 = text.find("call_id=\"c-2\"").expect("c-2");
+        assert!(text.starts_with("<step_action_results"));
+        assert!(text.ends_with("</step_action_results>"));
+        // Both action results present, in order.
+        let i1 = text.find("Run exec_bash:").expect("exec_bash");
+        let i2 = text.find("Run write_file").expect("write_file");
         assert!(i1 < i2, "actions should render in order");
+    }
+
+    #[test]
+    fn write_file_command_omits_content_body() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.meta.behavior_name = "do".into();
+        step.meta.step_index = 1;
+        step.actions = vec![tool_call_with_args(
+            "write_file",
+            "c-2",
+            &[
+                ("path", json!("demo.txt")),
+                ("mode", json!("write")),
+                (
+                    "content",
+                    json!("large body should not appear in action cmd"),
+                ),
+            ],
+        )];
+        step.action_results = vec![Observation::Success {
+            call_id: "c-2".into(),
+            content: json!("wrote 10 bytes"),
+            bytes: 14,
+            truncated: false,
+        }];
+        let (_, u) = renderer.render(&step);
+        let text = user_text_of(&u);
+        assert!(text.contains("<step_action_results behavior=\"do\" step=\"1\">"));
+        assert!(text.contains("Run write_file demo.txt mode=write:"));
+        assert!(text.contains("wrote 10 bytes"));
+        assert!(!text.contains("large body should not appear in action cmd"));
     }
 
     #[test]
@@ -525,7 +625,7 @@ mod tests {
         let mut step = StepRecord::default();
         step.self_report = Some("checkpoint".into());
         let (_, u) = renderer.render(&step);
-        assert_eq!(user_text_of(&u), "<report_ack/>");
+        assert!(user_text_of(&u).contains("Report acknowledged."));
     }
 
     #[test]
@@ -538,7 +638,7 @@ mod tests {
             body: "progress".into(),
         }];
         let (_, u) = renderer.render(&step);
-        assert!(user_text_of(&u).contains("<message_sent target=\"user\"/>"));
+        assert!(user_text_of(&u).contains("Message sent to user."));
     }
 
     #[test]
@@ -552,12 +652,12 @@ mod tests {
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
-        assert!(user_text.contains("status=\"error\""));
+        assert!(user_text.contains("Error:"));
         assert!(user_text.contains("permission denied"));
     }
 
     #[test]
-    fn pending_result_is_self_closing() {
+    fn pending_result_is_plain_text() {
         let renderer = XmlStepRenderer::new();
         let mut step = StepRecord::default();
         step.actions = vec![tool_call("read", "p-1")];
@@ -566,8 +666,8 @@ mod tests {
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
-        assert!(user_text.contains("status=\"pending\""));
-        assert!(user_text.ends_with("/>"));
+        assert!(user_text.contains("Run read target:"));
+        assert!(user_text.contains("Pending"));
     }
 
     #[test]
@@ -582,13 +682,13 @@ mod tests {
             truncated: false,
         }];
         let (_, u) = renderer.render(&step);
-        // JSON object stringified — angle brackets escaped, "rows":3 visible.
+        // JSON object stringified without XML escaping.
         let user_text = user_text_of(&u);
-        assert!(user_text.contains("&quot;rows&quot;:3"));
+        assert!(user_text.contains("{\"rows\":3}"));
     }
 
     #[test]
-    fn xml_special_chars_in_body_are_escaped() {
+    fn xml_special_chars_in_body_are_not_escaped() {
         let renderer = XmlStepRenderer::new();
         let mut step = StepRecord::default();
         step.actions = vec![tool_call("exec_bash", "e-1")];
@@ -600,7 +700,7 @@ mod tests {
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
-        assert!(user_text.contains("&lt;b&gt;not html&lt;/b&gt; &amp; friends"));
+        assert!(user_text.contains("<b>not html</b> & friends"));
     }
 
     #[test]

@@ -41,6 +41,7 @@ Your only job is to complete the TODO in TASK_ANCHOR.
    - needs confidence: test, diff, validate, or inspect output.
 4. You MUST use the selected skills when they apply.
 5. You MAY mix reading, editing, and verification in one step when the action is coherent.
+6. When the TODO is not complete, you MUST NOT set `next_behavior`; omitting it lets the behavior proceed to the next Step.
 
 ## Completion
 
@@ -72,18 +73,14 @@ __INCLUDE(./step_record_rule.inc)__
 
 ## OpenDAN Runtime Skill
 
-Use this when you need global Agent state or durable session context.
-
+- Use Glob instead of `glob` or `ls` when exploring directories.
+- Use Grep instead of `grep` when searching text.
 - Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
 - Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
 - Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.
-- Deliverables root: `{{ paths.workspace_root }}`. Store generated files, reports, patches, documents, and other user-facing artifacts here.
 - Memory root: `{{ paths.agent_root }}/memory/`. AgentMemory stores durable memory here, including `memory.sqlite` and `.meta/` logs. Prefer memory tools over direct edits.
 - Notepads root: `{{ paths.agent_root }}/notepads/`. Use for durable human-readable Agent notes.
 - Skills root: `{{ paths.agent_root }}/skills/`. Agent-provided skills live here.
-- Tools root: `{{ paths.agent_root }}/tools/`. Agent-provided tools live here; session execution views are rendered by the runtime.
-- Workspace root collection: `{{ paths.agent_root }}/workspace/`. Local workspaces are stored under this directory by workspace id.
-- Archive root: `{{ paths.agent_root }}/archive/`. Runtime archive area for old sessions, workspaces, and skills.
 
 Read global state only when it can change execution. Do not dump large state into the report; include only the facts needed to explain the result.
 

@@ -64,15 +64,14 @@ __INCLUDE(./step_record_rule.inc)__
 <<SKILLS>>
 ## OpenDAN Runtime Skill
 
-Use this when you need global Agent state or durable session context.
-
+- Use Glob instead of `glob` or `ls` when exploring directories.
+- Use Grep instead of `grep` when searching text.
 - Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
 - Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
 - Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.
 - Memory root: `{{ paths.agent_root }}/memory/`. AgentMemory stores durable memory here, including `memory.sqlite` and `.meta/` logs. Prefer memory tools over direct edits.
 - Notepads root: `{{ paths.agent_root }}/notepads/`. Use for durable human-readable Agent notes.
 - Skills root: `{{ paths.agent_root }}/skills/`. Agent-provided skills live here.
-- Tools root: `{{ paths.agent_root }}/tools/`. Agent-provided tools live here; session execution views are rendered by the runtime.
 
 Read global state only when it can change the plan. Do not repeat large state dumps in todos; copy only the facts needed for DO mode.
 

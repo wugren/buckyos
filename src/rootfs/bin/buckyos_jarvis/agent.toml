@@ -62,3 +62,4 @@ session_id_strategy = "per_event_session"
 switch_mode = "normal"
 process_stack_limit = 8
 keep_alive = false
+inject_background_environment = false

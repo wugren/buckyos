@@ -79,8 +79,11 @@ pub struct StepRecord {
     /// pure-thought / terminal-only steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<AiToolCall>,
-    /// "Next behavior" slot — when `Some`, this step is terminal and the
-    /// actions (if any) are still dispatched first, then the loop returns.
+    /// "Next behavior" slot — when `Some` on a step with no action side
+    /// effects, this step is terminal and the loop returns. If the LLM emits
+    /// actions / sendmsg and next_behavior together, the loop suppresses
+    /// next_behavior so action observations are seen before any behavior
+    /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_behavior: Option<String>,
     /// Self Report (`<report>`) — overwrites
@@ -178,7 +181,9 @@ pub struct LLMBehaviorResult {
     /// excluding parser-side tags like `<sendmsg>` and `<report>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub do_actions: Vec<AiToolCall>,
-    /// Terminal signal + jump target. `Some(_)` is terminal; the loop does
+    /// Terminal signal + jump target. `Some(_)` is terminal only when
+    /// `do_actions` is empty; otherwise the loop suppresses it and requires
+    /// the next inference to observe action results first. The loop does
     /// **not** interpret the string — that belongs to the worksession above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_behavior: Option<String>,

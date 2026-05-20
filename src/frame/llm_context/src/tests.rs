@@ -449,3 +449,100 @@ async fn behavior_loop_assigns_step_metadata() {
     assert!(step.meta.ended_at_ms.is_some());
     assert_eq!(snapshot.state.next_step_index, 1);
 }
+
+#[tokio::test]
+async fn behavior_loop_ignores_next_behavior_when_actions_exist() {
+    let llm = Arc::new(ScriptedLlm::new(vec![
+        text_response(
+            r#"<response>
+<thinking>run before switching</thinking>
+<actions><exec_bash>echo done</exec_bash></actions>
+<next_behavior>END</next_behavior>
+</response>"#,
+        ),
+        text_response(
+            r#"<response>
+<observation>action result observed</observation>
+<thinking>now switch</thinking>
+<next_behavior>END</next_behavior>
+</response>"#,
+        ),
+    ]));
+    let mut req = base_request();
+    req.behavior_name = "plan".into();
+    let deps = LLMContextDeps::new(llm, Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()));
+    let mut ctx = LLMContext::new(req, deps);
+
+    let outcome = ctx.run().await;
+    let LLMContextOutcome::Done {
+        behavior_result,
+        trace,
+        ..
+    } = outcome
+    else {
+        panic!("expected behavior Done");
+    };
+    assert_eq!(trace.tool_trace.len(), 1);
+    assert_eq!(
+        behavior_result.and_then(|r| r.next_behavior).as_deref(),
+        Some("END")
+    );
+
+    let snapshot = ctx.snapshot();
+    assert_eq!(snapshot.state.steps.len(), 2);
+    assert_eq!(snapshot.state.steps[0].actions.len(), 1);
+    assert_eq!(snapshot.state.steps[0].next_behavior, None);
+    assert_eq!(snapshot.state.steps[0].action_results.len(), 1);
+    assert_eq!(
+        snapshot.state.steps[1].next_behavior.as_deref(),
+        Some("END")
+    );
+}
+
+#[tokio::test]
+async fn behavior_loop_ignores_next_behavior_when_sendmsg_exists() {
+    let llm = Arc::new(ScriptedLlm::new(vec![
+        text_response(
+            r#"<response>
+<thinking>notify before switching</thinking>
+<actions><sendmsg target="user">working</sendmsg></actions>
+<next_behavior>END</next_behavior>
+</response>"#,
+        ),
+        text_response(
+            r#"<response>
+<thinking>now switch</thinking>
+<next_behavior>END</next_behavior>
+</response>"#,
+        ),
+    ]));
+    let mut req = base_request();
+    req.behavior_name = "plan".into();
+    let deps = LLMContextDeps::new(llm, Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()));
+    let mut ctx = LLMContext::new(req, deps);
+
+    let outcome = ctx.run().await;
+    let LLMContextOutcome::Done {
+        behavior_result, ..
+    } = outcome
+    else {
+        panic!("expected behavior Done");
+    };
+    assert_eq!(
+        behavior_result.and_then(|r| r.next_behavior).as_deref(),
+        Some("END")
+    );
+
+    let snapshot = ctx.snapshot();
+    assert_eq!(snapshot.state.steps.len(), 2);
+    assert_eq!(snapshot.state.steps[0].messages_sent.len(), 1);
+    assert_eq!(snapshot.state.steps[0].next_behavior, None);
+    assert_eq!(
+        snapshot.state.steps[1].next_behavior.as_deref(),
+        Some("END")
+    );
+}

@@ -9,7 +9,8 @@
 //! [[channel]]           Gateway inbound sources (msg_center / kevent / ...)
 //! [dispatch]            default_class + ordered match-rule list
 //! [session.<class>]     per-class loop_mode / default_behavior / subscribe /
-//!                       session_id_strategy / switch_mode / keep_alive / kind
+//!                       session_id_strategy / switch_mode / keep_alive /
+//!                       inject_background_environment / kind
 //! ```
 //!
 //! Loaded once at `AIAgent::open(root)`. `[session]` is a map keyed by
@@ -252,6 +253,12 @@ pub struct SessionClassCfg {
     /// `true` ⇒ session is always "active" (UI). `false` ⇒ active iff
     /// `status != Ended` (Work).
     pub keep_alive: bool,
+    #[serde(default = "default_inject_background_environment")]
+    pub inject_background_environment: bool,
+}
+
+fn default_inject_background_environment() -> bool {
+    true
 }
 
 impl Default for SessionClassCfg {
@@ -265,6 +272,7 @@ impl Default for SessionClassCfg {
             switch_mode: SwitchMode::Normal,
             process_stack_limit: 0,
             keep_alive: false,
+            inject_background_environment: true,
         }
     }
 }
@@ -552,6 +560,7 @@ mod tests {
                 switch_mode = "normal"
                 process_stack_limit = 8
                 keep_alive = false
+                inject_background_environment = false
             "#,
         )
         .unwrap();
@@ -582,6 +591,8 @@ mod tests {
         assert_eq!(work.session_id_strategy, SessionIdStrategy::PerEventSession);
         assert_eq!(work.process_stack_limit, 8);
         assert!(!work.keep_alive);
+        assert!(!work.inject_background_environment);
+        assert!(ui.inject_background_environment);
     }
 
     #[test]

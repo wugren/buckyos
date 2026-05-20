@@ -153,6 +153,7 @@ pub async fn compress(
         force_json: false,
         json_schema: None,
         provider_options: None,
+        disable_capabilities: Vec::new(),
         tool_specs: Vec::new(),
         allow_tool_calls: false,
         // Internal summariser call — no scheduler-side interrupt handle is

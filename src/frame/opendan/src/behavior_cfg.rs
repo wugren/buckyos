@@ -178,6 +178,7 @@ pub struct CapabilitiesCfg {
     pub tool_whitelist: Vec<String>,
     pub action_whitelist: Vec<String>,
     pub approval_required: Vec<String>,
+    pub disable_capabilities: Vec<String>,
     /// Optional tool plan name (§9.2) — resolves to
     /// `<agent_root>/tool_plans/<name>.toml`. Empty ⇒ no tombstones.
     pub tool_plan: String,
@@ -345,6 +346,7 @@ impl BehaviorCfg {
             whitelist: self.capabilities.tool_whitelist.clone(),
             action_mode,
             action_whitelist: self.capabilities.action_whitelist.clone(),
+            disable_capabilities: self.capabilities.disable_capabilities.clone(),
             max_rounds: self.budget.max_rounds,
             ..Default::default()
         }
@@ -466,6 +468,20 @@ mod tests {
         assert!(matches!(pol.action_mode, ToolMode::Whitelist));
         assert_eq!(pol.whitelist, vec!["try_create_worksession"]);
         assert_eq!(pol.action_whitelist, vec!["read"]);
+    }
+
+    #[test]
+    fn disable_capabilities_round_trip_to_tool_policy() {
+        let toml_src = r#"
+            [meta]
+            name = "x"
+
+            [capabilities]
+            disable_capabilities = ["web_search"]
+        "#;
+        let cfg = BehaviorCfg::from_toml_str(toml_src).unwrap();
+        let pol = cfg.to_tool_policy();
+        assert_eq!(pol.disable_capabilities, vec!["web_search"]);
     }
 
     #[test]

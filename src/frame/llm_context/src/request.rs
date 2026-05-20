@@ -89,6 +89,7 @@ pub struct ToolPolicy {
     pub max_rounds: u32,
     pub max_calls_per_round: u32,
     pub max_observation_bytes: u32,
+    pub disable_capabilities: Vec<String>,
     /// Whether tool calls within the same round may run concurrently.
     pub parallel: bool,
     /// Whether ToolManager is allowed to return `Observation::Pending` and
@@ -106,6 +107,7 @@ impl Default for ToolPolicy {
             max_rounds: 8,
             max_calls_per_round: 8,
             max_observation_bytes: 32 * 1024,
+            disable_capabilities: Vec::new(),
             parallel: false,
             allow_deferred: false,
         }

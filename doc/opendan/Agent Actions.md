@@ -241,8 +241,6 @@ new content for lines 10..=20
   <report><![CDATA[
 本步骤完成总结...
 ]]></report>
-
-  <next_behavior>plan_step_3</next_behavior>
 </response>
 ```
 
@@ -251,7 +249,7 @@ new content for lines 10..=20
 1. 新增 `<actions>` 容器。所有 Action 是它的直接子元素，**一级标签即 Action 名**，不再用 `<action tool="...">`。
 2. **Self Report `<report>` 在 `<actions>` 外面**——它是当前 `LLMContext` 的 LastState 更新，跟 `<observation>` / `<thinking>` / `<next_behavior>` 同级。
 3. **SendMessage 形态用 `<sendmsg target=...>` 放在 `<actions>` 里面**——它是这一步内执行的副作用动作之一。
-4. `<next_behavior>` 保留，跟 v1 语义完全一致：终止本 behavior，可选携带下一个 behavior 名。
+4. `<next_behavior>` 保留，跟 v1 语义一致：终止本 behavior，可选携带下一个 behavior 名；但只能在 `<actions>` 为空时设置。
 
 ### 2.2 `<report>` 与 `<next_behavior>` 的共存规则
 
@@ -263,6 +261,8 @@ new content for lines 10..=20
 | 只 `<next_behavior>` | 跳转/终止，但本 behavior 没有可读结果 |
 | 只 `<report>` | 写 `last_report`，但**不终止**——下一轮仍是当前 behavior，可继续覆盖 `last_report` |
 | 两者都有 | 写 `last_report` 后跳转/终止——典型的"结束并留下产出" |
+
+`<next_behavior>` 必须只出现在没有 action side effect 的步骤里。若 LLM 在同一步同时输出 `<actions>` 和 `<next_behavior>`，`llm_context` 会忽略该 `<next_behavior>` 并输出 warning 日志；action 结果必须先被下一轮 LLM 观察，再由下一轮决定是否跳转。
 
 **为什么 `<report>` 单独出现不终止：** 长任务里 LLM 可能想中途"打个 checkpoint"——把当前阶段的结论先写进 last_report，方便外部 inspect / fork 用，但本任务还要继续。终止动作的权威信号始终是 `<next_behavior>`，单一职责。
 

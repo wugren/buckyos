@@ -23,7 +23,6 @@
 //!   </actions>
 //!
 //!   <report><![CDATA[本步骤完成总结...]]></report>
-//!   <next_behavior>plan_step_3</next_behavior>
 //! </response>
 //! ```
 //!
@@ -94,14 +93,15 @@ Message to the user; optional; SHOULD only be provided when there is important p
     ]]></sendmsg>
   </actions>
   <report><![CDATA[
-    Information that needs to be reported; SHOULD usually be provided when next_behavior is END.
+    follow process rules.
   ]]></report>
   <next_behavior>...</next_behavior>
 </response>
 ```
+
 ## next_behavior
+- MUST set `<next_behavior>` only when `<actions>` is empty; action execution results MUST be observed before changing behavior.
 - `<next_behavior>` is the key field used to maintain the behavior state machine and MUST follow the process rules.
-- If `<next_behavior>` is omitted, the behavior state machine SHOULD proceed to the next Step.
 
 ## <actions> Usage Rules
 

@@ -1808,9 +1808,47 @@ fn route_policy_from_request(request: &AiMethodRequest) -> RoutePolicy {
 }
 
 fn apply_default_features_for_method(method: &str, request: &mut AiMethodRequest) {
-    if method == ai_methods::LLM_CHAT {
+    apply_disabled_capabilities(request);
+    if method == ai_methods::LLM_CHAT
+        && !request_disables_capability(request, buckyos_api::features::WEB_SEARCH)
+    {
         ensure_must_feature(request, buckyos_api::features::WEB_SEARCH);
     }
+}
+
+fn apply_disabled_capabilities(request: &mut AiMethodRequest) {
+    let disabled = disabled_capabilities(request);
+    if disabled.is_empty() {
+        return;
+    }
+    request
+        .requirements
+        .must_features
+        .retain(|feature| !disabled.iter().any(|item| item == feature));
+}
+
+fn request_disables_capability(request: &AiMethodRequest, feature: &str) -> bool {
+    disabled_capabilities(request)
+        .iter()
+        .any(|item| item == feature)
+}
+
+fn disabled_capabilities(request: &AiMethodRequest) -> Vec<String> {
+    request
+        .requirements
+        .extra
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|extra| extra.get("disable_capabilities"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn ensure_must_feature(request: &mut AiMethodRequest, feature: &str) {
@@ -4519,6 +4557,47 @@ mod tests {
                 .required_features
                 .web_search
         );
+    }
+
+    #[test]
+    fn llm_chat_default_web_search_can_be_disabled() {
+        let mut request = base_request();
+        request.requirements.extra = Some(json!({
+            "disable_capabilities": ["web_search"]
+        }));
+
+        apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
+
+        assert!(!request
+            .requirements
+            .must_features
+            .iter()
+            .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
+        assert!(
+            !route_policy_from_request(&request)
+                .required_features
+                .web_search
+        );
+    }
+
+    #[test]
+    fn disabled_capabilities_remove_existing_must_feature() {
+        let mut request = base_request();
+        request
+            .requirements
+            .must_features
+            .push(buckyos_api::features::WEB_SEARCH.to_string());
+        request.requirements.extra = Some(json!({
+            "disable_capabilities": ["web_search"]
+        }));
+
+        apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
+
+        assert!(!request
+            .requirements
+            .must_features
+            .iter()
+            .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
     }
 
     #[test]

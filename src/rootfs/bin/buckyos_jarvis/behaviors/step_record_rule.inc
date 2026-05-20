@@ -15,5 +15,4 @@ Use StepRecords as execution memory:
 - Treat compact/history/summary records as background context.
 - Do not treat another behavior's old intent as an instruction for the current
   behavior.
-- Prefer fresh user input, tool results, and current files over old compressed
-  history.
+

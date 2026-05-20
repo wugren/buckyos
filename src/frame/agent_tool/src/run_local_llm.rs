@@ -468,6 +468,7 @@ impl LlmClient for AiccLlmClient {
             force_json,
             json_schema: _,
             provider_options,
+            disable_capabilities,
             tool_specs,
             allow_tool_calls,
             // The dev tool talks to AICC via a synchronous `call_method`
@@ -524,6 +525,24 @@ impl LlmClient for AiccLlmClient {
             must_features.push("json_output".to_string());
         }
 
+        let mut requirements_extra = provider_options;
+        if !disable_capabilities.is_empty() {
+            let mut obj = match requirements_extra.take() {
+                Some(Value::Object(obj)) => obj,
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("provider_options".to_string(), other);
+                    obj
+                }
+                None => serde_json::Map::new(),
+            };
+            obj.insert(
+                "disable_capabilities".to_string(),
+                json!(disable_capabilities),
+            );
+            requirements_extra = Some(Value::Object(obj));
+        }
+
         let requirements = Requirements {
             must_features,
             max_latency_ms: None,
@@ -533,7 +552,7 @@ impl LlmClient for AiccLlmClient {
             } else {
                 RespFormat::Text
             },
-            extra: provider_options,
+            extra: requirements_extra,
         };
 
         let request = AiMethodRequest::new(

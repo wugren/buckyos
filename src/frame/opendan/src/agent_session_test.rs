@@ -57,6 +57,74 @@ fn compose_turn_message_preserves_structured_blocks() {
 }
 
 #[test]
+fn append_turn_message_preserves_behavior_step_records() {
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.rounds_left = 0;
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><actions><exec_bash>todo add \"first\"</exec_bash></actions><next_behavior>DO</next_behavior></response>".to_string(),
+        thought: Some("planned todos".to_string()),
+        actions: vec![buckyos_api::AiToolCall {
+            name: "exec_bash".to_string(),
+            args: std::collections::HashMap::new(),
+            call_id: "call-1".to_string(),
+        }],
+        action_results: vec![Observation::Success {
+            call_id: "call-1".to_string(),
+            content: serde_json::json!({"ok": true}),
+            bytes: 12,
+            truncated: false,
+        }],
+        ..Default::default()
+    });
+    state.next_step_index = 1;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        AiMessage::text(AiRole::User, "continue task"),
+        "new-trace",
+        true,
+    );
+
+    assert_eq!(out.request.trace.as_deref(), Some("new-trace"));
+    assert_eq!(out.request.input.len(), 3);
+    assert_eq!(out.state.accumulated.len(), 3);
+    assert_eq!(out.state.accumulated[2].text_content(), "continue task");
+    assert!(out.state.steps.is_empty());
+    let last_step = out.state.last_step.as_ref().expect("latest step hot tail");
+    assert!(last_step.assistant_text.contains("todo add"));
+    assert_eq!(last_step.meta.behavior_name, "plan");
+    assert_eq!(out.state.next_step_index, 1);
+    assert_eq!(out.state.rounds_left, out.request.tool_policy.max_rounds);
+}
+
+#[test]
 fn output_text_extraction() {
     let out = ContextOutput::Text {
         content: "hi".to_string(),

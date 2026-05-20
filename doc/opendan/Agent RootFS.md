@@ -179,6 +179,7 @@ session_id_strategy = "per_peer"        # 见下方枚举
 switch_mode         = "normal"          # behavior 切换语义；agent loop 下不会触发，写出来仅为对称
 process_stack_limit = 4
 keep_alive          = true              # 永远算 active，重启后 restore
+inject_background_environment = true    # 每轮 user input 前注入 <background_environment>
 
 [session.group]
 loop_mode           = "agent"
@@ -195,6 +196,7 @@ session_id_strategy = "per_event_session"
 switch_mode         = "normal"          # "normal" | "fork" | "independent"，整个 class 统一
 process_stack_limit = 8
 keep_alive          = false             # status != Ended 才算 active
+inject_background_environment = false   # worksession 通常只用 prompt 模板里的 session/workspace 变量
 ```
 
 **`session_id_strategy` 枚举**（v0 固化、不可扩展）：
@@ -228,6 +230,7 @@ keep_alive          = false             # status != Ended 才算 active
 | — | `[session.<class>].session_id_strategy` | **新增**，固化 session_id 派生策略 |
 | — | `[session.<class>].switch_mode` | **新增**（从 behavior 上提），整个 class 统一 |
 | — | `[session.<class>].keep_alive` | **新增**，固化"UI 永远活、Work 看状态"的差异 |
+| — | `[session.<class>].inject_background_environment` | **新增**，控制是否在每轮输入前动态注入 `<background_environment>` |
 
 ### 4.4 兼容性
 

@@ -512,6 +512,7 @@ impl LLMContext {
             force_json,
             json_schema,
             provider_options: self.request.model_policy.provider_options.clone(),
+            disable_capabilities: self.request.tool_policy.disable_capabilities.clone(),
             tool_specs,
             allow_tool_calls,
             abort: self.abort_token(),
@@ -776,6 +777,8 @@ impl LLMContext {
             //    the traditional loop's provider-tool policy gate while
             //    preserving the surface that produced the invocation.
             //    A rejection is folded back as a recoverable error step.
+            let had_action_side_effects_before_gate =
+                !new_step.actions.is_empty() || !new_step.messages_sent.is_empty();
             let actions = match self
                 .deps
                 .policy
@@ -800,6 +803,15 @@ impl LLMContext {
                     continue;
                 }
             };
+
+            if had_action_side_effects_before_gate {
+                if let Some(violating) = new_step.next_behavior.take() {
+                    log::warn!(
+                        "behavior_loop: ignoring `<next_behavior>{}</next_behavior>` because actions are present; action results must be observed before changing behavior",
+                        violating
+                    );
+                }
+            }
 
             // 6. Dispatch all actions in document order. v2 allows multiple
             //    actions per step via the `<actions>` container. On the first
@@ -908,9 +920,10 @@ impl LLMContext {
             }
 
             // 7. Terminal cases:
-            //    a) `<next_behavior>` was set — finish (after dispatching the
-            //       actions above; v2 allows actions + next_behavior in one
-            //       step, see doc §2.2).
+            //    a) `<next_behavior>` was set on an action-free step — finish.
+            //       If actions were present, the guard above scrubbed
+            //       next_behavior so the next inference can observe results
+            //       before changing behavior.
             //    b) No actions, no report, no message, no next_behavior — a
             //       pure-thought response = natural convergence.
             if new_step.next_behavior.is_some() {

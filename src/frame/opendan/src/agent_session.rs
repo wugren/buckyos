@@ -1708,6 +1708,14 @@ impl AgentSession {
             .unwrap_or(SwitchMode::Normal)
     }
 
+    fn session_class_inject_background_environment(&self) -> bool {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.inject_background_environment)
+            .unwrap_or(true)
+    }
+
     /// Map a `BehaviorCfg` to the round-history mode tag (parser-presence is
     /// the canonical signal for Behavior vs Chat per `notepads/session-history.md`
     /// §3).
@@ -1982,6 +1990,7 @@ impl AgentSession {
             session_id: self.session_id.clone(),
         };
         let parser_renderer = behavior.build_parser_and_renderer(self.session_class_loop_mode());
+        let preserve_behavior_state = parser_renderer.is_some();
         let approval_required = behavior.capabilities.approval_required.clone();
         let from_user_did = self.current_from_user_did().await;
 
@@ -2013,7 +2022,11 @@ impl AgentSession {
         // System and don't need env either.
         let turn_message = compose_turn_message(
             turn_messages,
-            self.compose_environment_message(behavior).await,
+            if self.session_class_inject_background_environment() {
+                self.compose_environment_message(behavior).await
+            } else {
+                None
+            },
         );
 
         if let Some(snapshot) = self.try_load_snapshot() {
@@ -2031,20 +2044,23 @@ impl AgentSession {
                 );
 
                 if let Some(message) = turn_message.clone() {
-                    // Idle session + new user message: build a fresh
-                    // LLMContext whose conversation history *is* the
-                    // snapshot's accumulated (already includes the system
-                    // segment that was sediment-cloned at first inference),
-                    // with the new user turn appended. Per-turn state
-                    // (consecutive_errors, usage, steps, trace) resets here;
-                    // cross-turn accumulation lives on SessionMeta.
-                    let LLMContextSnapshot { mut request, state } = snapshot;
-                    let mut input = state.accumulated;
-                    input.push(message);
-                    request.input = input;
-                    request.trace = Some(trace_id.to_string());
-                    let fresh = LLMContext::new(request.clone(), deps.clone());
-                    return Ok((BuiltContext::Fresh(fresh), request, deps));
+                    // Idle session + new user message: rebuild the snapshot
+                    // with the new user turn appended while resetting
+                    // per-run counters. In behavior mode the StepRecord
+                    // stream is the durable execution memory; keep it so a
+                    // behavior switch (plan -> do) can see the previous
+                    // assistant intent and action results.
+                    let snapshot = append_turn_message_to_snapshot(
+                        snapshot,
+                        message,
+                        trace_id,
+                        preserve_behavior_state,
+                    );
+                    let request = snapshot.request.clone();
+                    let resumed =
+                        LLMContext::resume(snapshot, ResumeFill::ResumeFromMidRun, deps.clone())
+                            .map_err(|e| anyhow!("resume with new turn: {e}"))?;
+                    return Ok((BuiltContext::Resumed(resumed), request, deps));
                 }
                 // No new user input — resume the snapshot in place
                 // (crash-recovery / idle re-entry without driver).
@@ -3440,6 +3456,34 @@ enum NextAction {
 enum BuiltContext {
     Fresh(LLMContext),
     Resumed(LLMContext),
+}
+
+fn append_turn_message_to_snapshot(
+    mut snapshot: LLMContextSnapshot,
+    message: AiMessage,
+    trace_id: &str,
+    preserve_behavior_state: bool,
+) -> LLMContextSnapshot {
+    let mut input = snapshot.state.accumulated.clone();
+    input.push(message);
+
+    snapshot.request.input = input;
+    snapshot.request.trace = Some(trace_id.to_string());
+
+    let previous_state = snapshot.state;
+    let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
+    if preserve_behavior_state {
+        state.steps = previous_state.steps;
+        state.history_summaries = previous_state.history_summaries;
+        state.last_step = previous_state.last_step;
+        if state.last_step.is_none() {
+            state.last_step = state.steps.pop();
+        }
+        state.last_report = previous_state.last_report;
+        state.next_step_index = previous_state.next_step_index;
+    }
+    snapshot.state = state;
+    snapshot
 }
 
 fn now_ms() -> u64 {

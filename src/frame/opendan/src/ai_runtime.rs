@@ -73,6 +73,7 @@ impl LlmClient for AiccLlmClient {
             force_json,
             json_schema,
             provider_options,
+            disable_capabilities,
             tool_specs,
             allow_tool_calls,
             // AICC's `call_method` does not currently support cancel
@@ -139,7 +140,14 @@ impl LlmClient for AiccLlmClient {
             must_features.push(features::JSON_OUTPUT.to_string());
         }
 
-        let mut requirements = Requirements::new(must_features, None, None, None);
+        let extra = if disable_capabilities.is_empty() {
+            None
+        } else {
+            Some(json!({
+                "disable_capabilities": disable_capabilities
+            }))
+        };
+        let mut requirements = Requirements::new(must_features, None, None, extra);
         if force_json {
             requirements.resp_format = RespFormat::Json;
         }
