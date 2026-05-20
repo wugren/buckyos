@@ -1,5 +1,25 @@
 use super::*;
 
+fn todo_json(
+    todo_id: &str,
+    status: &str,
+    title: &str,
+    content: &str,
+    skills: Vec<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "todo_id": todo_id,
+        "session_id": "s-1",
+        "order_index": 0,
+        "status": status,
+        "title": title,
+        "content": content,
+        "skills": skills,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    })
+}
+
 #[test]
 fn compose_human_text_skips_empties() {
     let v = vec!["  ".to_string(), "hello".to_string(), "".to_string()];
@@ -104,16 +124,8 @@ fn render_current_todo_list_marks_first_open_todo() {
     std::fs::write(
         dir.path().join("todos.json"),
         serde_json::json!([
-            {
-                "todo_id": "T01",
-                "status": "completed",
-                "task": "done task"
-            },
-            {
-                "todo_id": "T02",
-                "status": "pending",
-                "task": "next task"
-            }
+            todo_json("T01", "completed", "done task", "done task details", vec![]),
+            todo_json("T02", "pending", "next task", "next task details", vec![])
         ])
         .to_string(),
     )
@@ -130,17 +142,14 @@ fn load_current_todo_returns_first_open_todo() {
     std::fs::write(
         dir.path().join("todos.json"),
         serde_json::json!([
-            {
-                "todo_id": "T01",
-                "status": "completed",
-                "task": "done task"
-            },
-            {
-                "todo_id": "T02",
-                "status": "running",
-                "task": "next task",
-                "skills": ["docs"]
-            }
+            todo_json("T01", "completed", "done task", "done task details", vec![]),
+            todo_json(
+                "T02",
+                "running",
+                "next task",
+                "next task details",
+                vec!["docs"]
+            )
         ])
         .to_string(),
     )
@@ -148,7 +157,8 @@ fn load_current_todo_returns_first_open_todo() {
 
     let todo = load_current_todo(dir.path());
     assert_eq!(todo["todo_id"], "T02");
-    assert_eq!(todo["task"], "next task");
+    assert_eq!(todo["title"], "next task");
+    assert_eq!(todo["content"], "next task details");
     assert_eq!(todo["skills"][0], "docs");
 }
 
@@ -157,18 +167,102 @@ fn load_current_todo_returns_null_when_all_terminal() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("todos.json"),
-        serde_json::json!([
-            {
-                "todo_id": "T01",
-                "status": "completed",
-                "task": "done task"
-            }
-        ])
+        serde_json::json!([todo_json(
+            "T01",
+            "completed",
+            "done task",
+            "done task details",
+            vec![]
+        )])
         .to_string(),
     )
     .unwrap();
 
     assert!(load_current_todo(dir.path()).is_null());
+}
+
+#[test]
+fn template_failure_detail_points_to_null_todo_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let behavior_path = dir.path().join("behaviors/do.toml");
+    std::fs::create_dir_all(behavior_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &behavior_path,
+        r#"[meta]
+name = "do"
+objective = "execute"
+
+[prompt]
+parser = "xml"
+on_init = """
+__INCLUDE(/role.md)__
+
+<<TASK_ANCHOR>>
+{{ session.current_todo.todo_id }}: {{session.current_todo.title}}
+
+{{ session.current_todo.content }}
+<</TASK_ANCHOR>>
+"""
+"#,
+    )
+    .unwrap();
+
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "do"
+
+        [prompt]
+        on_init = """
+__INCLUDE(/role.md)__
+
+<<TASK_ANCHOR>>
+{{ session.current_todo.todo_id }}: {{session.current_todo.title}}
+
+{{ session.current_todo.content }}
+<</TASK_ANCHOR>>
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(behavior_path.clone());
+
+    let env = AgentSessionEnv {
+        session_id: "s-1".into(),
+        session_kind: "work",
+        session_title: "title".into(),
+        session_objective: "objective".into(),
+        session_owner: "owner".into(),
+        session_current_todo: serde_json::Value::Null,
+        session_current_todo_list: "(empty)".into(),
+        behavior_name: "do".into(),
+        behavior_objective: "execute".into(),
+        behavior_mode: "behavior",
+        behavior_template_dir: behavior_path.parent().map(|path| path.to_path_buf()),
+        workspace_id: Some("ws1".into()),
+        workspace_root: Some(dir.path().join("workspace/ws1")),
+        agent_root: dir.path().to_path_buf(),
+        session_root: dir.path().join("sessions/s-1"),
+        input_text: String::new(),
+        input_has_user_text: false,
+        input_has_events: false,
+        recent_activity: String::new(),
+        clock_unix_ms: 1,
+    };
+    let detail = render_template_failure_detail(
+        &behavior,
+        "prompt.on_init",
+        behavior.prompt.on_init.trim(),
+        &env,
+        &"none does not support key-based access",
+    );
+
+    assert!(detail.contains("behavior=`do`"));
+    assert!(detail.contains("field=`prompt.on_init`"));
+    assert!(detail.contains("do.toml:8"));
+    assert!(detail.contains("do.toml:11"));
+    assert!(detail.contains("session.current_todo` is null"));
+    assert!(detail.contains("{{ session.current_todo.todo_id }}"));
 }
 
 #[test]

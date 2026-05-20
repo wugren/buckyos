@@ -117,7 +117,11 @@ impl NotebookKind {
             "project" => Self::Project,
             "system" => Self::System,
             "agent" => Self::Agent,
-            other => return Err(NotebookError::Storage(format!("bad notebook kind: {other}"))),
+            other => {
+                return Err(NotebookError::Storage(format!(
+                    "bad notebook kind: {other}"
+                )))
+            }
         })
     }
 }
@@ -143,7 +147,11 @@ impl NotebookStatus {
             "active" => Self::Active,
             "archived" => Self::Archived,
             "deleted" => Self::Deleted,
-            other => return Err(NotebookError::Storage(format!("bad notebook status: {other}"))),
+            other => {
+                return Err(NotebookError::Storage(format!(
+                    "bad notebook status: {other}"
+                )))
+            }
         })
     }
 }
@@ -790,7 +798,11 @@ impl AgentNotebook {
         )?;
         let include_archived = if input.include_archived { 1 } else { 0 };
         let rows = stmt.query_map(
-            params![input.scope.owner_user_id, input.scope.agent(), include_archived],
+            params![
+                input.scope.owner_user_id,
+                input.scope.agent(),
+                include_archived
+            ],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -994,8 +1006,8 @@ impl AgentNotebook {
         let mut truncated_inputs = Vec::new();
         let raw_tags = input.tags.clone().unwrap_or_default();
         let normalized_tags = normalize_tags(&raw_tags)?;
-        let star_or_empty =
-            raw_tags.is_empty() || raw_tags.iter().any(|t| t.trim() == "*") && normalized_tags.is_empty();
+        let star_or_empty = raw_tags.is_empty()
+            || raw_tags.iter().any(|t| t.trim() == "*") && normalized_tags.is_empty();
         // tags is empty after normalization OR contains only "*" → no filter.
         let tags_effective: Vec<String> = if star_or_empty {
             Vec::new()
@@ -1078,9 +1090,13 @@ impl AgentNotebook {
         if input.allow_unchanged {
             if let Some(sid) = input.session_id.as_deref() {
                 // Direct hit on same scope.
-                if let Some(prev_version) =
-                    fetch_read_cache_version(&conn, sid, &input.scope, &notebook_id, &read_scope_hash)?
-                {
+                if let Some(prev_version) = fetch_read_cache_version(
+                    &conn,
+                    sid,
+                    &input.scope,
+                    &notebook_id,
+                    &read_scope_hash,
+                )? {
                     if prev_version == notebook.version {
                         return Ok(NotebookReadResult::Unchanged {
                             notebook_id: notebook_id.clone(),
@@ -1146,9 +1162,13 @@ impl AgentNotebook {
                 let needle = input.title.as_deref().unwrap_or("");
                 title_candidates(&conn, &input.scope, &notebook_id, needle, &include_status)?
             }
-            ReadMode::Tags => {
-                tag_candidates(&conn, &input.scope, &notebook_id, &tags_effective, &include_status)?
-            }
+            ReadMode::Tags => tag_candidates(
+                &conn,
+                &input.scope,
+                &notebook_id,
+                &tags_effective,
+                &include_status,
+            )?,
             ReadMode::Latest | ReadMode::AllActive => {
                 all_candidates(&conn, &input.scope, &notebook_id, &include_status)?
             }
@@ -1375,8 +1395,7 @@ impl AgentNotebook {
                         created_at: now.clone(),
                     },
                 )?;
-                load_notebook(&tx, &input.scope, &notebook_id)?
-                    .expect("notebook just inserted")
+                load_notebook(&tx, &input.scope, &notebook_id)?.expect("notebook just inserted")
             }
         };
 
@@ -1499,10 +1518,7 @@ impl AgentNotebook {
 
     // -------------------------------------------------- mark_note_status (§5.5)
 
-    pub fn mark_note_status(
-        &self,
-        input: MarkNoteStatusInput,
-    ) -> Result<MarkNoteStatusResult> {
+    pub fn mark_note_status(&self, input: MarkNoteStatusInput) -> Result<MarkNoteStatusResult> {
         validate_owner(&input.scope)?;
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
@@ -1512,13 +1528,16 @@ impl AgentNotebook {
             .query_row(
                 "SELECT notebook_id, status, item_revision FROM notebook_items
                  WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-                params![input.item_id, input.scope.owner_user_id, input.scope.agent()],
+                params![
+                    input.item_id,
+                    input.scope.owner_user_id,
+                    input.scope.agent()
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (notebook_id, prev_status_s, prev_rev) = row.ok_or_else(|| {
-            NotebookError::NotFound(format!("notebook item {}", input.item_id))
-        })?;
+        let (notebook_id, prev_status_s, prev_rev) =
+            row.ok_or_else(|| NotebookError::NotFound(format!("notebook item {}", input.item_id)))?;
         let prev_status = NotebookItemStatus::from_str(&prev_status_s)?;
 
         if let Some(expected) = input.expected_item_revision {
@@ -1666,18 +1685,16 @@ impl AgentNotebook {
         let now = now_iso8601();
 
         // Fetch source item.
-        let src: Option<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-        )> = tx
+        let src: Option<(String, String, String, String, Option<String>)> = tx
             .query_row(
                 "SELECT notebook_id, status, confidence, title, valid_until
                  FROM notebook_items
                  WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-                params![input.item_id, input.scope.owner_user_id, input.scope.agent()],
+                params![
+                    input.item_id,
+                    input.scope.owner_user_id,
+                    input.scope.agent()
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1719,7 +1736,11 @@ impl AgentNotebook {
             "SELECT COUNT(*) FROM notebook_items
              WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
                AND status = 'active'",
-            params![input.scope.owner_user_id, input.scope.agent(), SYSTEM_NOTEBOOK_ID],
+            params![
+                input.scope.owner_user_id,
+                input.scope.agent(),
+                SYSTEM_NOTEBOOK_ID
+            ],
             |r| r.get::<_, i64>(0),
         )? as usize;
 
@@ -1744,7 +1765,11 @@ impl AgentNotebook {
             "SELECT COUNT(*) FROM notebook_items
              WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
                AND status = 'active'",
-            params![input.scope.owner_user_id, input.scope.agent(), SYSTEM_NOTEBOOK_ID],
+            params![
+                input.scope.owner_user_id,
+                input.scope.agent(),
+                SYSTEM_NOTEBOOK_ID
+            ],
             |r| r.get::<_, i64>(0),
         )? as usize;
 
@@ -1809,7 +1834,11 @@ impl AgentNotebook {
             "SELECT COUNT(*) FROM notebook_items
              WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
                AND status = 'active'",
-            params![input.scope.owner_user_id, input.scope.agent(), SYSTEM_NOTEBOOK_ID],
+            params![
+                input.scope.owner_user_id,
+                input.scope.agent(),
+                SYSTEM_NOTEBOOK_ID
+            ],
             |r| r.get::<_, i64>(0),
         )? as usize;
         tx.commit()?;
@@ -1992,17 +2021,21 @@ impl AgentNotebook {
             },
         )?;
         let mut latest_seq = watermark_seq;
-        let mut per_notebook: HashMap<String, (String, Option<String>, Option<Vec<String>>, String)> =
-            HashMap::new();
+        let mut per_notebook: HashMap<
+            String,
+            (String, Option<String>, Option<Vec<String>>, String),
+        > = HashMap::new();
         for row in rows {
-            let (seq, _ev_id, nb_id, _ty, title, tags_s, _nv, created_at, _actor, current_v) =
-                row?;
+            let (seq, _ev_id, nb_id, _ty, title, tags_s, _nv, created_at, _actor, current_v) = row?;
             latest_seq = latest_seq.max(seq);
             let tags = match tags_s {
                 Some(s) if !s.is_empty() => serde_json::from_str::<Vec<String>>(&s).ok(),
                 _ => None,
             };
-            per_notebook.insert(nb_id, (title.unwrap_or_default(), Some(created_at), tags, current_v));
+            per_notebook.insert(
+                nb_id,
+                (title.unwrap_or_default(), Some(created_at), tags, current_v),
+            );
         }
         for (nb_id, (title, upd, tags, version)) in per_notebook.drain() {
             if has_session_read(&conn, &input.session_id, &input.scope, &nb_id)? {
@@ -2036,7 +2069,9 @@ impl AgentNotebook {
                 let text = format!(
                     "Notebook update since your last turn: {} was updated{}{}",
                     nb_id,
-                    upd.as_deref().map(|t| format!(" at {}", t)).unwrap_or_default(),
+                    upd.as_deref()
+                        .map(|t| format!(" at {}", t))
+                        .unwrap_or_default(),
                     matched
                         .as_ref()
                         .map(|m| format!(" (tag overlap: {})", m.join(",")))
@@ -2433,8 +2468,7 @@ fn build_read_scope_value(
     item_ids: Option<&[String]>,
     include_status: &HashSet<NotebookItemStatus>,
 ) -> Json {
-    let mut statuses: Vec<&'static str> =
-        include_status.iter().map(|s| s.as_str()).collect();
+    let mut statuses: Vec<&'static str> = include_status.iter().map(|s| s.as_str()).collect();
     statuses.sort();
     let mut obj = serde_json::Map::new();
     obj.insert("mode".into(), Json::from(mode.as_str()));
@@ -2453,10 +2487,7 @@ fn build_read_scope_value(
             obj.insert("title".into(), Json::from(title.unwrap_or("")));
         }
         ReadMode::Latest => {
-            obj.insert(
-                "latest_n".into(),
-                Json::from(latest_n.unwrap_or(0) as u64),
-            );
+            obj.insert("latest_n".into(), Json::from(latest_n.unwrap_or(0) as u64));
         }
         ReadMode::Items => {
             let mut ids: Vec<String> = item_ids.unwrap_or(&[]).to_vec();
@@ -2651,7 +2682,10 @@ fn detect_conflicts(
 
     // 2) Tag overlap.
     if !tags.is_empty() {
-        let placeholders = std::iter::repeat("?").take(tags.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat("?")
+            .take(tags.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let q = format!(
             "SELECT i.item_id, i.title, i.status, i.updated_at, GROUP_CONCAT(t.tag, ',')
              FROM notebook_items i
@@ -2792,7 +2826,10 @@ fn tag_candidates(
     if tags.is_empty() {
         return all_candidates(conn, scope, notebook_id, include_status);
     }
-    let placeholders = std::iter::repeat("?").take(tags.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat("?")
+        .take(tags.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let status_filter = build_status_filter(include_status);
     let q = format!(
         "SELECT i.item_id FROM notebook_items i
@@ -2867,7 +2904,10 @@ fn fetch_items_by_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let q = format!(
         "SELECT i.item_id, i.notebook_id, i.title, i.content, i.source_excerpt, i.source_ref,
                 i.source_session_id, i.actor_kind, i.actor_id, i.write_reason, i.confidence,
@@ -3113,11 +3153,7 @@ fn session_has_unchanged_for_notebook(
     Ok(n > 0)
 }
 
-fn fetch_watermark_seq(
-    conn: &Connection,
-    session_id: &str,
-    scope: &OwnerScope,
-) -> Result<i64> {
+fn fetch_watermark_seq(conn: &Connection, session_id: &str, scope: &OwnerScope) -> Result<i64> {
     let v = conn
         .query_row(
             "SELECT last_seen_seq FROM session_watermarks
@@ -3207,11 +3243,7 @@ fn bump_notebook_version(
     Ok(version)
 }
 
-fn ensure_system_notebook(
-    conn: &Connection,
-    scope: &OwnerScope,
-    now: &str,
-) -> Result<()> {
+fn ensure_system_notebook(conn: &Connection, scope: &OwnerScope, now: &str) -> Result<()> {
     if load_notebook(conn, scope, SYSTEM_NOTEBOOK_ID)?.is_some() {
         return Ok(());
     }
@@ -3275,7 +3307,10 @@ fn topic_relevance_candidates(
     let mut where_extra = String::new();
     if let Some(ids) = candidate_notebook_ids {
         if !ids.is_empty() {
-            let ph = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let ph = std::iter::repeat("?")
+                .take(ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
             where_extra = format!(" AND i.notebook_id IN ({})", ph);
         }
     }
@@ -3789,7 +3824,9 @@ mod tests {
             .possible_conflicts
             .iter()
             .any(|c| c.reason == ConflictReason::TagOverlap
-                && c.matched_tags.as_ref().is_some_and(|m| m.contains(&"tone".to_string()))));
+                && c.matched_tags
+                    .as_ref()
+                    .is_some_and(|m| m.contains(&"tone".to_string()))));
     }
 
     #[test]
@@ -3873,8 +3910,10 @@ mod tests {
                 max_hints: Some(3),
             })
             .unwrap();
-        assert!(h.hints.iter().any(|x| x.notebook_id == "projects/p"
-            && x.reason == HintReason::CrossSessionUpdate));
+        assert!(h
+            .hints
+            .iter()
+            .any(|x| x.notebook_id == "projects/p" && x.reason == HintReason::CrossSessionUpdate));
         // Watermark advanced — next call should produce no fresh hint.
         let h2 = n
             .build_notebook_hints(BuildHintsInput {

@@ -341,7 +341,8 @@ mod tests {
             session_current_todo: json!({
                 "todo_id": "T01",
                 "status": "pending",
-                "task": "do thing",
+                "title": "do thing",
+                "content": "do thing details",
                 "skills": ["docs"],
             }),
             session_current_todo_list: "T01 pending current - do thing".into(),
@@ -403,13 +404,18 @@ mod tests {
             Some(json!({
                 "todo_id": "T01",
                 "status": "pending",
-                "task": "do thing",
+                "title": "do thing",
+                "content": "do thing details",
                 "skills": ["docs"],
             }))
         );
         assert_eq!(
-            loader.load("$session.current_todo.task").await.unwrap(),
+            loader.load("$session.current_todo.title").await.unwrap(),
             Some(Json::String("do thing".into()))
+        );
+        assert_eq!(
+            loader.load("$session.current_todo.content").await.unwrap(),
+            Some(Json::String("do thing details".into()))
         );
         assert_eq!(
             loader.load("$session.has_current_todo").await.unwrap(),
@@ -446,7 +452,7 @@ mod tests {
     async fn engine_substitutes_aggregate_dotted_path() {
         let env = sample_env();
         let out = render_template(
-            "id={{ session.id }} todo={{ session.current_todo.task }}",
+            "id={{ session.id }} todo={{ session.current_todo.title }}",
             &env,
             &[],
         )
@@ -523,6 +529,21 @@ clock: unix_ms=123";
         let template = "{{ role_md }}\n\n{{ self_md }}";
         let out = render_template(template, &env, &extras).await.unwrap();
         assert_eq!(out, "ROLE\n\nSELF");
+    }
+
+    #[tokio::test]
+    async fn extra_vars_support_on_switch_from_context_report() {
+        let env = sample_env();
+        let extras = vec![(
+            "from_context",
+            json!({
+                "report": "finished todo T01",
+            }),
+        )];
+        let out = render_template("{{ from_context.report }}", &env, &extras)
+            .await
+            .unwrap();
+        assert_eq!(out, "finished todo T01");
     }
 
     #[tokio::test]

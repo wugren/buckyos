@@ -119,11 +119,15 @@ fn looks_like_base64_payload(value: &str) -> bool {
         return false;
     }
 
-    general_purpose::STANDARD.decode(normalized.as_bytes()).is_ok()
+    general_purpose::STANDARD
+        .decode(normalized.as_bytes())
+        .is_ok()
         || general_purpose::STANDARD_NO_PAD
             .decode(normalized.as_bytes())
             .is_ok()
-        || general_purpose::URL_SAFE.decode(normalized.as_bytes()).is_ok()
+        || general_purpose::URL_SAFE
+            .decode(normalized.as_bytes())
+            .is_ok()
         || general_purpose::URL_SAFE_NO_PAD
             .decode(normalized.as_bytes())
             .is_ok()
@@ -1792,6 +1796,13 @@ fn route_policy_from_request(request: &AiMethodRequest) -> RoutePolicy {
         if let Some(runtime_failover) = extra.get("runtime_failover").and_then(Value::as_bool) {
             policy.runtime_failover = runtime_failover;
         }
+        if let Some(min_context_tokens) = extra
+            .get("min_context_tokens")
+            .or_else(|| extra.get("min_context_window_tokens"))
+            .and_then(Value::as_u64)
+        {
+            policy.required_features.min_context_tokens = Some(min_context_tokens);
+        }
     }
     policy
 }
@@ -2063,6 +2074,7 @@ pub fn provider_model_metadata(
                 .iter()
                 .any(|item| item == buckyos_api::features::VISION),
             max_context_tokens: None,
+            max_output_tokens: None,
         },
         attributes: ModelAttributes {
             provider_type: provider_type.clone(),
@@ -2261,6 +2273,7 @@ impl AIComputeCenter {
                             "provider_model_id": model.provider_model_id,
                             "api_types": model.api_types,
                             "logical_mounts": model.logical_mounts,
+                            "capabilities": model.capabilities,
                             "health": model.health.status,
                             "quota": model.health.quota_state,
                         })
@@ -4518,6 +4531,21 @@ mod tests {
             .must_features
             .iter()
             .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
+    }
+
+    #[test]
+    fn route_policy_reads_min_context_tokens_from_requirements_extra() {
+        let mut request = base_request();
+        request.requirements.extra = Some(json!({
+            "min_context_tokens": 128000
+        }));
+
+        assert_eq!(
+            route_policy_from_request(&request)
+                .required_features
+                .min_context_tokens,
+            Some(128000)
+        );
     }
 
     #[test]

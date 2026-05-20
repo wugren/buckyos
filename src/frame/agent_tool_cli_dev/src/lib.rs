@@ -18,11 +18,11 @@ use tokio::process::Command;
 
 use agent_tool::agent_memory::{AgentMemory, AgentMemoryConfig, AgentMemoryError, LoadOptions};
 use agent_tool::agent_notebook::{
-    self as nb, ActorKind, AgentNotebook, AgentNotebookConfig, AppendNoteInput,
-    BuildHintsInput, BuildRegistryContextInput, BuildSystemContextInput, Confidence,
-    CreateOrUpdateNotebookInput, ListNotebooksInput, MarkNoteStatusInput, NotebookError,
-    NotebookItemStatus, NotebookKind, NotebookReadResult, OwnerScope, PromoteToSystemInput,
-    PromoteToSystemResult, ReadNotebookInput, WriteReason,
+    self as nb, ActorKind, AgentNotebook, AgentNotebookConfig, AppendNoteInput, BuildHintsInput,
+    BuildRegistryContextInput, BuildSystemContextInput, Confidence, CreateOrUpdateNotebookInput,
+    ListNotebooksInput, MarkNoteStatusInput, NotebookError, NotebookItemStatus, NotebookKind,
+    NotebookReadResult, OwnerScope, PromoteToSystemInput, PromoteToSystemResult, ReadNotebookInput,
+    WriteReason,
 };
 use agent_tool::llm_tool_carft::{self, CommandNotFoundRequest};
 use agent_tool::{
@@ -31,7 +31,7 @@ use agent_tool::{
     AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus, BindWorkspaceTool,
     CliRunOutput, CreateWorkspaceTool, EditFileTool, FileToolConfig, GetSessionTool, GlobTool,
     GrepTool, NoopFileWriteAudit, ReadFileTool, SessionRuntimeContext, SessionViewBackend,
-    WorkspaceToolBackend, WriteFileTool,
+    TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
 };
 use agent_tool::{llm_explore, run_local_llm};
 
@@ -41,12 +41,13 @@ const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
-const TOOL_NAMES: [&str; 14] = [
+const TOOL_NAMES: [&str; 15] = [
     "Glob",
     "Grep",
     "read_file",
     "write_file",
     "edit_file",
+    "todo",
     "get_session",
     "create_workspace",
     "bind_workspace",
@@ -1102,8 +1103,7 @@ fn format_verify_report(report: &agent_tool::VerifyReport) -> String {
 //  agent-notebook CLI (doc/opendan/Agent Notebook.md §9)
 // =================================================================
 
-const AGENT_NOTEBOOK_USAGE: &str =
-    "agent-notebook [--root <path> | env AGENT_NOTEBOOK_ROOT] \
+const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NOTEBOOK_ROOT] \
 [--owner-user <user_id> | env OPENDAN_OWNER_USER_ID] \
 [--owner-agent <agent> | env OPENDAN_AGENT_ID] \
 [--session <id> | env OPENDAN_SESSION_ID] \
@@ -1368,9 +1368,9 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
             }
             "--include-status" => {
                 idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--include-status`"))?;
+                let value = rest.get(idx).ok_or_else(|| {
+                    agent_notebook_invalid("missing value for `--include-status`")
+                })?;
                 include_status = Some(parse_status_list(value)?);
             }
             v if v.starts_with("--include-status=") => {
@@ -1447,9 +1447,9 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
             "--stdin" => use_stdin = true,
             "--source-excerpt" => {
                 idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--source-excerpt`"))?;
+                let value = rest.get(idx).ok_or_else(|| {
+                    agent_notebook_invalid("missing value for `--source-excerpt`")
+                })?;
                 source_excerpt = Some(value.clone());
             }
             v if v.starts_with("--source-excerpt=") => {
@@ -1535,15 +1535,19 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
         }
         idx += 1;
     }
-    let actor_kind = actor_kind
-        .ok_or_else(|| agent_notebook_invalid("`append` requires `--actor-kind`"))?;
-    let write_reason = write_reason
-        .ok_or_else(|| agent_notebook_invalid("`append` requires `--write-reason`"))?;
+    let actor_kind =
+        actor_kind.ok_or_else(|| agent_notebook_invalid("`append` requires `--actor-kind`"))?;
+    let write_reason =
+        write_reason.ok_or_else(|| agent_notebook_invalid("`append` requires `--write-reason`"))?;
 
     let (notebook_id, title, content) = match (use_stdin, positionals.len()) {
         (false, 3) => {
             let mut it = positionals.into_iter();
-            (it.next().unwrap(), it.next().unwrap(), Some(it.next().unwrap()))
+            (
+                it.next().unwrap(),
+                it.next().unwrap(),
+                Some(it.next().unwrap()),
+            )
         }
         (true, 2) => {
             let mut it = positionals.into_iter();
@@ -1732,10 +1736,9 @@ fn parse_agent_notebook_promote(rest: &[String]) -> Result<AgentNotebookVerb, Ag
             positionals.len()
         )));
     }
-    let reason =
-        reason.ok_or_else(|| agent_notebook_invalid("`promote` requires `--reason`"))?;
-    let actor_kind = actor_kind
-        .ok_or_else(|| agent_notebook_invalid("`promote` requires `--actor-kind`"))?;
+    let reason = reason.ok_or_else(|| agent_notebook_invalid("`promote` requires `--reason`"))?;
+    let actor_kind =
+        actor_kind.ok_or_else(|| agent_notebook_invalid("`promote` requires `--actor-kind`"))?;
     Ok(AgentNotebookVerb::Promote {
         item_id: positionals.into_iter().next().unwrap(),
         reason,
@@ -1822,7 +1825,10 @@ fn parse_agent_notebook_registry_context(
                 max_notebooks = Some(parse_usize(value, "max-notebooks")?);
             }
             v if v.starts_with("--max-notebooks=") => {
-                max_notebooks = Some(parse_usize(&v["--max-notebooks=".len()..], "max-notebooks")?);
+                max_notebooks = Some(parse_usize(
+                    &v["--max-notebooks=".len()..],
+                    "max-notebooks",
+                )?);
             }
             v => {
                 return Err(agent_notebook_invalid(format!(
@@ -2071,8 +2077,7 @@ async fn dispatch_agent_notebook(
         verb,
     } = invocation;
 
-    let owner_user_id = match owner_user_id
-        .or_else(|| first_string_env(&[DEFAULT_OWNER_USER_ENV]))
+    let owner_user_id = match owner_user_id.or_else(|| first_string_env(&[DEFAULT_OWNER_USER_ENV]))
     {
         Some(v) if !v.trim().is_empty() => v,
         _ => {
@@ -2185,8 +2190,8 @@ async fn dispatch_agent_notebook(
     match result {
         Ok(value) => {
             // Append a trailing newline so the JSON line plays nice with shell consumers.
-            let mut stdout = serde_json::to_string(&value)
-                .unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string());
+            let mut stdout =
+                serde_json::to_string(&value).unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string());
             stdout.push('\n');
             CliRunOutput {
                 exit_code: 0,
@@ -2359,10 +2364,8 @@ fn run_agent_notebook_blocking(
             }))
         }
         AgentNotebookVerb::SystemContext { max_items } => {
-            let result = notebook.build_system_notebook_context(BuildSystemContextInput {
-                scope,
-                max_items,
-            })?;
+            let result = notebook
+                .build_system_notebook_context(BuildSystemContextInput { scope, max_items })?;
             Ok(json!({
                 "status": "ok",
                 "system": result,
@@ -2396,7 +2399,10 @@ fn run_agent_notebook_blocking(
 struct NotebookReadResultWire(NotebookReadResult);
 
 impl Serialize for NotebookReadResultWire {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
@@ -2404,7 +2410,10 @@ impl Serialize for NotebookReadResultWire {
 struct PromoteResultWire(PromoteToSystemResult);
 
 impl Serialize for PromoteResultWire {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
@@ -2728,6 +2737,7 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
     mgr.register_typed_tool(ReadFileTool::new(file_cfg.clone()))?;
     mgr.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()))?;
     mgr.register_typed_tool(EditFileTool::new(file_cfg, audit))?;
+    mgr.register_typed_tool(TodoTool::new(TodoToolConfig::new(state_root)))?;
 
     Ok(mgr)
 }
@@ -3589,8 +3599,62 @@ mod tests {
         assert_eq!(payload["status"], "success");
         assert_eq!(
             payload["detail"]["tools"].as_array().map(|v| v.len()),
-            Some(14)
+            Some(15)
         );
+    }
+
+    #[tokio::test]
+    async fn todo_cli_writes_session_todos_under_agent_env() {
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+
+        let add_output = execute(
+            vec![
+                OsString::from("/tmp/todo"),
+                OsString::from("add"),
+                OsString::from("first task"),
+                OsString::from("--content"),
+                OsString::from("task body"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run todo add");
+        assert_eq!(add_output.exit_code, EXIT_SUCCESS);
+
+        let todos_path = root
+            .join("sessions")
+            .join("session-test")
+            .join("todos.json");
+        let todos: Json = serde_json::from_str(
+            &fs::read_to_string(&todos_path)
+                .await
+                .expect("read todos.json"),
+        )
+        .expect("parse todos");
+        assert_eq!(todos[0]["todo_id"], "T01");
+        assert_eq!(todos[0]["session_id"], "session-test");
+        assert_eq!(todos[0]["title"], "first task");
+
+        let current_output = execute(
+            vec![
+                OsString::from(MAIN_BINARY_NAME),
+                OsString::from("todo"),
+                OsString::from("current"),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("run todo current");
+        assert_eq!(current_output.exit_code, EXIT_SUCCESS);
+        let payload: Json = serde_json::from_str(&current_output.stdout).expect("parse json");
+        assert_eq!(payload["detail"]["todo"]["todo_id"], "T01");
     }
 
     #[tokio::test]
@@ -4268,8 +4332,7 @@ mod tests {
         .await
         .expect("run agent-notebook append --stdin");
         assert_eq!(output.exit_code, EXIT_SUCCESS);
-        let payload: Json =
-            serde_json::from_str(output.stdout.trim()).expect("parse append json");
+        let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse append json");
         assert_eq!(payload["status"], "ok");
     }
 
@@ -4294,8 +4357,7 @@ mod tests {
         .await
         .expect("run agent-notebook list without owner");
         assert_eq!(output.exit_code, 2);
-        let payload: Json =
-            serde_json::from_str(output.stdout.trim()).expect("parse error json");
+        let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse error json");
         assert_eq!(payload["status"], "error");
         assert_eq!(payload["code"], "invalid_input");
     }
@@ -4333,9 +4395,11 @@ mod tests {
         .await
         .expect("seed item");
         assert_eq!(seed.exit_code, EXIT_SUCCESS);
-        let seed_payload: Json =
-            serde_json::from_str(seed.stdout.trim()).expect("parse seed json");
-        let item_id = seed_payload["item_id"].as_str().expect("item_id").to_string();
+        let seed_payload: Json = serde_json::from_str(seed.stdout.trim()).expect("parse seed json");
+        let item_id = seed_payload["item_id"]
+            .as_str()
+            .expect("item_id")
+            .to_string();
 
         // Mark stale.
         let status_output = execute(
@@ -4417,8 +4481,7 @@ mod tests {
         .await
         .expect("run agent-notebook append with bad tag");
         assert_eq!(output.exit_code, 2);
-        let payload: Json =
-            serde_json::from_str(output.stdout.trim()).expect("parse error json");
+        let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse error json");
         assert_eq!(payload["status"], "error");
         assert_eq!(payload["code"], "invalid_tag");
     }
@@ -4469,11 +4532,7 @@ mod tests {
         )
         .await
         .expect("run append via env");
-        assert_eq!(
-            out.exit_code, EXIT_SUCCESS,
-            "stdout={:?}",
-            out.stdout
-        );
+        assert_eq!(out.exit_code, EXIT_SUCCESS, "stdout={:?}", out.stdout);
         assert!(nb_root.join("notebook.sqlite").exists());
 
         // Read also picks env session / owner up.
@@ -4491,8 +4550,7 @@ mod tests {
         .await
         .expect("run read via env");
         assert_eq!(read.exit_code, EXIT_SUCCESS);
-        let payload: Json =
-            serde_json::from_str(read.stdout.trim()).expect("parse env read json");
+        let payload: Json = serde_json::from_str(read.stdout.trim()).expect("parse env read json");
         assert_eq!(payload["status"], "ok");
         let entries = payload["entries"].as_array().expect("entries array");
         assert_eq!(entries.len(), 1);
@@ -4555,9 +4613,7 @@ mod tests {
         let payload: Json =
             serde_json::from_str(registry_out.stdout.trim()).expect("parse registry json");
         assert_eq!(payload["status"], "ok");
-        let text = payload["registry"]["text"]
-            .as_str()
-            .expect("registry text");
+        let text = payload["registry"]["text"].as_str().expect("registry text");
         assert!(text.contains("user/preferences"));
         assert!(text.contains("projects/demo"));
         // Body content must not leak into registry.

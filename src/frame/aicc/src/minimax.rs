@@ -228,8 +228,12 @@ impl MiniMaxProvider {
         provider_model: &str,
         req: &AiMethodRequest,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        let (request_obj, _ignored) =
-            convert_complete_request_with_dialect(req, provider_model, ProtocolDialect::MiniMax)?;
+        let (request_obj, _ignored) = convert_complete_request_with_dialect(
+            req,
+            provider_model,
+            ProtocolDialect::MiniMax,
+            None,
+        )?;
         let request_value = Value::Object(request_obj.clone());
         let endpoint = format!("{}/messages", self.base_url);
 

@@ -48,7 +48,7 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
-    fn is_terminal(self) -> bool {
+    pub fn is_terminal(self) -> bool {
         matches!(
             self,
             TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Timeout
@@ -62,13 +62,12 @@ pub struct TodoRecord {
     pub session_id: String,
     pub order_index: usize,
     pub status: TodoStatus,
-    pub task: String,
+    pub title: String,
+    pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_context: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,7 +246,7 @@ where
     Ok(outcome)
 }
 
-fn read_todos(path: &Path) -> Result<Vec<TodoRecord>, AgentToolError> {
+pub fn read_todo_records(path: &Path) -> Result<Vec<TodoRecord>, AgentToolError> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -264,6 +263,10 @@ fn read_todos(path: &Path) -> Result<Vec<TodoRecord>, AgentToolError> {
     serde_json::from_str(&buf).map_err(|err| {
         AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
     })
+}
+
+fn read_todos(path: &Path) -> Result<Vec<TodoRecord>, AgentToolError> {
+    read_todo_records(path)
 }
 
 fn read_tasks(path: &Path) -> Result<Vec<TaskEntry>, AgentToolError> {
@@ -297,14 +300,15 @@ fn now_iso() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// TodoTool — todo {add|current|list|done|finish|show}
+// TodoTool — todo {add|current|list|done|failed|finish|show}
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TodoArgs {
     Add {
-        task: String,
+        title: String,
+        content: String,
         #[serde(default)]
         skills: Vec<String>,
         #[serde(default)]
@@ -313,6 +317,15 @@ pub enum TodoArgs {
     Current,
     List,
     Done {
+        summary: String,
+        #[serde(default)]
+        report: Option<String>,
+        #[serde(default)]
+        report_file: Option<String>,
+        #[serde(default)]
+        todo_id: Option<String>,
+    },
+    Failed {
         summary: String,
         #[serde(default)]
         report: Option<String>,
@@ -360,6 +373,10 @@ pub enum TodoOutput {
         todo_id: String,
         status: TodoStatus,
     },
+    Failed {
+        todo_id: String,
+        status: TodoStatus,
+    },
     Finish {
         todo_id: String,
         status: TodoStatus,
@@ -377,14 +394,13 @@ pub enum TodoOutput {
 pub struct TodoView {
     pub todo_id: String,
     pub status: TodoStatus,
-    pub task: String,
+    pub title: String,
+    pub content: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
     pub order_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_context: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
 }
@@ -394,11 +410,11 @@ impl From<&TodoRecord> for TodoView {
         Self {
             todo_id: r.todo_id.clone(),
             status: r.status,
-            task: r.task.clone(),
+            title: r.title.clone(),
+            content: r.content.clone(),
             skills: r.skills.clone(),
             order_index: r.order_index,
             creation_context: r.creation_context.clone(),
-            summary: r.summary.clone(),
             report: r.report.clone(),
         }
     }
@@ -411,7 +427,7 @@ pub struct TodoListItem {
     pub status: TodoStatus,
     pub order_index: usize,
     pub is_current: bool,
-    pub summary: String, // 任务描述截断到一行
+    pub title: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
     pub updated_at: String,
@@ -457,10 +473,11 @@ impl TypedTool for TodoTool {
 
     fn usage(&self) -> Option<String> {
         Some(
-            "todo add \"<task>\" [--skill <name>]... [--context <text>]\n\
+            "todo add \"<title>\" --content <text> [--skill <name>]... [--context <text>]\n\
              todo current\n\
              todo list\n\
              todo done \"<summary>\" [--report <text> | --report-file <path>]\n\
+             todo failed \"<summary>\" [--report <text> | --report-file <path>]\n\
              todo finish --status <completed|failed|timeout|blocked> \"<summary>\" \
                 [--report <text> | --report-file <path>] [--id <todoID>]\n\
              todo show [<todoID>]\n\
@@ -495,6 +512,7 @@ impl TypedTool for TodoTool {
             TodoArgs::Current => "todo current",
             TodoArgs::List => "todo list",
             TodoArgs::Done { .. } => "todo done",
+            TodoArgs::Failed { .. } => "todo failed",
             TodoArgs::Finish { .. } => "todo finish",
             TodoArgs::Show { .. } => "todo show",
             TodoArgs::Clean => "todo clean",
@@ -519,9 +537,9 @@ impl TypedTool for TodoTool {
             TodoOutput::List { todos, tasks } => {
                 format!("{} todos / {} delegated tasks", todos.len(), tasks.len())
             }
-            TodoOutput::Done { todo_id, status } | TodoOutput::Finish { todo_id, status } => {
-                format!("{todo_id} -> {:?}", status)
-            }
+            TodoOutput::Done { todo_id, status }
+            | TodoOutput::Failed { todo_id, status }
+            | TodoOutput::Finish { todo_id, status } => format!("{todo_id} -> {:?}", status),
             TodoOutput::Show { todo: Some(t) } => format!("show {} {:?}", t.todo_id, t.status),
             TodoOutput::Show { todo: None } => "no such todo".to_string(),
             TodoOutput::Clean { removed, kept } => {
@@ -545,10 +563,11 @@ impl TypedTool for TodoTool {
 
         match args {
             TodoArgs::Add {
-                task,
+                title,
+                content,
                 skills,
                 context,
-            } => execute_add(&todos_path, &session_id, task, skills, context).await,
+            } => execute_add(&todos_path, &session_id, title, content, skills, context).await,
             TodoArgs::Current => execute_current(&todos_path),
             TodoArgs::List => execute_list(ctx, &todos_path),
             TodoArgs::Done {
@@ -567,6 +586,15 @@ impl TypedTool for TodoTool {
                     /*is_done_alias=*/ true,
                 )
                 .await
+            }
+            TodoArgs::Failed {
+                summary,
+                report,
+                report_file,
+                todo_id,
+            } => {
+                let report = resolve_report(ctx, report, report_file)?;
+                execute_failed(&todos_path, todo_id.as_deref(), summary, report).await
             }
             TodoArgs::Finish {
                 status,
@@ -592,17 +620,45 @@ impl TypedTool for TodoTool {
     }
 }
 
+async fn execute_failed(
+    todos_path: &Path,
+    todo_id: Option<&str>,
+    summary: String,
+    report: Option<String>,
+) -> Result<TodoOutput, AgentToolError> {
+    match execute_finish(
+        todos_path,
+        todo_id,
+        TodoStatus::Failed,
+        summary,
+        report,
+        /*is_done_alias=*/ false,
+    )
+    .await?
+    {
+        TodoOutput::Finish { todo_id, status } => Ok(TodoOutput::Failed { todo_id, status }),
+        other => Ok(other),
+    }
+}
+
 async fn execute_add(
     todos_path: &Path,
     session_id: &str,
-    task: String,
+    title: String,
+    content: String,
     skills: Vec<String>,
     context: Option<String>,
 ) -> Result<TodoOutput, AgentToolError> {
-    let task = task.trim().to_string();
-    if task.is_empty() {
+    let title = title.trim().to_string();
+    if title.is_empty() {
         return Err(AgentToolError::InvalidArgs(
-            "`task` must be a non-empty natural-language description".to_string(),
+            "`title` must be non-empty".to_string(),
+        ));
+    }
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err(AgentToolError::InvalidArgs(
+            "`content` must be a non-empty natural-language description".to_string(),
         ));
     }
     if skills.len() > MAX_SKILLS_PER_TODO {
@@ -621,10 +677,10 @@ async fn execute_add(
             session_id: session_id.to_string(),
             order_index,
             status: TodoStatus::Pending,
-            task,
+            title: title.clone(),
+            content: content.clone(),
             skills,
             creation_context: context,
-            summary: None,
             report: None,
             workspace: None,
             created_at: now.clone(),
@@ -669,7 +725,7 @@ fn execute_list(ctx: &ToolCtx<'_>, todos_path: &Path) -> Result<TodoOutput, Agen
             status: r.status,
             order_index: r.order_index,
             is_current: Some(&r.todo_id) == current_id.as_ref(),
-            summary: first_line(&r.task, 80),
+            title: first_line(&r.title, 80),
             skills: r.skills.clone(),
             updated_at: r.updated_at.clone(),
         })
@@ -737,10 +793,7 @@ async fn execute_finish(
         };
         let rec = &mut list[idx];
         rec.status = status;
-        rec.summary = Some(summary);
-        if report.is_some() {
-            rec.report = report;
-        }
+        rec.report = report.or(Some(summary));
         rec.updated_at = now.clone();
         Ok((rec.todo_id.clone(), rec.status))
     })?;
@@ -841,7 +894,8 @@ fn parse_todo_cli_tokens(tokens: &[String]) -> Result<Json, AgentToolError> {
     let mut iter = tokens.iter();
     let sub = iter.next().map(String::as_str).ok_or_else(|| {
         AgentToolError::InvalidArgs(
-            "todo requires a subcommand (add|current|list|done|finish|show)".to_string(),
+            "todo requires a subcommand (add|current|list|done|failed|finish|show|clean)"
+                .to_string(),
         )
     })?;
     let rest: Vec<String> = iter.cloned().collect();
@@ -857,6 +911,7 @@ fn parse_todo_cli_tokens(tokens: &[String]) -> Result<Json, AgentToolError> {
             Ok(serde_json::json!({"op": "list"}))
         }
         "done" => parse_done(&rest),
+        "failed" => parse_failed(&rest),
         "finish" => parse_finish(&rest),
         "show" => parse_show(&rest),
         "clean" => {
@@ -864,7 +919,7 @@ fn parse_todo_cli_tokens(tokens: &[String]) -> Result<Json, AgentToolError> {
             Ok(serde_json::json!({"op": "clean"}))
         }
         other => Err(AgentToolError::InvalidArgs(format!(
-            "unknown todo subcommand `{other}` (expected add|current|list|done|finish|show|clean)"
+            "unknown todo subcommand `{other}` (expected add|current|list|done|failed|finish|show|clean)"
         ))),
     }
 }
@@ -926,16 +981,19 @@ fn parse_add(tokens: &[String]) -> Result<Json, AgentToolError> {
     let flags = parse_flags(tokens, &["skill"])?;
     if flags.positionals.len() != 1 {
         return Err(AgentToolError::InvalidArgs(
-            "todo add takes exactly one positional <task> description".to_string(),
+            "todo add takes exactly one positional <title>".to_string(),
         ));
     }
-    let task = flags.positionals.into_iter().next().unwrap();
+    let title = flags.positionals.into_iter().next().unwrap();
+    let content = flags.single.get("content").cloned().ok_or_else(|| {
+        AgentToolError::InvalidArgs("todo add requires --content <text>".to_string())
+    })?;
     let skills = flags.repeated.get("skill").cloned().unwrap_or_default();
     let context = flags.single.get("context").cloned();
     let unknown: Vec<&String> = flags
         .single
         .keys()
-        .filter(|k| k.as_str() != "context")
+        .filter(|k| !matches!(k.as_str(), "content" | "context"))
         .collect();
     if !unknown.is_empty() {
         return Err(AgentToolError::InvalidArgs(format!(
@@ -945,18 +1003,27 @@ fn parse_add(tokens: &[String]) -> Result<Json, AgentToolError> {
     }
     Ok(serde_json::json!({
         "op": "add",
-        "task": task,
+        "title": title,
+        "content": content,
         "skills": skills,
         "context": context,
     }))
 }
 
 fn parse_done(tokens: &[String]) -> Result<Json, AgentToolError> {
+    parse_terminal_alias(tokens, "done", "todo done")
+}
+
+fn parse_failed(tokens: &[String]) -> Result<Json, AgentToolError> {
+    parse_terminal_alias(tokens, "failed", "todo failed")
+}
+
+fn parse_terminal_alias(tokens: &[String], op: &str, cmd: &str) -> Result<Json, AgentToolError> {
     let flags = parse_flags(tokens, &[])?;
     if flags.positionals.len() != 1 {
-        return Err(AgentToolError::InvalidArgs(
-            "todo done takes exactly one positional <summary>".to_string(),
-        ));
+        return Err(AgentToolError::InvalidArgs(format!(
+            "{cmd} takes exactly one positional <summary>"
+        )));
     }
     let summary = flags.positionals.into_iter().next().unwrap();
     let report = flags.single.get("report").cloned();
@@ -968,12 +1035,11 @@ fn parse_done(tokens: &[String]) -> Result<Json, AgentToolError> {
         .collect();
     if !unknown.is_empty() {
         return Err(AgentToolError::InvalidArgs(format!(
-            "todo done: unknown flag(s) {:?}",
-            unknown
+            "{cmd}: unknown flag(s) {unknown:?}"
         )));
     }
     Ok(serde_json::json!({
-        "op": "done",
+        "op": op,
         "summary": summary,
         "report": report,
         "report_file": report_file,
@@ -1255,7 +1321,8 @@ mod tests {
             .execute(
                 &ctx,
                 TodoArgs::Add {
-                    task: "write docs".into(),
+                    title: "write docs".into(),
+                    content: "write docs details".into(),
                     skills: vec!["docs".into()],
                     context: None,
                 },
@@ -1281,7 +1348,8 @@ mod tests {
             .execute(
                 &ToolCtx::new(&sess, &host).with_shell_cwd(Some(ws.path())),
                 TodoArgs::Add {
-                    task: "ship feature".into(),
+                    title: "ship feature".into(),
+                    content: "ship feature details".into(),
                     skills: vec![],
                     context: None,
                 },
@@ -1348,7 +1416,8 @@ mod tests {
         tool.execute(
             &make_ctx(),
             TodoArgs::Add {
-                task: "a".into(),
+                title: "a".into(),
+                content: "a details".into(),
                 skills: vec![],
                 context: None,
             },
@@ -1376,6 +1445,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_alias_marks_current_failed() {
+        let (tool, _dir) = make_tool();
+        let sess = session("sess-failed");
+        let host = NullToolHost;
+        let ws = tempdir().unwrap();
+        let make_ctx = || ToolCtx::new(&sess, &host).with_shell_cwd(Some(ws.path()));
+
+        tool.execute(
+            &make_ctx(),
+            TodoArgs::Add {
+                title: "investigate failure".into(),
+                content: "investigate failure details".into(),
+                skills: vec![],
+                context: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let failed = tool
+            .execute(
+                &make_ctx(),
+                TodoArgs::Failed {
+                    summary: "upstream is unavailable".into(),
+                    report: None,
+                    report_file: None,
+                    todo_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        match failed {
+            TodoOutput::Failed { todo_id, status } => {
+                assert_eq!(todo_id, "T01");
+                assert_eq!(status, TodoStatus::Failed);
+            }
+            _ => panic!("expected Failed"),
+        }
+
+        let cur = tool.execute(&make_ctx(), TodoArgs::Current).await.unwrap();
+        match cur {
+            TodoOutput::Current { todo } => assert!(todo.is_none()),
+            _ => panic!("expected Current"),
+        }
+    }
+
+    #[tokio::test]
     async fn too_many_skills_rejected() {
         let (tool, _dir) = make_tool();
         let sess = session("sess-skills");
@@ -1386,7 +1502,8 @@ mod tests {
             .execute(
                 &ctx,
                 TodoArgs::Add {
-                    task: "x".into(),
+                    title: "x".into(),
+                    content: "x details".into(),
                     skills: vec!["a".into(), "b".into(), "c".into(), "d".into()],
                     context: None,
                 },
@@ -1412,6 +1529,8 @@ mod tests {
         let tokens = vec![
             "add".to_string(),
             "do the thing".into(),
+            "--content".into(),
+            "do the thing details".into(),
             "--skill".into(),
             "docs".into(),
             "--skill".into(),
@@ -1421,10 +1540,32 @@ mod tests {
         ];
         let json = parse_todo_cli_tokens(&tokens).unwrap();
         assert_eq!(json["op"], "add");
-        assert_eq!(json["task"], "do the thing");
+        assert_eq!(json["title"], "do the thing");
+        assert_eq!(json["content"], "do the thing details");
         assert_eq!(json["skills"][0], "docs");
         assert_eq!(json["skills"][1], "code-rust");
         assert_eq!(json["context"], "why");
+    }
+
+    #[test]
+    fn parse_add_cli_requires_content() {
+        let tokens = vec!["add".to_string(), "do the thing".into()];
+        let err = parse_todo_cli_tokens(&tokens).expect_err("must reject");
+        assert!(matches!(err, AgentToolError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn parse_failed_cli_accepts_report() {
+        let tokens = vec![
+            "failed".to_string(),
+            "upstream failed".into(),
+            "--report".into(),
+            "full failure report".into(),
+        ];
+        let json = parse_todo_cli_tokens(&tokens).unwrap();
+        assert_eq!(json["op"], "failed");
+        assert_eq!(json["summary"], "upstream failed");
+        assert_eq!(json["report"], "full failure report");
     }
 
     #[test]
@@ -1482,7 +1623,8 @@ mod tests {
         tool.execute(
             &make_ctx(),
             TodoArgs::Add {
-                task: "first".into(),
+                title: "first".into(),
+                content: "first details".into(),
                 skills: vec![],
                 context: None,
             },
@@ -1503,7 +1645,8 @@ mod tests {
         tool.execute(
             &make_ctx(),
             TodoArgs::Add {
-                task: "second".into(),
+                title: "second".into(),
+                content: "second details".into(),
                 skills: vec![],
                 context: None,
             },
@@ -1513,7 +1656,8 @@ mod tests {
         tool.execute(
             &make_ctx(),
             TodoArgs::Add {
-                task: "third".into(),
+                title: "third".into(),
+                content: "third details".into(),
                 skills: vec![],
                 context: None,
             },
@@ -1542,7 +1686,8 @@ mod tests {
             .execute(
                 &make_ctx(),
                 TodoArgs::Add {
-                    task: "replanned".into(),
+                    title: "replanned".into(),
+                    content: "replanned details".into(),
                     skills: vec![],
                     context: None,
                 },

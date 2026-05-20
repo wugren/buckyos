@@ -1,12 +1,12 @@
 use crate::aicc::{
     llm_logical_mounts, logical_mount_segment, provider_model_metadata,
-    provider_type_from_settings, AIComputeCenter, Provider, ProviderError, ProviderInstance,
-    ProviderStartResult, ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
 use crate::claude_protocol::convert_complete_request;
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
-    ProviderType, ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
+    ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -231,9 +231,39 @@ impl ClaudeProvider {
                 ));
             }
 
-            let parsed = response
-                .json::<ClaudeModelsResponse>()
+            let body = response
+                .json::<Value>()
                 .await
+                .context("failed to parse claude models response")?;
+            if body
+                .get("models")
+                .and_then(|value| value.as_array())
+                .is_some()
+            {
+                let inventory = serde_json::from_value::<ProviderInventory>(body)
+                    .context("failed to parse claude provider inventory response")?;
+                let inventory = self.normalize_remote_provider_inventory(inventory);
+                if inventory.models.is_empty() {
+                    return Err(anyhow!(
+                        "claude provider inventory returned no supported models"
+                    ));
+                }
+                {
+                    let mut current = self
+                        .inventory
+                        .write()
+                        .map_err(|_| anyhow!("claude inventory lock poisoned"))?;
+                    *current = inventory.clone();
+                }
+                info!(
+                    "aicc.claude.inventory.refreshed provider_instance_name={} models={}",
+                    self.provider_instance_name,
+                    inventory.models.len()
+                );
+                return Ok(inventory);
+            }
+
+            let parsed = serde_json::from_value::<ClaudeModelsResponse>(body)
                 .context("failed to parse claude models response")?;
 
             for entry in parsed.data.iter() {
@@ -290,6 +320,64 @@ impl ClaudeProvider {
             inventory.models.len()
         );
         Ok(inventory)
+    }
+
+    fn normalize_remote_provider_inventory(
+        &self,
+        inventory: ProviderInventory,
+    ) -> ProviderInventory {
+        let version = inventory.version.clone();
+        let models = inventory
+            .models
+            .into_iter()
+            .filter_map(|model| self.normalize_remote_provider_model(model))
+            .collect::<Vec<_>>();
+
+        ProviderInventory {
+            provider_instance_name: self.provider_instance_name.clone(),
+            provider_type: self.provider_type.clone(),
+            provider_driver: self.provider_driver.clone(),
+            provider_origin: ProviderOrigin::SystemConfig,
+            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
+            provider_type_revision: None,
+            version: version.clone(),
+            inventory_revision: inventory
+                .inventory_revision
+                .or_else(|| Some(claude_inventory_revision_from_metadata(models.as_slice()))),
+            models,
+        }
+    }
+
+    fn normalize_remote_provider_model(&self, model: ModelMetadata) -> Option<ModelMetadata> {
+        let provider_model_id = model.provider_model_id.trim();
+        if provider_model_id.is_empty() {
+            return None;
+        }
+
+        let model_features =
+            effective_features_for_claude_model(provider_model_id, self.features.as_slice());
+        let mut normalized = provider_model_metadata(
+            self.provider_instance_name.as_str(),
+            self.provider_type.clone(),
+            provider_model_id,
+            ApiType::LlmChat,
+            llm_logical_mounts(self.provider_driver.as_str(), provider_model_id),
+            model_features.as_slice(),
+            model.pricing.estimated_cost_usd,
+            model.health.p50_latency_ms,
+        );
+        normalized.parameter_scale = model.parameter_scale;
+        if !model.api_types.is_empty() {
+            normalized.api_types = model.api_types;
+        }
+        if !model.logical_mounts.is_empty() {
+            normalized.logical_mounts = model.logical_mounts;
+        }
+        normalized.capabilities = model.capabilities;
+        normalized.attributes = model.attributes;
+        normalized.pricing = model.pricing;
+        normalized.health = model.health;
+        Some(normalized)
     }
 
     fn price_per_1m_tokens(model: &str) -> (f64, f64) {
@@ -393,6 +481,16 @@ impl ClaudeProvider {
             .unwrap_or_default()
     }
 
+    fn max_output_tokens_from_inventory(&self, provider_model: &str) -> Option<u64> {
+        self.inventory
+            .read()
+            .ok()?
+            .models
+            .iter()
+            .find(|model| model.provider_model_id == provider_model)
+            .and_then(|model| model.capabilities.max_output_tokens)
+    }
+
     fn classify_api_error(status: StatusCode, message: String) -> ProviderError {
         if status.as_u16() == 429 || status.is_server_error() {
             ProviderError::retryable(message)
@@ -407,9 +505,30 @@ impl ClaudeProvider {
         provider_model: &str,
         req: &AiMethodRequest,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        let (request_obj, _ignored) = convert_complete_request(req, provider_model)?;
+        let (request_obj, ignored_options) = convert_complete_request(
+            req,
+            provider_model,
+            self.max_output_tokens_from_inventory(provider_model),
+        )?;
         let request_value = Value::Object(request_obj.clone());
         let endpoint = format!("{}/messages", self.base_url);
+
+        if !ignored_options.is_empty() {
+            warn!(
+                "aicc.claude ignored unsupported llm options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                self.instance.provider_instance_name,
+                provider_model,
+                ctx.trace_id,
+                ignored_options
+            );
+        }
+        info!(
+            "aicc.claude.llm.input provider_instance_name={} model={} trace_id={:?} request={}",
+            self.instance.provider_instance_name,
+            provider_model,
+            ctx.trace_id,
+            redacted_json_log(&request_value)
+        );
 
         let response = self
             .client
@@ -421,13 +540,33 @@ impl ClaudeProvider {
             .send()
             .await
             .map_err(|error| {
+                warn!(
+                    "aicc.claude.http_send_failed provider_instance_name={} provider_type={} url={} retryable={} timeout={} connect={} status={:?} err={}",
+                    self.instance.provider_instance_name,
+                    self.instance.provider_type,
+                    endpoint,
+                    error.is_timeout() || error.is_connect(),
+                    error.is_timeout(),
+                    error.is_connect(),
+                    error.status(),
+                    error
+                );
                 ProviderError::retryable(format!("claude request failed: {}", error))
             })?;
 
         let status = response.status();
         let body = response.json::<Value>().await.map_err(|error| {
+            warn!(
+                "aicc.claude.response_decode_failed provider_instance_name={} provider_type={} url={} status={} err={}",
+                self.instance.provider_instance_name,
+                self.instance.provider_type,
+                endpoint,
+                status.as_u16(),
+                error
+            );
             ProviderError::fatal(format!("claude response decode failed: {}", error))
         })?;
+        let response_log = redacted_json_log(&body);
 
         if !status.is_success() {
             let message = body
@@ -437,15 +576,23 @@ impl ClaudeProvider {
                 .unwrap_or("claude api returned non-success status")
                 .to_string();
             warn!(
-                "aicc.claude.llm.error provider_instance_name={} model={} trace_id={:?} status={} body={}",
+                "aicc.claude.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
                 self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
                 status.as_u16(),
-                body
+                response_log
             );
             return Err(Self::classify_api_error(status, message));
         }
+        info!(
+            "aicc.claude.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+            self.instance.provider_instance_name,
+            provider_model,
+            ctx.trace_id,
+            status.as_u16(),
+            response_log
+        );
 
         let content = Self::extract_text_content(&body);
         let tool_calls = Self::extract_tool_calls(&body);
@@ -561,7 +708,7 @@ impl ClaudeProvider {
             .ok_or_else(|| ProviderError::fatal("vision request requires an image resource"))?;
         let request_value = json!({
             "model": provider_model,
-            "max_tokens": 1024,
+            "max_tokens": self.max_output_tokens_from_inventory(provider_model).unwrap_or(1024),
             "messages": [{
                 "role": "user",
                 "content": [
@@ -574,6 +721,14 @@ impl ClaudeProvider {
             }]
         });
         let endpoint = format!("{}/messages", self.base_url);
+        info!(
+            "aicc.claude.vision.input provider_instance_name={} model={} method={} trace_id={:?} request={}",
+            self.instance.provider_instance_name,
+            provider_model,
+            method,
+            ctx.trace_id,
+            redacted_json_log(&request_value)
+        );
         let response = self
             .client
             .post(&endpoint)
@@ -584,20 +739,58 @@ impl ClaudeProvider {
             .send()
             .await
             .map_err(|error| {
+                warn!(
+                    "aicc.claude.http_send_failed provider_instance_name={} provider_type={} url={} retryable={} timeout={} connect={} status={:?} err={}",
+                    self.instance.provider_instance_name,
+                    self.instance.provider_type,
+                    endpoint,
+                    error.is_timeout() || error.is_connect(),
+                    error.is_timeout(),
+                    error.is_connect(),
+                    error.status(),
+                    error
+                );
                 ProviderError::retryable(format!("claude vision request failed: {}", error))
             })?;
         let status = response.status();
         let body = response.json::<Value>().await.map_err(|error| {
+            warn!(
+                "aicc.claude.response_decode_failed provider_instance_name={} provider_type={} url={} status={} err={}",
+                self.instance.provider_instance_name,
+                self.instance.provider_type,
+                endpoint,
+                status.as_u16(),
+                error
+            );
             ProviderError::fatal(format!("claude vision response decode failed: {}", error))
         })?;
+        let response_log = redacted_json_log(&body);
         if !status.is_success() {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
                 .unwrap_or("claude vision api returned non-success status")
                 .to_string();
+            warn!(
+                "aicc.claude.vision.output provider_instance_name={} model={} method={} trace_id={:?} status={} response={}",
+                self.instance.provider_instance_name,
+                provider_model,
+                method,
+                ctx.trace_id,
+                status.as_u16(),
+                response_log
+            );
             return Err(Self::classify_api_error(status, message));
         }
+        info!(
+            "aicc.claude.vision.output provider_instance_name={} model={} method={} trace_id={:?} status={} response={}",
+            self.instance.provider_instance_name,
+            provider_model,
+            method,
+            ctx.trace_id,
+            status.as_u16(),
+            response_log
+        );
         let text = Self::extract_text_content(&body);
         let mut extra = Map::new();
         let key = if method == ai_methods::VISION_OCR {
@@ -707,6 +900,23 @@ fn claude_inventory_revision(models: &[String]) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     models.hash(&mut hasher);
     format!("claude-models-{}-{:x}", models.len(), hasher.finish())
+}
+
+fn claude_inventory_revision_from_metadata(models: &[ModelMetadata]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for model in models {
+        model.provider_model_id.hash(&mut hasher);
+        model.exact_model.hash(&mut hasher);
+        model.api_types.hash(&mut hasher);
+        model.logical_mounts.hash(&mut hasher);
+        if let Some(max_context_tokens) = model.capabilities.max_context_tokens {
+            max_context_tokens.hash(&mut hasher);
+        }
+        if let Some(max_output_tokens) = model.capabilities.max_output_tokens {
+            max_output_tokens.hash(&mut hasher);
+        }
+    }
+    format!("claude-inventory-{}-{:x}", models.len(), hasher.finish())
 }
 
 fn claude_vision_mounts(api_type: ApiType, model: &str) -> Vec<String> {
@@ -1113,7 +1323,9 @@ mod tests {
 
         // Claude 3.5 Haiku: text-only, web_search yes, plan no.
         assert!(!claude_model_supports_vision("claude-3-5-haiku-20241022"));
-        assert!(claude_model_supports_web_search("claude-3-5-haiku-20241022"));
+        assert!(claude_model_supports_web_search(
+            "claude-3-5-haiku-20241022"
+        ));
         assert!(!claude_model_supports_extended_thinking(
             "claude-3-5-haiku-20241022"
         ));

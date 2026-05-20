@@ -609,11 +609,17 @@ mod tests {
         // function parameters / input_schema.
         assert_eq!(schema.get("type"), Some(&json!("object")));
         assert!(schema.pointer("/properties/message/description").is_some());
-        assert_eq!(schema.pointer("/properties/message/type"), Some(&json!("string")));
+        assert_eq!(
+            schema.pointer("/properties/message/type"),
+            Some(&json!("string"))
+        );
         // `Option<String>` must collapse to a plain `"type":"string"` and
         // shed the `"default":null` schemars emits — both forms cause OpenAI
         // to reject the tool schema ("got type None").
-        assert_eq!(schema.pointer("/properties/suffix/type"), Some(&json!("string")));
+        assert_eq!(
+            schema.pointer("/properties/suffix/type"),
+            Some(&json!("string"))
+        );
         assert!(schema.pointer("/properties/suffix/default").is_none());
     }
 

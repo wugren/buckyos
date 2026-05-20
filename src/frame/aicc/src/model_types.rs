@@ -343,6 +343,8 @@ pub struct ModelCapabilities {
     pub vision: bool,
     #[serde(default)]
     pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl ModelCapabilities {
@@ -1087,6 +1089,7 @@ mod tests {
                 web_search: true,
                 vision: false,
                 max_context_tokens: Some(128_000),
+                max_output_tokens: Some(16_384),
             },
             attributes: ModelAttributes::default(),
             pricing: ModelPricing::default(),
@@ -1133,7 +1136,8 @@ mod tests {
                     "streaming": true,
                     "tool_call": true,
                     "json_schema": true,
-                    "max_context_tokens": 128000
+                    "max_context_tokens": 128000,
+                    "max_output_tokens": 16384
                 },
                 "attributes": {
                     "provider_type": "cloud_api",

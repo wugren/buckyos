@@ -614,9 +614,14 @@ impl AgentTool for ExecBashTool {
         };
 
         let details = self.build_details(&command, &target, &output);
+        let status = if output.exit_code == 0 {
+            AgentToolStatus::Success
+        } else {
+            AgentToolStatus::Error
+        };
         let mut result = build_builtin_tool_result(details, command.clone(), summary)
             .with_tool(self.tool_name())
-            .with_status(AgentToolStatus::Success)
+            .with_status(status)
             .with_return_code(output.exit_code);
         if !output.output.is_empty() {
             result = result.with_output(output.output.clone());
@@ -780,7 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_zero_exit_is_success_with_exit_code() {
+    async fn non_zero_exit_is_error_with_exit_code() {
         let (_dir, workspace) = ws();
         let tool = ExecBashTool::local_workspace(workspace);
 
@@ -788,7 +793,7 @@ mod tests {
             .call(&ctx(), json!({ "command": "exit 7" }))
             .await
             .expect("call ok despite non-zero exit");
-        assert_eq!(result.status, AgentToolStatus::Success);
+        assert_eq!(result.status, AgentToolStatus::Error);
         assert_eq!(result.details["exit_code"], 7);
         assert_eq!(result.return_code, Some(7));
     }

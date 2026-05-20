@@ -402,7 +402,29 @@ impl AgentConfig {
     /// callers (session worker) decide whether to fall back to a built-in
     /// default behavior or to surface the error.
     pub fn load_behavior(&self, name: &str) -> Result<BehaviorCfg, AgentConfigError> {
-        let path = self.layout.behavior_path(name);
+        let exact_path = self.layout.behavior_path(name);
+        let mut entries = std::fs::read_dir(&self.layout.behaviors_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect::<Vec<_>>();
+        entries.sort();
+
+        let exact_file = format!("{name}.toml");
+        let path = entries
+            .iter()
+            .find(|path| path.file_name().and_then(|s| s.to_str()) == Some(exact_file.as_str()))
+            .cloned()
+            .or_else(|| {
+                entries.into_iter().find(|path| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|stem| stem.eq_ignore_ascii_case(name))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(exact_path);
         Ok(BehaviorCfg::load_from_file(&path)?)
     }
 
@@ -612,6 +634,26 @@ mod tests {
         let cfg = AgentConfig::open(dir.path().to_path_buf()).unwrap();
         let names = cfg.list_behavior_names();
         assert_eq!(names, vec!["explorer", "ui_default"]);
+    }
+
+    #[test]
+    fn load_behavior_matches_name_case_insensitively() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("behaviors")).unwrap();
+        std::fs::write(
+            dir.path().join("behaviors/do.toml"),
+            "[meta]\nname = \"do\"\n",
+        )
+        .unwrap();
+
+        let cfg = AgentConfig::open(dir.path().to_path_buf()).unwrap();
+        let behavior = cfg.load_behavior("DO").expect("load lowercase file");
+        assert_eq!(behavior.name(), "do");
+        let expected_path = dir.path().join("behaviors/do.toml");
+        assert_eq!(
+            behavior.source_path.as_deref(),
+            Some(expected_path.as_path())
+        );
     }
 
     #[test]

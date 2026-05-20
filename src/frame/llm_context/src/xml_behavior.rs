@@ -71,19 +71,15 @@ use crate::behavior_loop::{LLMBehaviorResult, LLMResultParser, SendMessageRecord
 /// This is intentionally protocol-shaped rather than behavior-shaped:
 /// behavior prompts should still decide when to use each action and which
 /// `next_behavior` values are valid.
-pub const XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT: &str = r#"请严格按以下 XML Behavior v2 格式输出；最终回复只输出 XML，不要用 Markdown code fence 包裹。
+pub const XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT: &str = r#"
 
-```xml
+The returned message MUST be parseable by XMLParser. Example:
+```
 <response>
-  <observation><![CDATA[
-基于 last_step / action_result / 当前已知状态提炼的结论。请尽量自包含，后续步骤可能看不到原始 action_result。
-  ]]></observation>
-  <thinking><![CDATA[
-距离评估：当前状态距目标还差什么？
-动作选择：本步做什么能最有效缩短距离？为什么？
-  ]]></thinking>
+  <observation>follow process rules</observation>
+  <thinking>follow process rules</thinking>
   <actions>
-    <exec_bash cwd="src" timeout_ms="30000"><![CDATA[
+    <exec_bash timeout_ms="30000"><![CDATA[
 cargo test
     ]]></exec_bash>
     <write_file path="src/foo.rs"><![CDATA[
@@ -93,29 +89,25 @@ pub fn bar() -> u32 { 42 }
 new content
     ]]></edit_file>
     <read uri="src/foo.rs" offset="0" limit="4096"/>
-    <sendmsg target="user"><![CDATA[
-给用户的消息；可选；仅在有重要进展或需要用户输入时填写。
+    <sendmsg><![CDATA[
+Message to the user; optional; SHOULD only be provided when there is important progress or user input is required.
     ]]></sendmsg>
   </actions>
   <report><![CDATA[
-本步骤完成总结；写入 last_report；可选但建议在阶段性完成时填写。
+    Information that needs to be reported; SHOULD usually be provided when next_behavior is END.
   ]]></report>
-  <next_behavior>END</next_behavior>
+  <next_behavior>...</next_behavior>
 </response>
 ```
+## next_behavior
+- `<next_behavior>` is the key field used to maintain the behavior state machine and MUST follow the process rules.
+- If `<next_behavior>` is omitted, the behavior state machine SHOULD proceed to the next Step.
 
-## 输出规则
-- `<observation>`：填写对上一步结果或当前状态的自包含结论；没有新观察时也要简洁说明当前已知状态。
-- `<thinking>`：填写本步推理，重点说明距离评估和动作选择。
-- `<actions>`：只放当前 behavior 允许使用的 XML action；不需要 action 时可省略整个 `<actions>`。
-- `<exec_bash>`：一条 shell 命令对应一个标签；不要把结构化写文件动作塞进 shell。
-- 写文本文件必须使用 `<write_file>` 或 `<edit_file>`，不要用 `echo` / `cat` / heredoc 写文件。
-- XML body 统一使用 CDATA；文件内容、命令、报告正文都放在对应标签 body 中。
-- `read` 读取文件时优先使用 workspace 内相对路径；没有 `://` 协议头时默认按文件路径处理。
-- `<sendmsg target="user">` 表示发送给用户的过程消息，不写入 last_report。
-- `<report>` 表示 Self Report，写入 last_report，但不会自动终止 behavior；不要放入 `<actions>`。
-- `<next_behavior>` 只在当前 behavior 应结束或切换时填写；继续当前 behavior 时省略。
-- `<report>` 与 `<next_behavior>` 相互独立：结束并留下结果时同时输出二者。
+## <actions> Usage Rules
+
+- You SHOULD always prefer `write_file` / `edit_file` / `read` over `exec_bash`.
+- `<exec_bash>` SHOULD contain bash commands in its body, and multi-line commands are allowed. If any command fails, the action MUST stop.
+- You MUST use `<write_file>` or `<edit_file>` to write text files. You MUST NOT use `echo`, `cat`, or heredoc to write files.
 "#;
 
 /// Hardcoded allowlist of v2 first-class Action tag names. Everything in

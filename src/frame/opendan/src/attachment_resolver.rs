@@ -63,8 +63,8 @@ impl LocalFileResolver for NamedStoreLocalLinkResolver {
         }
         let file_size = metadata.len();
 
-        let runtime = get_buckyos_api_runtime()
-            .map_err(|e| format!("buckyos runtime unavailable: {e}"))?;
+        let runtime =
+            get_buckyos_api_runtime().map_err(|e| format!("buckyos runtime unavailable: {e}"))?;
         let store_mgr = runtime
             .get_named_store()
             .await

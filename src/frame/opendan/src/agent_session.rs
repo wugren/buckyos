@@ -10,7 +10,8 @@ use log::{info, warn};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
-use agent_tool::{AgentToolManager, SessionRuntimeContext};
+use agent_tool::todo_tools::read_todo_records;
+use agent_tool::{AgentToolManager, SessionRuntimeContext, TodoRecord};
 use llm_context::{
     context_loop::LLMContext,
     interrupt::LLMContextInterruptHandle,
@@ -605,16 +606,43 @@ impl AgentSession {
                     matches!(self.kind, SessionKind::Work) && self.needs_bootstrap_turn().await;
                 if needs_bootstrap {
                     self.set_status(SessionStatus::Running).await;
+                    let behavior = match self.load_current_behavior().await {
+                        Ok(behavior) => behavior,
+                        Err(err) => {
+                            warn!(
+                                "opendan.session[{}]: bootstrap load behavior failed: {err:#}",
+                                self.session_id
+                            );
+                            self.set_status(SessionStatus::Error).await;
+                            let _ = self
+                                .reply_tx
+                                .send(SessionReply::Error {
+                                    message: format!("bootstrap load behavior failed: {err:#}"),
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let bootstrap_message = self
+                        .render_on_switch_input_text("none", &behavior, None)
+                        .await
+                        .map(|text| AiMessage::text(AiRole::User, text));
+                    let bootstrap_messages = bootstrap_message.into_iter().collect::<Vec<_>>();
+                    self.set_current_origin_msg(
+                        bootstrap_messages
+                            .first()
+                            .map(|message| message.text_content()),
+                    );
                     let seed = RoundSeed {
                         trigger: RoundTrigger::SystemEvent {
                             source: "bootstrap".to_string(),
                             event_kind: "objective".to_string(),
                         },
                         input_keys: Vec::new(),
-                        user_messages: Vec::new(),
+                        user_messages: bootstrap_messages.clone(),
                         system_events: Vec::new(),
                     };
-                    let round_result = self.run_one_round(Vec::new(), Some(seed)).await;
+                    let round_result = self.run_one_round(bootstrap_messages, Some(seed)).await;
                     self.mark_bootstrap_done().await;
                     match round_result {
                         Ok(action) => match action {
@@ -1916,9 +1944,9 @@ impl AgentSession {
     /// tool policy, budget, …) made between turns silently fail to land:
     /// resume re-uses the snapshot's stored `request` and only a `switch` /
     /// `discard` path would otherwise pick up the new config.
-    async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> RequestOverrides {
-        RequestOverrides {
-            system_messages: Some(self.render_system_messages(behavior).await),
+    async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> Result<RequestOverrides> {
+        Ok(RequestOverrides {
+            system_messages: Some(self.render_system_messages(behavior).await?),
             tool_policy: Some(behavior.to_tool_policy()),
             objective: Some(behavior.meta.objective.clone()),
             behavior_name: Some(behavior.meta.name.clone()),
@@ -1932,7 +1960,7 @@ impl AgentSession {
             reset_errors: false,
             reset_behavior_hot_tail: false,
             forbid_next_behavior: false,
-        }
+        })
     }
 
     async fn build_or_resume(
@@ -1999,7 +2027,7 @@ impl AgentSession {
                 // the new system prompt / model / tool policy.
                 let snapshot = apply_overrides_to_snapshot(
                     snapshot,
-                    self.current_behavior_overrides(behavior).await,
+                    self.current_behavior_overrides(behavior).await?,
                 );
 
                 if let Some(message) = turn_message.clone() {
@@ -2052,7 +2080,7 @@ impl AgentSession {
             .await;
         }
 
-        let mut input = self.render_system_messages(behavior).await;
+        let mut input = self.render_system_messages(behavior).await?;
         if let Some(message) = turn_message {
             input.push(message);
         }
@@ -2122,15 +2150,15 @@ impl AgentSession {
 
     /// Build a fresh (no inherited state) [`LLMContextRequest`] for the given
     /// behavior. Used by independent-mode first-time entry into a process.
-    async fn fresh_request_for(&self, cfg: &BehaviorCfg) -> LLMContextRequest {
-        LLMContextRequest {
+    async fn fresh_request_for(&self, cfg: &BehaviorCfg) -> Result<LLMContextRequest> {
+        Ok(LLMContextRequest {
             owner: ContextOwnerRef::Agent {
                 session_id: self.session_id.clone(),
             },
             trace: None,
             objective: cfg.meta.objective.clone(),
             behavior_name: cfg.meta.name.clone(),
-            input: self.render_system_messages(cfg).await,
+            input: self.render_system_messages(cfg).await?,
             model_policy: cfg.to_model_policy(),
             tool_policy: cfg.to_tool_policy(),
             output: cfg.to_output_spec(),
@@ -2138,7 +2166,7 @@ impl AgentSession {
             human_policy: cfg.to_human_policy(),
             error_policy: cfg.to_error_policy(),
             forbid_next_behavior: false,
-        }
+        })
     }
 
     /// Compose the "environment-aware message" — a short, structured
@@ -2228,7 +2256,7 @@ impl AgentSession {
         }
     }
 
-    async fn render_system_messages(&self, behavior: &BehaviorCfg) -> Vec<AiMessage> {
+    async fn render_system_messages(&self, behavior: &BehaviorCfg) -> Result<Vec<AiMessage>> {
         // Read once: file-system anchors `role.md` / `self.md`, current
         // session env. role.md / self.md are pre-read and injected as
         // `{{ role_md }}` / `{{ self_md }}` template extras for the four
@@ -2251,18 +2279,25 @@ impl AgentSession {
                 ("self_md", serde_json::Value::String(self_md.clone())),
             ];
             match prompt_env::render_template(template, &env, &extras).await {
-                Ok(rendered) => return vec![AiMessage::text(AiRole::System, rendered)],
+                Ok(rendered) => return Ok(vec![AiMessage::text(AiRole::System, rendered)]),
                 Err(err) => {
-                    warn!(
-                        "opendan.session[{}]: render system prompt template failed: {err}; falling back to built-in composition",
-                        self.session_id
+                    let detail = render_template_failure_detail(
+                        behavior,
+                        "prompt.on_init",
+                        template,
+                        &env,
+                        &err,
                     );
-                    // fall through to the built-in composition path below
+                    warn!(
+                        "opendan.session[{}]: render system prompt template failed: {}",
+                        self.session_id, detail
+                    );
+                    return Err(anyhow!("render system prompt template failed: {detail}"));
                 }
             }
         }
 
-        // No template (or render error) ⇒ runtime built-in composition
+        // No template ⇒ runtime built-in composition
         // (matches pre-config-rewrite behavior). Worksession objective
         // surfaces as a dedicated block ahead of the session readme so the
         // LLM sees its task statement first.
@@ -2294,7 +2329,7 @@ impl AgentSession {
                 self.agent_name, self.session_id
             ));
         }
-        vec![AiMessage::text(AiRole::System, chunks.join("\n\n"))]
+        Ok(vec![AiMessage::text(AiRole::System, chunks.join("\n\n"))])
     }
 
     async fn load_current_behavior(&self) -> Result<BehaviorCfg> {
@@ -2606,9 +2641,10 @@ impl AgentSession {
         // §4.2 of the config-rewrite doc: switch_mode is a session-class
         // property — the LLM picks `<next_behavior>`, the runtime decides
         // whether to go Normal / Fork / Independent.
+        let from_context_report = final_snapshot.state.last_report.clone().unwrap_or_default();
         match self.session_class_switch_mode() {
             SwitchMode::Normal => {
-                self.apply_switch_normal(&new_cfg, final_snapshot).await;
+                self.apply_switch_normal(&new_cfg, final_snapshot).await?;
                 self.meta.lock().await.current_behavior = new_cfg.meta.name.clone();
             }
             SwitchMode::Independent => {
@@ -2623,7 +2659,7 @@ impl AgentSession {
                      (Phase 4 — treating as Normal for now)",
                     self.session_id
                 );
-                self.apply_switch_normal(&new_cfg, final_snapshot).await;
+                self.apply_switch_normal(&new_cfg, final_snapshot).await?;
                 self.meta.lock().await.current_behavior = new_cfg.meta.name.clone();
             }
         }
@@ -2633,44 +2669,71 @@ impl AgentSession {
                 self.session_id
             );
         }
-        self.enqueue_on_switch_input(prev, &new_cfg).await;
+        self.enqueue_on_switch_input(prev, &new_cfg, Some(from_context_report.as_str()))
+            .await;
         Ok(())
     }
 
-    async fn enqueue_on_switch_input(&self, prev: &BehaviorCfg, next: &BehaviorCfg) {
-        let Some(template) = next.prompt.on_switch.as_deref().map(str::trim) else {
-            return;
-        };
+    async fn render_on_switch_input_text(
+        &self,
+        prev_name: &str,
+        next: &BehaviorCfg,
+        from_context_report: Option<&str>,
+    ) -> Option<String> {
+        let template = next.prompt.on_switch.as_deref().map(str::trim)?;
         if template.is_empty() {
-            return;
+            return None;
         }
         let env = self.build_prompt_env(next).await;
+        let report = from_context_report
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let from_context = report
+            .map(|value| {
+                serde_json::json!({
+                    "report": value,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
         let extras = [
             (
                 "switch",
                 serde_json::json!({
-                    "from": prev.meta.name.clone(),
+                    "from": prev_name,
                     "to": next.meta.name.clone(),
                 }),
             ),
             (
                 "from_behavior",
-                serde_json::Value::String(prev.meta.name.clone()),
+                serde_json::Value::String(prev_name.to_string()),
             ),
+            ("from_context", from_context),
         ];
-        let text = match prompt_env::render_template(template, &env, &extras).await {
-            Ok(text) => text.trim().to_string(),
+        match prompt_env::render_template(template, &env, &extras).await {
+            Ok(text) => Some(text.trim().to_string()),
             Err(err) => {
                 warn!(
                     "opendan.session[{}]: render on_switch for behavior `{}` failed: {err}",
                     self.session_id, next.meta.name
                 );
-                return;
+                None
             }
-        };
-        if text.is_empty() {
-            return;
         }
+        .filter(|text| !text.is_empty())
+    }
+
+    async fn enqueue_on_switch_input(
+        &self,
+        prev: &BehaviorCfg,
+        next: &BehaviorCfg,
+        from_context_report: Option<&str>,
+    ) {
+        let Some(text) = self
+            .render_on_switch_input_text(&prev.meta.name, next, from_context_report)
+            .await
+        else {
+            return;
+        };
         let seq = self
             .trace_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2700,8 +2763,12 @@ impl AgentSession {
     /// - rounds_left: NOT reset (continue parent budget)
     /// - consecutive_errors: NOT cleared (block LLM from bypassing the cap
     ///   by switching behavior)
-    async fn apply_switch_normal(&self, new_cfg: &BehaviorCfg, final_snapshot: LLMContextSnapshot) {
-        let new_system = self.render_system_messages(new_cfg).await;
+    async fn apply_switch_normal(
+        &self,
+        new_cfg: &BehaviorCfg,
+        final_snapshot: LLMContextSnapshot,
+    ) -> Result<()> {
+        let new_system = self.render_system_messages(new_cfg).await?;
         let overrides = RequestOverrides {
             system_messages: Some(new_system),
             tool_policy: Some(new_cfg.to_tool_policy()),
@@ -2720,6 +2787,7 @@ impl AgentSession {
         };
         let rebuilt = apply_overrides_to_snapshot(final_snapshot, overrides);
         self.persist_snapshot(&rebuilt).await;
+        Ok(())
     }
 
     /// Switch mode = Independent: each behavior name is its own "process"
@@ -2767,7 +2835,7 @@ impl AgentSession {
             // behavior's request template. Mirrors `build_fresh` at the
             // snapshot level (we don't construct an LLMContext here because
             // the next worker turn will do the resume).
-            let request = self.fresh_request_for(new_cfg).await;
+            let request = self.fresh_request_for(new_cfg).await?;
             let state = LLMContextState::from_request(&request, now_ms());
             LLMContextSnapshot { request, state }
         };
@@ -2935,7 +3003,7 @@ impl AgentSession {
 
         let mut overrides = overrides;
         if overrides.system_messages.is_none() {
-            overrides.system_messages = Some(self.render_system_messages(&sub_cfg).await);
+            overrides.system_messages = Some(self.render_system_messages(&sub_cfg).await?);
         }
         if overrides.behavior_name.is_none() {
             overrides.behavior_name = Some(sub_cfg.meta.name.clone());
@@ -3543,45 +3611,21 @@ fn json_scalar_to_text(value: &serde_json::Value) -> String {
 
 fn load_current_todo(session_dir: &Path) -> serde_json::Value {
     let path = session_dir.join("todos.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return serde_json::Value::Null,
-    };
-    let todos = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Array(items)) => items,
+    let todos = match read_todo_records(&path) {
+        Ok(todos) => todos,
         _ => return serde_json::Value::Null,
     };
     todos
-        .into_iter()
-        .find(|todo| !todo_status_is_terminal(todo_text_field(todo, "status").as_deref()))
-        .map(normalize_current_todo)
+        .iter()
+        .find(|todo| !todo.status.is_terminal())
+        .and_then(|todo| serde_json::to_value(todo).ok())
         .unwrap_or(serde_json::Value::Null)
-}
-
-fn normalize_current_todo(mut todo: serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut todo {
-        map.entry("todo_id".to_string())
-            .or_insert_with(|| serde_json::Value::String(String::new()));
-        map.entry("status".to_string())
-            .or_insert_with(|| serde_json::Value::String(String::new()));
-        map.entry("task".to_string())
-            .or_insert_with(|| serde_json::Value::String(String::new()));
-        map.entry("skills".to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    }
-    todo
 }
 
 fn render_current_todo_list(session_dir: &Path) -> String {
     let path = session_dir.join("todos.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return "(empty)".to_string(),
-        Err(err) => return format!("(unavailable: {err})"),
-    };
-    let todos = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Array(items)) => items,
-        Ok(_) => return "(invalid todos.json: expected array)".to_string(),
+    let todos = match read_todo_records(&path) {
+        Ok(todos) => todos,
         Err(err) => return format!("(invalid todos.json: {err})"),
     };
     if todos.is_empty() {
@@ -3589,33 +3633,161 @@ fn render_current_todo_list(session_dir: &Path) -> String {
     }
     let current_id = todos
         .iter()
-        .find(|todo| !todo_status_is_terminal(todo_text_field(todo, "status").as_deref()))
-        .and_then(|todo| todo_text_field(todo, "todo_id"));
+        .find(|todo| !todo.status.is_terminal())
+        .map(|todo| todo.todo_id.clone());
     let mut lines = Vec::with_capacity(todos.len());
     for todo in todos {
-        let id = todo_text_field(&todo, "todo_id").unwrap_or_else(|| "?".to_string());
-        let status = todo_text_field(&todo, "status").unwrap_or_else(|| "unknown".to_string());
-        let task = todo_text_field(&todo, "task").unwrap_or_default();
-        let marker = if current_id.as_deref() == Some(id.as_str()) {
+        let marker = if current_id.as_deref() == Some(todo.todo_id.as_str()) {
             " current"
         } else {
             ""
         };
-        lines.push(format!("- {id} [{status}{marker}] {task}"));
+        lines.push(format!(
+            "- {} [{}{marker}] {}",
+            todo.todo_id,
+            todo_status_label(&todo),
+            todo_title_for_display(&todo)
+        ));
     }
     lines.join("\n")
 }
 
-fn todo_text_field(todo: &serde_json::Value, key: &str) -> Option<String> {
-    todo.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+fn todo_title_for_display(todo: &TodoRecord) -> &str {
+    let title = todo.title.trim();
+    if title.is_empty() {
+        todo.content.trim()
+    } else {
+        title
+    }
 }
 
-fn todo_status_is_terminal(status: Option<&str>) -> bool {
-    matches!(status, Some("completed" | "failed" | "timeout"))
+fn todo_status_label(todo: &TodoRecord) -> String {
+    serde_json::to_value(todo.status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{:?}", todo.status))
+}
+
+#[derive(Debug)]
+struct TemplateExpression {
+    expr: String,
+    line: usize,
+    raw: String,
+}
+
+fn render_template_failure_detail(
+    behavior: &BehaviorCfg,
+    field: &str,
+    template: &str,
+    env: &AgentSessionEnv,
+    err: &dyn std::fmt::Display,
+) -> String {
+    let source_path = behavior
+        .source_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<builtin>".to_string());
+    let value_start_line = behavior
+        .source_path
+        .as_ref()
+        .and_then(|path| toml_field_value_start_line(path, "prompt", field.rsplit('.').next()?));
+
+    let expressions = extract_template_expressions(template);
+    let mut hints = Vec::new();
+    if env.session_current_todo.is_null() {
+        for expr in &expressions {
+            if expression_primary_path(&expr.expr).starts_with("session.current_todo.") {
+                let loc = template_expr_location(&source_path, value_start_line, expr.line);
+                hints.push(format!(
+                    "likely null access: `session.current_todo` is null, but {loc} uses `{}`",
+                    expr.raw
+                ));
+            }
+        }
+    }
+
+    let location = value_start_line
+        .map(|line| format!("{source_path}:{line}"))
+        .unwrap_or(source_path);
+    let mut detail = format!(
+        "behavior=`{}`, field=`{field}`, template={location}, error={err}",
+        behavior.meta.name
+    );
+    if !hints.is_empty() {
+        detail.push_str(", ");
+        detail.push_str(&hints.join("; "));
+    }
+    detail
+}
+
+fn template_expr_location(
+    source_path: &str,
+    value_start_line: Option<usize>,
+    expr_line: usize,
+) -> String {
+    match value_start_line {
+        Some(start) => format!("{source_path}:{}", start + expr_line.saturating_sub(1)),
+        None => source_path.to_string(),
+    }
+}
+
+fn toml_field_value_start_line(path: &Path, table: &str, field: &str) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut in_table = false;
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_table = trimmed == format!("[{table}]");
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != field {
+            continue;
+        }
+        let line_number = idx + 1;
+        return if value.trim_start().starts_with("\"\"\"") {
+            Some(line_number + 1)
+        } else {
+            Some(line_number)
+        };
+    }
+    None
+}
+
+fn extract_template_expressions(template: &str) -> Vec<TemplateExpression> {
+    let mut out = Vec::new();
+    for (line_idx, line) in template.lines().enumerate() {
+        let mut rest = line;
+        while let Some(start) = rest.find("{{") {
+            let after_start = &rest[start + 2..];
+            let Some(end) = after_start.find("}}") else {
+                break;
+            };
+            let raw = &rest[start..start + 2 + end + 2];
+            let expr = after_start[..end].trim();
+            if !expr.is_empty() {
+                out.push(TemplateExpression {
+                    expr: expr.to_string(),
+                    line: line_idx + 1,
+                    raw: raw.to_string(),
+                });
+            }
+            rest = &after_start[end + 2..];
+        }
+    }
+    out
+}
+
+fn expression_primary_path(expr: &str) -> &str {
+    expr.split(|ch: char| ch.is_whitespace() || ch == '|' || ch == ')')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('(')
 }
 
 fn format_event_batch_for_turn(events: &[EventForTurn]) -> Option<String> {

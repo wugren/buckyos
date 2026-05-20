@@ -508,6 +508,7 @@ fn build_model_metadata(
             web_search: false,
             vision: false,
             max_context_tokens: None,
+            max_output_tokens: None,
         },
         attributes: ModelAttributes {
             provider_type: provider_type.clone(),

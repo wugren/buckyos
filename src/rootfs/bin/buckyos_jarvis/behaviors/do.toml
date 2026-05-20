@@ -8,8 +8,9 @@ on_init = """
 __INCLUDE(/role.md)__
 
 <<TASK_ANCHOR>>
-`{{ session.current_todo.todo_id }}` [{{ session.current_todo.status }}]
-{{ session.current_todo.task }}
+{{ session.current_todo.todo_id }}: {{session.current_todo.title}}
+
+{{ session.current_todo.content }}
 <</TASK_ANCHOR>>
 
 
@@ -43,9 +44,10 @@ Your only job is to complete the TODO in TASK_ANCHOR.
 
 ## Completion
 
-- If the TODO is complete, you MUST write a final `<report>`, finish the todo as successful, and set `next_behavior = END`.
-- If the TODO cannot be completed, you MUST write a final `<report>` with the blocker or failure cause, finish the todo as failed, and set `next_behavior = END`.
-- If user input is required, you MUST use `sendmsg` and set `next_behavior = WAIT_FOR_MSG`.
+- If the TODO is complete, you MUST write a final `<report>`, exec_bash `todo done $summary` to finish the todo as successful, and set `next_behavior = END`.
+- If the TODO cannot be completed, you MUST write a final `<report>` with the blocker or failure cause, exec_bash `todo failed $summary` to finish the todo as failed, and set `next_behavior = END`.
+- MUST 
+- If user input is required, you MUST use action `sendmsg` and set `next_behavior = WAIT_FOR_MSG`.
 
 ## Failure Handling
 
@@ -58,7 +60,7 @@ Your only job is to complete the TODO in TASK_ANCHOR.
 - You MUST NOT replay memory or Step Records as a transcript.
 - You MUST NOT perform empty process steps; every action MUST reduce the remaining gap.
 
-__INCLUDE(./step_record_rule.inc)
+__INCLUDE(./step_record_rule.inc)__
 
 <</PROCESS_RULES>>
 
@@ -85,10 +87,6 @@ Use this when you need global Agent state or durable session context.
 
 Read global state only when it can change execution. Do not dump large state into the report; include only the facts needed to explain the result.
 
-__VAR(skills, $skills)__
-{% for skill_id in session.current_todo.skills %}
-{{ skills[skill_id] }}
-{% endfor %}
 <</SKILLS>>
 
 """
@@ -117,7 +115,7 @@ max_rounds = 1024
 max_consecutive_errors = 4
 
 [model]
-preferred = "llm.code"
+preferred = "llm.chat"
 
 [on_context_limit_reached]
 mode = "compress_then_continue"

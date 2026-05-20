@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use buckyos_api::{AiMessage, AiRole};
+use chrono::Local;
 use log::{info, warn};
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -1080,7 +1081,7 @@ impl AIAgent {
         if objective.trim().is_empty() {
             return Err(anyhow!("create_work_session: objective must not be empty"));
         }
-        let new_session_id = mint_session_id("ws");
+        let new_session_id = self.allocate_worksession_id(title.trim()).await;
         // Workspace resolution: explicit id reuses; absence mints a new
         // id deterministic-ish on the session id (so a crash mid-create
         // doesn't strand two half-built workspaces).
@@ -1163,6 +1164,24 @@ impl AIAgent {
             workspace_status,
             behavior: behavior_name,
         })
+    }
+
+    async fn allocate_worksession_id(&self, title: &str) -> String {
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let base = build_worksession_id(&date, title);
+        let mut suffix = 1usize;
+        loop {
+            let candidate = if suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base} {suffix}")
+            };
+            let in_memory = self.sessions.lock().await.contains_key(&candidate);
+            if !in_memory && !self.config.layout.session_dir(&candidate).exists() {
+                return candidate;
+            }
+            suffix += 1;
+        }
     }
 
     /// Forward a chat message from one session to another's pending queue.
@@ -1262,6 +1281,40 @@ pub fn mint_session_id(prefix: &str) -> String {
     format!("{prefix}-{short}")
 }
 
+fn build_worksession_id(date: &str, title: &str) -> String {
+    let readable_title = sanitize_worksession_title(title);
+    format!("{date} {readable_title}")
+}
+
+fn sanitize_worksession_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(80));
+    let mut prev_space = false;
+    for ch in raw.trim().chars() {
+        let replacement = if ch.is_control()
+            || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        {
+            ' '
+        } else {
+            ch
+        };
+        if replacement.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        out.push(replacement);
+        prev_space = false;
+    }
+    let trimmed = out.trim_matches([' ', '.']).to_string();
+    if trimmed.is_empty() {
+        "未命名任务".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// Render the work-session readme. Captures title / objective / origin
 /// session / reason messages so a later reader can reconstruct context
 /// without grovelling through agent logs.
@@ -1339,6 +1392,26 @@ mod tests {
     fn sanitizes_session_segment() {
         assert_eq!(sanitize_session_segment("did:dev:alice"), "did_dev_alice");
         assert_eq!(sanitize_session_segment(""), "anon");
+    }
+
+    #[test]
+    fn builds_human_readable_worksession_id() {
+        assert_eq!(
+            build_worksession_id("2026-05-20", "开发网页版连连看小游戏"),
+            "2026-05-20 开发网页版连连看小游戏"
+        );
+    }
+
+    #[test]
+    fn sanitizes_worksession_title_for_directory_name() {
+        assert_eq!(
+            build_worksession_id("2026-05-20", "  a/b\\c:d*e? \n f  "),
+            "2026-05-20 a b c d e f"
+        );
+        assert_eq!(
+            build_worksession_id("2026-05-20", "../"),
+            "2026-05-20 未命名任务"
+        );
     }
 
     #[test]

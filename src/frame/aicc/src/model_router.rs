@@ -516,6 +516,7 @@ mod tests {
                 web_search: true,
                 vision: false,
                 max_context_tokens: Some(128_000),
+                max_output_tokens: Some(16_384),
             },
             attributes: ModelAttributes {
                 provider_type,

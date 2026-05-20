@@ -32,7 +32,7 @@ const CLAUDE_OPTION_ALLOWLIST: &[&str] = &[
     "system",
 ];
 const CLAUDE_TOOL_NAME_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
-const DEFAULT_MAX_TOKENS: u64 = 1024;
+const FALLBACK_MAX_TOKENS: u64 = 1024;
 
 fn is_valid_claude_tool_name(value: &str) -> bool {
     !value.is_empty()
@@ -1160,14 +1160,21 @@ fn resolve_provider_model(req: &AiMethodRequest, provider_model: &str) -> Option
 pub(crate) fn convert_complete_request(
     req: &AiMethodRequest,
     provider_model: &str,
+    default_max_tokens: Option<u64>,
 ) -> Result<(Map<String, Value>, Vec<String>), ProviderError> {
-    convert_complete_request_with_dialect(req, provider_model, ProtocolDialect::Claude)
+    convert_complete_request_with_dialect(
+        req,
+        provider_model,
+        ProtocolDialect::Claude,
+        default_max_tokens,
+    )
 }
 
 pub(crate) fn convert_complete_request_with_dialect(
     req: &AiMethodRequest,
     provider_model: &str,
     dialect: ProtocolDialect,
+    default_max_tokens: Option<u64>,
 ) -> Result<(Map<String, Value>, Vec<String>), ProviderError> {
     let model = resolve_provider_model(req, provider_model)
         .ok_or_else(|| ProviderError::fatal("provider model is required for claude request"))?;
@@ -1210,7 +1217,10 @@ pub(crate) fn convert_complete_request_with_dialect(
     }
 
     if !request.contains_key("max_tokens") {
-        request.insert("max_tokens".to_string(), Value::from(DEFAULT_MAX_TOKENS));
+        request.insert(
+            "max_tokens".to_string(),
+            Value::from(default_max_tokens.unwrap_or(FALLBACK_MAX_TOKENS)),
+        );
     }
 
     Ok((request, ignored))
@@ -1262,7 +1272,7 @@ mod tests {
             ]
         }));
 
-        let (request, ignored) = convert_complete_request(&req, "claude-3-7-sonnet-20250219")
+        let (request, ignored) = convert_complete_request(&req, "claude-3-7-sonnet-20250219", None)
             .expect("convert should work");
         let request_value = Value::Object(request);
 
@@ -1312,7 +1322,7 @@ mod tests {
             Some("text/plain".to_string()),
         )];
 
-        let (request, _ignored) = convert_complete_request(&req, "claude-3-5-haiku-20241022")
+        let (request, _ignored) = convert_complete_request(&req, "claude-3-5-haiku-20241022", None)
             .expect("convert should work");
         let request_value = Value::Object(request);
 
@@ -1322,6 +1332,18 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("summarize updates\n\nresource_url: https://example.com/doc")
         );
+    }
+
+    #[test]
+    fn convert_complete_request_uses_inventory_default_max_tokens() {
+        let mut req = base_request();
+        req.payload.messages = vec![AiMessage::text(AiRole::User, "hello")];
+
+        let (request, _ignored) =
+            convert_complete_request(&req, "claude-3-7-sonnet-20250219", Some(8192))
+                .expect("convert should work");
+
+        assert_eq!(request.get("max_tokens"), Some(&json!(8192)));
     }
 
     #[test]
@@ -1452,8 +1474,9 @@ mod tests {
             ]
         }));
 
-        let (request, _ignored) = convert_complete_request(&req, "claude-3-7-sonnet-20250219")
-            .expect("convert should work");
+        let (request, _ignored) =
+            convert_complete_request(&req, "claude-3-7-sonnet-20250219", None)
+                .expect("convert should work");
         let request_value = Value::Object(request);
 
         assert_eq!(
@@ -1484,7 +1507,7 @@ mod tests {
             ),
         ];
 
-        let (request, _) = convert_complete_request(&req, "claude-3-7-sonnet-20250219")
+        let (request, _) = convert_complete_request(&req, "claude-3-7-sonnet-20250219", None)
             .expect("convert should work");
         let value = Value::Object(request);
 
@@ -1531,9 +1554,13 @@ mod tests {
             ),
         ];
 
-        let (request, _) =
-            convert_complete_request_with_dialect(&req, "MiniMax-M2.5", ProtocolDialect::MiniMax)
-                .expect("convert should work");
+        let (request, _) = convert_complete_request_with_dialect(
+            &req,
+            "MiniMax-M2.5",
+            ProtocolDialect::MiniMax,
+            None,
+        )
+        .expect("convert should work");
         let value = Value::Object(request);
 
         // The tool result must NOT carry a Claude-shaped tool_result block;
@@ -1566,7 +1593,7 @@ mod tests {
             .push(buckyos_api::features::WEB_SEARCH.to_string());
 
         let (request, _ignored) =
-            convert_complete_request(&req, "claude-3-7-sonnet-20250219").expect("convert");
+            convert_complete_request(&req, "claude-3-7-sonnet-20250219", None).expect("convert");
         let tools = request
             .get("tools")
             .and_then(|v| v.as_array())
@@ -1600,7 +1627,7 @@ mod tests {
         }));
 
         let (request, _ignored) =
-            convert_complete_request(&req, "claude-3-7-sonnet-20250219").expect("convert");
+            convert_complete_request(&req, "claude-3-7-sonnet-20250219", None).expect("convert");
         let tools = request
             .get("tools")
             .and_then(|v| v.as_array())
@@ -1618,7 +1645,7 @@ mod tests {
         let mut req = base_request();
         req.payload.messages = vec![AiMessage::text(AiRole::User, "hello")];
         let (request, _ignored) =
-            convert_complete_request(&req, "claude-3-7-sonnet-20250219").expect("convert");
+            convert_complete_request(&req, "claude-3-7-sonnet-20250219", None).expect("convert");
         assert!(
             request.get("tools").is_none(),
             "tools must not be set when web_search not required: {:?}",

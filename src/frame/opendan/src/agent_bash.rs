@@ -66,6 +66,13 @@ const TMUX_GC_IDLE_SECS: u64 = 24 * 60 * 60;
 /// normally. The session-level intent-bypass toggle is responsible for
 /// populating this var when wired up.
 pub const OPENDAN_AGENT_TOOL_ENV: &str = "OPENDAN_AGENT_TOOL";
+const OPENDAN_AGENT_ENV_ENV: &str = "OPENDAN_AGENT_ENV";
+const OPENDAN_AGENT_ID_ENV: &str = "OPENDAN_AGENT_ID";
+const OPENDAN_SESSION_ID_ENV: &str = "OPENDAN_SESSION_ID";
+const OPENDAN_TRACE_ID_ENV: &str = "OPENDAN_TRACE_ID";
+const OPENDAN_BEHAVIOR_ENV: &str = "OPENDAN_BEHAVIOR";
+const OPENDAN_STEP_IDX_ENV: &str = "OPENDAN_STEP_IDX";
+const OPENDAN_WAKEUP_ID_ENV: &str = "OPENDAN_WAKEUP_ID";
 
 static EXEC_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -185,6 +192,7 @@ pub struct TmuxBashRunner {
     /// tool edits + tool-plan tombstone refreshes propagate without a
     /// session restart. `None` in unit tests that don't need the layer.
     bin_renderer: Option<Arc<SessionBinRenderer>>,
+    base_env: Vec<(String, String)>,
 }
 
 impl TmuxBashRunner {
@@ -192,11 +200,17 @@ impl TmuxBashRunner {
         Self {
             runtime_dir: runtime_dir.into(),
             bin_renderer: None,
+            base_env: Vec::new(),
         }
     }
 
     pub fn with_bin_renderer(mut self, renderer: Arc<SessionBinRenderer>) -> Self {
         self.bin_renderer = Some(renderer);
+        self
+    }
+
+    pub fn with_base_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.base_env = env;
         self
     }
 }
@@ -252,6 +266,7 @@ impl BashRunner for TmuxBashRunner {
         let exit_code_path = self.runtime_dir.join(format!("{run_id}.exit.code"));
         let script_path = self.runtime_dir.join(format!("{run_id}.exec.sh"));
 
+        let env = runtime_exec_env(&req.env, &self.base_env, ctx);
         let script = build_exec_script(
             &run_id,
             &stdout_path,
@@ -259,7 +274,7 @@ impl BashRunner for TmuxBashRunner {
             &exit_code_path,
             &req.cwd,
             &req.command,
-            &req.env,
+            &env,
         );
         fs::write(&script_path, script).await.map_err(|err| {
             AgentToolError::ExecFailed(format!(
@@ -351,12 +366,13 @@ pub fn build_default_tool_manager(
     layout: &SessionBinLayout,
     bash_runtime_dir: &Path,
     bin_renderer: Option<Arc<SessionBinRenderer>>,
+    bash_base_env: Vec<(String, String)>,
 ) -> Arc<AgentToolManager> {
     let manager = AgentToolManager::new();
 
     let bash_cfg =
         LlmBashConfig::local_workspace(&fs_roots.workspace_root).with_overlay(layout.to_overlay());
-    let mut runner = TmuxBashRunner::new(bash_runtime_dir);
+    let mut runner = TmuxBashRunner::new(bash_runtime_dir).with_base_env(bash_base_env);
     if let Some(renderer) = bin_renderer {
         runner = runner.with_bin_renderer(renderer);
     }
@@ -393,6 +409,12 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
     if let Some(renderer) = build.bin_renderer.as_ref() {
         renderer.render_initial(&build.session_dir)?;
     }
+    write_builtin_shell_shims(
+        &layout.session_bin,
+        &build.agent_root,
+        &build.agent_id,
+        &build.session_id,
+    )?;
 
     let manager = build_default_tool_manager(
         FsRoots::workspace_only(&build.workspace_root)
@@ -401,8 +423,121 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
         &layout,
         &bash_runtime_dir,
         build.bin_renderer.clone(),
+        session_exec_base_env(&build.agent_root, &build.agent_id, &build.session_id),
     );
     Ok(manager)
+}
+
+fn write_builtin_shell_shims(
+    session_bin: &Path,
+    agent_root: &Path,
+    agent_id: &str,
+    session_id: &str,
+) -> std::io::Result<()> {
+    let Some(agent_tool) = resolve_agent_tool_cli_path() else {
+        warn!("opendan.agent_bash: skip `todo` shim because agent_tool binary was not found");
+        return Ok(());
+    };
+    let path = session_bin.join("todo");
+    let script = format!(
+        "#!/bin/sh\nexport {agent_env}={agent_root}\nexport {agent_id_env}={agent_id}\nexport {session_env}={session_id}\nexec {agent_tool} todo \"$@\"\n",
+        agent_env = OPENDAN_AGENT_ENV_ENV,
+        agent_root = shell_quote(agent_root.to_string_lossy().as_ref()),
+        agent_id_env = OPENDAN_AGENT_ID_ENV,
+        agent_id = shell_quote(agent_id),
+        session_env = OPENDAN_SESSION_ID_ENV,
+        session_id = shell_quote(session_id),
+        agent_tool = shell_quote(agent_tool.to_string_lossy().as_ref()),
+    );
+    std::fs::write(&path, script)?;
+    make_executable(&path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn session_exec_base_env(
+    agent_root: &Path,
+    agent_id: &str,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            OPENDAN_AGENT_ENV_ENV.to_string(),
+            agent_root.to_string_lossy().to_string(),
+        ),
+        (OPENDAN_AGENT_ID_ENV.to_string(), agent_id.to_string()),
+        (OPENDAN_SESSION_ID_ENV.to_string(), session_id.to_string()),
+    ];
+    if let Some(agent_tool) = resolve_agent_tool_cli_path() {
+        env.push((
+            OPENDAN_AGENT_TOOL_ENV.to_string(),
+            agent_tool.to_string_lossy().to_string(),
+        ));
+    } else {
+        warn!(
+            "opendan.agent_bash: `{}` is not configured and `agent_tool` sibling binary was not found; shell tool proxy is disabled",
+            OPENDAN_AGENT_TOOL_ENV
+        );
+    }
+    env
+}
+
+fn resolve_agent_tool_cli_path() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var(OPENDAN_AGENT_TOOL_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let sibling = exe.parent()?.join(agent_tool_binary_name());
+    sibling.exists().then_some(sibling)
+}
+
+fn agent_tool_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "agent_tool.exe"
+    } else {
+        "agent_tool"
+    }
+}
+
+fn runtime_exec_env(
+    request_env: &[(String, String)],
+    base_env: &[(String, String)],
+    ctx: &SessionRuntimeContext,
+) -> Vec<(String, String)> {
+    let mut env = request_env.to_vec();
+    for (key, value) in base_env {
+        set_env_value(&mut env, key, value.clone());
+    }
+    set_env_value(&mut env, OPENDAN_TRACE_ID_ENV, ctx.trace_id.clone());
+    set_env_value(&mut env, OPENDAN_BEHAVIOR_ENV, ctx.behavior.clone());
+    set_env_value(&mut env, OPENDAN_STEP_IDX_ENV, ctx.step_idx.to_string());
+    set_env_value(&mut env, OPENDAN_WAKEUP_ID_ENV, ctx.wakeup_id.clone());
+    set_env_value(&mut env, OPENDAN_SESSION_ID_ENV, ctx.session_id.clone());
+    set_env_value(&mut env, OPENDAN_AGENT_ID_ENV, ctx.agent_name.clone());
+    env
+}
+
+fn set_env_value(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = env.iter_mut().find(|(k, _)| k == key) {
+        *existing = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +985,30 @@ mod tests {
     }
 
     #[test]
+    fn writes_todo_shim() {
+        let dir = tempdir().unwrap();
+        let session_bin = dir.path().join("session_bin");
+        std::fs::create_dir_all(&session_bin).unwrap();
+        let fake_agent_tool = dir.path().join("agent_tool");
+        std::fs::write(&fake_agent_tool, "#!/bin/sh\n").unwrap();
+        let _agent_tool = ScopedEnvVar::set(OPENDAN_AGENT_TOOL_ENV, &fake_agent_tool);
+
+        write_builtin_shell_shims(
+            &session_bin,
+            &dir.path().join("agent_root"),
+            "test-agent",
+            "session 1",
+        )
+        .expect("write shims");
+
+        let shim = session_bin.join("todo");
+        let content = std::fs::read_to_string(&shim).expect("read todo shim");
+        assert!(content.contains(OPENDAN_AGENT_ENV_ENV));
+        assert!(content.contains(OPENDAN_SESSION_ID_ENV));
+        assert!(content.contains(" todo \"$@\""));
+    }
+
+    #[test]
     fn filesystem_policy_controls_read_roots() {
         let dir = tempdir().unwrap();
         let ws = dir.path().join("workspace");
@@ -907,6 +1066,28 @@ mod tests {
             match &self.prev {
                 Some(p) => std::env::set_var("BUCKYOS_ROOT", p),
                 None => std::env::remove_var("BUCKYOS_ROOT"),
+            }
+        }
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(p) => std::env::set_var(self.key, p),
+                None => std::env::remove_var(self.key),
             }
         }
     }
@@ -971,6 +1152,50 @@ mod tests {
             handler_idx < subshell_idx,
             "handler must be defined before the user-command subshell so it's inherited"
         );
+    }
+
+    #[test]
+    fn runtime_env_overrides_user_session_context() {
+        let ctx = SessionRuntimeContext {
+            trace_id: "trace-1".into(),
+            agent_name: "agent-1".into(),
+            behavior: "do".into(),
+            step_idx: 7,
+            wakeup_id: "wake-1".into(),
+            session_id: "session-real".into(),
+        };
+        let env = runtime_exec_env(
+            &[
+                ("PATH".to_string(), "/bin".to_string()),
+                (
+                    OPENDAN_SESSION_ID_ENV.to_string(),
+                    "session-wrong".to_string(),
+                ),
+            ],
+            &[
+                (
+                    OPENDAN_AGENT_ENV_ENV.to_string(),
+                    "/tmp/agent-root".to_string(),
+                ),
+                (
+                    OPENDAN_AGENT_TOOL_ENV.to_string(),
+                    "/tmp/agent_tool".to_string(),
+                ),
+            ],
+            &ctx,
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(value("PATH"), "/bin");
+        assert_eq!(value(OPENDAN_SESSION_ID_ENV), "session-real");
+        assert_eq!(value(OPENDAN_AGENT_ENV_ENV), "/tmp/agent-root");
+        assert_eq!(value(OPENDAN_AGENT_TOOL_ENV), "/tmp/agent_tool");
+        assert_eq!(value(OPENDAN_BEHAVIOR_ENV), "do");
+        assert_eq!(value(OPENDAN_STEP_IDX_ENV), "7");
     }
 
     #[test]
