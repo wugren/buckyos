@@ -426,6 +426,7 @@ impl AgentConfig {
                     "write_file".to_string(),
                     "edit_file".to_string(),
                     "read".to_string(),
+                    "sendmsg".to_string(),
                     "subscribe_event".to_string(),
                     "unsubscribe_event".to_string(),
                 ],

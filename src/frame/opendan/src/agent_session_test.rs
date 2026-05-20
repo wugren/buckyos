@@ -99,6 +99,79 @@ fn format_event_for_turn_uses_subscription_template() {
 }
 
 #[test]
+fn render_current_todo_list_marks_first_open_todo() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("todos.json"),
+        serde_json::json!([
+            {
+                "todo_id": "T01",
+                "status": "completed",
+                "task": "done task"
+            },
+            {
+                "todo_id": "T02",
+                "status": "pending",
+                "task": "next task"
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let rendered = render_current_todo_list(dir.path());
+    assert!(rendered.contains("- T01 [completed] done task"));
+    assert!(rendered.contains("- T02 [pending current] next task"));
+}
+
+#[test]
+fn load_current_todo_returns_first_open_todo() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("todos.json"),
+        serde_json::json!([
+            {
+                "todo_id": "T01",
+                "status": "completed",
+                "task": "done task"
+            },
+            {
+                "todo_id": "T02",
+                "status": "running",
+                "task": "next task",
+                "skills": ["docs"]
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let todo = load_current_todo(dir.path());
+    assert_eq!(todo["todo_id"], "T02");
+    assert_eq!(todo["task"], "next task");
+    assert_eq!(todo["skills"][0], "docs");
+}
+
+#[test]
+fn load_current_todo_returns_null_when_all_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("todos.json"),
+        serde_json::json!([
+            {
+                "todo_id": "T01",
+                "status": "completed",
+                "task": "done task"
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    assert!(load_current_todo(dir.path()).is_null());
+}
+
+#[test]
 fn event_batch_formats_single_user_wakeup() {
     let batch = format_event_batch_for_turn(&[
         EventForTurn {

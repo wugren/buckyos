@@ -747,7 +747,7 @@ impl LLMContext {
             // 4. Apply `<report>` side-effects BEFORE actions. self_report
             //    updates LLMContextState.last_report unconditionally (the
             //    snapshot/fork-and-collect contract — see
-            //    doc/opendan/Agent Actions.md §3.3). SendMessage-form reports
+            //    doc/opendan/Agent Actions.md §3.3). `<sendmsg>` records
             //    are stub-emitted via worklog in v2 first cut; real delivery
             //    moves to a standard `send_message` agent_tool later.
             if let Some(report) = new_step.self_report.clone() {

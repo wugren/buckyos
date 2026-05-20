@@ -2193,6 +2193,8 @@ impl AgentSession {
             session_title: title.trim().to_string(),
             session_objective,
             session_owner: owner,
+            session_current_todo: load_current_todo(&self.session_dir),
+            session_current_todo_list: render_current_todo_list(&self.session_dir),
             behavior_name: behavior.meta.name.clone(),
             behavior_objective: behavior.meta.objective.clone(),
             behavior_mode: "behavior",
@@ -2594,7 +2596,7 @@ impl AgentSession {
     async fn switch_behavior(
         &self,
         next: &str,
-        _prev: &BehaviorCfg,
+        prev: &BehaviorCfg,
         final_snapshot: LLMContextSnapshot,
     ) -> Result<()> {
         let new_cfg = self
@@ -2631,7 +2633,62 @@ impl AgentSession {
                 self.session_id
             );
         }
+        self.enqueue_on_switch_input(prev, &new_cfg).await;
         Ok(())
+    }
+
+    async fn enqueue_on_switch_input(&self, prev: &BehaviorCfg, next: &BehaviorCfg) {
+        let Some(template) = next.prompt.on_switch.as_deref().map(str::trim) else {
+            return;
+        };
+        if template.is_empty() {
+            return;
+        }
+        let env = self.build_prompt_env(next).await;
+        let extras = [
+            (
+                "switch",
+                serde_json::json!({
+                    "from": prev.meta.name.clone(),
+                    "to": next.meta.name.clone(),
+                }),
+            ),
+            (
+                "from_behavior",
+                serde_json::Value::String(prev.meta.name.clone()),
+            ),
+        ];
+        let text = match prompt_env::render_template(template, &env, &extras).await {
+            Ok(text) => text.trim().to_string(),
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: render on_switch for behavior `{}` failed: {err}",
+                    self.session_id, next.meta.name
+                );
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        let seq = self
+            .trace_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let input = PendingInput::Msg {
+            record_id: format!("on-switch-{}-{}-{}", self.session_id, next.meta.name, seq),
+            from: "opendan:on_switch".to_string(),
+            from_did: None,
+            from_name: Some("on_switch".to_string()),
+            tunnel_did: None,
+            text: text.clone(),
+            ai_message: AiMessage::text(AiRole::User, text),
+        };
+        if let Err(err) = self.enqueue_pending(input).await {
+            warn!(
+                "opendan.session[{}]: enqueue on_switch input for behavior `{}` failed: {err:#}",
+                self.session_id, next.meta.name
+            );
+        }
     }
 
     /// Switch mode = Normal: keep accumulated history + step records, swap
@@ -3482,6 +3539,83 @@ fn json_scalar_to_text(value: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         _ => json_compact(value),
     }
+}
+
+fn load_current_todo(session_dir: &Path) -> serde_json::Value {
+    let path = session_dir.join("todos.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return serde_json::Value::Null,
+    };
+    let todos = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(items)) => items,
+        _ => return serde_json::Value::Null,
+    };
+    todos
+        .into_iter()
+        .find(|todo| !todo_status_is_terminal(todo_text_field(todo, "status").as_deref()))
+        .map(normalize_current_todo)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn normalize_current_todo(mut todo: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut todo {
+        map.entry("todo_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+        map.entry("status".to_string())
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+        map.entry("task".to_string())
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+        map.entry("skills".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    }
+    todo
+}
+
+fn render_current_todo_list(session_dir: &Path) -> String {
+    let path = session_dir.join("todos.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return "(empty)".to_string(),
+        Err(err) => return format!("(unavailable: {err})"),
+    };
+    let todos = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(items)) => items,
+        Ok(_) => return "(invalid todos.json: expected array)".to_string(),
+        Err(err) => return format!("(invalid todos.json: {err})"),
+    };
+    if todos.is_empty() {
+        return "(empty)".to_string();
+    }
+    let current_id = todos
+        .iter()
+        .find(|todo| !todo_status_is_terminal(todo_text_field(todo, "status").as_deref()))
+        .and_then(|todo| todo_text_field(todo, "todo_id"));
+    let mut lines = Vec::with_capacity(todos.len());
+    for todo in todos {
+        let id = todo_text_field(&todo, "todo_id").unwrap_or_else(|| "?".to_string());
+        let status = todo_text_field(&todo, "status").unwrap_or_else(|| "unknown".to_string());
+        let task = todo_text_field(&todo, "task").unwrap_or_default();
+        let marker = if current_id.as_deref() == Some(id.as_str()) {
+            " current"
+        } else {
+            ""
+        };
+        lines.push(format!("- {id} [{status}{marker}] {task}"));
+    }
+    lines.join("\n")
+}
+
+fn todo_text_field(todo: &serde_json::Value, key: &str) -> Option<String> {
+    todo.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn todo_status_is_terminal(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "timeout"))
 }
 
 fn format_event_batch_for_turn(events: &[EventForTurn]) -> Option<String> {

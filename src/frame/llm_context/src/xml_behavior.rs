@@ -19,7 +19,7 @@
 //!     <write_file path="src/foo.rs"><![CDATA[
 //! pub fn bar() -> u32 { 42 }
 //! ]]></write_file>
-//!     <report target="user"><![CDATA[已开始测试...]]></report>
+//!     <sendmsg target="user"><![CDATA[已开始测试...]]></sendmsg>
 //!   </actions>
 //!
 //!   <report><![CDATA[本步骤完成总结...]]></report>
@@ -29,23 +29,22 @@
 //!
 //! ## Recognized Action tags (first-class, hardcoded allowlist)
 //!
-//! `exec_bash`, `write_file`, `edit_file`, `read`, `report`,
+//! `exec_bash`, `write_file`, `edit_file`, `read`, `sendmsg`,
 //! `subscribe_event`, `unsubscribe_event`. Any other element inside
 //! `<actions>` is silently skipped — the v2 Action set is prompt-coupled,
 //! not registry-driven.
 //!
-//! ## `<report>` handling
+//! ## `<sendmsg>` / `<report>` handling
 //!
-//! `<report>` is **not** turned into an `AiToolCall`. It is captured into
-//! a dedicated slot on [`LLMBehaviorResult`]:
+//! These tags are **not** turned into `AiToolCall`s. They are captured into
+//! dedicated slots on [`LLMBehaviorResult`]:
 //!
-//! - `<report>` without `target` attribute  → `self_report` (last one wins)
-//! - `<report target="...">`                → `messages_to_send` (ordered)
+//! - `<sendmsg target="...">` inside `<actions>` → `messages_to_send` (ordered)
+//! - `<report>` outside `<actions>`              → `self_report` (last one wins)
 //!
-//! Location is tolerant: `<report>` is scanned across the whole response,
-//! so it works inside or outside `<actions>`. The doc convention (Self
-//! Report outside, SendMessage inside) is prompt guidance, not parser
-//! enforcement.
+//! This keeps process messaging and LLMContext last-state updates separate:
+//! `<sendmsg>` is the side-effect action shape, while `<report>` updates
+//! `last_report`.
 //!
 //! ## Tolerance
 //!
@@ -94,9 +93,9 @@ pub fn bar() -> u32 { 42 }
 new content
     ]]></edit_file>
     <read uri="src/foo.rs" offset="0" limit="4096"/>
-    <report target="user"><![CDATA[
+    <sendmsg target="user"><![CDATA[
 给用户的消息；可选；仅在有重要进展或需要用户输入时填写。
-    ]]></report>
+    ]]></sendmsg>
   </actions>
   <report><![CDATA[
 本步骤完成总结；写入 last_report；可选但建议在阶段性完成时填写。
@@ -113,8 +112,8 @@ new content
 - 写文本文件必须使用 `<write_file>` 或 `<edit_file>`，不要用 `echo` / `cat` / heredoc 写文件。
 - XML body 统一使用 CDATA；文件内容、命令、报告正文都放在对应标签 body 中。
 - `read` 读取文件时优先使用 workspace 内相对路径；没有 `://` 协议头时默认按文件路径处理。
-- `<report target="user">` 表示发送给用户的过程消息，不写入 last_report。
-- `<report>` 不带 target 表示 Self Report，写入 last_report，但不会自动终止 behavior。
+- `<sendmsg target="user">` 表示发送给用户的过程消息，不写入 last_report。
+- `<report>` 表示 Self Report，写入 last_report，但不会自动终止 behavior；不要放入 `<actions>`。
 - `<next_behavior>` 只在当前 behavior 应结束或切换时填写；继续当前 behavior 时省略。
 - `<report>` 与 `<next_behavior>` 相互独立：结束并留下结果时同时输出二者。
 "#;
@@ -122,8 +121,8 @@ new content
 /// Hardcoded allowlist of v2 first-class Action tag names. Everything in
 /// `<actions>` that isn't one of these is silently skipped.
 ///
-/// `report` lives in this set because it shares the same XML scanning path,
-/// but it's never dispatched as an action — see the `<report>` handling
+/// `sendmsg` lives in this set because it shares the same XML scanning path,
+/// but it's never dispatched as an action — see the `<sendmsg>` handling
 /// note above.
 pub const V2_ACTION_TAGS: &[&str] = &[
     "exec_bash",
@@ -132,14 +131,16 @@ pub const V2_ACTION_TAGS: &[&str] = &[
     "read",
     "subscribe_event",
     "unsubscribe_event",
-    "report",
+    "sendmsg",
 ];
+
+const SELF_REPORT_TAGS: &[&str] = &["report"];
 
 /// True if `name` is a v2 first-class Action tag (i.e. handled by the XML
 /// behavior parser rather than by `ToolManager`'s provider-native tool
 /// surface). Used by policy gates to decide which whitelist to consult.
 ///
-/// `report` is intentionally excluded — it's a v2 tag for the parser but
+/// `sendmsg` is intentionally excluded — it's a v2 tag for the parser but
 /// never becomes a dispatchable invocation, so policy gating for it is a
 /// non-event.
 pub fn is_v2_action_tag(name: &str) -> bool {
@@ -150,7 +151,7 @@ pub fn is_v2_action_tag(name: &str) -> bool {
 }
 
 /// Per-tag body→arg mapping. Tags not in the table either expect no body
-/// (e.g. `<read uri="..."/>`) or are special-cased (`report`).
+/// (e.g. `<read uri="..."/>`) or are special-cased (`sendmsg`).
 fn body_arg_name(tag: &str) -> Option<&'static str> {
     match tag {
         "exec_bash" => Some("command"),
@@ -221,7 +222,8 @@ impl LLMResultParser for XmlBehaviorParser {
             && messages_to_send.is_empty()
         {
             return Err(
-                "strict parse: response has no <actions>, <report>, or <next_behavior>".to_string(),
+                "strict parse: response has no <actions>, <sendmsg>, <report>, or <next_behavior>"
+                    .to_string(),
             );
         }
 
@@ -242,15 +244,17 @@ impl LLMResultParser for XmlBehaviorParser {
 // =========================================================================
 
 /// Walk the scan region and split out (regular actions, self_report,
-/// messages_to_send). Document order is preserved within `do_actions`.
+/// messages_to_send). Document order is preserved within `do_actions` and
+/// `messages_to_send` independently.
 ///
 /// Strategy:
 /// 1. Find `<actions>` container body — if missing, treat the whole region
 ///    as the container (tolerant: LLM may forget the wrapper).
 /// 2. Inside the container, walk left-to-right with [`scan_v2_action_tags`];
-///    each known tag becomes an `AiToolCall` (except `<report>`).
-/// 3. Scan the **whole region** (not just the container) for `<report>`
-///    tags — they're valid inside or outside `<actions>`.
+///    each known tag becomes an `AiToolCall` except `<sendmsg>`, which is
+///    captured as `messages_to_send`.
+/// 3. Scan the response outside `<actions>` for `<report>` tags. Self Report
+///    is a last-state update, not an action.
 fn extract_v2_actions(
     scan_region: &str,
 ) -> (Vec<AiToolCall>, Option<String>, Vec<SendMessageRecord>) {
@@ -258,13 +262,24 @@ fn extract_v2_actions(
         extract_tag_body(scan_region, "actions").unwrap_or_else(|| scan_region.to_string());
 
     let mut do_actions: Vec<AiToolCall> = Vec::new();
+    let mut messages_to_send: Vec<SendMessageRecord> = Vec::new();
     let mut auto_id: u32 = 0;
 
-    // Pass 1: walk the actions container for non-report tags only. Reports
-    // inside `<actions>` are picked up by pass 2 (we don't want to double-
-    // count, so skip them here).
+    // Pass 1: walk the actions container. Dispatchable actions become
+    // AiToolCalls; `<sendmsg>` is a parser-side message side effect.
     for raw in scan_v2_action_tags(&actions_body) {
-        if raw.tag == "report" {
+        if raw.tag == "sendmsg" {
+            let target = raw
+                .attrs
+                .get("target")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(target) = target {
+                messages_to_send.push(SendMessageRecord {
+                    target,
+                    body: raw.body,
+                });
+            }
             continue;
         }
         auto_id += 1;
@@ -294,27 +309,15 @@ fn extract_v2_actions(
         });
     }
 
-    // Pass 2: scan the WHOLE region for `<report>` — works inside or outside
-    // `<actions>`. Self Report (no target): last one wins; messages_to_send
-    // preserves emission order.
+    // Pass 2: scan for `<report>` outside `<actions>`. Self Report updates
+    // the LLMContext last state; it is not an action and has no target mode.
     let mut self_report: Option<String> = None;
-    let mut messages_to_send: Vec<SendMessageRecord> = Vec::new();
-    for raw in scan_v2_action_tags(scan_region) {
-        if raw.tag != "report" {
+    let action_ranges = find_tag_ranges(scan_region, "actions");
+    for raw in scan_self_report_tags(scan_region) {
+        if is_in_ranges(raw.start, &action_ranges) {
             continue;
         }
-        let target = raw
-            .attrs
-            .get("target")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        match target {
-            Some(target) => messages_to_send.push(SendMessageRecord {
-                target,
-                body: raw.body,
-            }),
-            None => self_report = Some(raw.body),
-        }
+        self_report = Some(raw.body);
     }
 
     (do_actions, self_report, messages_to_send)
@@ -325,11 +328,20 @@ struct RawActionTag {
     tag: &'static str,
     attrs: HashMap<String, String>,
     body: String,
+    start: usize,
 }
 
 /// Walk `input` left-to-right, yielding every recognized v2 Action tag in
 /// document order. Unknown tag names are skipped (treated as opaque text).
 fn scan_v2_action_tags(input: &str) -> Vec<RawActionTag> {
+    scan_known_tags(input, V2_ACTION_TAGS)
+}
+
+fn scan_self_report_tags(input: &str) -> Vec<RawActionTag> {
+    scan_known_tags(input, SELF_REPORT_TAGS)
+}
+
+fn scan_known_tags(input: &str, tags: &'static [&'static str]) -> Vec<RawActionTag> {
     let lc_input = input.to_ascii_lowercase();
     let bytes = lc_input.as_bytes();
     let mut out: Vec<RawActionTag> = Vec::new();
@@ -346,7 +358,7 @@ fn scan_v2_action_tags(input: &str) -> Vec<RawActionTag> {
         // into following content like `<report>本...</report>`, a str slice
         // can land mid-multibyte-char and panic. Bytes are safe and faster.
         let mut matched: Option<&'static str> = None;
-        for &tag in V2_ACTION_TAGS {
+        for &tag in tags {
             let needed = 1 + tag.len();
             if open + needed > bytes.len() {
                 continue;
@@ -387,6 +399,7 @@ fn scan_v2_action_tags(input: &str) -> Vec<RawActionTag> {
                 tag,
                 attrs,
                 body: String::new(),
+                start: open,
             });
             cursor = open_end + 1;
             continue;
@@ -398,11 +411,62 @@ fn scan_v2_action_tags(input: &str) -> Vec<RawActionTag> {
         let (body_raw, after_close) =
             extract_body_cdata_aware(input, &lc_input, body_start, &close_marker);
         let body = normalize_action_body(&body_raw);
-        out.push(RawActionTag { tag, attrs, body });
+        out.push(RawActionTag {
+            tag,
+            attrs,
+            body,
+            start: open,
+        });
         cursor = after_close;
     }
 
     out
+}
+
+fn find_tag_ranges(input: &str, tag: &str) -> Vec<(usize, usize)> {
+    let lc_input = input.to_ascii_lowercase();
+    let bytes = lc_input.as_bytes();
+    let open_prefix = format!("<{tag}");
+    let close_marker = format!("</{tag}>");
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < input.len() {
+        let Some(rel) = lc_input[cursor..].find(&open_prefix) else {
+            break;
+        };
+        let open = cursor + rel;
+        match bytes.get(open + open_prefix.len()) {
+            Some(c) if matches!(*c, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/') => {}
+            _ => {
+                cursor = open + 1;
+                continue;
+            }
+        }
+        let Some(close_open_rel) = input[open..].find('>') else {
+            break;
+        };
+        let open_end = open + close_open_rel;
+        let opening_inner = &input[open + 1..open_end];
+        let self_closing = opening_inner.trim_end().ends_with('/');
+        let end = if self_closing {
+            open_end + 1
+        } else {
+            let (_, after_close) =
+                extract_body_cdata_aware(input, &lc_input, open_end + 1, &close_marker);
+            after_close
+        };
+        ranges.push((open, end));
+        cursor = end;
+    }
+
+    ranges
+}
+
+fn is_in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| pos >= *start && pos < *end)
 }
 
 /// Scan forward from `body_start` for `close_marker_lc`, skipping over any
@@ -831,7 +895,7 @@ mod tests {
         assert_eq!(out.do_actions[0].name, "exec_bash");
     }
 
-    // ---- <report> handling ----
+    // ---- <sendmsg> / <report> handling ----
 
     #[test]
     fn self_report_outside_actions() {
@@ -852,18 +916,31 @@ mod tests {
     }
 
     #[test]
-    fn report_with_target_becomes_message_send() {
+    fn sendmsg_in_actions_becomes_message_send() {
         let parser = XmlBehaviorParser::new();
         let out = parser
             .parse(&resp(
-                r#"<actions><report target="user">进度更新</report></actions>"#,
+                r#"<actions><sendmsg target="user">进度更新</sendmsg></actions>"#,
             ))
             .unwrap();
-        assert!(out.do_actions.is_empty()); // <report> is NOT a do_action
+        assert!(out.do_actions.is_empty()); // <sendmsg> is NOT a do_action
         assert!(out.self_report.is_none());
         assert_eq!(out.messages_to_send.len(), 1);
         assert_eq!(out.messages_to_send[0].target, "user");
         assert_eq!(out.messages_to_send[0].body, "进度更新");
+    }
+
+    #[test]
+    fn report_inside_actions_is_ignored() {
+        let parser = XmlBehaviorParser::new();
+        let out = parser
+            .parse(&resp(
+                r#"<actions><report target="user">旧协议消息</report></actions>"#,
+            ))
+            .unwrap();
+        assert!(out.do_actions.is_empty());
+        assert!(out.self_report.is_none());
+        assert!(out.messages_to_send.is_empty());
     }
 
     #[test]
@@ -873,7 +950,7 @@ mod tests {
             .parse(&resp(
                 r#"<response>
 <actions>
-<report target="user">中途反馈</report>
+<sendmsg target="user">中途反馈</sendmsg>
 <exec_bash>echo work</exec_bash>
 </actions>
 <report>最终总结</report>

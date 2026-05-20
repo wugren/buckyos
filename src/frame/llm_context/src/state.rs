@@ -61,7 +61,7 @@ pub struct LLMContextState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_step: Option<StepRecord>,
 
-    /// Behavior mode: latest Self Report (`<report>` without `target`) emitted
+    /// Behavior mode: latest Self Report (`<report>`) emitted
     /// by the LLM in this run. Overwritten by every new Self Report; carried
     /// in the snapshot so a forked LLMContext that runs to terminal can have
     /// its produced result read out by the parent — see

@@ -65,7 +65,7 @@ OpenDAN 里的 Agent Tool 在工程上由 `agent_tool` crate 的 `AgentToolManag
 
 ### 3.3 关于 Action 集合
 
-完整的 v2 Action 7 件集合（`exec_bash` / `read` / `write_file` / `edit_file` / `report` / `subscribe_event` / `unsubscribe_event`）已经在 [Agent Actions.md](doc/opendan/Agent%20Actions.md) 单独定稿。本文不重复 Action 部分；这里只列出"被 Session 层手工注册、没有 CLI 化身"的工具——这才是把"特殊"四个字落到代码上的判定标准。
+完整的 v2 Action 7 件集合（`exec_bash` / `read` / `write_file` / `edit_file` / `sendmsg` / `subscribe_event` / `unsubscribe_event`）以及 actions 外的 `<report>` LastState 标签已经在 [Agent Actions.md](doc/opendan/Agent%20Actions.md) 单独定稿。本文不重复 Action 部分；这里只列出"被 Session 层手工注册、没有 CLI 化身"的工具——这才是把"特殊"四个字落到代码上的判定标准。
 
 ## 4. 增加新特殊工具的检查表
 

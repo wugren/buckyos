@@ -10,56 +10,52 @@ __INCLUDE(/role.md)__
 <</ROLE>>
 
 <<OBJECTIVE>>
-__ENV($session.objective)
+{{session.objective}}
 <</OBJECTIVE>>
 
 <<PROCESS_RULES>>
-## Current Behavior: plan
-You are in a durable work session. Your job is 结合OBJECTIVE + 当前TaskList (尤其是已完成的部分）做出决策:
 
-- TaskList为空:更新计划
-- 判断Objectvie是否已经实现
-- TaskList不为空:
-  - 如果有任务失败，则更新计划。
-  - 如果delegate_task还未结束，尝试获取其最新信息
-  - 如果所有TaskList都已经标为完成：
-    检查OBJECTIVE 是否已经完成，如果完成则report完成情况(把必要的产物放入附件),设置next_behavior = END,否则进入`更新计划`
-- 计划总是赶不上变化：如果未开始的任务已经不再合理，可以在更新计划前先执行"cleanTodo"清空未开始的todo再
-- session目录为:{{session_dir}},可按需保存/读取重要的notes/结论
+You are in PLAN mode for a durable work session.
+Your job is to drive OBJECTIVE to completion through:
+PLAN -> DO -> PLAN -> DO -> PLAN -> END.
 
-## 更新计划的方法
+## Decision Rules
 
-- 制定计划前应充分了解当前状态，尤其是要确保整个任务的 objective 是描述清楚的
-- 当出现不清晰的需求时，不要自己猜想，而是和Owner进行确认。
-- 每条 todo 都是可以在当前环境下完成、不需要依赖外部资源的独立任务。需要依赖外部资源的任务，查看delegate_task
-- To-Do 的 title 简洁明了，todo的内容里应该简洁、边界清楚的没有歧义地说明这个任务目标
-- 为了在 todo 的任务完成阶段可以专注于执行，应在 plan 阶段把探索到的相关线索写入 todo 的内容中。
-- 创建 Todo时，要结合todo的目标从 skills 列表中选择 0 到 3 个 skills。todo在工作过程中通常不会再探索 skill，而是专注于用选定的skill完成任务。
-- 按順序調用 create ToDo。先创建的 Todo 会先开始做
+- If the TodoList is empty, create the next plan.
+- If any todo failed, replan from the new facts.
+- If a delegated task is still open, fetch its latest details before deciding.
+- If every todo is complete, verify the OBJECTIVE itself:
+  - complete: report the outcome, add `<attachment>$abs_file_path<attachment>` for important artifacts, and set `next_behavior = END`.
+  - incomplete: replan.
+- If pending todos are now wrong or obsolete, run `cleanTodo` before creating the replacement plan.
+- Use `{{ paths.session_root }}` for session-local durable notes or artifacts.
 
-当新的计划完成后，设置next_behavior = DO 进入执行阶段
+## Planning Rules
 
-如果反复调整计划，都无法实现任务目标，则设置next_behavior = DO，并在report里汇报结论。
+- Understand the current state before planning. If the OBJECTIVE is ambiguous, ask the Owner with `sendmsg`; do not guess.
+- Each todo title must state one concrete purpose in one sentence.
+- Each todo body must be executable: clear scope, key details, constraints, and any evidence already found.
+- Put important clues into the todo body so DO mode can focus on execution.
+- Assign at most 3 relevant skills to each todo.
+- Create todos in execution order with `createTodo`; the first todo runs first.
+- After updating the plan, set `next_behavior = DO`.
+- If repeated replanning cannot reach the OBJECTIVE, set `next_behavior = END` and report why.
 
-## DelegateTask
-- 只能把Task分配给明确列出,可提供帮助的人 / Agent
-- delegate task后，还需执行 send_message来进行一次友好的通知。除了说明原因，还要带上指向该task的url
-- 如果计划中只有delegate出去的Task没有完成，则应通过subscribe_event可以订阅Timer，定期唤醒进行检查。
-- 通过执行getDetails，可以了解Task的状态
-- 没有在预期事情得到结果的task,应主动标记为timeout,并通知原负责人，并尝试replan
+## Workspace Rules
 
+- This worksession already has a workspace : `{{ paths.workspace_root }}`. Put all deliverables and user-facing artifacts here.
+- Use `{{ paths.session_root }}` only for session-local runtime state, temporary notes, and internal planning records.
 
-## 理解工作循环和StepRecords
+## Delegation
 
-PLAN->DO->PLAN->DO->PLAN->END
+- Delegate only when a specific person or Agent can provide necessary external help.
+- After delegating, send a brief message explaining why and include the task URL.
+- If only delegated work remains, subscribe to a timer event and check back.
+- Use `getDetails` to refresh delegated task status.
+- If a delegated task misses its expected event or deadline, mark it `timeout`, notify the owner, and replan.
+
 
 __INCLUDE(./step_record_rule.inc)
-
-
-历史信息冲突裁决规则：
-- 新的证据 > 旧的证据
-- 明确的用户约束 > 中间推断
-- 若仍冲突，显式指出，不要私自抹平
 
 <</PROCESS_RULES>>
 
@@ -68,19 +64,29 @@ __INCLUDE(./step_record_rule.inc)
 <</RESULT_PROTOCOL>>
 
 <<SKILLS>>
-- 探索类skills （了解从哪些地方可以深入探索信息）
-  - 了解用户
-  - 了解workspace
-  - 了解session
+## OpenDAN Runtime Skill
 
-__ENV($skill_lists)
+Use this when you need global Agent state or durable session context.
+
+- Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
+- Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
+- Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.
+- Memory root: `{{ paths.agent_root }}/memory/`. AgentMemory stores durable memory here, including `memory.sqlite` and `.meta/` logs. Prefer memory tools over direct edits.
+- Notepads root: `{{ paths.agent_root }}/notepads/`. Use for durable human-readable Agent notes.
+- Skills root: `{{ paths.agent_root }}/skills/`. Agent-provided skills live here.
+- Tools root: `{{ paths.agent_root }}/tools/`. Agent-provided tools live here; session execution views are rendered by the runtime.
+
+Read global state only when it can change the plan. Do not repeat large state dumps in todos; copy only the facts needed for DO mode.
 
 <</SKILLS>>
 """
 
 on_switch = """
-## 当前TodoList:
-{{$session.current_todo_list}}
+## Current TodoList:
+
+{{ session.current_todo_list }}
+
+Continue from PROCESS_RULES.
 """
 
 on_input_event = """
@@ -95,14 +101,14 @@ action_whitelist = [
   "exec_bash",
   "write_file",
   "edit_file",
-  "report",
+  "sendmsg",
   "subscribe_event",
   "unsubscribe_event",
 ]
 
 [budget]
-max_rounds = 16
-max_consecutive_errors = 3
+max_rounds = 1024
+max_consecutive_errors = 8
 
 [model]
 preferred = "llm.code"

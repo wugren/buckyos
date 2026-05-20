@@ -38,6 +38,8 @@ pub struct AgentSessionEnv {
     pub session_title: String,
     pub session_objective: String,
     pub session_owner: String,
+    pub session_current_todo: Json,
+    pub session_current_todo_list: String,
 
     pub behavior_name: String,
     pub behavior_objective: String,
@@ -69,6 +71,10 @@ impl AgentSessionEnv {
 
     fn has_title(&self) -> bool {
         !self.session_title.is_empty()
+    }
+
+    fn has_current_todo(&self) -> bool {
+        !self.session_current_todo.is_null()
     }
 
     fn has_workspace_id(&self) -> bool {
@@ -162,7 +168,15 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "session.title" => Some(Json::String(env.session_title.clone())),
         "session.objective" => Some(Json::String(env.session_objective.clone())),
         "session.owner" => Some(Json::String(env.session_owner.clone())),
+        "session.current_todo" => Some(env.session_current_todo.clone()),
+        "session.current_todo_list" => Some(Json::String(env.session_current_todo_list.clone())),
         "session.has_title" => Some(Json::Bool(env.has_title())),
+        "session.has_current_todo" => Some(Json::Bool(env.has_current_todo())),
+
+        _ if key.starts_with("session.current_todo.") => {
+            let path = key.trim_start_matches("session.current_todo.");
+            resolve_json_path(&env.session_current_todo, path)
+        }
 
         "behavior" => Some(behavior_object(env)),
         "behavior.name" => Some(Json::String(env.behavior_name.clone())),
@@ -204,8 +218,27 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "title": env.session_title,
         "objective": env.session_objective,
         "owner": env.session_owner,
+        "current_todo": env.session_current_todo.clone(),
+        "current_todo_list": env.session_current_todo_list,
         "has_title": env.has_title(),
+        "has_current_todo": env.has_current_todo(),
     })
+}
+
+fn resolve_json_path(value: &Json, path: &str) -> Option<Json> {
+    let mut current = value;
+    for segment in path
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+    {
+        current = match current {
+            Json::Object(map) => map.get(segment)?,
+            Json::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current.clone())
 }
 
 fn behavior_object(env: &AgentSessionEnv) -> Json {
@@ -305,6 +338,13 @@ mod tests {
             session_title: "hello".into(),
             session_objective: "do thing".into(),
             session_owner: "alice".into(),
+            session_current_todo: json!({
+                "todo_id": "T01",
+                "status": "pending",
+                "task": "do thing",
+                "skills": ["docs"],
+            }),
+            session_current_todo_list: "T01 pending current - do thing".into(),
             behavior_name: "chat_route".into(),
             behavior_objective: "route".into(),
             behavior_mode: "behavior",
@@ -328,6 +368,8 @@ mod tests {
             session_title: String::new(),
             session_objective: String::new(),
             session_owner: String::new(),
+            session_current_todo: Json::Null,
+            session_current_todo_list: String::new(),
             behavior_name: "chat_route".into(),
             behavior_objective: String::new(),
             behavior_mode: "behavior",
@@ -351,6 +393,27 @@ mod tests {
         assert_eq!(
             loader.load("$session.id").await.unwrap(),
             Some(Json::String("s-1".into()))
+        );
+        assert_eq!(
+            loader.load("$session.current_todo_list").await.unwrap(),
+            Some(Json::String("T01 pending current - do thing".into()))
+        );
+        assert_eq!(
+            loader.load("$session.current_todo").await.unwrap(),
+            Some(json!({
+                "todo_id": "T01",
+                "status": "pending",
+                "task": "do thing",
+                "skills": ["docs"],
+            }))
+        );
+        assert_eq!(
+            loader.load("$session.current_todo.task").await.unwrap(),
+            Some(Json::String("do thing".into()))
+        );
+        assert_eq!(
+            loader.load("$session.has_current_todo").await.unwrap(),
+            Some(Json::Bool(true))
         );
         assert_eq!(
             loader.load("$behavior.name").await.unwrap(),
@@ -382,10 +445,14 @@ mod tests {
     #[tokio::test]
     async fn engine_substitutes_aggregate_dotted_path() {
         let env = sample_env();
-        let out = render_template("id={{ session.id }}", &env, &[])
-            .await
-            .unwrap();
-        assert_eq!(out, "id=s-1");
+        let out = render_template(
+            "id={{ session.id }} todo={{ session.current_todo.task }}",
+            &env,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "id=s-1 todo=do thing");
     }
 
     #[tokio::test]

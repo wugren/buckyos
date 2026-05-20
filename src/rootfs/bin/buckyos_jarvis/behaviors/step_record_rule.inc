@@ -1,3 +1,4 @@
+## Behavior Loop StepRecords:
 
 Behavior Loop history is not a plain chat log. Each round becomes one
 StepRecord: the assistant side is the step intent, and the user side is the

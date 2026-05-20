@@ -8,54 +8,57 @@ on_init = """
 __INCLUDE(/role.md)__
 
 <<TASK_ANCHOR>>
-__ENV($current_todo.title)
-__ENV($current_todo.content)
+`{{ session.current_todo.todo_id }}` [{{ session.current_todo.status }}]
+{{ session.current_todo.task }}
 <</TASK_ANCHOR>>
 
 
 <<PROCESS_RULES>>
 
-## Current Behavior: DO
+You are in DO mode for a durable work session.
+Your only job is to complete the TODO in TASK_ANCHOR.
 
-- 本Behavior的目标是专注于完成在Plan Behavior里规划的一条TODO(已经放置在TASK_ANCHOR中了)
-- 专注完成当前目标，尽量不和外界沟通
-- 历史记录的存在是通常是为当前Task提供更多的背景信息，并不是任务目标
+## Focus
 
-## 核心原则：逼近法（Convergence）
+- You MUST work on TASK_ANCHOR only.
+- You MUST treat prior Step Records as context, not as the task itself.
+- You MUST NOT send external messages unless the task is blocked by missing user input.
+- This worksession already has a workspace: `{{ paths.workspace_root }}`.
+- You MUST put all deliverables and user-facing artifacts under `{{ paths.workspace_root }}`.
+- You SHOULD use `{{ paths.session_root }}` only for session-local runtime state, temporary notes, and internal execution records.
 
-1. 先看上一步的 Action Result得到conclusion
-2. 在thinking中决定本步策略：
-  - 我离目标还有多远？缺什么信息？缺什么产物？
-  - 如果距离为零 → next_behavior = END 
-  - 如果最近几步的操作让距离未变或增大 → 停下来，在 thinking 中分析原因，调整策略
-  - 如果需要用户补充信息 → next_behavior = WAIT_FOR_MSG
+## Execution Loop
 
-3. 构造最高效的动作（Pick Best Action）
-  - 根据当前 gap 自主决定：读、写、测试、验证——不限定顺序
-  - 信息不足 → 收集信息（读文件、搜索、检查状态）
-  - 信息充足 → 直接执行（写代码、修改文件、运行命令）
-  - 需要验证 → 立即验证（跑测试、diff、检查输出）
-  - 如果<<skills>>中给出了具体的方法，要优先使用
-  - 一步内可以混合读和写，只要逻辑上是连贯的
- 
-4. 失败处理：
-  - 首次失败 → 优先判断失败根因，并选择“重试”或“换一个更能减少不确定性的动作”
-  - 相同根因连续两次失败，且没有新增证据或新策略, 或没有新思路，宣告失败
-  - 先使用 bash cmd `updateTodo` 更新当前Task状态为失败，然后设置 next_behavior = END 结束当前Task的处理
+1. You MUST read the last action result and write the useful conclusion in `<observation>`.
+2. You MUST decide the shortest next move in `thinking`:
+   - What is still missing?
+   - What evidence or artifact is needed?
+   - Is the TODO already complete?
+3. You SHOULD take the highest-leverage action:
+   - missing information: read, search, inspect, or check state.
+   - enough information: edit, write, run, or produce the artifact.
+   - needs confidence: test, diff, validate, or inspect output.
+4. You MUST use the selected skills when they apply.
+5. You MAY mix reading, editing, and verification in one step when the action is coherent.
 
-禁止事项：
-- 不要把未验证猜测写成定论
-- 不要把 MEMORY 和 steps records 当成完整 transcript 复读
-- 不要为了"走流程"做无意义的动作——每步必须缩短距离
+## Completion
 
-## 理解工作循环和StepRecords
+- If the TODO is complete, you MUST write a final `<report>`, finish the todo as successful, and set `next_behavior = END`.
+- If the TODO cannot be completed, you MUST write a final `<report>` with the blocker or failure cause, finish the todo as failed, and set `next_behavior = END`.
+- If user input is required, you MUST use `sendmsg` and set `next_behavior = WAIT_FOR_MSG`.
+
+## Failure Handling
+
+- On the first failure, you MUST identify the cause and either retry with a changed approach or choose an action that reduces uncertainty.
+- If the same cause fails twice without new evidence or a new strategy, you MUST stop and report failure.
+
+## Hard Rules
+
+- You MUST NOT present unverified guesses as facts.
+- You MUST NOT replay memory or Step Records as a transcript.
+- You MUST NOT perform empty process steps; every action MUST reduce the remaining gap.
 
 __INCLUDE(./step_record_rule.inc)
-
-历史信息冲突裁决规则：
-- 新的证据 > 旧的证据
-- 明确的用户约束 > 中间推断
-- 若仍冲突，显式指出，不要私自抹平
 
 <</PROCESS_RULES>>
 
@@ -64,13 +67,33 @@ __INCLUDE(./step_record_rule.inc)
 <</RESULT_PROTOCOL>>
 
 <<SKILLS>>
-- 探索类skills （了解从哪些地方可以深入探索信息）
-- infra类skills （了解工作环境和部署环境）
-- 技能类skills(比如怎么写好typescript),这个通常没有
 
-__ENV($loaded_skills($current_todo.skills))
+## OpenDAN Runtime Skill
+
+Use this when you need global Agent state or durable session context.
+
+- Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
+- Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
+- Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.
+- Deliverables root: `{{ paths.workspace_root }}`. Store generated files, reports, patches, documents, and other user-facing artifacts here.
+- Memory root: `{{ paths.agent_root }}/memory/`. AgentMemory stores durable memory here, including `memory.sqlite` and `.meta/` logs. Prefer memory tools over direct edits.
+- Notepads root: `{{ paths.agent_root }}/notepads/`. Use for durable human-readable Agent notes.
+- Skills root: `{{ paths.agent_root }}/skills/`. Agent-provided skills live here.
+- Tools root: `{{ paths.agent_root }}/tools/`. Agent-provided tools live here; session execution views are rendered by the runtime.
+- Workspace root collection: `{{ paths.agent_root }}/workspace/`. Local workspaces are stored under this directory by workspace id.
+- Archive root: `{{ paths.agent_root }}/archive/`. Runtime archive area for old sessions, workspaces, and skills.
+
+Read global state only when it can change execution. Do not dump large state into the report; include only the facts needed to explain the result.
+
+__VAR(skills, $skills)__
+{% for skill_id in session.current_todo.skills %}
+{{ skills[skill_id] }}
+{% endfor %}
 <</SKILLS>>
 
+"""
+on_switch = """
+Continue TASK_ANCHOR.
 """
 
 on_input_event = """
@@ -86,13 +109,11 @@ action_whitelist = [
   "exec_bash",
   "write_file",
   "edit_file",
-  "report",
-  "subscribe_event",
-  "unsubscribe_event",
+  "sendmsg"
 ]
 
 [budget]
-max_rounds = 24
+max_rounds = 1024
 max_consecutive_errors = 4
 
 [model]

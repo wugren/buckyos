@@ -83,12 +83,12 @@ pub struct StepRecord {
     /// actions (if any) are still dispatched first, then the loop returns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_behavior: Option<String>,
-    /// Self Report (`<report>` without `target`) — overwrites
+    /// Self Report (`<report>`) — overwrites
     /// `LLMContextState.last_report` at dispatch time. Kept on the step too
     /// so the rendered history preserves the report-emit event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_report: Option<String>,
-    /// SendMessage-form reports (`<report target=...>`) emitted in this step.
+    /// SendMessage actions (`<sendmsg target=...>`) emitted in this step.
     /// Stub in v2 first cut: parser captures them, executor only emits a
     /// worklog event. Real delivery moves to a standard `send_message`
     /// agent_tool in a later phase.
@@ -102,7 +102,7 @@ pub struct StepRecord {
     pub action_results: Vec<Observation>,
 }
 
-/// One `<report target=...>` emit (SendMessage form). v2 stub: recorded on
+/// One `<sendmsg target=...>` emit. v2 stub: recorded on
 /// the step for transcript / audit; not actually delivered yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageRecord {
@@ -175,7 +175,7 @@ impl StepRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LLMBehaviorResult {
     /// Dispatchable actions extracted from the `<actions>` container,
-    /// excluding `<report>` (which is captured separately below).
+    /// excluding parser-side tags like `<sendmsg>` and `<report>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub do_actions: Vec<AiToolCall>,
     /// Terminal signal + jump target. `Some(_)` is terminal; the loop does
@@ -190,11 +190,11 @@ pub struct LLMBehaviorResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
 
-    /// Self Report (`<report>` without `target`) — at most one per step;
+    /// Self Report (`<report>`) — at most one per step;
     /// last occurrence wins. Overwrites `LLMContextState.last_report`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_report: Option<String>,
-    /// SendMessage-form reports (`<report target=...>`); recorded in order of
+    /// SendMessage actions (`<sendmsg target=...>`); recorded in order of
     /// appearance. Stub-delivered in v2 first cut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages_to_send: Vec<SendMessageRecord>,
