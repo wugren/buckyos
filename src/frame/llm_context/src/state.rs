@@ -74,6 +74,9 @@ pub struct LLMContextState {
 
     #[serde(default)]
     pub next_step_index: u32,
+
+    #[serde(default)]
+    pub next_action_id: u32,
 }
 
 impl LLMContextState {
@@ -97,6 +100,7 @@ impl LLMContextState {
             last_step: None,
             last_report: None,
             next_step_index: 0,
+            next_action_id: 0,
         }
     }
 }

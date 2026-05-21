@@ -174,7 +174,7 @@ task-mgr-main
 Schema version 当前为：
 
 ```text
-1
+2
 ```
 
 默认 Sqlite 连接为空，由 rdb_mgr 在解析时生成 `sqlite://$appdata/main.db`。服务启动时会从 service spec 中获取 RDB instance，并应用 schema。测试场景可以直接用编译期默认 DDL 打开临时 Sqlite。
@@ -199,6 +199,7 @@ Schema version 当前为：
 | `updated_at` | 更新时间 |
 | `user_id` | 所属用户 |
 | `app_id` | 所属应用 |
+| `session_id` | 会话 ID，用于跨 app 聚合同一 session 的任务 |
 | `parent_id` | 父任务 ID，外键，删除父任务会级联删除子任务 |
 | `root_id` | 根任务 ID 字符串 |
 | `permissions` | JSON 字符串 |
@@ -210,6 +211,7 @@ Schema version 当前为：
 - `idx_task_root_status`：`(root_id, status)`
 - `idx_task_parent`：`parent_id`
 - `idx_task_app_created`：`(app_id, created_at DESC)`
+- `idx_task_session_created`：`(session_id, created_at DESC)`
 - `idx_task_status_created`：`(status, created_at DESC)`
 - `idx_task_type_created`：`(task_type, created_at DESC)`
 
@@ -265,7 +267,6 @@ TaskData schema 与 `task_type` 的绑定关系如下。一个任务的 `task_ty
     "root_id": "optional-root-id",
     "rootid": "optional-root-id"
   },
-  "session_id": "optional-session-id",
   "owner_session_id": "optional-owner-session-id",
   "completed_items": 1,
   "total_items": 10
@@ -275,7 +276,8 @@ TaskData schema 与 `task_type` 的绑定关系如下。一个任务的 `task_ty
 说明：
 
 - `root_id` / `rootid` / `meta.root_id` / `meta.rootid`：创建根任务时 TaskMgr 会尝试读取这些字段作为 `Task.root_id`。如果请求参数中已有 `CreateTaskOptions.root_id`，则优先使用请求参数。
-- `session_id` / `owner_session_id`：OpenDAN、AICC 等模块用于把任务归到一次会话或 agent loop。
+- `Task.session_id`：OpenDAN、AICC 等模块用于把任务归到一次会话或 agent loop，应优先写入 task 顶层字段而不是塞进 `app_id` 或 `data`。
+- `owner_session_id`：业务 data 中的归因字段，仅用于模块内部语义，不参与 TaskMgr 核心过滤。
 - `completed_items` / `total_items`：`update_task_progress` 会把这两个字段同步写入 `data`，并据此计算 `Task.progress`。
 
 新 schema 应避免把业务字段直接铺满根对象。推荐使用以模块名命名的顶层 namespace，例如 `workflow`、`download`、`aicc`、`executor`。
@@ -535,7 +537,7 @@ aicc.compute
 | 项 | 说明 |
 | --- | --- |
 | 绑定 task_type | `aicc.compute` |
-| data 主 namespace | `aicc`，外加根字段 `rootid` / `session_id` / `owner_session_id` |
+| data 主 namespace | `aicc`，外加根字段 `rootid` / `owner_session_id` |
 | 创建方 | AICC |
 | 更新方 | AICC `TaskAuditSink` / provider task event sink |
 | 消费方 | AICC、OpenDAN、TaskMgr UI |

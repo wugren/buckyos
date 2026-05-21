@@ -16,6 +16,7 @@ use crate::request::{
 };
 use crate::state::{LLMContextSnapshot, LLMContextState};
 use crate::{LLMContext, XmlBehaviorParser, XmlStepRenderer};
+use crate::{StepResultHook, StepResultHookOutput};
 
 /// Scripted LLM responses popped off in order.
 struct ScriptedLlm {
@@ -88,6 +89,25 @@ impl ToolManager for EchoTools {
             description: "echo the args".into(),
             args_schema: json!({}),
         }]
+    }
+}
+
+struct CustomStepResultHook;
+
+#[async_trait]
+impl StepResultHook for CustomStepResultHook {
+    async fn on_step_result(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+        step: &crate::behavior_loop::StepRecord,
+    ) -> Result<StepResultHookOutput, String> {
+        Ok(StepResultHookOutput {
+            user_message: Some(AiMessage::text(
+                AiRole::User,
+                format!("custom step result {}", step.meta.step_index),
+            )),
+            history_inputs: Vec::new(),
+        })
     }
 }
 
@@ -601,11 +621,70 @@ async fn behavior_loop_ignores_next_behavior_when_actions_exist() {
     let snapshot = ctx.snapshot();
     assert_eq!(snapshot.state.steps.len(), 2);
     assert_eq!(snapshot.state.steps[0].actions.len(), 1);
+    assert_eq!(snapshot.state.steps[0].actions[0].call_id, "1");
     assert_eq!(snapshot.state.steps[0].next_behavior, None);
     assert_eq!(snapshot.state.steps[0].action_results.len(), 1);
+    assert_eq!(snapshot.state.next_action_id, 1);
     assert_eq!(
         snapshot.state.steps[1].next_behavior.as_deref(),
         Some("END")
+    );
+}
+
+#[tokio::test]
+async fn behavior_loop_on_step_result_overrides_next_user_message() {
+    let llm = Arc::new(RecordingLlm::new(text_response(
+        r#"<response>
+<observation>custom observed</observation>
+<thinking>now switch</thinking>
+<next_behavior>END</next_behavior>
+</response>"#,
+    )));
+    let scripted = Arc::new(ScriptedLlm::new(vec![text_response(
+        r#"<response>
+<thinking>run action</thinking>
+<actions><exec_bash>echo done</exec_bash></actions>
+</response>"#,
+    )]));
+    let mut req = base_request();
+    req.behavior_name = "plan".into();
+    let deps = LLMContextDeps::new(scripted, Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()))
+        .with_step_result_hook(Arc::new(CustomStepResultHook));
+    let mut ctx = LLMContext::new(req, deps);
+
+    let first = ctx.run().await;
+    assert!(matches!(first, LLMContextOutcome::Error { .. }));
+
+    let snapshot = ctx.snapshot();
+    assert_eq!(
+        snapshot
+            .state
+            .last_step
+            .as_ref()
+            .and_then(|step| step.next_user_message.as_ref())
+            .map(|msg| msg.text_content())
+            .as_deref(),
+        Some("custom step result 0")
+    );
+
+    let req = snapshot.request.clone();
+    let deps = LLMContextDeps::new(llm.clone(), Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()));
+    let mut resumed = LLMContext::resume(snapshot, ResumeFill::ResumeFromMidRun, deps)
+        .expect("resume behavior snapshot");
+    let outcome = resumed.run().await;
+    assert!(matches!(outcome, LLMContextOutcome::Done { .. }));
+    assert_eq!(req.behavior_name, "plan");
+    let seen = llm.seen();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0]
+            .iter()
+            .any(|m| m.role == AiRole::User && m.text_content() == "custom step result 0"),
+        "custom on_step_result user message should be rendered into the next inference"
     );
 }
 

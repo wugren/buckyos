@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use buckyos_api::{
     match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient,
     UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
@@ -13,13 +15,15 @@ use tokio::task::JoinHandle;
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{AgentToolManager, SessionRuntimeContext, TodoRecord};
 use llm_context::{
-    behavior_loop::HistoryInputRecord,
+    behavior_loop::{HistoryInputRecord, StepRecord, StepResultHook, StepResultHookOutput},
     context_loop::LLMContext,
     interrupt::LLMContextInterruptHandle,
     observation::Observation,
     outcome::{ContextOutput, LLMContextOutcome, ResumeFill},
     request::{ContextOwnerRef, LLMContextRequest},
     state::{LLMContextSnapshot, LLMContextState},
+    step_record::XmlStepRenderer,
+    StepRenderer,
 };
 
 use crate::agent_config::{AgentConfig, LoopMode, SwitchMode};
@@ -233,6 +237,94 @@ struct EventForTurn {
     event_id: String,
     data: serde_json::Value,
     message: String,
+}
+
+struct OpenDanStepResultHook {
+    template: String,
+    behavior: BehaviorCfg,
+    agent_config: Arc<AgentConfig>,
+    meta: Arc<Mutex<SessionMeta>>,
+    session_id: String,
+    session_dir: PathBuf,
+    excluded_pending_keys: HashSet<String>,
+}
+
+#[async_trait]
+impl StepResultHook for OpenDanStepResultHook {
+    async fn on_step_result(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+        step: &StepRecord,
+    ) -> std::result::Result<StepResultHookOutput, String> {
+        let template = self.template.trim();
+        if template.is_empty() {
+            return Ok(StepResultHookOutput::default());
+        }
+
+        let (_, default_user) = XmlStepRenderer::new().render(step);
+        let default_user_message = default_user.text_content();
+        let pending_inputs = self.pending_input_values().await;
+        let pending_input_text = render_pending_input_values(&pending_inputs);
+        let env = build_agent_session_env(
+            &self.session_id,
+            &self.agent_config,
+            &self.meta,
+            &self.session_dir,
+            &self.behavior,
+        )
+        .await;
+        let extras = [
+            (
+                "step",
+                serde_json::to_value(step).unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "step_result",
+                serde_json::json!({
+                    "behavior": step.meta.behavior_name,
+                    "step_index": step.meta.step_index,
+                    "action_count": step.actions.len(),
+                    "result_count": step.action_results.len(),
+                    "default_user_message": default_user_message,
+                    "actions": step.actions,
+                    "action_results": step.action_results,
+                    "messages_sent": step.messages_sent,
+                }),
+            ),
+            (
+                "pending_inputs",
+                serde_json::Value::Array(pending_inputs.clone()),
+            ),
+            (
+                "pending_input_text",
+                serde_json::Value::String(pending_input_text),
+            ),
+        ];
+
+        let rendered = prompt_env::render_template(template, &env, &extras)
+            .await
+            .map_err(|err| err.to_string())?;
+        let rendered = rendered.trim();
+        if rendered.is_empty() {
+            return Ok(StepResultHookOutput::default());
+        }
+
+        Ok(StepResultHookOutput {
+            user_message: Some(AiMessage::text(AiRole::User, rendered.to_string())),
+            history_inputs: Vec::new(),
+        })
+    }
+}
+
+impl OpenDanStepResultHook {
+    async fn pending_input_values(&self) -> Vec<serde_json::Value> {
+        let meta = self.meta.lock().await;
+        meta.pending_inputs
+            .iter()
+            .filter(|input| !self.excluded_pending_keys.contains(&input.dedup_key()))
+            .map(pending_input_hook_value)
+            .collect()
+    }
 }
 
 /// RAII handle slot — installs `LLMContextInterruptHandle` into a session's
@@ -1221,7 +1313,7 @@ impl AgentSession {
             session_id: self.session_id.clone(),
         };
         let from_user_did = self.current_from_user_did().await;
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -1234,6 +1326,9 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        let completion_keys: Vec<String> =
+            completions.iter().map(|(_, _, _, k)| k.clone()).collect();
+        deps = self.attach_step_result_hook(&behavior, deps, &completion_keys);
         let mut ctx =
             LLMContext::resume(snapshot, fill, deps).map_err(|e| anyhow!("resume: {e}"))?;
         // Capture the post-resume baseline before the next inference so the
@@ -1462,7 +1557,7 @@ impl AgentSession {
             session_id: self.session_id.clone(),
         };
         let from_user_did = self.current_from_user_did().await;
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -1475,6 +1570,7 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        deps = self.attach_step_result_hook(&behavior, deps, &[]);
 
         let mut ctx = LLMContext::resume(snap_winddown, ResumeFill::ToolResults { results }, deps)
             .map_err(|e| anyhow!("interrupt graceful resume: {e}"))?;
@@ -1754,6 +1850,10 @@ impl AgentSession {
     ) -> Result<NextAction> {
         let behavior = self.load_current_behavior().await?;
         let mode = self.history_mode_for(&behavior);
+        let in_flight_input_keys = seed
+            .as_ref()
+            .map(|seed| seed.input_keys.clone())
+            .unwrap_or_default();
 
         // Open a round (or attach to one already open). For the PendingTool
         // resume path the worker passes `seed = None`; the caller is
@@ -1779,7 +1879,13 @@ impl AgentSession {
         let trace_id = self.next_trace_id();
         self.status.set_turn_nonce(Some(trace_id.clone()));
         let (ctx_owner, _request, deps) = self
-            .build_or_resume(&behavior, &turn_messages, history_inputs, &trace_id)
+            .build_or_resume(
+                &behavior,
+                &turn_messages,
+                history_inputs,
+                &trace_id,
+                &in_flight_input_keys,
+            )
             .await?;
         let mut ctx = match ctx_owner {
             BuiltContext::Fresh(c) => c,
@@ -1994,6 +2100,7 @@ impl AgentSession {
         turn_messages: &[AiMessage],
         history_inputs: Vec<HistoryInputRecord>,
         trace_id: &str,
+        in_flight_input_keys: &[String],
     ) -> Result<(
         BuiltContext,
         LLMContextRequest,
@@ -2012,7 +2119,7 @@ impl AgentSession {
         let approval_required = behavior.capabilities.approval_required.clone();
         let from_user_did = self.current_from_user_did().await;
 
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -2025,6 +2132,7 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        deps = self.attach_step_result_hook(behavior, deps, in_flight_input_keys);
 
         // Compose the per-turn "environment-aware message" once so both the
         // resume and fresh-build branches see it. The message is the
@@ -2153,6 +2261,33 @@ impl AgentSession {
         Ok((BuiltContext::Fresh(fresh), request, deps))
     }
 
+    fn attach_step_result_hook(
+        &self,
+        behavior: &BehaviorCfg,
+        deps: llm_context::deps::LLMContextDeps,
+        in_flight_input_keys: &[String],
+    ) -> llm_context::deps::LLMContextDeps {
+        let Some(template) = behavior
+            .prompt
+            .on_step_result
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return deps;
+        };
+        let hook = OpenDanStepResultHook {
+            template: template.to_string(),
+            behavior: behavior.clone(),
+            agent_config: self.agent_config.clone(),
+            meta: self.meta.clone(),
+            session_id: self.session_id.clone(),
+            session_dir: self.session_dir.clone(),
+            excluded_pending_keys: in_flight_input_keys.iter().cloned().collect(),
+        };
+        deps.with_step_result_hook(Arc::new(hook))
+    }
+
     fn try_load_snapshot(&self) -> Option<LLMContextSnapshot> {
         self.try_load_snapshot_from(&self.state_snap_path)
     }
@@ -2244,51 +2379,14 @@ impl AgentSession {
     /// the two currently-templated sections, and the user-input section is
     /// still composed by the legacy `compose_turn_message` path.
     async fn build_prompt_env(&self, behavior: &BehaviorCfg) -> AgentSessionEnv {
-        let (kind, title, objective, owner, workspace_id, one_line) = {
-            let meta = self.meta.lock().await;
-            (
-                meta.kind,
-                meta.title.clone(),
-                meta.objective.clone(),
-                meta.owner.clone(),
-                meta.workspace_id.clone(),
-                meta.one_line_status.clone(),
-            )
-        };
-        let session_objective = if objective.trim().is_empty() {
-            behavior.meta.objective.clone()
-        } else {
-            objective
-        };
-        let workspace_id = workspace_id.filter(|s| !s.is_empty());
-        let workspace_root = workspace_id
-            .as_deref()
-            .map(|ws| self.agent_config.layout.workspaces_dir.join(ws));
-        AgentSessionEnv {
-            session_id: self.session_id.clone(),
-            session_kind: AgentSessionEnv::kind_str(kind),
-            session_title: title.trim().to_string(),
-            session_objective,
-            session_owner: owner,
-            session_current_todo: load_current_todo(&self.session_dir),
-            session_current_todo_list: render_current_todo_list(&self.session_dir),
-            behavior_name: behavior.meta.name.clone(),
-            behavior_objective: behavior.meta.objective.clone(),
-            behavior_mode: "behavior",
-            behavior_template_dir: behavior
-                .source_path
-                .as_ref()
-                .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
-            workspace_id,
-            workspace_root,
-            agent_root: self.agent_config.layout.root.clone(),
-            session_root: self.session_dir.clone(),
-            input_text: String::new(),
-            input_has_user_text: false,
-            input_has_events: false,
-            recent_activity: one_line.trim().to_string(),
-            clock_unix_ms: now_ms(),
-        }
+        build_agent_session_env(
+            &self.session_id,
+            &self.agent_config,
+            &self.meta,
+            &self.session_dir,
+            behavior,
+        )
+        .await
     }
 
     async fn compose_environment_message(&self, behavior: &BehaviorCfg) -> Option<String> {
@@ -2861,6 +2959,7 @@ impl AgentSession {
         }
         state.history_summaries = final_snapshot.state.history_summaries;
         state.next_step_index = final_snapshot.state.next_step_index;
+        state.next_action_id = final_snapshot.state.next_action_id;
 
         self.persist_snapshot(&LLMContextSnapshot { request, state })
             .await;
@@ -3555,6 +3654,60 @@ enum BuiltContext {
     Resumed(LLMContext),
 }
 
+async fn build_agent_session_env(
+    session_id: &str,
+    agent_config: &AgentConfig,
+    meta: &Arc<Mutex<SessionMeta>>,
+    session_dir: &Path,
+    behavior: &BehaviorCfg,
+) -> AgentSessionEnv {
+    let (kind, title, objective, owner, workspace_id, one_line) = {
+        let meta = meta.lock().await;
+        (
+            meta.kind,
+            meta.title.clone(),
+            meta.objective.clone(),
+            meta.owner.clone(),
+            meta.workspace_id.clone(),
+            meta.one_line_status.clone(),
+        )
+    };
+    let session_objective = if objective.trim().is_empty() {
+        behavior.meta.objective.clone()
+    } else {
+        objective
+    };
+    let workspace_id = workspace_id.filter(|s| !s.is_empty());
+    let workspace_root = workspace_id
+        .as_deref()
+        .map(|ws| agent_config.layout.workspaces_dir.join(ws));
+    AgentSessionEnv {
+        session_id: session_id.to_string(),
+        session_kind: AgentSessionEnv::kind_str(kind),
+        session_title: title.trim().to_string(),
+        session_objective,
+        session_owner: owner,
+        session_current_todo: load_current_todo(session_dir),
+        session_current_todo_list: render_current_todo_list(session_dir),
+        behavior_name: behavior.meta.name.clone(),
+        behavior_objective: behavior.meta.objective.clone(),
+        behavior_mode: "behavior",
+        behavior_template_dir: behavior
+            .source_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
+        workspace_id,
+        workspace_root,
+        agent_root: agent_config.layout.root.clone(),
+        session_root: session_dir.to_path_buf(),
+        input_text: String::new(),
+        input_has_user_text: false,
+        input_has_events: false,
+        recent_activity: one_line.trim().to_string(),
+        clock_unix_ms: now_ms(),
+    }
+}
+
 fn append_turn_message_to_snapshot(
     mut snapshot: LLMContextSnapshot,
     message: Option<AiMessage>,
@@ -3585,6 +3738,7 @@ fn append_turn_message_to_snapshot(
         }
         state.last_report = previous_state.last_report;
         state.next_step_index = previous_state.next_step_index;
+        state.next_action_id = previous_state.next_action_id;
         state
     } else {
         let mut input = previous_state.accumulated;
@@ -4094,6 +4248,76 @@ fn pending_msg_ai_message(message: &AiMessage) -> AiMessage {
     let mut message = message.clone();
     message.role = AiRole::User;
     message
+}
+
+fn pending_input_hook_value(input: &PendingInput) -> serde_json::Value {
+    match input {
+        PendingInput::Msg {
+            record_id,
+            from,
+            from_did,
+            from_name,
+            tunnel_did,
+            text,
+            ai_message,
+        } => serde_json::json!({
+            "kind": "msg",
+            "key": input.dedup_key(),
+            "record_id": record_id,
+            "from": from,
+            "from_did": from_did,
+            "from_name": from_name,
+            "tunnel_did": tunnel_did,
+            "text": text,
+            "message_text": ai_message.text_content(),
+        }),
+        PendingInput::Event { event_id, data } => serde_json::json!({
+            "kind": "event",
+            "key": input.dedup_key(),
+            "event_id": event_id,
+            "data": data,
+        }),
+        PendingInput::Interrupt { mode, id } => serde_json::json!({
+            "kind": "interrupt",
+            "key": input.dedup_key(),
+            "mode": mode,
+            "id": id,
+        }),
+    }
+}
+
+fn render_pending_input_values(values: &[serde_json::Value]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .filter_map(|value| {
+            let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "msg" => {
+                    let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| value.get("message_text").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    Some(format!("- msg from {from}: {}", text.trim()))
+                }
+                "event" => {
+                    let event_id = value.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(format!("- event {event_id}: {}", value["data"]))
+                }
+                "interrupt" => {
+                    let mode = value.get("mode").map(|v| v.to_string()).unwrap_or_default();
+                    Some(format!("- interrupt {mode}"))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn ai_message_has_payload(message: &AiMessage) -> bool {

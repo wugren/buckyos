@@ -639,6 +639,7 @@ mod tests {
             id: 7,
             user_id: "root".to_string(),
             app_id: "scheduler".to_string(),
+            session_id: String::new(),
             parent_id: None,
             root_id: "7".to_string(),
             name: "dispatch".to_string(),

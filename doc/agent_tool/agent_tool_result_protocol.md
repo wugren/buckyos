@@ -190,6 +190,8 @@ AgentToolResult.output | AgentToolResult.detail
 
 当前实现会把 action 渲染成紧凑的一行 command。后续如果 action result 已经是合法 `AgentToolResult`，标题应优先使用 `AgentToolResult.title`；否则按 action 参数降级构造。
 
+Behavior XML action 的 ID 由运行时执行前分配，LLM 不需要输出。最近 step 以 assistant/user pair 回灌时，assistant action 标签会补 `call_id="<id>"`，对应 action result 标题前会补 `#<id>`，用于把命令和执行结果稳定关联起来。
+
 | Action | 降级标题规则 |
 | --- | --- |
 | `exec_bash` | 使用 `command` 参数，压缩空白并截断到 160 字符 |

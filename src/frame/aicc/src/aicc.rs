@@ -4284,6 +4284,7 @@ mod tests {
                 id: *guard as i64,
                 user_id: user_id.to_string(),
                 app_id: app_id.to_string(),
+                session_id: opts.session_id.unwrap_or_default(),
                 parent_id: opts.parent_id,
                 root_id: String::new(),
                 name: name.to_string(),
@@ -4336,6 +4337,7 @@ mod tests {
         async fn handle_list_tasks_by_time_range(
             &self,
             _app_id: Option<&str>,
+            _session_id: Option<&str>,
             _task_type: Option<&str>,
             _source_user_id: Option<&str>,
             _source_app_id: Option<&str>,

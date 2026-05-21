@@ -100,6 +100,7 @@ impl TaskDispatch {
             // worksession code group tasks by session for cancel / cleanup.
             parent_id: None,
             root_id: None,
+            session_id: Some(session_id.to_string()),
             priority: None,
             permissions: None,
         };

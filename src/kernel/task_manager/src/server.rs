@@ -199,6 +199,7 @@ impl TaskManagerService {
             "parent_id": after.parent_id,
             "user_id": after.user_id,
             "app_id": after.app_id,
+            "session_id": after.session_id,
             "task_type": after.task_type,
             "from_status": before.status.to_string(),
             "to_status": after.status.to_string(),
@@ -340,7 +341,15 @@ impl TaskManagerService {
             (!request_ctx.user_id.trim().is_empty()).then_some(request_ctx.user_id.as_str());
         let app_id = (!request_ctx.app_id.trim().is_empty()).then_some(request_ctx.app_id.as_str());
         self.db
-            .list_tasks_filtered(app_id, Some(DOWNLOAD_TASK_TYPE), None, None, None, user_id)
+            .list_tasks_filtered(
+                app_id,
+                None,
+                Some(DOWNLOAD_TASK_TYPE),
+                None,
+                None,
+                None,
+                user_id,
+            )
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))
     }
@@ -452,6 +461,7 @@ impl TaskManagerHandler for TaskManagerService {
             task_type.to_string(),
             request_ctx.user_id.clone(),
             request_ctx.app_id.clone(),
+            opts.session_id.clone().unwrap_or_default(),
             opts.parent_id,
             permissions,
             data,
@@ -622,6 +632,7 @@ impl TaskManagerHandler for TaskManagerService {
             .db
             .list_tasks_filtered(
                 filter.app_id.as_deref(),
+                filter.session_id.as_deref(),
                 filter.task_type.as_deref(),
                 filter.status,
                 filter.parent_id,
@@ -642,6 +653,7 @@ impl TaskManagerHandler for TaskManagerService {
     async fn handle_list_tasks_by_time_range(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
         source_user_id: Option<&str>,
         source_app_id: Option<&str>,
@@ -651,7 +663,7 @@ impl TaskManagerHandler for TaskManagerService {
         let request_ctx = request_context_from_source(source_user_id, source_app_id);
         let tasks = self
             .db
-            .list_tasks_filtered(app_id, task_type, None, None, None, None)
+            .list_tasks_filtered(app_id, session_id, task_type, None, None, None, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -724,7 +736,7 @@ impl TaskManagerHandler for TaskManagerService {
 
             let before_tasks = self
                 .db
-                .list_tasks_filtered(None, None, None, None, Some(root_id.as_str()), None)
+                .list_tasks_filtered(None, None, None, None, None, Some(root_id.as_str()), None)
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -789,7 +801,7 @@ impl TaskManagerHandler for TaskManagerService {
         let request_ctx = request_context_from_source(None, None);
         let tasks = self
             .db
-            .list_tasks_filtered(None, None, None, Some(parent_id), None, None)
+            .list_tasks_filtered(None, None, None, None, Some(parent_id), None, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -987,6 +999,42 @@ impl TaskManagerHandler for TaskManagerService {
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn handle_delete_tasks_by_session(
+        &self,
+        session_id: &str,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        _ctx: RPCContext,
+    ) -> Result<u64> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "session_id is required".to_string(),
+            ));
+        }
+
+        let request_ctx = request_context_from_source(source_user_id, source_app_id);
+        let tasks = self
+            .db
+            .list_tasks_filtered(None, Some(session_id), None, None, None, None, None)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        if let Some(task) = tasks
+            .iter()
+            .find(|task| !self.can_write_task(&request_ctx, task))
+        {
+            return Err(RPCErrors::NoPermission(format!(
+                "No permission to delete task {} in session {}",
+                task.id, session_id
+            )));
+        }
+
+        self.db
+            .delete_tasks_by_session_id(session_id)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))
     }
 }
 pub struct TaskManagerHttpServer<T: TaskManagerHandler> {
@@ -1293,6 +1341,66 @@ mod tests {
             assert_eq!(tasks[0]["app_id"], "app1");
         } else {
             panic!("Failed to list tasks by app");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_list_and_delete_tasks_by_session() {
+        let (server, _temp_dir) = setup_test_environment().await;
+        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+
+        for (name, app_id, session_id) in [
+            ("session_task_1", "app1", "session-alpha"),
+            ("session_task_2", "app2", "session-alpha"),
+            ("session_task_3", "app1", "session-beta"),
+        ] {
+            let create_params = json!({
+                "name": name,
+                "task_type": "test_type",
+                "app_id": app_id,
+                "session_id": session_id
+            });
+            let create_req = create_rpc_request("create_task", create_params);
+            let create_resp = server.handle_rpc_call(create_req, ip).await.unwrap();
+            if let RPCResult::Success(result) = create_resp.result {
+                assert_eq!(result["task"]["session_id"], session_id);
+                assert_eq!(result["task"]["app_id"], app_id);
+            } else {
+                panic!("Failed to create session task");
+            }
+        }
+
+        let list_req = create_rpc_request("list_tasks", json!({ "session_id": "session-alpha" }));
+        let list_resp = server.handle_rpc_call(list_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = list_resp.result {
+            let tasks = result["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 2);
+            assert!(tasks
+                .iter()
+                .all(|task| task["session_id"] == "session-alpha"));
+        } else {
+            panic!("Failed to list tasks by session");
+        }
+
+        let delete_req = create_rpc_request(
+            "delete_tasks_by_session",
+            json!({ "session_id": "session-alpha" }),
+        );
+        let delete_resp = server.handle_rpc_call(delete_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = delete_resp.result {
+            assert_eq!(result["deleted_count"], 2);
+        } else {
+            panic!("Failed to delete tasks by session");
+        }
+
+        let list_req = create_rpc_request("list_tasks", json!({}));
+        let list_resp = server.handle_rpc_call(list_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = list_resp.result {
+            let tasks = result["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["session_id"], "session-beta");
+        } else {
+            panic!("Failed to list remaining tasks");
         }
     }
 

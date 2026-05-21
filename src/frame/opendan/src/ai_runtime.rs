@@ -250,6 +250,7 @@ async fn resolve_aicc_task_id(
 
     let filter = TaskFilter {
         app_id: Some(AICC_SERVICE_SERVICE_NAME.to_string()),
+        session_id: None,
         task_type: None,
         status: None,
         parent_id: None,

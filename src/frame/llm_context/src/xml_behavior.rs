@@ -72,21 +72,21 @@ use crate::behavior_loop::{LLMBehaviorResult, LLMResultParser, SendMessageRecord
 /// `next_behavior` values are valid.
 pub const XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT: &str = r#"
 
-The returned message MUST be parseable by XMLParser. Example:
+The response MUST be parseable by XMLParser. Example:
 ```
 <response>
   <observation>follow process rules</observation>
   <thinking>follow process rules</thinking>
   <actions>
+    <write_file path="test.py"><![CDATA[
+print("test")
+    ]]></write_file>
     <exec_bash><![CDATA[
-Glob *.txt
+python3 test.py
     ]]></exec_bash>
     <exec_bash><![CDATA[
 ifconfig
     ]]></exec_bash>
-    <write_file path="src/foo.rs"><![CDATA[
-pub fn bar() -> u32 { 42 }
-    ]]></write_file>
     <edit_file path="src/foo.rs" mode="replace_range" from_line="10" to_line="20"><![CDATA[
 new content
     ]]></edit_file>
@@ -103,13 +103,15 @@ Message to the user; optional; SHOULD only be provided when there is important p
 ```
 
 ## next_behavior
+
 - MUST set `<next_behavior>` only when `<actions>` is empty; action execution results MUST be observed before changing behavior.
 - `<next_behavior>` is the key field used to maintain the behavior state machine and MUST follow the process rules.
 
 ## <actions> Usage Rules
 
+- Actions are executed in order, and later actions can depend on the results of earlier actions.
 - You SHOULD always prefer `write_file` / `edit_file` / `read` over `exec_bash`. MUST NOT use `echo`, `cat`, or heredoc to write files
-- `<exec_bash>` SHOULD contain bash commands in its body, and each `<exec_bash>` SHOULD complete exactly one task.
+- `<exec_bash>` MUST contain online bash commands in its body, and each `<exec_bash>` SHOULD complete exactly one task.
 
 "#;
 

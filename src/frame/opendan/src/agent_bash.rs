@@ -369,7 +369,7 @@ pub fn build_default_tool_manager(
     bin_renderer: Option<Arc<SessionBinRenderer>>,
     bash_base_env: Vec<(String, String)>,
 ) -> Arc<AgentToolManager> {
-    let manager = AgentToolManager::new();
+    let manager = Arc::new(AgentToolManager::new());
 
     let bash_cfg =
         LlmBashConfig::local_workspace(&fs_roots.workspace_root).with_overlay(layout.to_overlay());
@@ -378,7 +378,8 @@ pub fn build_default_tool_manager(
         runner = runner.with_bin_renderer(renderer);
     }
     let runner: Arc<dyn BashRunner> = Arc::new(runner);
-    let _ = manager.register_tool(ExecBashTool::with_runner(bash_cfg, runner));
+    let _ = manager
+        .register_tool(ExecBashTool::with_runner(bash_cfg, runner).with_tool_manager(&manager));
 
     let file_cfg = fs_roots.to_file_tool_config();
     let audit = Arc::new(NoopFileWriteAudit);
@@ -391,7 +392,7 @@ pub fn build_default_tool_manager(
     let _ = manager.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()));
     let _ = manager.register_typed_tool(EditFileTool::new(file_cfg, audit));
 
-    Arc::new(manager)
+    manager
 }
 
 /// Higher-level convenience used by `AIAgent` on session create — bundles

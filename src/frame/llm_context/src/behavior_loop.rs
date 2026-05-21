@@ -10,6 +10,7 @@ use buckyos_api::{AiMessage, AiResponse, AiToolCall};
 use serde::{Deserialize, Serialize};
 
 use crate::observation::Observation;
+use crate::state::LLMContextSnapshot;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +112,11 @@ pub struct StepRecord {
     /// steps with no actions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub action_results: Vec<Observation>,
+    /// Optional user message to render after this step's assistant message.
+    /// When unset, the configured [`StepRenderer`] renders the default
+    /// action-result observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_user_message: Option<AiMessage>,
 }
 
 /// One `<sendmsg target=...>` emit. v2 stub: recorded on
@@ -144,6 +150,7 @@ impl StepRecord {
             self_report,
             messages_sent: messages_to_send,
             action_results: Vec::new(),
+            next_user_message: None,
         }
     }
 
@@ -177,6 +184,7 @@ impl StepRecord {
                 message,
                 tool_result: None,
             }],
+            next_user_message: None,
         }
     }
 }
@@ -305,6 +313,24 @@ pub trait StepRenderer: Send + Sync {
         }
         out
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StepResultHookOutput {
+    /// Override the user message rendered immediately after this step on the
+    /// next behavior inference. `None` keeps the renderer default.
+    pub user_message: Option<AiMessage>,
+    /// Extra history inputs to append before the next behavior inference.
+    pub history_inputs: Vec<HistoryInputRecord>,
+}
+
+#[async_trait]
+pub trait StepResultHook: Send + Sync {
+    async fn on_step_result(
+        &self,
+        snapshot: &LLMContextSnapshot,
+        step: &StepRecord,
+    ) -> Result<StepResultHookOutput, String>;
 }
 
 /// Budget hint passed into the compressor. Implementations may ignore it.

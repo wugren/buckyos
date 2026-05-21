@@ -26,7 +26,7 @@ pub const TASK_MANAGER_SERVICE_PORT: u16 = 3380;
 pub const TASK_MANAGER_RDB_INSTANCE_ID: &str = "task-mgr-main";
 /// Version of the task table schema. Bump whenever the DDL below changes in a
 /// way that is not trivially re-idempotent, so the scheduler can detect drift.
-pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 1;
+pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 2;
 
 /// Sqlite DDL for the task-manager database. `CREATE TABLE IF NOT EXISTS` so
 /// the migration is safe to re-run on every process start.
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS task (
     updated_at      INTEGER NOT NULL,
     user_id         TEXT NOT NULL DEFAULT '',
     app_id          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
     parent_id       INTEGER,
     root_id         TEXT NOT NULL DEFAULT '',
     permissions     TEXT,
@@ -56,6 +57,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_name_scope ON task(app_id, user_id, n
 CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
 CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
 "#;
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS task (
     updated_at      BIGINT NOT NULL,
     user_id         TEXT NOT NULL DEFAULT '',
     app_id          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
     parent_id       BIGINT REFERENCES task(id) ON DELETE CASCADE,
     root_id         TEXT NOT NULL DEFAULT '',
     permissions     TEXT,
@@ -87,6 +90,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_name_scope ON task(app_id, user_id, n
 CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
 CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
 "#;
@@ -208,6 +212,7 @@ pub struct Task {
     pub id: i64,
     pub user_id: String,
     pub app_id: String,
+    pub session_id: String,
     pub parent_id: Option<i64>,
     pub root_id: String,
     pub name: String,
@@ -226,6 +231,7 @@ pub struct CreateTaskOptions {
     pub permissions: Option<TaskPermissions>,
     pub parent_id: Option<i64>,
     pub root_id: Option<String>,
+    pub session_id: Option<String>,
     pub priority: Option<u8>,
 }
 
@@ -241,6 +247,7 @@ impl CreateTaskOptions {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TaskFilter {
     pub app_id: Option<String>,
+    pub session_id: Option<String>,
     pub task_type: Option<String>,
     pub status: Option<TaskStatus>,
     pub parent_id: Option<i64>,
@@ -300,6 +307,8 @@ pub struct TaskManagerCreateTaskReq {
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub app_name: Option<String>,
 }
 
@@ -314,6 +323,7 @@ impl TaskManagerCreateTaskReq {
         priority: Option<u8>,
         user_id: String,
         app_id: String,
+        session_id: Option<String>,
     ) -> Self {
         let app_name = if app_id.is_empty() {
             None
@@ -330,6 +340,7 @@ impl TaskManagerCreateTaskReq {
             priority,
             user_id,
             app_id,
+            session_id,
             app_name,
         }
     }
@@ -361,6 +372,8 @@ pub struct TaskManagerCreateDownloadTaskReq {
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub app_name: Option<String>,
 }
 
@@ -375,6 +388,7 @@ impl TaskManagerCreateDownloadTaskReq {
         priority: Option<u8>,
         user_id: String,
         app_id: String,
+        session_id: Option<String>,
     ) -> Self {
         let app_name = if app_id.is_empty() {
             None
@@ -391,6 +405,7 @@ impl TaskManagerCreateDownloadTaskReq {
             priority,
             user_id,
             app_id,
+            session_id,
             app_name,
         }
     }
@@ -427,6 +442,8 @@ pub struct TaskManagerListTasksReq {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub task_type: Option<String>,
     #[serde(default)]
     pub status: Option<TaskStatus>,
@@ -448,6 +465,7 @@ impl TaskManagerListTasksReq {
     ) -> Self {
         Self {
             app_id: filter.app_id,
+            session_id: filter.session_id,
             task_type: filter.task_type,
             status: filter.status,
             parent_id: filter.parent_id,
@@ -469,6 +487,8 @@ pub struct TaskManagerListTasksByTimeRangeReq {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub task_type: Option<String>,
     #[serde(default)]
     pub source_user_id: Option<String>,
@@ -481,6 +501,7 @@ pub struct TaskManagerListTasksByTimeRangeReq {
 impl TaskManagerListTasksByTimeRangeReq {
     pub fn new(
         app_id: Option<String>,
+        session_id: Option<String>,
         task_type: Option<String>,
         source_user_id: Option<String>,
         source_app_id: Option<String>,
@@ -488,6 +509,7 @@ impl TaskManagerListTasksByTimeRangeReq {
     ) -> Self {
         Self {
             app_id,
+            session_id,
             task_type,
             source_user_id,
             source_app_id,
@@ -682,6 +704,43 @@ impl TaskManagerDeleteTaskReq {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskManagerDeleteTasksBySessionReq {
+    pub session_id: String,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_app_id: Option<String>,
+}
+
+impl TaskManagerDeleteTasksBySessionReq {
+    pub fn new(
+        session_id: String,
+        source_user_id: Option<String>,
+        source_app_id: Option<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            source_user_id,
+            source_app_id,
+        }
+    }
+
+    pub fn from_json(value: Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TaskManagerDeleteTasksBySessionReq: {}",
+                e
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteTasksResult {
+    pub deleted_count: u64,
+}
+
 pub enum TaskManagerClient {
     InProcess(Box<dyn TaskManagerHandler>),
     KRPC(Box<kRPC>),
@@ -737,6 +796,7 @@ impl TaskManagerClient {
                     opts.priority,
                     user_id.to_string(),
                     app_id.to_string(),
+                    opts.session_id,
                 );
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
@@ -796,6 +856,7 @@ impl TaskManagerClient {
                     opts.priority,
                     user_id.to_string(),
                     app_id.to_string(),
+                    opts.session_id,
                 );
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
@@ -998,6 +1059,7 @@ impl TaskManagerClient {
     pub async fn list_tasks_by_time_range(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
         source_user_id: Option<&str>,
         source_app_id: Option<&str>,
@@ -1009,6 +1071,7 @@ impl TaskManagerClient {
                 let result = handler
                     .handle_list_tasks_by_time_range(
                         app_id,
+                        session_id,
                         task_type,
                         source_user_id,
                         source_app_id,
@@ -1021,6 +1084,7 @@ impl TaskManagerClient {
             Self::KRPC(client) => {
                 let req = TaskManagerListTasksByTimeRangeReq::new(
                     app_id.map(|value| value.to_string()),
+                    session_id.map(|value| value.to_string()),
                     task_type.map(|value| value.to_string()),
                     source_user_id.map(|value| value.to_string()),
                     source_app_id.map(|value| value.to_string()),
@@ -1220,6 +1284,41 @@ impl TaskManagerClient {
         }
     }
 
+    pub async fn delete_tasks_by_session(
+        &self,
+        session_id: &str,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+    ) -> Result<u64> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_delete_tasks_by_session(session_id, source_user_id, source_app_id, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = TaskManagerDeleteTasksBySessionReq::new(
+                    session_id.to_string(),
+                    source_user_id.map(|value| value.to_string()),
+                    source_app_id.map(|value| value.to_string()),
+                );
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+                let result = client.call("delete_tasks_by_session", req_json).await?;
+                let response =
+                    serde_json::from_value::<DeleteTasksResult>(result).map_err(|e| {
+                        RPCErrors::ParserResponseError(format!(
+                            "Expected DeleteTasksResult response: {}",
+                            e
+                        ))
+                    })?;
+                Ok(response.deleted_count)
+            }
+        }
+    }
+
     pub async fn pause_task(&self, id: i64) -> Result<()> {
         self.update_task_status(id, TaskStatus::Paused).await
     }
@@ -1330,6 +1429,7 @@ pub trait TaskManagerHandler: Send + Sync {
     async fn handle_list_tasks_by_time_range(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
         source_user_id: Option<&str>,
         source_app_id: Option<&str>,
@@ -1376,6 +1476,19 @@ pub trait TaskManagerHandler: Send + Sync {
     async fn handle_cancel_task(&self, id: i64, recursive: bool, ctx: RPCContext) -> Result<()>;
 
     async fn handle_delete_task(&self, id: i64, ctx: RPCContext) -> Result<()>;
+
+    async fn handle_delete_tasks_by_session(
+        &self,
+        session_id: &str,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<u64> {
+        let _ = (session_id, source_user_id, source_app_id, ctx);
+        Err(RPCErrors::ReasonError(
+            "delete_tasks_by_session not implemented".to_string(),
+        ))
+    }
 }
 
 pub struct TaskManagerServerHandler<T: TaskManagerHandler>(pub T);
@@ -1406,6 +1519,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     priority,
                     user_id,
                     app_id,
+                    session_id,
                     app_name,
                 } = create_req;
                 let resolved_app_id = if app_id.is_empty() {
@@ -1417,6 +1531,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions,
                     parent_id,
                     root_id,
+                    session_id,
                     priority,
                 };
                 let task = self
@@ -1442,6 +1557,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions: create_req.permissions,
                     parent_id: create_req.parent_id,
                     root_id: create_req.root_id,
+                    session_id: create_req.session_id,
                     priority: create_req.priority,
                 };
                 let task_id = self
@@ -1468,6 +1584,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let list_req = TaskManagerListTasksReq::from_json(req.params)?;
                 let TaskManagerListTasksReq {
                     app_id,
+                    session_id,
                     task_type,
                     status,
                     parent_id,
@@ -1477,6 +1594,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 } = list_req;
                 let filter = TaskFilter {
                     app_id,
+                    session_id,
                     task_type,
                     status,
                     parent_id,
@@ -1497,6 +1615,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let list_req = TaskManagerListTasksByTimeRangeReq::from_json(req.params)?;
                 let TaskManagerListTasksByTimeRangeReq {
                     app_id,
+                    session_id,
                     task_type,
                     source_user_id,
                     source_app_id,
@@ -1508,6 +1627,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     .0
                     .handle_list_tasks_by_time_range(
                         app_id.as_deref(),
+                        session_id.as_deref(),
                         task_type.as_deref(),
                         source_user_id.as_deref(),
                         source_app_id.as_deref(),
@@ -1586,6 +1706,19 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let delete_req = TaskManagerDeleteTaskReq::from_json(req.params)?;
                 let result = self.0.handle_delete_task(delete_req.id, ctx).await?;
                 RPCResult::Success(json!(result))
+            }
+            "delete_tasks_by_session" => {
+                let delete_req = TaskManagerDeleteTasksBySessionReq::from_json(req.params)?;
+                let deleted_count = self
+                    .0
+                    .handle_delete_tasks_by_session(
+                        delete_req.session_id.as_str(),
+                        delete_req.source_user_id.as_deref(),
+                        delete_req.source_app_id.as_deref(),
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(DeleteTasksResult { deleted_count }))
             }
             _ => return Err(RPCErrors::UnknownMethod(req.method.clone())),
         };

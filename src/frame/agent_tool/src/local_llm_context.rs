@@ -1189,7 +1189,7 @@ impl TurnHook for SnapshotPersistingTurnHook {
 /// 细节,泄漏即破坏双中立性(§A.2)。
 pub struct LocalDirToolManager {
     workspace: PathBuf,
-    inner: AgentToolManager,
+    inner: Arc<AgentToolManager>,
     step_idx: AtomicU32,
     session_template: SessionRuntimeContext,
 }
@@ -1210,7 +1210,7 @@ impl LocalDirToolManager {
     pub fn new(dir: PathBuf, run_id: String) -> Result<Self, LocalLLMContextError> {
         let workspace = dir.join("workspace");
         let bin_dir = dir.join("bin");
-        let inner = AgentToolManager::new();
+        let inner = Arc::new(AgentToolManager::new());
         let cfg = FileToolConfig::new(workspace.clone());
         let write_audit = Arc::new(NoopFileWriteAudit);
         // v2 Action set (see doc/opendan/Agent Actions.md §1):
@@ -1237,7 +1237,7 @@ impl LocalDirToolManager {
             .with_max_output_bytes(EXEC_BASH_MAX_OUTPUT_BYTES)
             .with_allow_env(true);
         inner
-            .register_tool(ExecBashTool::new(bash_cfg))
+            .register_tool(ExecBashTool::new(bash_cfg).with_tool_manager(&inner))
             .map_err(|e| LocalLLMContextError::ToolWiringFailed(e.to_string()))?;
 
         let session_template = SessionRuntimeContext {

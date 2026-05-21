@@ -941,6 +941,7 @@ impl LLMContext {
             //    consecutive-error counter.
             if let Some(err) = error_to_bump {
                 self.finish_step(&mut new_step);
+                self.apply_step_result_hook(&mut new_step).await;
                 self.sediment(new_step);
                 if let Some(outcome) = self.bump_consecutive_errors(err).await {
                     return outcome;
@@ -950,6 +951,7 @@ impl LLMContext {
             }
 
             self.finish_step(&mut new_step);
+            self.apply_step_result_hook(&mut new_step).await;
             self.sediment(new_step);
             self.maybe_compress().await;
         }
@@ -1109,6 +1111,10 @@ impl LLMContext {
     fn prepare_step(&mut self, mut step: StepRecord, started_at_ms: u64) -> StepRecord {
         let step_index = self.state.next_step_index;
         self.state.next_step_index = self.state.next_step_index.saturating_add(1);
+        for action in &mut step.actions {
+            self.state.next_action_id = self.state.next_action_id.saturating_add(1);
+            action.call_id = self.state.next_action_id.to_string();
+        }
         step.meta = StepMeta {
             behavior_name: self.request.behavior_name.clone(),
             step_index,
@@ -1121,6 +1127,32 @@ impl LLMContext {
 
     fn finish_step(&self, step: &mut StepRecord) {
         step.meta.ended_at_ms = Some(now_ms());
+    }
+
+    async fn apply_step_result_hook(&mut self, step: &mut StepRecord) {
+        if step.action_results.is_empty() && step.messages_sent.is_empty() {
+            return;
+        }
+        let Some(hook) = self.deps.step_result_hook.clone() else {
+            return;
+        };
+        let snapshot = self.snapshot();
+        match hook.on_step_result(&snapshot, step).await {
+            Ok(output) => {
+                if let Some(message) = output.user_message {
+                    step.next_user_message = Some(normalize_user_message(message));
+                }
+                self.state.history_inputs.extend(output.history_inputs);
+            }
+            Err(err) => {
+                log::warn!(
+                    "behavior_loop: on_step_result hook failed for behavior `{}` step {}: {}",
+                    step.meta.behavior_name,
+                    step.meta.step_index,
+                    err
+                );
+            }
+        }
     }
 
     /// Run the optional history compressor. Compression failures are
@@ -1205,6 +1237,13 @@ impl LLMContext {
             behavior_result: Some(behavior_result),
         }
     }
+}
+
+fn normalize_user_message(message: AiMessage) -> AiMessage {
+    if matches!(message.role, AiRole::User) {
+        return message;
+    }
+    AiMessage::text(AiRole::User, message.text_content())
 }
 
 /// Map a raw `LLMComputeError` to the default `ErrorClass`.

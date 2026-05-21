@@ -82,17 +82,28 @@ impl XmlStepRenderer {
     }
 
     fn render_full(&self, step: &StepRecord) -> (AiMessage, AiMessage) {
-        let assistant = AiMessage::text(AiRole::Assistant, step.assistant_text.clone());
-        let user_text = render_action_results_full(step, self.max_result_chars);
-        let user = AiMessage::text(AiRole::User, user_text);
+        let assistant = AiMessage::text(
+            AiRole::Assistant,
+            render_assistant_text_with_action_ids(step),
+        );
+        let user = step.next_user_message.clone().unwrap_or_else(|| {
+            AiMessage::text(
+                AiRole::User,
+                render_action_results_full(step, self.max_result_chars),
+            )
+        });
         (assistant, user)
     }
 
     fn render_compact(&self, step: &StepRecord) -> (AiMessage, AiMessage) {
         let assistant_text = compact_assistant_text(step, self.summary_chars);
         let assistant = AiMessage::text(AiRole::Assistant, assistant_text);
-        let user_text = render_action_results_compact(step, self.summary_chars / 2);
-        let user = AiMessage::text(AiRole::User, user_text);
+        let user = step.next_user_message.clone().unwrap_or_else(|| {
+            AiMessage::text(
+                AiRole::User,
+                render_action_results_compact(step, self.summary_chars / 2),
+            )
+        });
         (assistant, user)
     }
 
@@ -272,6 +283,141 @@ fn render_step_action_results_wrapper(step: &StepRecord, parts: Vec<(String, Str
     )
 }
 
+fn render_assistant_text_with_action_ids(step: &StepRecord) -> String {
+    if step.actions.is_empty() || step.assistant_text.is_empty() {
+        return step.assistant_text.clone();
+    }
+    inject_action_ids_into_assistant_text(&step.assistant_text, &step.actions)
+}
+
+fn inject_action_ids_into_assistant_text(
+    text: &str,
+    actions: &[buckyos_api::AiToolCall],
+) -> String {
+    let mut out = text.to_string();
+    let mut cursor = 0usize;
+    for action in actions {
+        if !is_dispatcher_action_id(&action.call_id) {
+            continue;
+        }
+        let Some((tag_start, tag_end)) = find_next_action_open_tag(&out, cursor, &action.name)
+        else {
+            continue;
+        };
+        let replacement = upsert_xml_attr(&out[tag_start..tag_end], "call_id", &action.call_id);
+        out.replace_range(tag_start..tag_end, &replacement);
+        cursor = tag_start + replacement.len();
+    }
+    out
+}
+
+fn find_next_action_open_tag(text: &str, cursor: usize, name: &str) -> Option<(usize, usize)> {
+    if name.is_empty() {
+        return None;
+    }
+    let needle = format!("<{name}");
+    let mut search_from = cursor.min(text.len());
+    while let Some(rel_start) = text[search_from..].find(&needle) {
+        let start = search_from + rel_start;
+        let name_end = start + needle.len();
+        let next = text[name_end..].chars().next();
+        if matches!(next, Some('>' | '/' | ' ' | '\n' | '\r' | '\t')) {
+            if let Some(rel_end) = text[name_end..].find('>') {
+                return Some((start, name_end + rel_end + 1));
+            }
+            return None;
+        }
+        search_from = name_end;
+    }
+    None
+}
+
+fn upsert_xml_attr(open_tag: &str, attr: &str, value: &str) -> String {
+    let encoded = xml_escape(value);
+    if let Some((start, end)) = find_xml_attr_range(open_tag, attr) {
+        let mut out = String::with_capacity(open_tag.len() + encoded.len() + attr.len() + 4);
+        out.push_str(&open_tag[..start]);
+        out.push_str(attr);
+        out.push_str("=\"");
+        out.push_str(&encoded);
+        out.push('"');
+        out.push_str(&open_tag[end..]);
+        return out;
+    }
+
+    let insert_at = open_tag
+        .rfind("/>")
+        .or_else(|| open_tag.rfind('>'))
+        .unwrap_or(open_tag.len());
+    let mut out = String::with_capacity(open_tag.len() + attr.len() + encoded.len() + 4);
+    out.push_str(&open_tag[..insert_at]);
+    out.push(' ');
+    out.push_str(attr);
+    out.push_str("=\"");
+    out.push_str(&encoded);
+    out.push('"');
+    out.push_str(&open_tag[insert_at..]);
+    out
+}
+
+fn find_xml_attr_range(open_tag: &str, attr: &str) -> Option<(usize, usize)> {
+    for (idx, _) in open_tag.match_indices(attr) {
+        if idx > 0
+            && !open_tag[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let mut pos = idx + attr.len();
+        pos = skip_ascii_ws(open_tag, pos);
+        if open_tag.as_bytes().get(pos) != Some(&b'=') {
+            continue;
+        }
+        pos += 1;
+        pos = skip_ascii_ws(open_tag, pos);
+        let Some(quote) = open_tag.as_bytes().get(pos).copied() else {
+            continue;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        let value_start = pos + 1;
+        let Some(rel_end) = open_tag[value_start..].find(quote as char) else {
+            continue;
+        };
+        return Some((idx, value_start + rel_end + 1));
+    }
+    None
+}
+
+fn skip_ascii_ws(value: &str, mut pos: usize) -> usize {
+    while value
+        .as_bytes()
+        .get(pos)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        pos += 1;
+    }
+    pos
+}
+
+fn with_action_title_id(
+    action: &buckyos_api::AiToolCall,
+    rendered: (String, String),
+) -> (String, String) {
+    let id = action.call_id.trim();
+    if !is_dispatcher_action_id(id) {
+        return rendered;
+    }
+    (format!("#{id} {}", rendered.0), rendered.1)
+}
+
+fn is_dispatcher_action_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
+}
+
 fn render_one_action_result_full(
     action: &buckyos_api::AiToolCall,
     obs: &Observation,
@@ -286,13 +432,19 @@ fn render_one_action_result_full(
             ..
         } => {
             if let Some(result) = tool_result {
-                return render_tool_result_full(action, result, max_body_chars, *truncated);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_full(action, result, max_body_chars, *truncated),
+                );
             }
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
-            (
-                format!("Run {command}"),
-                format_action_result_body(&body, *truncated || body_truncated),
+            with_action_title_id(
+                action,
+                (
+                    format!("Run {command}"),
+                    format_action_result_body(&body, *truncated || body_truncated),
+                ),
             )
         }
         Observation::Error {
@@ -301,20 +453,29 @@ fn render_one_action_result_full(
             ..
         } => {
             if let Some(result) = tool_result {
-                return render_tool_result_full(action, result, max_body_chars, false);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_full(action, result, max_body_chars, false),
+                );
             }
             let (msg, _) = clip(message.as_str(), max_body_chars.max(1024));
-            (format!("Run {command}"), format!("Error: {msg}"))
+            with_action_title_id(action, (format!("Run {command}"), format!("Error: {msg}")))
         }
         Observation::Pending { tool_result, .. } => {
             if let Some(result) = tool_result {
-                return render_tool_result_full(action, result, max_body_chars, false);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_full(action, result, max_body_chars, false),
+                );
             }
-            (format!("Run {command}"), "Pending".to_string())
+            with_action_title_id(action, (format!("Run {command}"), "Pending".to_string()))
         }
         Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars.max(512));
-            (format!("Run {command}"), format!("Cancelled: {body}"))
+            with_action_title_id(
+                action,
+                (format!("Run {command}"), format!("Cancelled: {body}")),
+            )
         }
     }
 }
@@ -333,17 +494,23 @@ fn render_one_action_result_compact(
             ..
         } => {
             if let Some(result) = tool_result {
-                return render_tool_result_compact(action, result, max_body_chars, *truncated);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_compact(action, result, max_body_chars, *truncated),
+                );
             }
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
             let body = body.trim();
             if body.is_empty() {
-                (format!("Run {command}"), "Success".to_string())
+                with_action_title_id(action, (format!("Run {command}"), "Success".to_string()))
             } else {
-                (
-                    format!("Run {command}"),
-                    format_action_result_body(body, *truncated || body_truncated),
+                with_action_title_id(
+                    action,
+                    (
+                        format!("Run {command}"),
+                        format_action_result_body(body, *truncated || body_truncated),
+                    ),
                 )
             }
         }
@@ -353,24 +520,33 @@ fn render_one_action_result_compact(
             ..
         } => {
             if let Some(result) = tool_result {
-                return render_tool_result_compact(action, result, max_body_chars, false);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_compact(action, result, max_body_chars, false),
+                );
             }
             let (msg, _) = clip(message.as_str(), max_body_chars);
-            (format!("Run {command}"), format!("Error: {msg}"))
+            with_action_title_id(action, (format!("Run {command}"), format!("Error: {msg}")))
         }
         Observation::Pending { tool_result, .. } => {
             if let Some(result) = tool_result {
-                return render_tool_result_compact(action, result, max_body_chars, false);
+                return with_action_title_id(
+                    action,
+                    render_tool_result_compact(action, result, max_body_chars, false),
+                );
             }
-            (format!("Run {command}"), "Pending".to_string())
+            with_action_title_id(action, (format!("Run {command}"), "Pending".to_string()))
         }
         Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars);
             let body = body.trim();
             if body.is_empty() {
-                (format!("Run {command}"), "Cancelled".to_string())
+                with_action_title_id(action, (format!("Run {command}"), "Cancelled".to_string()))
             } else {
-                (format!("Run {command}"), format!("Cancelled: {body}"))
+                with_action_title_id(
+                    action,
+                    (format!("Run {command}"), format!("Cancelled: {body}")),
+                )
             }
         }
     }
@@ -884,6 +1060,41 @@ mod tests {
         let i1 = text.find("- Run exec_bash").expect("exec_bash");
         let i2 = text.find("Run write_file").expect("write_file");
         assert!(i1 < i2, "actions should render in order");
+    }
+
+    #[test]
+    fn dispatcher_action_ids_are_injected_into_pair() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.assistant_text = r#"<response><actions><exec_bash>ls</exec_bash><read uri="src/lib.rs"/></actions></response>"#.into();
+        step.actions = vec![
+            tool_call_with_args("exec_bash", "1", &[("command", json!("ls"))]),
+            tool_call_with_args("read", "2", &[("uri", json!("src/lib.rs"))]),
+        ];
+        step.action_results = vec![
+            Observation::Success {
+                call_id: "1".into(),
+                content: json!("listed"),
+                bytes: 6,
+                truncated: false,
+                tool_result: None,
+            },
+            Observation::Success {
+                call_id: "2".into(),
+                content: json!("file body"),
+                bytes: 9,
+                truncated: false,
+                tool_result: None,
+            },
+        ];
+
+        let (a, u) = renderer.render(&step);
+        let assistant_text = assistant_text_of(&a);
+        assert!(assistant_text.contains(r#"<exec_bash call_id="1">ls</exec_bash>"#));
+        assert!(assistant_text.contains(r#"<read uri="src/lib.rs" call_id="2"/>"#));
+        let user_text = user_text_of(&u);
+        assert!(user_text.contains("- #1 Run ls"));
+        assert!(user_text.contains("- #2 Run read src/lib.rs"));
     }
 
     #[test]
