@@ -298,7 +298,7 @@ fn render_step_action_results_wrapper(
         } else {
             result_body.push_str(format!("- {}\n\n", part.title).as_str());
         }
-        result_body.push_str(format!("```{}\n{}\n```\n", part.fence, part.body).as_str());
+        result_body.push_str(format!("```output\n{}\n```\n", part.body).as_str());
     }
     format!(
         "<<last_step_action_results behavior=\"{}\" step=\"{}\">>\n{}\n<</last_step_action_results>>",
