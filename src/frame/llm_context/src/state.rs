@@ -8,7 +8,7 @@
 use buckyos_api::{AiMessage, AiUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::behavior_loop::{HistorySummaryRecord, StepRecord};
+use crate::behavior_loop::{HistoryInputRecord, HistorySummaryRecord, StepRecord};
 use crate::observation::PendingToolCall;
 use crate::request::LLMContextRequest;
 
@@ -55,6 +55,9 @@ pub struct LLMContextState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_summaries: Vec<HistorySummaryRecord>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_inputs: Vec<HistoryInputRecord>,
+
     /// Behavior mode: the freshest step still being processed — rendered
     /// verbatim into the next inference. `None` until the first iteration
     /// finishes parsing.
@@ -90,6 +93,7 @@ impl LLMContextState {
             llm_task_ids: Vec::new(),
             steps: Vec::new(),
             history_summaries: Vec::new(),
+            history_inputs: Vec::new(),
             last_step: None,
             last_report: None,
             next_step_index: 0,

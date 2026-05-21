@@ -1050,6 +1050,7 @@ impl LLMContext {
             self.state.steps.clone(),
             current_behavior,
             self.state.history_summaries.clone(),
+            self.state.history_inputs.clone(),
         ));
         if let Some(ref last) = self.state.last_step {
             let (assistant_msg, user_msg) = renderer.render(last);
@@ -1081,6 +1082,7 @@ impl LLMContext {
     }
 
     fn clear_behavior_turn_tail(&mut self) {
+        self.state.history_inputs.clear();
         let prefix_len = self.request.input.len();
         if self.state.accumulated.len() <= prefix_len {
             return;

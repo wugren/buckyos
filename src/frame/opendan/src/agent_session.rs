@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{AgentToolManager, SessionRuntimeContext, TodoRecord};
 use llm_context::{
+    behavior_loop::HistoryInputRecord,
     context_loop::LLMContext,
     interrupt::LLMContextInterruptHandle,
     observation::Observation,
@@ -642,7 +643,9 @@ impl AgentSession {
                         user_messages: bootstrap_messages.clone(),
                         system_events: Vec::new(),
                     };
-                    let round_result = self.run_one_round(bootstrap_messages, Some(seed)).await;
+                    let round_result = self
+                        .run_one_round(bootstrap_messages, Vec::new(), Some(seed))
+                        .await;
                     self.mark_bootstrap_done().await;
                     match round_result {
                         Ok(action) => match action {
@@ -760,6 +763,7 @@ impl AgentSession {
             // Latest peer info wins — the most recent Msg in this batch
             // dictates where outbound replies will be routed.
             let mut turn_messages: Vec<AiMessage> = Vec::new();
+            let mut history_inputs: Vec<HistoryInputRecord> = Vec::new();
             let mut turn_events = Vec::new();
             let mut consumed_keys = Vec::new();
             let mut task_completions: Vec<(String, Observation, String, String)> = Vec::new();
@@ -780,6 +784,8 @@ impl AgentSession {
             for input in &pending {
                 match input {
                     PendingInput::Msg {
+                        record_id,
+                        from,
                         text,
                         from_did,
                         tunnel_did,
@@ -792,12 +798,18 @@ impl AgentSession {
                             if first_msg_preview.is_none() {
                                 first_msg_preview = Some(trigger_preview(&preview_text));
                             }
-                            if !preview_text.trim().is_empty() {
+                            if is_history_input_pending(from, record_id) {
+                                history_inputs.push(HistoryInputRecord {
+                                    source: from.clone(),
+                                    text: message.text_content().trim().to_string(),
+                                    at_ms: now_ms(),
+                                });
+                            } else if !preview_text.trim().is_empty() {
                                 latest_origin_msg = Some(preview_text);
+                                turn_messages.push(message.clone());
+                                hist_user_messages.push(message);
+                                msg_count += 1;
                             }
-                            turn_messages.push(message.clone());
-                            hist_user_messages.push(message);
-                            msg_count += 1;
                         }
                         if let Some(did) = from_did.as_ref().filter(|s| !s.trim().is_empty()) {
                             latest_peer_did = Some(did.clone());
@@ -962,7 +974,9 @@ impl AgentSession {
             // barrier, defer: starting a fresh turn here would discard
             // the in-flight tool round. Upper layers that want immediate
             // attention should `interrupt()` first, then `enqueue_pending`.
-            if !round_inputs.is_empty() && self.snapshot_has_pending_tool_calls().await {
+            if (!round_inputs.is_empty() || !history_inputs.is_empty())
+                && self.snapshot_has_pending_tool_calls().await
+            {
                 self.set_status(SessionStatus::WaitingTool).await;
                 match self.wait_with_tool_sweep(inbox_rx).await {
                     None => return,
@@ -977,7 +991,7 @@ impl AgentSession {
                 continue;
             }
 
-            if round_inputs.is_empty() {
+            if round_inputs.is_empty() && history_inputs.is_empty() {
                 self.discard_consumed(&consumed_keys).await;
                 continue;
             }
@@ -1012,7 +1026,9 @@ impl AgentSession {
                 user_messages: hist_user_messages,
                 system_events: hist_system_events,
             };
-            let round_result = self.run_one_round(round_inputs, Some(seed)).await;
+            let round_result = self
+                .run_one_round(round_inputs, history_inputs, Some(seed))
+                .await;
             match round_result {
                 Ok(action) => {
                     // Successful turn ⇒ remove the items we just fed to the
@@ -1733,6 +1749,7 @@ impl AgentSession {
     async fn run_one_round(
         &self,
         turn_messages: Vec<AiMessage>,
+        history_inputs: Vec<HistoryInputRecord>,
         seed: Option<RoundSeed>,
     ) -> Result<NextAction> {
         let behavior = self.load_current_behavior().await?;
@@ -1762,7 +1779,7 @@ impl AgentSession {
         let trace_id = self.next_trace_id();
         self.status.set_turn_nonce(Some(trace_id.clone()));
         let (ctx_owner, _request, deps) = self
-            .build_or_resume(&behavior, &turn_messages, &trace_id)
+            .build_or_resume(&behavior, &turn_messages, history_inputs, &trace_id)
             .await?;
         let mut ctx = match ctx_owner {
             BuiltContext::Fresh(c) => c,
@@ -1975,6 +1992,7 @@ impl AgentSession {
         &self,
         behavior: &BehaviorCfg,
         turn_messages: &[AiMessage],
+        history_inputs: Vec<HistoryInputRecord>,
         trace_id: &str,
     ) -> Result<(
         BuiltContext,
@@ -2043,7 +2061,7 @@ impl AgentSession {
                     self.current_behavior_overrides(behavior).await?,
                 );
 
-                if let Some(message) = turn_message.clone() {
+                if turn_message.is_some() || !history_inputs.is_empty() {
                     // Idle session + new user message: rebuild the snapshot
                     // with the new user turn appended while resetting
                     // per-run counters. In behavior mode the StepRecord
@@ -2052,7 +2070,8 @@ impl AgentSession {
                     // assistant intent and action results.
                     let snapshot = append_turn_message_to_snapshot(
                         snapshot,
-                        message,
+                        turn_message.clone(),
+                        history_inputs,
                         trace_id,
                         preserve_behavior_state,
                     );
@@ -2116,7 +2135,21 @@ impl AgentSession {
             error_policy: behavior.to_error_policy(),
             forbid_next_behavior: false,
         };
-        let fresh = LLMContext::new(request.clone(), deps.clone());
+        let fresh = if history_inputs.is_empty() {
+            LLMContext::new(request.clone(), deps.clone())
+        } else {
+            let mut state = LLMContextState::from_request(&request, now_ms());
+            state.history_inputs = history_inputs;
+            LLMContext::resume(
+                LLMContextSnapshot {
+                    request: request.clone(),
+                    state,
+                },
+                ResumeFill::ResumeFromMidRun,
+                deps.clone(),
+            )
+            .map_err(|e| anyhow!("resume fresh with history input: {e}"))?
+        };
         Ok((BuiltContext::Fresh(fresh), request, deps))
     }
 
@@ -3524,7 +3557,8 @@ enum BuiltContext {
 
 fn append_turn_message_to_snapshot(
     mut snapshot: LLMContextSnapshot,
-    message: AiMessage,
+    message: Option<AiMessage>,
+    history_inputs: Vec<HistoryInputRecord>,
     trace_id: &str,
     preserve_behavior_state: bool,
 ) -> LLMContextSnapshot {
@@ -3533,9 +3567,13 @@ fn append_turn_message_to_snapshot(
     let previous_state = snapshot.state;
     let state = if preserve_behavior_state {
         let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
-        state.accumulated.push(message);
+        if let Some(message) = message {
+            state.accumulated.push(message);
+        }
         state.steps = previous_state.steps;
         state.history_summaries = previous_state.history_summaries;
+        state.history_inputs = previous_state.history_inputs;
+        state.history_inputs.extend(history_inputs);
         state.last_step = previous_state.last_step;
         if state.last_step.is_none()
             && state
@@ -3550,12 +3588,21 @@ fn append_turn_message_to_snapshot(
         state
     } else {
         let mut input = previous_state.accumulated;
-        input.push(message);
+        if let Some(message) = message {
+            input.push(message);
+        }
         snapshot.request.input = input;
-        LLMContextState::from_request(&snapshot.request, now_ms())
+        let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
+        state.history_inputs = previous_state.history_inputs;
+        state.history_inputs.extend(history_inputs);
+        state
     };
     snapshot.state = state;
     snapshot
+}
+
+fn is_history_input_pending(from: &str, record_id: &str) -> bool {
+    from == "opendan:on_switch" || record_id.starts_with("process-end:")
 }
 
 fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {

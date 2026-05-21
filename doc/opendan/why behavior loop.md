@@ -123,72 +123,135 @@ user:      Step Action Results
 - 跨 Behavior 继承的旧历史:必须降级为系统可解释的 history record 或 summary,不能继续占用当前 Behavior 的 hot tail
 - 触顶后的长期历史:固定大小的 summary block
 
-## 五、Behavior 切换和 fork 语义
+## 五、Behavior switch 的三种模式
 
-`next_behavior` 不是普通的下一轮提示词变化,而是状态机边界。切换 Behavior 时,等价于同时更换 Work Session 的"头"和"尾":
+`next_behavior` 不是普通的下一轮提示词变化,而是状态机边界。LLM 只在 Step 输出里声明"我要去哪个 behavior";具体怎么切换由 session class 的 `switch_mode` 决定。当前实现支持三种模式:
+
+| 模式 | 心智模型 | 是否继承上一个 behavior 的 history | `END` 语义 |
+| --- | --- | --- | --- |
+| `normal` | 带历史的跳转 | 继承同一 session/process 的 step history | 结束当前 session/process |
+| `fork` | 带历史的调用,结束后返回 | 子 behavior 继承 parent 的已解释 history | 子 behavior `END` 后恢复 parent |
+| `independent` | 切到另一个独立历史流 | 不继承上一个 behavior 的 history;恢复目标 process 自己的 snapshot | 弹回上一 process;栈空才结束 |
+
+三种模式共同遵守一个规则:切换 Behavior 时会同时更换 Work Session 的"头"和"尾"。
 
 - 头部更换:新的 system prompt、生效的 process rules、Action 视图和 skills
 - 尾部重置:新的 Behavior 开始自己的最近 StepRound hot area
 
-这意味着 Step history 必须是 session 级别的,但每个 StepRecord 需要能被系统解释清楚它属于哪个 Behavior。设计要求是:StepRecord 或其外层 envelope 至少携带:
+因此跨 behavior 继承的历史只能作为系统解释过的 history record 进入新 behavior,不能继续占用新 behavior 的 hot tail。
 
+### `normal`:同一历史流里的跳转
+
+`normal` 是最直接的状态机跳转。Runtime 用新的 behavior 配置刷新 snapshot 的 request 侧:
+
+- 替换 system prompt、objective、tool/action policy、model policy、budget、human/error/output policy。
+- 保留同一 session/process 的 `steps`、`history_summaries`、`next_step_index` 和 `last_report`。
+- 把旧 behavior 的 hot `last_step` 沉淀回 `steps`,新 behavior 不继承旧 hot tail。
+- 后续推理继续在同一个 process 上运行,没有"返回调用方"概念。
+
+如果从 `plan` normal 切到 `do`,那么 `plan` 的 StepRecord 会进入 `do` 的 `step_history`;`do` 自己随后产生的最近 step 才能作为 `assistant/user` hot pair 出现在尾部。
+
+### `fork`:继承 history 的子调用
+
+`fork` 是 fork-join 模型。Runtime 在切到 child behavior 前保存 parent snapshot,然后为 child 创建新的 request:
+
+- child 使用自己的 system prompt、Action 视图和 hot tail。
+- child 继承 parent 已沉淀的 `steps`、`history_summaries` 和 `next_step_index`。
+- parent 当前 hot `last_step` 会先降级为 child 可读的 inherited StepRecord,不会作为 child 的 hot pair。
+- child 结束时不把自己的完整 step stream 写回 parent;child stream 是一次性分支。
+- child 的 `<report>` / join handoff 会作为 runtime history input 回到 parent。
+- parent snapshot 被恢复,parent 从 fork 点之后继续推理。
+
+因此 `fork` 和 `normal` 的共同点是"子/目标 behavior 能理解之前发生了什么";区别是 `fork` 有调用栈和返回点,且返回时只把子分支结果汇入 parent,不把 child 的全部执行历史并入 parent 的主干 hot tail。
+
+### `independent`:独立历史流
+
+`independent` 把每个 process entry 视为独立的 behavior 历史流。切换时:
+
+- parent 的 terminal snapshot 写入自己的 `.meta/behavior_<entry>.snap`。
+- target process 如果已有 snapshot,就恢复它自己的 snapshot;如果没有,就从 target behavior fresh request 开始。
+- 不把 parent 的 `steps`、`history_summaries` 或 hot tail 复制给 target。
+- 每个 process 有自己的 round/error budget 窗口。
+- `END` 时保存当前 child process 的 terminal snapshot,再恢复 parent process snapshot;栈空时 session 才真正结束。
+
+所以 `independent` 适合长期并列的独立工作流,不是"带上下文的分支执行"。
+
+## 六、Step history 和推理输入形态
+
+Behavior Loop 的下一轮输入不是简单 append chat transcript,而是由 request 头部、`step_history`、当前 behavior hot tail 和真实用户/event 输入共同构造。当前实现的核心 message 序列是:
+
+```text
+system: current behavior objective + process rules + action view + result protocol
+optional user: real user/event input with background environment
+optional user: <<step_history>> ... <</step_history>>
+assistant: current behavior hot step intent
+user:      current behavior hot step action results
+assistant: current behavior hot step intent
+user:      current behavior hot step action results
 ```
+
+`step_history` 是一条 user message,承载已经不该占 hot tail 的历史语义。它可以同时包含:
+
+- 跨 behavior 继承的 `<step_record>`
+- 压缩后的 `<history_summary>`
+- runtime 生成的 `<history_input>`,例如 `on_switch` 和 fork join handoff
+
+示例:
+
+````xml
+<<step_history>>
+<step_record behavior="plan" index="1" started_at_ms="..." ended_at_ms="..." compression="full">
+<observation>Todos were created successfully.</observation>
+<thought>The plan is ready, so execution should start.</thought>
+<actions>
+- Run todo add "T01"
+
+```output
+Created T01.
+```
+</actions>
+</step_record>
+<history_input source="opendan:on_switch" at_ms="...">Continue TASK_ANCHOR.</history_input>
+<</step_history>>
+````
+
+这个例子里的 `Continue TASK_ANCHOR.` 不是一条裸 user turn。它是 runtime 根据目标 behavior 的 `on_switch` 模板生成的 handoff input,必须合并在 `step_history` 里,并且排在触发它的历史 StepRecord 后面。这样模型看到的是一段连续的、可解释的状态机历史,而不是两个用户消息突然相邻。
+
+完整 step 仍然渲染为严格相邻的 hot pair:
+
+````text
+assistant: <response>...</response>
+user:
+<<last_step_action_results behavior="<behavior_name>" step="<step_index>">>
+- AgentToolResult.title
+
+```output
+AgentToolResult.output | AgentToolResult.detail
+```
+<</last_step_action_results>>
+````
+
+这个 hot pair 只属于当前 behavior 的最近执行上下文。一旦切到另一个 behavior,它必须沉淀进 `step_history`,并携带至少这些元数据:
+
+```text
 behavior_name
 step_index
 started_at / ended_at
 compression_level
 ```
 
-其中 `behavior_name` 是跨 Behavior 继承历史的关键。一个 step 在自己的 Behavior 中可以作为完整 StepRound 出现在尾部;一旦切换到另一个 Behavior,它就不应再以"当前轮 assistant Intent + user Action Results"的热区形式出现。新 Behavior 只能通过系统解释过的 history record 理解它:
+随后推理产生新的 `assistant Step 0 Intent`;系统执行 Step 0 actions 后得到 `user Step 0 Action Results`;Step 0 成为当前 behavior 的 hot tail。再往后,它会逐渐进入当前 behavior 的 StepRecord history;如果发生 Behavior 切换,它会以 `step_record` 或 summary 的形式被继承,而不是继续作为新 Behavior 的完整 assistant/user hot round。
 
-```
-history step record:
-  behavior: plan
-  index: 12
-  summary/detail: ...
-  result: ...
-```
+## 七、`on_switch`、fork join 和真实用户输入的区别
 
-换句话说,完整的:
+`on_switch` 是 behavior 配置里的 runtime 模板,不是用户真实发来的消息。当前实现按来源区分输入:
 
-```
-assistant: Step Intent
-user:      Step Action Results
-```
+- 真实用户/peer message:作为本轮 user turn 进入 request tail,可附带 background environment。
+- 业务 event:格式化为 user-visible wakeup,驱动本轮推理。
+- `on_switch`:渲染为 `HistoryInputRecord`,进入 `step_history`。
+- fork child `END`:恢复 parent snapshot 后,把 child report / join marker 渲染为 `HistoryInputRecord`,进入 parent 的 `step_history`。
 
-只属于当前 Behavior 的最近执行上下文。跨 Behavior 继承的历史必须变成单条 StepRecord message 或 summary block,由当前 Behavior 的 system prompt 解释其含义。这一点很重要:切换 Behavior 必然导致 system prompt 和 skills 重新匹配,也必然造成 KV Cache miss;这个 miss 是可接受的。但切换后不能把旧 Behavior 的 hot tail 原样带到新 Behavior 尾部,否则新 Behavior 会在错误的语义框架下读取旧 Intent。
-
-fork 模型也是同一个原则。fork 出来的子上下文可以继承 parent 的 session history,但继承的是已经解释过的 StepRecord / History Summary,不是 parent 当前 Behavior 的完整热区。子上下文有自己的 system prompt、Action 视图和 hot tail;它运行结束后,结果再以 report、summary 或 join record 的形式回到 parent。
-
-## 六、推理输入形态
-
-从一次 Behavior step 的 LLM 输入看,理想结构是:
-
-```
-- system: current behavior objective + process_rules + action view + skills + result_protocol
-- optional user: real user/event input with background environment
-- optional user/assistant: history summary blocks produced by hard compression
-- user: inherited StepRecord history from previous behaviors, already interpreted/compressed
-- assistant/user pairs: current behavior recent full StepRounds
-  - assistant Step -2 Intent
-  - user      Step -2 Action Results
-  - assistant Step -1 Intent
-  - user      Step -1 Action Results
-```
-
-推理后得到:
-
-```
-assistant Step 0 Intent
-```
-
-系统执行 Step 0 actions 后得到:
-
-```
-user Step 0 Action Results
-```
-
-随后 Step 0 进入当前 Behavior 的 hot tail。再往后,它会逐渐进入当前 Behavior 的 StepRecord history;如果发生 Behavior 切换,它必须以带 `behavior_name` 和 `step_index` 的 history record 形式被继承,而不是继续作为新 Behavior 的完整 assistant/user hot round。
+这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;而 `on_switch` / fork join 是 Runtime 对状态机边界的解释,应该归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
 
 
 ## 收束

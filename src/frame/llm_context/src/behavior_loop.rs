@@ -49,6 +49,14 @@ pub struct HistorySummaryRecord {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HistoryInputRecord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub text: String,
+    pub at_ms: u64,
+}
+
 /// One Behavior step. Carries both the LLM-emitted intent (`assistant_text`
 /// + the parsed slots) and the dispatcher-side echo (`action_results`).
 ///
@@ -270,10 +278,20 @@ pub trait StepRenderer: Send + Sync {
         steps: Vec<StepRecord>,
         current_behavior: &str,
         summaries: Vec<HistorySummaryRecord>,
+        inputs: Vec<HistoryInputRecord>,
     ) -> Vec<AiMessage> {
         let mut out = Vec::with_capacity(steps.len() * 2 + summaries.len());
         for summary in &summaries {
             out.push(self.render_summary(summary));
+        }
+        for input in inputs {
+            out.push(AiMessage::text(
+                buckyos_api::AiRole::User,
+                format!(
+                    "history input:\nsource: {}\nat_ms: {}\n{}",
+                    input.source, input.at_ms, input.text
+                ),
+            ));
         }
         for step in &steps {
             if !current_behavior.is_empty() && step.meta.behavior_name != current_behavior {

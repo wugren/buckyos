@@ -32,7 +32,7 @@
 use buckyos_api::{AiMessage, AiRole};
 use serde_json::Value;
 
-use crate::behavior_loop::{HistorySummaryRecord, StepRecord, StepRenderer};
+use crate::behavior_loop::{HistoryInputRecord, HistorySummaryRecord, StepRecord, StepRenderer};
 use crate::observation::Observation;
 use crate::xml_behavior::xml_escape;
 
@@ -98,6 +98,15 @@ impl XmlStepRenderer {
         let user = AiMessage::text(AiRole::User, user_text);
         (assistant, user)
     }
+
+    fn render_history_input(&self, input: &HistoryInputRecord) -> String {
+        format!(
+            "<history_input source=\"{}\" at_ms=\"{}\">{}</history_input>",
+            xml_escape(&input.source),
+            input.at_ms,
+            xml_escape(&input.text)
+        )
+    }
 }
 
 impl StepRenderer for XmlStepRenderer {
@@ -135,8 +144,9 @@ impl StepRenderer for XmlStepRenderer {
         steps: Vec<StepRecord>,
         current_behavior: &str,
         summaries: Vec<HistorySummaryRecord>,
+        inputs: Vec<HistoryInputRecord>,
     ) -> Vec<AiMessage> {
-        if steps.is_empty() && summaries.is_empty() {
+        if steps.is_empty() && summaries.is_empty() && inputs.is_empty() {
             return Vec::new();
         }
         let current_indices: Vec<usize> = steps
@@ -153,13 +163,14 @@ impl StepRenderer for XmlStepRenderer {
         let current_full_cutoff = current_indices.len().saturating_sub(self.recent_full_steps);
         let mut current_seen = 0usize;
 
-        let mut out = Vec::with_capacity(steps.len() * 2 + summaries.len());
+        let mut history_records: Vec<String> = Vec::new();
         for summary in &summaries {
-            out.push(self.render_summary(summary));
+            history_records.push(self.render_summary(summary).text_content());
         }
+        let mut current_pairs = Vec::new();
         for step in &steps {
             if !current_behavior.is_empty() && step.meta.behavior_name != current_behavior {
-                out.push(self.render_inherited(step));
+                history_records.push(self.render_inherited(step).text_content());
                 continue;
             }
             let (a, u) = if current_seen >= current_full_cutoff {
@@ -168,9 +179,25 @@ impl StepRenderer for XmlStepRenderer {
                 self.render_compact(step)
             };
             current_seen = current_seen.saturating_add(1);
-            out.push(a);
-            out.push(u);
+            current_pairs.push(a);
+            current_pairs.push(u);
         }
+        for input in &inputs {
+            history_records.push(self.render_history_input(input));
+        }
+
+        let mut out =
+            Vec::with_capacity(current_pairs.len() + usize::from(!history_records.is_empty()));
+        if !history_records.is_empty() {
+            out.push(AiMessage::text(
+                AiRole::User,
+                format!(
+                    "<<step_history>>\n{}\n<</step_history>>",
+                    history_records.join("\n")
+                ),
+            ));
+        }
+        out.extend(current_pairs);
         out
     }
 }
@@ -704,12 +731,42 @@ mod tests {
         step.meta.behavior_name = "plan".into();
         step.self_report = Some("checkpoint".into());
 
-        let msgs = renderer.render_history(vec![step], "do", Vec::new());
+        let msgs = renderer.render_history(vec![step], "do", Vec::new(), Vec::new());
         assert_eq!(msgs.len(), 1);
         let inherited = plain_text(&msgs[0]);
         assert!(inherited.contains("<actions>\nNo action.\n</actions>"));
         assert!(!inherited.contains("Report acknowledged"));
         assert!(!inherited.contains("- Report"));
+    }
+
+    #[test]
+    fn history_input_merges_into_step_history_after_inherited_steps() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.meta.behavior_name = "plan".into();
+        step.meta.step_index = 1;
+        step.thought = Some("plan ready".into());
+
+        let msgs = renderer.render_history(
+            vec![step],
+            "do",
+            Vec::new(),
+            vec![HistoryInputRecord {
+                source: "opendan:on_switch".into(),
+                text: "Continue TASK_ANCHOR.".into(),
+                at_ms: 42,
+            }],
+        );
+
+        assert_eq!(msgs.len(), 1);
+        let history = plain_text(&msgs[0]);
+        assert!(history.starts_with("<<step_history>>"));
+        assert!(history.ends_with("<</step_history>>"));
+        let step_idx = history.find("<step_record").expect("step record");
+        let input_idx = history.find("<history_input").expect("history input");
+        assert!(step_idx < input_idx);
+        assert!(history.contains("source=\"opendan:on_switch\""));
+        assert!(history.contains("Continue TASK_ANCHOR."));
     }
 
     #[test]
@@ -830,7 +887,7 @@ mod tests {
             make_step(0, "old body, should compress"),
             make_step(1, "newest body, full"),
         ];
-        let msgs = renderer.render_history(steps, "", Vec::new());
+        let msgs = renderer.render_history(steps, "", Vec::new(), Vec::new());
         assert_eq!(msgs.len(), 4);
 
         // Step 0 (older, compressed) should use the <thinking>thought-0</thinking>
@@ -865,6 +922,7 @@ mod tests {
         let msgs = renderer.render_history(
             vec![make_step(0), make_step(1), make_step(2)],
             "",
+            Vec::new(),
             Vec::new(),
         );
         // Pairs: A U A U A U
@@ -909,6 +967,7 @@ mod tests {
         let msgs = renderer.render_history(
             vec![make_step("plan", 0), make_step("execute", 1)],
             "execute",
+            Vec::new(),
             Vec::new(),
         );
 
