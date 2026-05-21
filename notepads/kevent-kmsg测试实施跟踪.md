@@ -14,6 +14,7 @@
 
 - 提供一组测试脚本和一个统一控制入口，而不是把所有逻辑塞进单个大脚本。
 - 统一入口负责 preflight、环境构建、环境重置、分批执行测试、汇总报告。
+- 测试脚本按模块组织：`kmsg`、`kevent`、`kevent+kmsg` 组合测试分开放置，组合目录只放跨模块语义。
 - 执行期间不依赖人工交互；缺少工具、权限、配置或外部资源时，在 preflight 阶段明确标记为 `blocked` 并给出原因。
 - 报告必须直观看到每个用例的 `pass` / `fail` / `skip` / `blocked` 状态、执行命令、失败摘要和日志位置。
 - 每新增一批测试，都要同步接入统一入口，不能只留下单独命令。
@@ -21,8 +22,8 @@
 自动化边界：
 
 - 可以独立构建：统一 runner、preflight、报告汇总、`cargo test` 执行、本机 single-node build/start/reset/check、`node_daemon`/`kmsg` 启停、gateway/DV 用例执行入口。
-- 不能只靠当前仓库独立构建：`scripts/kevent_kmsg/dv_vm_env.py` 这类多节点 DV VM 环境后端。原因是当前仓库只有 `src/dev_configs/readme.md` 和配置文件，文档里提到的 `main.py $group_name create_vms/snapshot/restore/run` 入口不存在；可以先写 preflight 和适配层，但实际 VM 后端需要现有工具或环境协助。
-- 不能只靠当前仓库独立构建：`scripts/kevent_kmsg/external_dv_bootstrap.py` 这类公网/外部 DV 资源 bootstrap。原因是 `test.buckyos.io`、`devtests.org`、SN、测试账号、域名、外部 token/owner key 等资源需要外部权限或凭据；脚本只能检测资源是否存在并在缺失时标记 `blocked`。
+- 不能只靠当前仓库独立构建：多节点 DV VM 环境后端。原因是当前仓库只有 `src/dev_configs/readme.md` 和配置文件，文档里提到的 `main.py $group_name create_vms/snapshot/restore/run` 入口不存在；可以先写 preflight 和适配层，但实际 VM 后端需要现有工具或环境协助。
+- 不能只靠当前仓库独立构建：公网/外部 DV 资源 bootstrap。原因是 `test.buckyos.io`、`devtests.org`、SN、测试账号、域名、外部 token/owner key 等资源需要外部权限或凭据；脚本只能检测资源是否存在并在缺失时标记 `blocked`。
 
 ## 2. 批次总览
 
@@ -32,8 +33,8 @@
 | Batch 1 | pending | `SledMsgQueue` in-process 契约测试 | `cargo test -p kmsg` | kmsg P0 + 大部分 P1 cursor/数据边界 |
 | Batch 2 | pending | `kevent` in-process 语义测试 | `cargo test -p kevent` | kevent P0 + 大部分 P1 API/reader 边界 |
 | Batch 3 | pending | in-process 组合和当前业务语义 mock | `cargo test -p kevent && cargo test -p kmsg`，必要时加相关 crate | kevent+kmsg 组合、workflow/task_manager 关键语义 mock |
-| Batch 4 | pending | 单节点真实进程测试 | 专用 runner + `uv run src/check.py` | node_daemon/kmsg 启停、HTTP stream、真实服务恢复 |
-| Batch 5 | pending | DV/gateway 验收测试 | `uv run test/run.py -p <case>` | gateway、token、路由、对外协议 |
+| Batch 4 | pending | 单节点真实进程测试 | `uv run test/run.py -p kmsg_test -p kevent_test -p kevent_kmsg_test` | node_daemon/kmsg 启停、HTTP stream、真实服务恢复 |
+| Batch 5 | pending | DV/gateway 验收测试 | `uv run test/run.py -p kmsg_test -p kevent_test -p kevent_kmsg_test` | gateway、token、路由、对外协议 |
 | Batch 6 | pending | P2 基线和故障注入 | 专用基线 runner | 压力、延迟、丢包、CPU/IO/内存趋势 |
 
 状态取值：
@@ -53,9 +54,16 @@
 - 确认新增测试文件放置位置。
   - `src/kernel/kmsg/tests/...`
   - `src/kernel/kevent/tests/...`
+  - `test/kmsg_test/...`
+  - `test/kevent_test/...`
+  - `test/kevent_kmsg_test/...`
   - 如需共享 helper，优先放在测试目录内。
 - 确认统一 runner 脚本位置。
-  - 建议入口：`scripts/kevent_kmsg/run_all.py`。
+  - 模块入口优先使用现有 `test/run.py` 可发现的 `main.py`。
+  - `kmsg` 真实进程/gateway/DV 用例入口：`test/kmsg_test/main.py`。
+  - `kevent` 真实进程/gateway/DV 用例入口：`test/kevent_test/main.py`。
+  - `kevent+kmsg` 组合语义入口：`test/kevent_kmsg_test/main.py`。
+  - 一键执行命令：`uv run test/run.py -p kmsg_test -p kevent_test -p kevent_kmsg_test`。
   - 子脚本按职责拆分：preflight、reset、cargo、single-node、DV、report。
   - 如现有测试框架已有更合适入口，优先复用现有框架。
 - 确认 `kmsg` 独立 integration test 如何访问 `SledMsgQueue`。
