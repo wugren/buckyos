@@ -10,11 +10,25 @@
 - 如果某个测试需要真实环境能力，先用 mock/in-process 覆盖语义，再把真实环境测试放到后续批次。
 - 每批完成后必须更新本文档，不能只提交测试代码。
 
+最终交付形态：
+
+- 提供一组测试脚本和一个统一控制入口，而不是把所有逻辑塞进单个大脚本。
+- 统一入口负责 preflight、环境构建、环境重置、分批执行测试、汇总报告。
+- 执行期间不依赖人工交互；缺少工具、权限、配置或外部资源时，在 preflight 阶段明确标记为 `blocked` 并给出原因。
+- 报告必须直观看到每个用例的 `pass` / `fail` / `skip` / `blocked` 状态、执行命令、失败摘要和日志位置。
+- 每新增一批测试，都要同步接入统一入口，不能只留下单独命令。
+
+自动化边界：
+
+- 可以独立构建：统一 runner、preflight、报告汇总、`cargo test` 执行、本机 single-node build/start/reset/check、`node_daemon`/`kmsg` 启停、gateway/DV 用例执行入口。
+- 不能只靠当前仓库独立构建：`scripts/kevent_kmsg/dv_vm_env.py` 这类多节点 DV VM 环境后端。原因是当前仓库只有 `src/dev_configs/readme.md` 和配置文件，文档里提到的 `main.py $group_name create_vms/snapshot/restore/run` 入口不存在；可以先写 preflight 和适配层，但实际 VM 后端需要现有工具或环境协助。
+- 不能只靠当前仓库独立构建：`scripts/kevent_kmsg/external_dv_bootstrap.py` 这类公网/外部 DV 资源 bootstrap。原因是 `test.buckyos.io`、`devtests.org`、SN、测试账号、域名、外部 token/owner key 等资源需要外部权限或凭据；脚本只能检测资源是否存在并在缺失时标记 `blocked`。
+
 ## 2. 批次总览
 
 | 批次 | 状态 | 目标 | 主要命令 | 覆盖范围 |
 |---|---|---|---|---|
-| Batch 0 | pending | 测试目录和 helper 准备 | 不要求跑完整测试 | 测试结构、命名、报告格式 |
+| Batch 0 | pending | 测试目录、helper 和统一 runner 骨架准备 | 不要求跑完整测试 | 测试结构、命名、报告格式、runner 接入规范 |
 | Batch 1 | pending | `SledMsgQueue` in-process 契约测试 | `cargo test -p kmsg` | kmsg P0 + 大部分 P1 cursor/数据边界 |
 | Batch 2 | pending | `kevent` in-process 语义测试 | `cargo test -p kevent` | kevent P0 + 大部分 P1 API/reader 边界 |
 | Batch 3 | pending | in-process 组合和当前业务语义 mock | `cargo test -p kevent && cargo test -p kmsg`，必要时加相关 crate | kevent+kmsg 组合、workflow/task_manager 关键语义 mock |
@@ -32,7 +46,7 @@
 
 ## 3. Batch 0：测试结构准备
 
-目标：先建立可维护的测试组织方式，不碰功能代码。
+目标：先建立可维护的测试组织方式和统一 runner 骨架，不碰功能代码。
 
 建议内容：
 
@@ -40,6 +54,10 @@
   - `src/kernel/kmsg/tests/...`
   - `src/kernel/kevent/tests/...`
   - 如需共享 helper，优先放在测试目录内。
+- 确认统一 runner 脚本位置。
+  - 建议入口：`scripts/kevent_kmsg/run_all.py`。
+  - 子脚本按职责拆分：preflight、reset、cargo、single-node、DV、report。
+  - 如现有测试框架已有更合适入口，优先复用现有框架。
 - 确认 `kmsg` 独立 integration test 如何访问 `SledMsgQueue`。
   - 优先方案：测试文件用 `#[path = "../src/sled_msg_queue.rs"]` 引入实现，不改功能代码。
   - 如果该方式无法编译，再记录原因，另开设计讨论。
@@ -47,11 +65,15 @@
   - `p0_*`：硬验收语义。
   - `p1_*`：边界和负向协议。
   - `p2_*`：基线和压力，不进第一批硬门槛。
+- 确认报告字段。
+  - 用例名、批次、状态、执行命令、耗时、失败摘要、日志路径、blocked/skip 原因。
 
 完成标准：
 
 - 测试文件布局确定。
 - 至少有一个最小 smoke test 能被 `cargo test` 发现。
+- 统一 runner 能列出已注册用例，并能输出空跑或 smoke 报告。
+- runner 的环境检查不做隐式等待；缺什么直接输出 `blocked` 原因。
 - 本文档 Batch 0 状态更新为 `done`，并记录提交号。
 
 ## 4. Batch 1：SledMsgQueue in-process 契约测试
@@ -308,11 +330,13 @@ uv run test/run.py -p <test_name>
 - `## 2. 批次总览` 中对应批次状态。
 - `## 10. 覆盖追踪` 中对应用例状态、测试文件和命令。
 - `## 11. 批次执行记录` 中追加或更新执行记录。
+- 统一 runner 的用例注册和报告输出；如果本批暂不接入，必须写明原因和后续批次。
 - 如果发现测试方案本身不合理，同时更新 `notepads/kevent-kmsg测试方案.md`，并在执行记录里说明原因。
 
 每批 PR 描述至少包含：
 
 - 本批覆盖哪些测试方案用例。
 - 新增哪些测试文件。
+- 统一 runner 如何执行本批测试。
 - 跑了哪些命令。
 - 哪些用例延后，为什么延后。
