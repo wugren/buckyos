@@ -274,6 +274,7 @@ mod tests {
             llm_context::observation::Observation::Error {
                 call_id: call.call_id,
                 message: "stub".to_string(),
+                tool_result: None,
             }
         }
     }

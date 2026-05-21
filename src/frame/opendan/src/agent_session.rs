@@ -3638,6 +3638,7 @@ fn observation_from_task_event(call_id: &str, data: &serde_json::Value) -> Optio
                 content,
                 bytes,
                 truncated: false,
+                tool_result: None,
             })
         }
         "Failed" => {
@@ -3654,6 +3655,7 @@ fn observation_from_task_event(call_id: &str, data: &serde_json::Value) -> Optio
             Some(Observation::Error {
                 call_id: call_id.to_string(),
                 message,
+                tool_result: None,
             })
         }
         "Canceled" => {

@@ -99,6 +99,7 @@ fn append_turn_message_preserves_behavior_step_records() {
             content: serde_json::json!({"ok": true}),
             bytes: 12,
             truncated: false,
+            tool_result: None,
         }],
         ..Default::default()
     });
@@ -657,7 +658,9 @@ fn observation_from_task_event_translates_failed() {
     });
     let obs = observation_from_task_event("call-9", &payload).expect("terminal observation");
     match obs {
-        Observation::Error { call_id, message } => {
+        Observation::Error {
+            call_id, message, ..
+        } => {
             assert_eq!(call_id, "call-9");
             assert!(message.contains("network"));
         }

@@ -338,6 +338,7 @@ impl ToolManager for OpendanToolAdapter {
             Err(err) => Observation::Error {
                 call_id,
                 message: err.to_string(),
+                tool_result: None,
             },
         }
     }
@@ -360,8 +361,12 @@ impl ToolManager for OpendanToolAdapter {
 }
 
 fn result_to_observation(call_id: String, result: AgentToolResult) -> Observation {
+    let tool_result = Some(result.to_tool_result_view());
     if matches!(result.status, AgentToolStatus::Pending) {
-        return Observation::Pending { call_id };
+        return Observation::Pending {
+            call_id,
+            tool_result,
+        };
     }
     let is_error = matches!(result.status, AgentToolStatus::Error);
     let summary = result.summary.clone();
@@ -374,14 +379,12 @@ fn result_to_observation(call_id: String, result: AgentToolResult) -> Observatio
         } else {
             "tool error".to_string()
         };
-        Observation::Error { call_id, message }
+        Observation::Error {
+            call_id,
+            message,
+            tool_result,
+        }
     } else {
-        // Per agent_tool protocol, only the canonical `output` is fed back to
-        // the LLM so history records carry the minimum needed for tiered
-        // compression — detail / cmd_args / stdout / stderr / title are
-        // metadata for the UI and worklog, not for the model. Tools that
-        // don't populate `output` (write_file / edit_file / ...) fall back
-        // to `summary`, which already embeds the operation result.
         let text = result
             .output
             .clone()
@@ -393,6 +396,7 @@ fn result_to_observation(call_id: String, result: AgentToolResult) -> Observatio
             content: Value::String(text),
             bytes,
             truncated: false,
+            tool_result,
         }
     }
 }

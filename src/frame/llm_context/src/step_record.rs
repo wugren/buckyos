@@ -2,27 +2,24 @@
 //! [`crate::xml_behavior::XmlBehaviorParser`].
 //!
 //! The renderer is responsible for turning sedimented + hot [`StepRecord`]s
-//! back into [`AiMessage`]s that the next inner LLM call sees. The waist
-//! enforces strict (assistant, user) alternation per step, so this renderer
-//! produces exactly one pair per step:
+//! back into [`AiMessage`]s that the next inner LLM call sees. It renders one
+//! `<<step_history>>` user message for compact / inherited / summary records,
+//! followed by the hot tail as strict `(assistant, user)` step pairs:
 //!
-//! - **Assistant message**: the verbatim text the LLM emitted last turn
-//!   (the parsed XML lives inside `step.assistant_text`).
+//! - **Assistant message**: the verbatim hot step text the LLM emitted last
+//!   turn (the parsed XML lives inside `step.assistant_text`).
 //! - **User message**: a `<<last_step_action_results>>` wrapper carrying the
-//!   dispatcher-side echo (success body / error message / pending marker).
+//!   full dispatcher-side action result.
 //!
 //! ## History compression
 //!
 //! `render_history` applies a simple recency-based two-level scheme so the
 //! oldest steps don't blow the prompt budget:
 //!
-//! - The most recent [`XmlStepRenderer::recent_full_steps`] entries render
-//!   the same as [`XmlStepRenderer::render`] — full assistant text, full
-//!   action body.
-//! - Older entries collapse to a compact form: assistant text truncated to
-//!   [`XmlStepRenderer::summary_chars`], action result body truncated to
-//!   [`XmlStepRenderer::summary_chars`] / 2, success bodies replaced with
-//!   `Success` once truncated to zero.
+//! - Inherited and compact records live inside `<<step_history>>` and prefer
+//!   structured `ToolResultView.summary` / `ToolResultView.title`.
+//! - Hot / recent steps stay as `(assistant, user)` pairs and prefer
+//!   structured `ToolResultView.output` / `ToolResultView.detail`.
 //!
 //! Schedulers needing more sophisticated tiering (e.g. the four-level
 //! Min/Mini/Medium/Full scheme from the legacy opendan renderer) should
@@ -33,7 +30,7 @@ use buckyos_api::{AiMessage, AiRole};
 use serde_json::Value;
 
 use crate::behavior_loop::{HistoryInputRecord, HistorySummaryRecord, StepRecord, StepRenderer};
-use crate::observation::Observation;
+use crate::observation::{Observation, ToolResultStatusView, ToolResultView};
 use crate::xml_behavior::xml_escape;
 
 /// Default renderer for the XML behavior protocol. Stateless beyond the
@@ -283,8 +280,14 @@ fn render_one_action_result_full(
     let command = action_command_text(action);
     match obs {
         Observation::Success {
-            content, truncated, ..
+            content,
+            truncated,
+            tool_result,
+            ..
         } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_full(action, result, max_body_chars, *truncated);
+            }
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
             (
@@ -292,11 +295,23 @@ fn render_one_action_result_full(
                 format_action_result_body(&body, *truncated || body_truncated),
             )
         }
-        Observation::Error { message, .. } => {
+        Observation::Error {
+            message,
+            tool_result,
+            ..
+        } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_full(action, result, max_body_chars, false);
+            }
             let (msg, _) = clip(message.as_str(), max_body_chars.max(1024));
             (format!("Run {command}"), format!("Error: {msg}"))
         }
-        Observation::Pending { .. } => (format!("Run {command}"), "Pending".to_string()),
+        Observation::Pending { tool_result, .. } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_full(action, result, max_body_chars, false);
+            }
+            (format!("Run {command}"), "Pending".to_string())
+        }
         Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars.max(512));
             (format!("Run {command}"), format!("Cancelled: {body}"))
@@ -312,8 +327,14 @@ fn render_one_action_result_compact(
     let command = action_command_text(action);
     match obs {
         Observation::Success {
-            content, truncated, ..
+            content,
+            truncated,
+            tool_result,
+            ..
         } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_compact(action, result, max_body_chars, *truncated);
+            }
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
             let body = body.trim();
@@ -326,11 +347,23 @@ fn render_one_action_result_compact(
                 )
             }
         }
-        Observation::Error { message, .. } => {
+        Observation::Error {
+            message,
+            tool_result,
+            ..
+        } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_compact(action, result, max_body_chars, false);
+            }
             let (msg, _) = clip(message.as_str(), max_body_chars);
             (format!("Run {command}"), format!("Error: {msg}"))
         }
-        Observation::Pending { .. } => (format!("Run {command}"), "Pending".to_string()),
+        Observation::Pending { tool_result, .. } => {
+            if let Some(result) = tool_result {
+                return render_tool_result_compact(action, result, max_body_chars, false);
+            }
+            (format!("Run {command}"), "Pending".to_string())
+        }
         Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars);
             let body = body.trim();
@@ -346,8 +379,16 @@ fn render_one_action_result_compact(
 fn render_unpaired_action_result(obs: &Observation, max_body_chars: usize) -> (String, String) {
     match obs {
         Observation::Success {
-            content, truncated, ..
+            content,
+            truncated,
+            tool_result,
+            ..
         } => {
+            if let Some(result) = tool_result {
+                let (_, body) =
+                    render_tool_result_full_placeholder(result, max_body_chars, *truncated);
+                return (tool_result_title(None, result), body);
+            }
             let body = stringify_content(content);
             let (body, body_truncated) = clip(body.as_str(), max_body_chars);
             (
@@ -355,16 +396,177 @@ fn render_unpaired_action_result(obs: &Observation, max_body_chars: usize) -> (S
                 format_action_result_body(&body, *truncated || body_truncated),
             )
         }
-        Observation::Error { message, .. } => {
+        Observation::Error {
+            message,
+            tool_result,
+            ..
+        } => {
+            if let Some(result) = tool_result {
+                let (_, body) = render_tool_result_full_placeholder(result, max_body_chars, false);
+                return (tool_result_title(None, result), body);
+            }
             let (msg, _) = clip(message.as_str(), max_body_chars.max(1024));
             ("Step error".to_string(), format!("Error: {msg}"))
         }
-        Observation::Pending { .. } => ("Step result".to_string(), "Pending".to_string()),
+        Observation::Pending { tool_result, .. } => {
+            if let Some(result) = tool_result {
+                let (_, body) = render_tool_result_full_placeholder(result, max_body_chars, false);
+                return (tool_result_title(None, result), body);
+            }
+            ("Step result".to_string(), "Pending".to_string())
+        }
         Observation::Cancelled { reason, .. } => {
             let (body, _) = clip(reason.as_str(), max_body_chars.max(512));
             ("Step result".to_string(), format!("Cancelled: {body}"))
         }
     }
+}
+
+fn render_tool_result_full(
+    action: &buckyos_api::AiToolCall,
+    result: &ToolResultView,
+    max_body_chars: usize,
+    fallback_truncated: bool,
+) -> (String, String) {
+    let title = tool_result_title(Some(action), result);
+    let (_, body) = render_tool_result_full_placeholder(result, max_body_chars, fallback_truncated);
+    (title, body)
+}
+
+fn render_tool_result_full_placeholder(
+    result: &ToolResultView,
+    max_body_chars: usize,
+    fallback_truncated: bool,
+) -> (String, String) {
+    let body = match result.status {
+        ToolResultStatusView::Error => tool_result_error_body(result),
+        ToolResultStatusView::Pending => tool_result_pending_body(result),
+        ToolResultStatusView::Success => tool_result_full_body(result),
+    };
+    let (body, clipped) = clip(body.as_str(), max_body_chars);
+    (
+        tool_result_title(None, result),
+        format_action_result_body(&body, fallback_truncated || clipped),
+    )
+}
+
+fn render_tool_result_compact(
+    action: &buckyos_api::AiToolCall,
+    result: &ToolResultView,
+    max_body_chars: usize,
+    fallback_truncated: bool,
+) -> (String, String) {
+    let title = tool_result_title(Some(action), result);
+    let body = match result.status {
+        ToolResultStatusView::Pending => tool_result_pending_body(result),
+        ToolResultStatusView::Error => tool_result_error_body(result),
+        ToolResultStatusView::Success => {
+            if !result.summary.trim().is_empty() {
+                result.summary.trim().to_string()
+            } else if !result.title.trim().is_empty() {
+                result.title.trim().to_string()
+            } else {
+                "Success".to_string()
+            }
+        }
+    };
+    let (body, clipped) = clip(body.as_str(), max_body_chars);
+    (
+        title,
+        format_action_result_body(&body, fallback_truncated || clipped),
+    )
+}
+
+fn tool_result_title(action: Option<&buckyos_api::AiToolCall>, result: &ToolResultView) -> String {
+    let title = result.title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    if let Some(command) = result
+        .command_line_text()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return command;
+    }
+    action
+        .map(action_command_text)
+        .map(|command| format!("Run {command}"))
+        .unwrap_or_else(|| "Step result".to_string())
+}
+
+fn tool_result_full_body(result: &ToolResultView) -> String {
+    if let Some(output) = result
+        .output
+        .as_deref()
+        .map(str::trim_end)
+        .filter(|value| !value.is_empty())
+    {
+        return output.to_string();
+    }
+    if let Some(detail) = result.detail.as_ref() {
+        return serde_json::to_string_pretty(detail).unwrap_or_else(|_| detail.to_string());
+    }
+    if !result.summary.trim().is_empty() {
+        return result.summary.trim().to_string();
+    }
+    if !result.title.trim().is_empty() {
+        return result.title.trim().to_string();
+    }
+    "Success".to_string()
+}
+
+fn tool_result_error_body(result: &ToolResultView) -> String {
+    let mut lines = Vec::new();
+    if !result.summary.trim().is_empty() {
+        lines.push(result.summary.trim().to_string());
+    } else if let Some(output) = result
+        .output
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(output.to_string());
+    } else if !result.title.trim().is_empty() {
+        lines.push(result.title.trim().to_string());
+    } else {
+        lines.push("Error".to_string());
+    }
+    if let Some(code) = result.return_code {
+        lines.push(format!("return_code={code}"));
+    }
+    lines.join("\n")
+}
+
+fn tool_result_pending_body(result: &ToolResultView) -> String {
+    let mut lines = Vec::new();
+    if !result.summary.trim().is_empty() {
+        lines.push(result.summary.trim().to_string());
+    } else {
+        lines.push("Pending".to_string());
+    }
+    if let Some(task_id) = result.task_id.as_deref().filter(|value| !value.is_empty()) {
+        lines.push(format!("task_id={task_id}"));
+    }
+    if let Some(reason) = result
+        .pending_reason
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("pending_reason={reason}"));
+    }
+    if let Some(check_after) = result.check_after {
+        lines.push(format!("check_after={check_after}"));
+    }
+    if let Some(partial) = result
+        .partial_output
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("partial_output:\n{partial}"));
+    }
+    lines.join("\n")
 }
 
 fn format_action_result_body(body: &str, truncated: bool) -> String {
@@ -625,6 +827,7 @@ mod tests {
             content: json!("ok"),
             bytes: 2,
             truncated: false,
+            tool_result: None,
         }];
 
         let (a, u) = renderer.render(&step);
@@ -663,12 +866,14 @@ mod tests {
                 content: json!("first"),
                 bytes: 5,
                 truncated: false,
+                tool_result: None,
             },
             Observation::Success {
                 call_id: "c-2".into(),
                 content: json!("second"),
                 bytes: 6,
                 truncated: false,
+                tool_result: None,
             },
         ];
         let (_, u) = renderer.render(&step);
@@ -704,6 +909,7 @@ mod tests {
             content: json!("wrote 10 bytes"),
             bytes: 14,
             truncated: false,
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         let text = user_text_of(&u);
@@ -792,6 +998,7 @@ mod tests {
         step.action_results = vec![Observation::Error {
             call_id: "c-9".into(),
             message: "permission denied".into(),
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
@@ -806,6 +1013,7 @@ mod tests {
         step.action_results = vec![Observation::Error {
             call_id: String::new(),
             message: "parse failed".into(),
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
@@ -820,6 +1028,7 @@ mod tests {
         step.actions = vec![tool_call("read", "p-1")];
         step.action_results = vec![Observation::Pending {
             call_id: "p-1".into(),
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
@@ -837,6 +1046,7 @@ mod tests {
             content: json!({"rows": 3}),
             bytes: 0,
             truncated: false,
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         // JSON object stringified without XML escaping.
@@ -854,10 +1064,82 @@ mod tests {
             content: json!("<b>not html</b> & friends"),
             bytes: 0,
             truncated: false,
+            tool_result: None,
         }];
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
         assert!(user_text.contains("<b>not html</b> & friends"));
+    }
+
+    #[test]
+    fn protocol_tool_result_full_uses_title_and_output() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.actions = vec![tool_call("custom_tool", "t-1")];
+        step.action_results = vec![Observation::Success {
+            call_id: "t-1".into(),
+            content: json!("legacy fallback should not render"),
+            bytes: 0,
+            truncated: false,
+            tool_result: Some(ToolResultView {
+                status: ToolResultStatusView::Success,
+                title: "custom_tool target => success".into(),
+                summary: "short protocol summary".into(),
+                output: Some("protocol output body".into()),
+                ..Default::default()
+            }),
+        }];
+
+        let (_, u) = renderer.render(&step);
+        let user_text = user_text_of(&u);
+        assert!(user_text.contains("- custom_tool target => success"));
+        assert!(user_text.contains("```output\nprotocol output body\n```"));
+        assert!(!user_text.contains("legacy fallback should not render"));
+    }
+
+    #[test]
+    fn inherited_protocol_tool_result_uses_summary_not_detail() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.meta.behavior_name = "plan".into();
+        step.actions = vec![tool_call("custom_tool", "t-2")];
+        step.action_results = vec![Observation::Success {
+            call_id: "t-2".into(),
+            content: json!("legacy fallback should not render"),
+            bytes: 0,
+            truncated: false,
+            tool_result: Some(ToolResultView {
+                status: ToolResultStatusView::Success,
+                title: "custom_tool => success".into(),
+                summary: "compact protocol summary".into(),
+                output: Some("full protocol output should not render".into()),
+                detail: Some(json!({"large": "detail should not render"})),
+                ..Default::default()
+            }),
+        }];
+
+        let msgs = renderer.render_history(vec![step], "do", Vec::new(), Vec::new());
+        let history = plain_text(&msgs[0]);
+        assert!(history.contains("- custom_tool => success"));
+        assert!(history.contains("compact protocol summary"));
+        assert!(!history.contains("full protocol output should not render"));
+        assert!(!history.contains("detail should not render"));
+    }
+
+    #[test]
+    fn observation_deserializes_old_success_without_tool_result() {
+        let value = json!({
+            "kind": "success",
+            "call_id": "old",
+            "content": "ok",
+            "bytes": 2,
+            "truncated": false
+        });
+        let obs: Observation = serde_json::from_value(value).expect("old observation");
+        match obs {
+            Observation::Success { tool_result, .. } => assert!(tool_result.is_none()),
+            _ => panic!("expected success"),
+        }
     }
 
     #[test]
@@ -879,6 +1161,7 @@ mod tests {
                 content: json!(body),
                 bytes: body.len(),
                 truncated: false,
+                tool_result: None,
             }];
             step
         };
@@ -916,6 +1199,7 @@ mod tests {
                 content: json!("ok"),
                 bytes: 2,
                 truncated: false,
+                tool_result: None,
             }];
             step
         };
@@ -960,6 +1244,7 @@ mod tests {
                 content: json!("<raw output>"),
                 bytes: 12,
                 truncated: false,
+                tool_result: None,
             }];
             step
         };

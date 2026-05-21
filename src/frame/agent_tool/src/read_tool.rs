@@ -231,6 +231,10 @@ impl ReadTool {
                 build_builtin_tool_result(details, cmd_line, READ_UNCHANGED_MESSAGE)
                     .with_tool(TOOL_READ)
                     .with_status(AgentToolStatus::Success)
+                    .with_title(format!(
+                        "read {uri} => read 0 bytes{}",
+                        if eof { " (EOF)" } else { "" }
+                    ))
                     .with_output(READ_UNCHANGED_MESSAGE),
             );
         }
@@ -258,6 +262,10 @@ impl ReadTool {
             "read {actual_bytes} bytes at offset {read_start} of {total}{}",
             if eof { " (EOF)" } else { "" }
         );
+        let title = format!(
+            "read {uri} => read {actual_bytes} bytes{}",
+            if eof { " (EOF)" } else { "" }
+        );
         let details = json!({
             "uri": uri,
             "scheme": "file",
@@ -272,7 +280,8 @@ impl ReadTool {
 
         let mut result = build_builtin_tool_result(details, cmd_line, summary)
             .with_tool(TOOL_READ)
-            .with_status(AgentToolStatus::Success);
+            .with_status(AgentToolStatus::Success)
+            .with_title(title);
         if !content.is_empty() {
             result = result.with_output(content);
         }

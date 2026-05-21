@@ -1249,7 +1249,7 @@ fn tool_observation_message(call_id: &str, observation: &Observation) -> AiMessa
             (text, false)
         }
         Observation::Error { message, .. } => (message.clone(), true),
-        Observation::Pending { call_id: cid } => (format!("pending:{cid}"), true),
+        Observation::Pending { call_id: cid, .. } => (format!("pending:{cid}"), true),
         Observation::Cancelled { reason, .. } => {
             // `is_error=false` — the call did not fail, it was interrupted.
             // The text marker lets a content-aware renderer / the LLM tell

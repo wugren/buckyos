@@ -78,6 +78,7 @@ impl ToolManager for EchoTools {
             content: json!({ "echo": value }),
             bytes: 0,
             truncated: false,
+            tool_result: None,
         }
     }
 

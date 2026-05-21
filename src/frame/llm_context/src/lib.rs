@@ -45,7 +45,9 @@ pub use msg_parser::{
     AttachmentValidation, AttachmentValidator, LocalFileResolver, MsgEgressOptions, MsgParseOutput,
     MsgParserError, PermissiveAttachmentValidator, SystemControlCommand,
 };
-pub use observation::{Observation, PendingToolCall, ToolExecRecord};
+pub use observation::{
+    Observation, PendingToolCall, ToolExecRecord, ToolResultStatusView, ToolResultView,
+};
 pub use outcome::{
     BudgetKind, ContextLimitKind, ContextOutput, ContextRunTrace, LLMContextOutcome, ResumeFill,
 };

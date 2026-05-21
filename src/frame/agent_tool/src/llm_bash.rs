@@ -622,7 +622,8 @@ impl AgentTool for ExecBashTool {
         let mut result = build_builtin_tool_result(details, command.clone(), summary)
             .with_tool(self.tool_name())
             .with_status(status)
-            .with_return_code(output.exit_code);
+            .with_return_code(output.exit_code)
+            .refresh_default_title();
         if !output.output.is_empty() {
             result = result.with_output(output.output.clone());
         }
@@ -796,6 +797,11 @@ mod tests {
         assert_eq!(result.status, AgentToolStatus::Error);
         assert_eq!(result.details["exit_code"], 7);
         assert_eq!(result.return_code, Some(7));
+        assert!(
+            result.title.contains("=> error"),
+            "failed command title must not say success: {}",
+            result.title
+        );
     }
 
     #[tokio::test]

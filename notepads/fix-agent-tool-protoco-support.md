@@ -2,20 +2,58 @@
 
 ## 背景
 
-`doc/agent_tool/agent_tool_result_protocol.md` 已经定义了 `AgentToolResult` 的字段分工和渲染规则。当前实现有一部分遵循了协议，例如 `AgentToolResult` 结构体、`TypedTool::build_summary/build_title`、`AgentToolResult::render_for_level` 都存在；但 LLMContext 的 action result 渲染路径没有完整消费协议，导致工具自己定义的 `title` / `summary` / `detail` 在进入 LLM 历史时被压扁或丢失。
+`doc/agent_tool/agent_tool_result_protocol.md` 已经把 `AgentToolResult` 的定位调整为：
 
-目标是让 action result 渲染优先使用 `agent_tool_protocol` 的语义字段，而不是由 `XmlStepRenderer` 重新猜测每个 action 的标题和内容。
+> 面向 Agent Loop / StepRecord prompt 渲染，并带 Runtime 控制语义的工具执行结果协议。
 
-## 协议文档要求
+这意味着修复目标不只是让单个工具返回 `title / summary / output / detail`，而是让这些字段能稳定进入下一轮 LLM 看到的 `StepRecord`：
 
-协议文档把字段分成几类：
+- hot tail / 最近 step：完整展示 action intent 和 action results。
+- compact history：使用 `summary` 保留可独立理解的多行摘要。
+- digest / list：使用 `title` 保留一行标题。
+- history summary：不再保留单个工具结果，只保留跨 step 的任务语义。
+
+当前实现已经有一部分基础：
+
+- `AgentToolResult` 结构体存在。
+- `TypedTool::build_cmd_line / build_summary / build_title` 存在。
+- `AgentToolResult::render_for_level / render_for_last_step / command_line_text` 存在。
+- `XmlStepRenderer` 已经有 `<<last_step_action_results>>` 和 `<<step_history>>` 基本结构。
+
+但 action result 从 AgentTool 执行结果进入 `llm_context::Observation` 时仍被压扁成字符串，导致 `XmlStepRenderer` 无法按协议字段渲染。
+
+## 新协议要求
+
+### StepRecord message 序列
+
+一次 Behavior 推理前的理想 message 序列：
+
+```text
+system
+user: behavior init | step_history
+assistant: hot step intent
+user: hot step action results
+assistant: hot step intent
+user: hot step action results
+```
+
+关键点：
+
+- `step_history` 是一条 user message，承载已经沉淀的 StepRecord 历史。
+- hot tail 是最近若干个完整 `(assistant, user)` step pair。
+- context 不够时，hot tail 中较旧的一部分会合并进 `step_history`，并在 `step_history` 内压缩或裁剪。
+- behavior init 如果和 `step_history` 同时存在，应合并到 `step_history` 末尾，保证时间顺序连续。
+
+### AgentToolResult 字段分层
+
+字段分工：
 
 - 控制语义：`status`、`task_id`、`pending_reason`、`check_after`、`return_code`、`partial_output`
 - 命令表达：`cmd_name`、`cmd_args`
 - 渲染压缩：`title`、`summary`
 - 完整返回体：`output` 或 `detail`
 
-渲染规则是：
+单个 `AgentToolResult` 展示级别：
 
 | Level | 应使用字段 |
 | --- | --- |
@@ -23,25 +61,72 @@
 | `Medium` | `summary` |
 | `Full` | `cmd_name + cmd_args + output/detail` |
 
-关键约束：
+StepRecord 场景映射：
 
-- `title` 是一行压缩视图，应表达命令和结果状态。
-- `summary` 是多行压缩视图，应独立可读。
-- `output` 是 bash 语义的完整文本输出。
-- `detail` 是工具内部完整返回，通常是结构化 JSON。
-- Runtime 控制只能读控制字段，不能从 `title` / `summary` / `output` 反推状态。
-- Prompt / history 压缩应优先读 `title` / `summary`，Full 展示才读 `cmd_name` / `cmd_args` 和完整返回体。
+| StepRecord 场景 | 应使用的 AgentToolResult 展示级别 |
+| --- | --- |
+| hot `last_step` / 最近 full step | `Full` |
+| compact history step | `Medium`，必要时降到 `Min` |
+| inherited step record | `Medium` 或 `Min` |
+| history summary block | 不再保留单个 `AgentToolResult`，只保留 summary 语义 |
 
-`doc/agent_tool/builtin_agent_tools.md` 还补充了内置工具约定：
+### wrapper 形态
 
-- builtin tool 默认至少返回 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`。
-- `write_file` 的 `summary` 不应包含完整写入内容。
-- `write_file.detail` 不应包含输入参数 `content`。
-- `edit_file.detail` 不应包含输入参数 `pos_chunk` / `new_content`。
+hot step action result：
 
-## 当前实现偏差
+````text
+<<last_step_action_results behavior="<behavior_name>" step="<step_index>">>
+- AgentToolResult.title
 
-### 1. AgentToolResult 被压扁成 Observation 字符串
+```output
+AgentToolResult.output | AgentToolResult.detail
+```
+<</last_step_action_results>>
+````
+
+history：
+
+````xml
+<<step_history>>
+<step_record behavior="<behavior_name>" index="<step_index>" started_at_ms="<started_at_ms>" ended_at_ms="<ended_at_ms>" compression="<full|compact|summary>">
+<observation>...</observation>
+<thought>...</thought>
+<actions>
+- AgentToolResult.title
+
+```output
+AgentToolResult.summary | AgentToolResult.title
+```
+</actions>
+</step_record>
+<history_summary steps="<start>..<end>" count="<count>" started_at_ms="<started_at_ms>" ended_at_ms="<ended_at_ms>" behaviors="<behavior_names>">...</history_summary>
+<</step_history>>
+````
+
+## 当前实现状态和偏差
+
+### 1. StepRecord 外层结构基本到位
+
+当前实现：
+
+- `src/frame/llm_context/src/step_record.rs::render_history`
+- `src/frame/llm_context/src/step_record.rs::render_action_results_full`
+- `src/frame/llm_context/src/step_record.rs::render_step_action_results_wrapper`
+
+现状：
+
+- hot step 已渲染成 `(assistant, user)` pair。
+- user action result 已使用 `<<last_step_action_results>>`。
+- history records 已合并进单条 `<<step_history>>` user message。
+- `HistoryInputRecord` 已能合并进 `step_history`。
+
+仍需对齐：
+
+- 文件顶部注释仍描述“每个 history step 产生一对 message”，应更新为当前 `step_history + hot tail` 模型。
+- `step_history` 中的 action result body 仍来自 `Observation` 字符串，不是 `AgentToolResult.summary/title`。
+- compact / inherited 的 compression level 语义还没有和 `AgentToolResult` level 严格绑定。
+
+### 2. AgentToolResult 被压扁成 Observation 字符串
 
 当前映射入口：
 
@@ -51,16 +136,35 @@
 现状：
 
 - `Success` 只保留 `result.output`，没有 output 时回退到 `result.summary`。
-- `Error` 只保留 `result.summary` 或 output。
-- `title`、`cmd_name`、`cmd_args`、`detail`、`return_code`、`pending_reason` 等协议字段不会进入 `Observation`。
+- `Error` 只保留 `result.summary` 或 title。
+- `Pending` 只保留 pending 状态。
+- `title`、`cmd_name`、`cmd_args`、`detail`、`return_code`、`pending_reason`、`check_after` 等协议字段不会进入 `Observation`。
 
 结果：
 
-- 后续 renderer 无法知道 tool 自己定义的 title。
-- Full / Medium / Min 三档渲染规则无法按协议执行。
-- 结构化 `detail` 在 LLM history 中不可见，除非工具额外把内容复制到 `output` 或 `summary`。
+- `XmlStepRenderer` 无法使用工具自己定义的 `title`。
+- Full / Medium / Min 三档无法按协议执行。
+- 结构化 `detail` 在 hot step 里不可见，除非工具额外复制到 `output` 或 `summary`。
+- pending 结果丢失 `task_id / pending_reason / check_after / partial_output` 等 LLM 可读上下文。
 
-### 2. XmlStepRenderer 重新从 AiToolCall 推导 action title
+### 3. 不能直接让 Observation 持有 agent_tool::AgentToolResult
+
+依赖关系：
+
+- `agent_tool` 依赖 `llm_context`
+- `opendan` 依赖 `agent_tool` 和 `llm_context`
+- `llm_context` 当前不依赖 `agent_tool`
+
+因此不能在 `llm_context::Observation` 中直接加入 `agent_tool::AgentToolResult`，否则会形成 crate 循环。
+
+正确方向：
+
+- 在 `llm_context` 或 `buckyos-api` 中定义一个轻量协议视图，例如 `ToolResultView`。
+- `agent_tool::AgentToolResult` 转换为 `ToolResultView`。
+- `Observation` 携带 `Option<ToolResultView>`。
+- `XmlStepRenderer` 只依赖 `ToolResultView`，不依赖 `agent_tool` crate。
+
+### 4. XmlStepRenderer 仍从 AiToolCall 推导 title/body
 
 当前渲染入口：
 
@@ -72,15 +176,15 @@
 
 - title 固定为 `Run {action_command_text(action)}`。
 - `action_command_text` 为 `exec_bash`、`write_file`、`edit_file`、`read` 写了专门逻辑。
-- 其它 action 走通用参数拼接，并手动跳过 `content` / `new_content` / `from_user_did`。
+- 其它 action 走通用参数拼接，并手动跳过 `content / new_content / from_user_did`。
 
 结果：
 
-- renderer 知道了过多 tool 细节，和协议中“tool 自己定义 title / summary”的方向相反。
+- renderer 知道了过多 tool 细节。
 - 新增 tool 时如果不改 renderer，title 可能过粗或泄露不该展示的参数。
-- 已经有 `AgentToolResult.title` 的工具，其 title 不会被 LLM history 使用。
+- 已经有 `AgentToolResult.title / summary` 的工具，其渲染结果不会被 LLM history 使用。
 
-### 3. exec_bash 默认 title 生成顺序错误
+### 5. exec_bash 默认 title 生成顺序仍可能错误
 
 当前代码：
 
@@ -89,40 +193,76 @@
 现状：
 
 - `build_builtin_tool_result(details, command, summary)` 会先按默认 `Success` 状态生成 title。
-- 后续再 `.with_status(status)` 改成 Error 或 Success。
+- 后续再 `.with_status(status)` 改成 `Error` 或 `Success`。
 
 结果：
 
 - 失败命令可能得到 `title = "<command> => success"`，但 `status = error`。
 - 这违反了协议里 `title` 应表达命令和结果状态的要求。
 
-### 4. 部分内置 TypedTool 没有定义足够的 title / summary
+### 6. 部分 LLM-visible 工具 title / summary 仍不足
 
 已有较好实现：
 
-- `write_file`：自定义 title，包含 path、mode、bytes。
-- `edit_file`：自定义 title，包含 path、mode、命中/修改状态。
-- legacy `read_file`：自定义 title。
-- `Glob` / `Grep`：自定义 title。
+- `write_file`
+- `edit_file`
+- legacy `read_file`
+- `Glob` / `Grep`
+- todo 类工具的一部分
 
-不足的实现：
+需要继续检查和补齐：
 
-- `subscribe_event` / `unsubscribe_event`：未定义 `build_cmd_line` / `build_summary` / `build_title`，默认只会得到 `subscribe_event => success` 和 `ok`。
-- `create_worksession` / `forward_msg` / `update_session_topic` / `try_create_worksession`：未定义 title / summary，默认 title 不包含 session id、target、topic、决策结果等关键信息。
-- v2 `read`：默认 title 勉强可用，但不包含 bytes / offset / EOF 等结果摘要。
-- 部分 workspace / worklog / MCP 工具只依赖默认 title 或很粗的 summary，需要按暴露范围逐步补齐。
+- `subscribe_event` / `unsubscribe_event`
+- `create_worksession`
+- `forward_msg`
+- `update_session_topic`
+- `try_create_worksession`
+- v2 `read`
+- workspace / worklog / MCP 相关工具
 
-### 5. TypedTool 默认 summary 过于宽松
-
-`TypedTool::build_summary` 默认返回 `"ok"`。
-
-这让没有显式实现 summary 的工具看起来“协议完整”，但实际 Medium 档没有足够信息。对 LLM-visible 或用户可见工具，应该要求显式定义 summary；默认 `"ok"` 只适合内部低风险工具或测试工具。
+`TypedTool::build_summary` 默认返回 `"ok"`，这对 LLM-visible 工具太弱。默认 `"ok"` 只适合内部低风险工具或测试工具。
 
 ## 建议调整方案
 
-### 阶段一：保持兼容，扩展 Observation 携带协议结果
+### 阶段一：定义 ToolResultView，避免 crate 循环
 
-给 `Observation::Success` 增加可选协议载荷，或新增专门 variant，例如：
+在 `llm_context` 或 `buckyos-api` 增加一个协议视图类型。建议先放 `llm_context::observation`，因为目前只有 StepRenderer 消费它；如果后续 UI / WorkLog 也需要复用，再上提到 `buckyos-api`。
+
+示意：
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolResultView {
+    pub agent_tool_protocol: Option<String>,
+    pub status: ToolResultStatusView,
+
+    pub cmd_name: Option<String>,
+    pub cmd_args: Option<String>,
+
+    pub title: String,
+    pub summary: String,
+
+    pub output: Option<String>,
+    pub detail: Option<serde_json::Value>,
+
+    pub return_code: Option<i32>,
+    pub task_id: Option<String>,
+    pub partial_output: Option<String>,
+    pub pending_reason: Option<String>,
+    pub check_after: Option<u64>,
+}
+```
+
+注意：
+
+- 这个类型是渲染视图，不是业务 schema。
+- 字段语义与 `AgentToolResult` 对齐。
+- `detail` 只作为 JSON value 保存，不要求 renderer 理解业务结构。
+- serde 要使用 default / skip_serializing_if，保证旧 snapshot 没有该字段也能反序列化。
+
+### 阶段二：扩展 Observation 保留协议视图
+
+给 `Observation` 增加可选协议载荷：
 
 ```rust
 Success {
@@ -130,69 +270,96 @@ Success {
     content: Value,
     bytes: usize,
     truncated: bool,
-    tool_result: Option<AgentToolResult>,
+    tool_result: Option<ToolResultView>,
+}
+
+Error {
+    call_id: String,
+    message: String,
+    tool_result: Option<ToolResultView>,
+}
+
+Pending {
+    call_id: String,
+    tool_result: Option<ToolResultView>,
 }
 ```
 
 兼容原则：
 
-- `content` 继续保留，避免一次性改动所有 renderer / 测试。
+- `content / message` 继续保留，作为旧 renderer fallback。
 - `tool_result` 存在时，renderer 优先按协议字段渲染。
-- `tool_result` 不存在时，继续走现在的 `action_command_text + content` fallback。
+- `tool_result` 不存在时，继续走现在的 `action_command_text + content/message` fallback。
 
 需要同步调整：
 
+- `src/frame/llm_context/src/observation.rs`
 - `src/frame/agent_tool/src/local_llm_context.rs::map_result_to_observation`
 - `src/frame/opendan/src/ai_runtime.rs::result_to_observation`
-- `src/frame/llm_context/src/observation.rs`
 - 相关 serde 测试和 StepRecord 测试。
 
-### 阶段二：XmlStepRenderer 优先消费 AgentToolResult
+### 阶段三：XmlStepRenderer 优先消费 ToolResultView
 
 在 `step_record.rs` 中建立统一函数：
 
 ```rust
-fn render_tool_result_for_action(action: &AiToolCall, result: &AgentToolResult, level: RenderLevel) -> (String, String)
+fn render_tool_result_for_action(
+    action: &AiToolCall,
+    result: &ToolResultView,
+    level: AgentHistoryShowLevel,
+) -> (String, String)
 ```
 
 建议规则：
 
 - Full / hot last step：
-  - title 优先 `result.title`，为空时用 `result.command_line_text()`，再 fallback 到 `Run {action_command_text(action)}`。
-  - content 优先使用 `result.render_for_last_step()` 或等价的 Full 渲染。
+  - bullet title 优先 `result.title`。
+  - title 为空时用 `cmd_name + cmd_args`。
+  - 再 fallback 到 `Run {action_command_text(action)}`。
+  - body 使用 `output` 或 `detail`；两者都为空时 fallback 到 `summary`。
 - Compact / old history：
-  - title 优先 `result.title`。
-  - content 优先 `result.summary`。
-  - summary 为空时 fallback 到 `result.render_for_level(Medium)` 或旧 content。
+  - bullet title 优先 `result.title`。
+  - body 优先 `result.summary`。
+  - summary 为空时 fallback 到 `title` 或旧 `content`。
 - Error：
-  - title 仍优先 `result.title`。
-  - content 用 `result.summary`，必要时追加 `output` 最后一行或 `return_code`。
+  - bullet title 优先 `result.title`。
+  - body 用 `summary`，必要时追加 `return_code` 或 output tail。
 - Pending：
-  - title 优先 `result.title`。
-  - content 用 `summary` + `task_id` / `pending_reason` / `check_after` 的人读描述。
+  - bullet title 优先 `result.title`。
+  - body 用 `summary + task_id / pending_reason / check_after / partial_output` 的人读描述。
 
-这样 renderer 不需要知道 `write_file`、`edit_file`、`read` 的细节；这些细节回到 tool 自己的 `build_title` / `build_summary`。
+完成后，`action_command_text` 只作为无协议载荷时的兼容 fallback，不再是主路径。
 
-### 阶段三：修复 AgentToolResult 构造顺序
+### 阶段四：对齐 StepRecord history 压缩语义
+
+当前 `render_history` 已经把 summary / inherited step / history input 合并进单条 `<<step_history>>`，这和新文档方向一致。后续需要补齐：
+
+- 文件顶部注释更新为 `step_history + hot tail` 模型。
+- compact current step 使用 `ToolResultView.summary`。
+- inherited step 使用 `ToolResultView.summary/title`，避免塞完整 detail。
+- `HistoryInputRecord` 合并到 `step_history` 末尾的行为写入测试，保障 behavior init / history input 时间顺序连续。
+- `history_summary` 与 `step_record` 同处 `<<step_history>>` 的测试保持稳定。
+
+### 阶段五：修复 AgentToolResult 构造顺序
 
 修复 `exec_bash`：
 
 - 先构造 result。
-- 设置 `status` / `return_code`。
+- 设置 `status / return_code / output`。
 - 最后生成或刷新默认 title。
 
 可选做法：
 
-- 增加 `AgentToolResult::ensure_title()`。
+- 增加 `AgentToolResult::refresh_default_title()`。
 - 或修改 `with_status()`：当 title 为空或是默认生成 title 时重新推导。
 - 更稳妥的是在 `llm_bash.rs` 里显式设置 title，避免影响其它调用者。
 
 需要测试：
 
-- `exec_bash` 成功 title 为 `<command> => success`。
-- `exec_bash` 失败 title 为 `<command> => error` 或 `<command> => failed (exit=N)`，不能是 success。
+- `exec_bash` 成功 title 为 `<command> => success` 或等价成功状态。
+- `exec_bash` 失败 title 为 `<command> => error` / `<command> => failed (exit=N)`，不能是 success。
 
-### 阶段四：补齐 LLM-visible 内置工具 title / summary
+### 阶段六：补齐 LLM-visible 内置工具 title / summary
 
 优先级建议：
 
@@ -225,31 +392,35 @@ fn render_tool_result_for_action(action: &AiToolCall, result: &AgentToolResult, 
    - title：`read <uri> => read <bytes> bytes`，EOF 时可加 `(EOF)`。
    - summary：沿用现有 bytes/offset/total/eof 信息。
 
-### 阶段五：收紧工具开发规范和测试
+### 阶段七：收紧工具开发规范和测试
 
 建议增加测试或 lint 风格用例：
 
-- LLM-visible TypedTool 不允许只使用默认 `"ok"` summary。
-- action result render 有 `tool_result` 时必须使用 `AgentToolResult.title`。
+- `Observation` serde 兼容旧 snapshot。
+- action result 有 `tool_result` 时，hot step 使用 `ToolResultView.title` 和 `output/detail`。
+- compact history 使用 `ToolResultView.summary`。
+- inherited step 不渲染完整 `detail`。
+- pending result 保留 `task_id / pending_reason / check_after / partial_output`。
 - `write_file` 的 rendered content 不包含输入 `content`。
-- `edit_file` 的 rendered title/content 不包含完整 `new_content`，只显示 diff / summary。
-- Full 渲染使用 `cmd_name + cmd_args + output/detail`。
-- Medium 渲染使用 `summary`。
-- Min 渲染使用 `title`。
+- `edit_file` 的 rendered title/body 不包含完整 `new_content`，只显示 diff / summary。
+- `exec_bash` 失败 title 不再显示 success。
+- LLM-visible TypedTool 不允许只使用默认 `"ok"` summary。
 
 ## 风险和注意事项
 
-- `Observation` 是序列化结构，增加字段要保持 serde 兼容，旧记录没有 `tool_result` 时应能正常反序列化。
-- `AgentToolResult.detail` 可能很大，直接塞进 StepRecord 会增加历史体积；需要依赖现有分级渲染和截断策略。
-- 有些工具当前把同一份主结果同时放进 `output` 和 `detail`，需要逐步对齐文档，避免 Full 渲染重复。
-- `cmd_args` 按协议可以保留完整原始命令表达，但写入类工具的完整 content 可能很大；历史 Full 展示要允许全局硬裁剪。
-- `title` / `summary` 是人读字段，不要让 Runtime 逻辑从中 parse 状态。
+- `Observation` 是序列化结构，新增字段必须 serde 兼容。
+- `AgentToolResult.detail` 可能很大，hot step Full 展示必须依赖现有截断策略和全局 token budget。
+- `ToolResultView` 放在 `llm_context` 可以避免 crate 循环，但如果后续 WorkLog / UI 也需要消费，可能要上提到 `buckyos-api`。
+- `cmd_args` 按协议可以保留完整原始命令表达，但写入类工具的完整 content 可能很大；Full 展示要允许硬裁剪。
+- `title / summary` 是人读字段，不要让 Runtime 逻辑从中 parse 状态。
+- 新旧 fallback 会并存一段时间，测试要覆盖有 `tool_result` 和无 `tool_result` 两条路径。
 
 ## 建议落地顺序
 
-1. 修复 `exec_bash` title 状态错误。
-2. 扩展 `Observation` 保留 `AgentToolResult`，先不改变旧 fallback。
+1. 定义 `ToolResultView`，扩展 `Observation`，保证 serde 兼容。
+2. 在 `local_llm_context.rs` 和 `ai_runtime.rs` 把 `AgentToolResult` 映射进 `ToolResultView`。
 3. 调整 `XmlStepRenderer`：有 `tool_result` 时优先按协议渲染。
-4. 补齐 event / worksession / read 等 LLM-visible 工具的 `build_cmd_line` / `build_summary` / `build_title`。
-5. 增加协议级单元测试，覆盖 Min / Medium / Full 字段选择。
-6. 回头清理 renderer 中对具体 tool 的特殊 title 逻辑，只保留兼容 fallback。
+4. 更新 `step_record.rs` 文件注释和 StepRecord 渲染测试，锁定 `step_history + hot tail` 结构。
+5. 修复 `exec_bash` title 状态错误。
+6. 补齐 event / worksession / read 等 LLM-visible 工具的 `build_cmd_line / build_summary / build_title`。
+7. 增加协议级测试，覆盖 hot Full、compact Medium、inherited Min/Medium、pending、error、旧 fallback。

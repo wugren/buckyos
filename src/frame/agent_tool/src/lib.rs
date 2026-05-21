@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use async_trait::async_trait;
 use buckyos_api::AiToolCall;
+use llm_context::{ToolResultStatusView, ToolResultView};
 use log::{info, warn};
 use schemars::JsonSchema;
 use serde::ser::SerializeSeq;
@@ -643,6 +644,40 @@ impl AgentToolResult {
                 None => cmd_name.clone(),
             }
         })
+    }
+
+    pub fn to_tool_result_view(&self) -> ToolResultView {
+        ToolResultView {
+            agent_tool_protocol: Some(self.agent_tool_protocol.clone()),
+            status: match self.status {
+                AgentToolStatus::Success => ToolResultStatusView::Success,
+                AgentToolStatus::Error => ToolResultStatusView::Error,
+                AgentToolStatus::Pending => ToolResultStatusView::Pending,
+            },
+            cmd_name: self.cmd_name.clone(),
+            cmd_args: self.cmd_args.clone(),
+            title: self.title.clone(),
+            summary: self.summary.clone(),
+            output: self.output.clone(),
+            detail: match &self.details {
+                Json::Null => None,
+                Json::Object(map) if map.is_empty() => None,
+                value => Some(value.clone()),
+            },
+            return_code: self.return_code,
+            task_id: self.task_id.clone(),
+            partial_output: self.partial_output.clone(),
+            pending_reason: self
+                .pending_reason
+                .map(history_pending_reason_label)
+                .map(str::to_string),
+            check_after: self.check_after,
+        }
+    }
+
+    pub fn refresh_default_title(mut self) -> Self {
+        self.title = derive_default_title(&self);
+        self
     }
 
     fn render_protocol_result_for_level(&self, level: AgentHistoryShowLevel) -> String {
@@ -1301,6 +1336,28 @@ impl TypedTool for CreateWorkspaceTool {
         ))
     }
 
+    fn build_summary(&self, output: &Self::Output) -> String {
+        let workspace = output
+            .get("workspace_id")
+            .or_else(|| output.pointer("/workspace/workspace_id"))
+            .or_else(|| output.get("id"))
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace");
+        format!("created workspace {workspace}")
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        let workspace = output
+            .get("workspace_id")
+            .or_else(|| output.pointer("/workspace/workspace_id"))
+            .or_else(|| output.get("id"))
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace");
+        Some(format!("{TOOL_CREATE_WORKSPACE} {workspace} => created"))
+    }
+
     async fn execute(
         &self,
         ctx: &ToolCtx<'_>,
@@ -1398,8 +1455,22 @@ impl TypedTool for BindExternalWorkspaceTool {
         Some(out)
     }
 
-    fn build_summary(&self, _output: &Self::Output) -> String {
-        "ok".to_string()
+    fn build_summary(&self, output: &Self::Output) -> String {
+        let name = output
+            .pointer("/binding/name")
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("external workspace");
+        format!("bound external workspace {name}")
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        let name = output
+            .pointer("/binding/name")
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("external workspace");
+        Some(format!("{TOOL_BIND_EXTERNAL_WORKSPACE} {name} => bound"))
     }
 
     async fn execute(
@@ -1577,6 +1648,30 @@ impl TypedTool for BindWorkspaceTool {
 
     fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
         Some(format!("{TOOL_BIND_WORKSPACE} {}", args.workspace.trim()))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        let workspace = output
+            .get("workspace_id")
+            .or_else(|| output.get("local_workspace_id"))
+            .or_else(|| output.pointer("/binding/local_workspace_id"))
+            .or_else(|| output.get("workspace"))
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace");
+        format!("bound session to workspace {workspace}")
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        let workspace = output
+            .get("workspace_id")
+            .or_else(|| output.get("local_workspace_id"))
+            .or_else(|| output.pointer("/binding/local_workspace_id"))
+            .or_else(|| output.get("workspace"))
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace");
+        Some(format!("{TOOL_BIND_WORKSPACE} {workspace} => bound"))
     }
 
     async fn execute(
@@ -1815,8 +1910,22 @@ impl TypedTool for MCPTool {
         Some(self.spec.name.clone())
     }
 
-    fn build_summary(&self, _output: &Self::Output) -> String {
-        "OK".to_string()
+    fn build_summary(&self, output: &Self::Output) -> String {
+        let content_count = output
+            .get("content")
+            .and_then(Json::as_array)
+            .map(|items| items.len());
+        match content_count {
+            Some(count) => format!(
+                "mcp {} completed with {count} content item(s)",
+                self.spec.name
+            ),
+            None => format!("mcp {} completed", self.spec.name),
+        }
+    }
+
+    fn build_title(&self, _output: &Self::Output) -> Option<String> {
+        Some(format!("mcp {} => success", self.spec.name))
     }
 
     async fn execute(
@@ -2706,6 +2815,29 @@ mod tests {
         assert!(full.contains("```output"));
         assert!(full.contains("line-1"));
         assert!(full.contains("line-9"));
+    }
+
+    #[test]
+    fn tool_result_view_preserves_protocol_fields() {
+        let view = AgentToolResult::from_details(json!({"rows": [1, 2]}))
+            .with_cmd_line("read file:///demo.txt")
+            .with_status(AgentToolStatus::Pending)
+            .with_result("waiting for task")
+            .with_title("read file:///demo.txt => pending")
+            .with_task_id("task-9")
+            .with_pending_reason(AgentToolPendingReason::LongRunning)
+            .with_check_after(5000)
+            .with_partial_output("partial")
+            .to_tool_result_view();
+
+        assert_eq!(view.status, ToolResultStatusView::Pending);
+        assert_eq!(view.cmd_name.as_deref(), Some("read"));
+        assert_eq!(view.summary, "waiting for task");
+        assert_eq!(view.task_id.as_deref(), Some("task-9"));
+        assert_eq!(view.pending_reason.as_deref(), Some("long_running"));
+        assert_eq!(view.check_after, Some(5000));
+        assert_eq!(view.partial_output.as_deref(), Some("partial"));
+        assert!(view.detail.is_some());
     }
 
     #[test]

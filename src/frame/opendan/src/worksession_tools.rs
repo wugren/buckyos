@@ -138,6 +138,45 @@ impl TypedTool for CreateWorksessionTool {
         CallingConventions::LLM
     }
 
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        let mut parts = vec![format!("create_worksession title={}", args.title.trim())];
+        if let Some(workspace_id) = args
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("workspace_id={workspace_id}"));
+        }
+        if let Some(behavior) = args
+            .behavior
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("behavior={behavior}"));
+        }
+        Some(parts.join(" "))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "created worksession {} titled `{}` on workspace {} ({}) with behavior {}",
+            output.session_id,
+            output.title,
+            output.workspace_id,
+            output.workspace_status,
+            output.behavior
+        )
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "create_worksession {} => created",
+            output.session_id
+        ))
+    }
+
     async fn execute(
         &self,
         _ctx: &ToolCtx<'_>,
@@ -217,6 +256,29 @@ impl TypedTool for ForwardMsgTool {
 
     fn calling(&self) -> CallingConventions {
         CallingConventions::LLM
+    }
+
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        Some(format!("forward_msg {}", args.target_worksession_id.trim()))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        if output.forwarded {
+            format!(
+                "forwarded current message to worksession {} as record {}",
+                output.target_session_id, output.record_id
+            )
+        } else {
+            format!("message not forwarded to {}", output.target_session_id)
+        }
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "forward_msg {} => {}",
+            output.target_session_id,
+            if output.forwarded { "sent" } else { "skipped" }
+        ))
     }
 
     async fn execute(
@@ -314,6 +376,28 @@ impl TypedTool for UpdateSessionTopicTool {
         CallingConventions::LLM
     }
 
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        let mut parts = vec![format!("update_session_topic topic={}", args.topic.trim())];
+        if !args.tags.is_empty() {
+            parts.push(format!("tags={}", args.tags.join(",")));
+        }
+        Some(parts.join(" "))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "updated session topic tags: +{} -{} current={}; recall={}",
+            output.tag_set_diff.added.len(),
+            output.tag_set_diff.removed.len(),
+            output.tag_set_diff.current.len(),
+            recall_status_label(&output.recall_status)
+        )
+    }
+
+    fn build_title(&self, _output: &Self::Output) -> Option<String> {
+        Some("update_session_topic => updated".to_string())
+    }
+
     async fn execute(
         &self,
         ctx: &ToolCtx<'_>,
@@ -349,6 +433,15 @@ fn map_session_topic_error(err: SessionTopicError) -> AgentToolError {
     match err {
         SessionTopicError::InvalidInput(msg) => AgentToolError::InvalidArgs(msg),
         other => AgentToolError::ExecFailed(format!("{other:#}")),
+    }
+}
+
+fn recall_status_label(status: &crate::session_topic::RecallStatus) -> String {
+    match status {
+        crate::session_topic::RecallStatus::NotTriggered => "not_triggered".to_string(),
+        crate::session_topic::RecallStatus::Mechanical { ms } => format!("mechanical({ms}ms)"),
+        crate::session_topic::RecallStatus::Llm { ms } => format!("llm({ms}ms)"),
+        crate::session_topic::RecallStatus::Failed { reason } => format!("failed({reason})"),
     }
 }
 
@@ -398,6 +491,37 @@ impl TypedTool for TryCreateWorksessionTool {
 
     fn calling(&self) -> CallingConventions {
         CallingConventions::LLM
+    }
+
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        Some(format!(
+            "try_create_worksession reason={}",
+            args.reason.trim()
+        ))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        if let Some(session_id) = json_string(output, "session_id") {
+            let workspace = json_string(output, "workspace_id").unwrap_or_else(|| "unknown".into());
+            format!("created worksession {session_id} on workspace {workspace}")
+        } else if let Some(decision) = json_string(output, "decision_text") {
+            format!(
+                "did not create worksession: {}",
+                truncate_for_prompt(&decision, 180)
+            )
+        } else {
+            "try_create_worksession completed".to_string()
+        }
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        if json_string(output, "session_id").is_some() {
+            Some("try_create_worksession => create".to_string())
+        } else if json_string(output, "decision_text").is_some() {
+            Some("try_create_worksession => skip".to_string())
+        } else {
+            Some("try_create_worksession => completed".to_string())
+        }
     }
 
     async fn execute(
@@ -499,6 +623,15 @@ impl TypedTool for TryCreateWorksessionTool {
             }),
         })
     }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Register non-CLI session tools on `manager`. Idempotent —

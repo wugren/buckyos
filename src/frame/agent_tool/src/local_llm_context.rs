@@ -1272,6 +1272,7 @@ impl ToolManager for LocalDirToolManager {
             Err(e) => Observation::Error {
                 call_id,
                 message: e.to_string(),
+                tool_result: None,
             },
         }
     }
@@ -1289,15 +1290,10 @@ impl ToolManager for LocalDirToolManager {
     }
 }
 
-/// 三态映射:
-/// - `Success` → `Observation::Success`,`content` = `output` 字符串(协议最小形态);
-///   `output` 缺失时回落到 `summary`,让 write/edit 这类不写 output 的工具仍有可读结果。
-///   `details` / `title` / `cmd_args` 等元数据留给 UI 和 worklog,不进 LLM 历史,
-///   这样上层 [`AgentToolResult::render_for_level`] 才有空间做分级压缩。
-/// - `Error`   → `Observation::Error`,`message` 优先 `summary`,fallback `output`;
-/// - `Pending` → `Observation::Pending`(由 ToolPolicy.allow_deferred 决定是否合法,
-///   不在这里 gate)。
+/// 三态映射：旧 `content/message` 继续保留为 provider tool-result fallback，
+/// 结构化 `tool_result` 则给 StepRecord renderer 做 Full/Medium/Min 分级渲染。
 fn map_result_to_observation(call_id: String, result: AgentToolResult) -> Observation {
+    let tool_result = Some(result.to_tool_result_view());
     match result.status {
         AgentToolStatus::Success => {
             let text = result
@@ -1311,6 +1307,7 @@ fn map_result_to_observation(call_id: String, result: AgentToolResult) -> Observ
                 content: serde_json::Value::String(text),
                 bytes,
                 truncated: false,
+                tool_result,
             }
         }
         AgentToolStatus::Error => {
@@ -1326,9 +1323,16 @@ fn map_result_to_observation(call_id: String, result: AgentToolResult) -> Observ
             } else {
                 "tool error".to_string()
             };
-            Observation::Error { call_id, message }
+            Observation::Error {
+                call_id,
+                message,
+                tool_result,
+            }
         }
-        AgentToolStatus::Pending => Observation::Pending { call_id },
+        AgentToolStatus::Pending => Observation::Pending {
+            call_id,
+            tool_result,
+        },
     }
 }
 

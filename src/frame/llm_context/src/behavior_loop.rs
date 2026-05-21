@@ -175,6 +175,7 @@ impl StepRecord {
             action_results: vec![Observation::Error {
                 call_id: String::new(),
                 message,
+                tool_result: None,
             }],
         }
     }
