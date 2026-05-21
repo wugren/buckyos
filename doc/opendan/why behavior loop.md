@@ -182,19 +182,19 @@ Behavior Loop 的下一轮输入不是简单 append chat transcript,而是由 re
 
 ```text
 system: current behavior objective + process rules + action view + result protocol
-optional user: real user/event input with background environment
 optional user: <<step_history>> ... <</step_history>>
 assistant: current behavior hot step intent
 user:      current behavior hot step action results
 assistant: current behavior hot step intent
 user:      current behavior hot step action results
+optional user: real user/event input with background environment, or on_switch rendered UserMessage
 ```
 
 `step_history` 是一条 user message,承载已经不该占 hot tail 的历史语义。它可以同时包含:
 
 - 跨 behavior 继承的 `<step_record>`
 - 压缩后的 `<history_summary>`
-- runtime 生成的 `<history_input>`,例如 `on_switch` 和 fork join handoff
+- runtime 生成的 `<history_input>`,例如 fork join handoff
 
 示例:
 
@@ -211,11 +211,22 @@ Created T01.
 ```
 </actions>
 </step_record>
-<history_input source="opendan:on_switch" at_ms="...">Continue TASK_ANCHOR.</history_input>
 <</step_history>>
 ````
 
-这个例子里的 `Continue TASK_ANCHOR.` 不是一条裸 user turn。它是 runtime 根据目标 behavior 的 `on_switch` 模板生成的 handoff input,必须合并在 `step_history` 里,并且排在触发它的历史 StepRecord 后面。这样模型看到的是一段连续的、可解释的状态机历史,而不是两个用户消息突然相邻。
+`on_switch` 模板渲染出的内容是一条 synthetic UserMessage,它不属于 `step_history`。正确顺序是先渲染已经发生的 `step_history`,再追加 `on_switch` 渲染出的 UserMessage:
+
+```text
+user:
+<<step_history>>
+...
+<</step_history>>
+
+user:
+UserMessage rendered from on_switch
+```
+
+核心语义是:沉淀的 StepRecord 历史比 on_switch 触发出的 UserMessage 更早发生。
 
 完整 step 仍然渲染为严格相邻的 hot pair:
 
@@ -248,10 +259,10 @@ compression_level
 
 - 真实用户/peer message:作为本轮 user turn 进入 request tail,可附带 background environment。
 - 业务 event:格式化为 user-visible wakeup,驱动本轮推理。
-- `on_switch`:渲染为 `HistoryInputRecord`,进入 `step_history`。
+- `on_switch`:渲染为 synthetic UserMessage,排在 `step_history` 后面。
 - fork child `END`:恢复 parent snapshot 后,把 child report / join marker 渲染为 `HistoryInputRecord`,进入 parent 的 `step_history`。
 
-这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;而 `on_switch` / fork join 是 Runtime 对状态机边界的解释,应该归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
+这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;`on_switch` 是 Runtime 在 behavior 边界生成的新 UserMessage,也应该在沉淀历史之后出现;fork join 是 Runtime 对已完成子过程的解释,仍归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
 
 
 ## 收束

@@ -186,7 +186,7 @@ fn append_turn_message_promotes_current_behavior_step_as_hot_tail() {
 }
 
 #[test]
-fn append_history_input_preserves_steps_without_user_tail() {
+fn append_process_end_history_input_preserves_steps_without_user_tail() {
     let request = LLMContextRequest {
         owner: ContextOwnerRef::Agent {
             session_id: "s-1".to_string(),
@@ -225,7 +225,7 @@ fn append_history_input_preserves_steps_without_user_tail() {
         snapshot,
         None,
         vec![HistoryInputRecord {
-            source: "opendan:on_switch".to_string(),
+            source: "system".to_string(),
             text: "Continue TASK_ANCHOR.".to_string(),
             at_ms: 42,
         }],
@@ -238,6 +238,62 @@ fn append_history_input_preserves_steps_without_user_tail() {
     assert_eq!(out.state.history_inputs.len(), 1);
     assert_eq!(out.state.history_inputs[0].text, "Continue TASK_ANCHOR.");
     assert!(out.state.last_step.is_none());
+}
+
+#[test]
+fn append_on_switch_message_after_step_history_as_user_tail() {
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        thought: Some("planned todos".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 1;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        Some(AiMessage::text(AiRole::User, "Continue TASK_ANCHOR.")),
+        Vec::new(),
+        "new-trace",
+        true,
+    );
+
+    assert_eq!(out.state.history_inputs.len(), 0);
+    assert_eq!(out.state.steps.len(), 1);
+    assert_eq!(out.state.accumulated.len(), out.request.input.len() + 1);
+    assert_eq!(
+        out.state.accumulated.last().map(|msg| msg.text_content()),
+        Some("Continue TASK_ANCHOR.".to_string())
+    );
+    assert!(out.state.last_step.is_none());
+    assert!(is_runtime_auto_user_pending("opendan:on_switch"));
+    assert!(!is_history_input_pending("on-switch-s-1-do-0"));
 }
 
 #[test]

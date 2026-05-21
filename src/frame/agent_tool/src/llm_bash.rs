@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -23,8 +23,8 @@ use tokio::time::{timeout as tokio_timeout, Duration};
 use crate::path_utils::{normalize_abs_path, resolve_path_under_root, to_abs_path};
 use crate::tool::CallingConventions;
 use crate::{
-    build_builtin_tool_result, AgentTool, AgentToolError, AgentToolManager, AgentToolResult,
-    AgentToolStatus, SessionRuntimeContext, ToolSpec,
+    build_builtin_tool_result, AgentTool, AgentToolError, AgentToolResult, AgentToolStatus,
+    SessionRuntimeContext, ToolSpec,
 };
 
 pub const TOOL_EXEC_BASH: &str = "exec_bash";
@@ -400,7 +400,6 @@ impl BashRunner for LocalProcessBashRunner {
 pub struct ExecBashTool {
     config: LlmBashConfig,
     runner: Arc<dyn BashRunner>,
-    tool_manager: Option<Weak<AgentToolManager>>,
 }
 
 impl ExecBashTool {
@@ -408,21 +407,11 @@ impl ExecBashTool {
         Self {
             config,
             runner: Arc::new(LocalProcessBashRunner::new()),
-            tool_manager: None,
         }
     }
 
     pub fn with_runner(config: LlmBashConfig, runner: Arc<dyn BashRunner>) -> Self {
-        Self {
-            config,
-            runner,
-            tool_manager: None,
-        }
-    }
-
-    pub fn with_tool_manager(mut self, manager: &Arc<AgentToolManager>) -> Self {
-        self.tool_manager = Some(Arc::downgrade(manager));
-        self
+        Self { config, runner }
     }
 
     pub fn local_workspace(workspace: impl Into<PathBuf>) -> Self {
@@ -522,7 +511,7 @@ impl ExecBashTool {
         command: &str,
         output: &BashRunOutput,
     ) -> Option<AgentToolResult> {
-        if !self.command_is_registered_simple_agent_tool(command) {
+        if !command_is_simple_for_protocol_forward(command) {
             return None;
         }
 
@@ -550,28 +539,15 @@ impl ExecBashTool {
 
         Some(result)
     }
+}
 
-    fn command_is_registered_simple_agent_tool(&self, command: &str) -> bool {
-        let Some(manager) = self.tool_manager.as_ref().and_then(Weak::upgrade) else {
-            return false;
-        };
-        if command_has_shell_operator(command) {
-            return false;
-        }
-        let Ok(tokens) = crate::tokenize_bash_command_line(command) else {
-            return false;
-        };
-        let Some(first) = tokens.first().map(String::as_str) else {
-            return false;
-        };
-        if manager.get_bash_cmd(first).is_some() {
-            return true;
-        }
-        first == "agent_tool"
-            && tokens
-                .get(1)
-                .map_or(false, |tool_name| manager.get_bash_cmd(tool_name).is_some())
+fn command_is_simple_for_protocol_forward(command: &str) -> bool {
+    if command_has_shell_operator(command) {
+        return false;
     }
+    crate::tokenize_bash_command_line(command)
+        .map(|tokens| !tokens.is_empty())
+        .unwrap_or(false)
 }
 
 fn command_has_shell_operator(command: &str) -> bool {
@@ -745,35 +721,6 @@ mod tests {
     use crate::AgentToolPendingReason;
     use tempfile::tempdir;
 
-    struct StubBashTool {
-        name: &'static str,
-    }
-
-    #[async_trait]
-    impl AgentTool for StubBashTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: self.name.to_string(),
-                description: "stub bash tool".to_string(),
-                args_schema: json!({ "type": "object" }),
-                output_schema: json!({ "type": "object" }),
-                usage: None,
-            }
-        }
-
-        fn calling(&self) -> CallingConventions {
-            CallingConventions::BASH
-        }
-
-        async fn call(
-            &self,
-            _ctx: &SessionRuntimeContext,
-            _args: Json,
-        ) -> Result<AgentToolResult, AgentToolError> {
-            Ok(AgentToolResult::from_details(json!({})))
-        }
-    }
-
     fn ctx() -> SessionRuntimeContext {
         SessionRuntimeContext {
             trace_id: "t".into(),
@@ -806,19 +753,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn exec_bash_with_registered_stub(
-        workspace: PathBuf,
-        bin_dir: PathBuf,
-        tool_name: &'static str,
-    ) -> (Arc<AgentToolManager>, ExecBashTool) {
-        let manager = Arc::new(AgentToolManager::new());
-        manager
-            .register_tool(StubBashTool { name: tool_name })
-            .expect("register stub");
+    fn exec_bash_with_overlay(workspace: PathBuf, bin_dir: PathBuf) -> ExecBashTool {
         let cfg = LlmBashConfig::local_workspace(workspace)
             .with_overlay(BinOverlayConfig::local(bin_dir));
-        let tool = ExecBashTool::new(cfg).with_tool_manager(&manager);
-        (manager, tool)
+        ExecBashTool::new(cfg)
     }
 
     #[tokio::test]
@@ -900,7 +838,7 @@ mod tests {
             r#"{"agent_tool_protocol":"1","status":"success","cmd_name":"fake_tool","detail":{"x":1}}"#,
             0,
         );
-        let (_manager, tool) = exec_bash_with_registered_stub(workspace, bin_dir, "fake_tool");
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
 
         let result = tool
             .call(&ctx(), json!({ "command": "fake_tool arg1" }))
@@ -924,7 +862,7 @@ mod tests {
             r#"{"agent_tool_protocol":"1","status":"pending","cmd_name":"fake_tool","task_id":"42","pending_reason":"long_running","check_after":3,"detail":{"queued":true}}"#,
             0,
         );
-        let (_manager, tool) = exec_bash_with_registered_stub(workspace, bin_dir, "fake_tool");
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
 
         let result = tool
             .call(&ctx(), json!({ "command": "fake_tool start" }))
@@ -943,15 +881,34 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn plain_bash_stdout_is_not_forwarded() {
+    async fn plain_bash_protocol_stdout_is_forwarded() {
         let (_dir, workspace) = ws();
-        let manager = Arc::new(AgentToolManager::new());
-        let tool = ExecBashTool::local_workspace(workspace).with_tool_manager(&manager);
+        let tool = ExecBashTool::local_workspace(workspace);
 
         let result = tool
             .call(
                 &ctx(),
-                json!({ "command": "echo '{\"agent_tool_protocol\":\"1\",\"status\":\"success\"}'" }),
+                json!({ "command": "echo '{\"agent_tool_protocol\":\"1\",\"status\":\"success\",\"cmd_name\":\"echo_protocol\",\"detail\":{\"x\":1}}'" }),
+            )
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.status, AgentToolStatus::Success);
+        assert_eq!(result.cmd_name.as_deref(), Some("echo_protocol"));
+        assert_eq!(result.details["x"], 1);
+        assert_eq!(result.output, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn plain_bash_non_protocol_json_is_not_forwarded() {
+        let (_dir, workspace) = ws();
+        let tool = ExecBashTool::local_workspace(workspace);
+
+        let result = tool
+            .call(
+                &ctx(),
+                json!({ "command": "echo '{\"status\":\"success\"}'" }),
             )
             .await
             .expect("call ok");
@@ -959,13 +916,12 @@ mod tests {
         assert_eq!(result.cmd_name.as_deref(), Some("exec_bash"));
         assert_eq!(
             result.details["stdout"].as_str().unwrap().trim(),
-            r#"{"agent_tool_protocol":"1","status":"success"}"#
+            r#"{"status":"success"}"#
         );
-        assert!(result
-            .output
-            .as_deref()
-            .unwrap_or_default()
-            .contains("agent_tool_protocol"));
+        assert_eq!(
+            result.output.as_deref().unwrap_or_default().trim(),
+            r#"{"status":"success"}"#
+        );
     }
 
     #[tokio::test]
@@ -979,7 +935,7 @@ mod tests {
             r#"{"agent_tool_protocol":"1","status":"success","cmd_name":"fake_tool","detail":{"x":1}}"#,
             0,
         );
-        let (_manager, tool) = exec_bash_with_registered_stub(workspace, bin_dir, "fake_tool");
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
 
         let result = tool
             .call(&ctx(), json!({ "command": "fake_tool args | cat" }))
@@ -1006,7 +962,7 @@ mod tests {
             r#"{"agent_tool_protocol":"1","status":"error","cmd_name":"fake_tool","detail":{"failed":true}}"#,
             1,
         );
-        let (_manager, tool) = exec_bash_with_registered_stub(workspace, bin_dir, "fake_tool");
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
 
         let result = tool
             .call(&ctx(), json!({ "command": "fake_tool fail" }))

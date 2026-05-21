@@ -736,7 +736,7 @@ impl AgentSession {
                         system_events: Vec::new(),
                     };
                     let round_result = self
-                        .run_one_round(bootstrap_messages, Vec::new(), Some(seed))
+                        .run_one_round(bootstrap_messages, Vec::new(), Some(seed), false)
                         .await;
                     self.mark_bootstrap_done().await;
                     match round_result {
@@ -887,20 +887,22 @@ impl AgentSession {
                         let message = pending_msg_ai_message(ai_message);
                         if ai_message_has_payload(&message) {
                             let preview_text = pending_msg_preview(text, &message);
-                            if first_msg_preview.is_none() {
-                                first_msg_preview = Some(trigger_preview(&preview_text));
-                            }
-                            if is_history_input_pending(from, record_id) {
+                            if is_history_input_pending(record_id) {
                                 history_inputs.push(HistoryInputRecord {
                                     source: from.clone(),
                                     text: message.text_content().trim().to_string(),
                                     at_ms: now_ms(),
                                 });
                             } else if !preview_text.trim().is_empty() {
-                                latest_origin_msg = Some(preview_text);
+                                if !is_runtime_auto_user_pending(from) {
+                                    if first_msg_preview.is_none() {
+                                        first_msg_preview = Some(trigger_preview(&preview_text));
+                                    }
+                                    latest_origin_msg = Some(preview_text);
+                                    hist_user_messages.push(message.clone());
+                                    msg_count += 1;
+                                }
                                 turn_messages.push(message.clone());
-                                hist_user_messages.push(message);
-                                msg_count += 1;
                             }
                         }
                         if let Some(did) = from_did.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -1119,7 +1121,12 @@ impl AgentSession {
                 system_events: hist_system_events,
             };
             let round_result = self
-                .run_one_round(round_inputs, history_inputs, Some(seed))
+                .run_one_round(
+                    round_inputs,
+                    history_inputs,
+                    Some(seed),
+                    msg_count > 0 || event_count > 0,
+                )
                 .await;
             match round_result {
                 Ok(action) => {
@@ -1847,6 +1854,7 @@ impl AgentSession {
         turn_messages: Vec<AiMessage>,
         history_inputs: Vec<HistoryInputRecord>,
         seed: Option<RoundSeed>,
+        inject_background_environment: bool,
     ) -> Result<NextAction> {
         let behavior = self.load_current_behavior().await?;
         let mode = self.history_mode_for(&behavior);
@@ -1885,6 +1893,7 @@ impl AgentSession {
                 history_inputs,
                 &trace_id,
                 &in_flight_input_keys,
+                inject_background_environment,
             )
             .await?;
         let mut ctx = match ctx_owner {
@@ -2101,6 +2110,7 @@ impl AgentSession {
         history_inputs: Vec<HistoryInputRecord>,
         trace_id: &str,
         in_flight_input_keys: &[String],
+        inject_background_environment: bool,
     ) -> Result<(
         BuiltContext,
         LLMContextRequest,
@@ -2148,7 +2158,7 @@ impl AgentSession {
         // System and don't need env either.
         let turn_message = compose_turn_message(
             turn_messages,
-            if self.session_class_inject_background_environment() {
+            if inject_background_environment && self.session_class_inject_background_environment() {
                 self.compose_environment_message(behavior).await
             } else {
                 None
@@ -3755,8 +3765,12 @@ fn append_turn_message_to_snapshot(
     snapshot
 }
 
-fn is_history_input_pending(from: &str, record_id: &str) -> bool {
-    from == "opendan:on_switch" || record_id.starts_with("process-end:")
+fn is_runtime_auto_user_pending(from: &str) -> bool {
+    from == "opendan:on_switch"
+}
+
+fn is_history_input_pending(record_id: &str) -> bool {
+    record_id.starts_with("process-end:")
 }
 
 fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {

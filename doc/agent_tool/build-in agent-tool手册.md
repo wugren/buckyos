@@ -118,9 +118,9 @@ JSON 调度形态：
 
 失败时 `status=error` / `return_code` 非零；超时 / `max_output_bytes` 命中时 `output_truncated=true`。
 
-#### B) 内层是内置 AgentTool
+#### B) 内层输出 AgentToolResult envelope
 
-当 `command` 指向的是 Session Exec Bin 中的 AgentTool 链接（`read_file` / `todo` / `Glob` / `Grep` …），内层命令自己在 stdout 输出合法 `agent_tool_protocol` envelope。按协议契约（见 [agent_tool_result_protocol.md](agent_tool_result_protocol.md) `exec_bash 约定` 节）：
+当内层命令自己在 stdout 输出合法 `agent_tool_protocol` envelope 时（典型来源是 Session Exec Bin 中的 AgentTool 链接，如 `read_file` / `todo` / `Glob` / `Grep` …），按协议契约（见 [agent_tool_result_protocol.md](agent_tool_result_protocol.md) `exec_bash 约定` 节）：
 
 - `exec_bash` 应把内层 stdout 上的合法 envelope **透传**为本次 `AgentToolResult`
 - 此时 `cmd_name` / `cmd_args` / `detail` 由内层工具决定，不再是 `exec_bash`
@@ -139,7 +139,7 @@ JSON 调度形态：
 }
 ```
 
-> 普通 bash 的 stdout 即使碰巧长得像 JSON，也不会被当作 AgentToolResult；透传只在内层是已登记的内置 AgentTool 命令时才允许。
+> 普通 bash 的 stdout 即使碰巧长得像 JSON，也不会被当作 AgentToolResult；透传依赖 stdout 是带合法 `agent_tool_protocol` 的 envelope。
 
 ---
 
