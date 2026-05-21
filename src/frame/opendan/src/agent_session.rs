@@ -3113,23 +3113,33 @@ impl AgentSession {
             self.discard_snapshot();
         }
 
-        let marker_text = if parent_frame.fork {
+        let on_switch_text = if parent_frame.fork {
             match self.agent_config.load_behavior(&parent_frame.current) {
-                Ok(parent_cfg) => self
-                    .render_on_switch_input_text(
+                Ok(parent_cfg) => {
+                    self.render_on_switch_input_text(
                         child_entry.as_str(),
                         &parent_cfg,
                         Some(child_report.as_str()),
                     )
                     .await
-                    .unwrap_or_else(|| fork_child_end_marker(&child_entry, &child_report)),
+                }
                 Err(err) => {
                     warn!(
                         "opendan.session[{}]: load parent behavior `{}` after fork pop failed: {err:#}",
                         self.session_id, parent_frame.current
                     );
-                    fork_child_end_marker(&child_entry, &child_report)
+                    None
                 }
+            }
+        } else {
+            None
+        };
+
+        let marker_text = if parent_frame.fork {
+            if on_switch_text.is_some() {
+                format!("[fork process `{}` ended]", child_entry)
+            } else {
+                fork_child_end_marker(&child_entry, &child_report)
             }
         } else {
             format!("[independent process `{}` ended]", child_entry)
@@ -3156,6 +3166,29 @@ impl AgentSession {
                 "opendan.session[{}]: enqueue end-marker after pop failed: {err:#}",
                 self.session_id
             );
+        }
+        if let Some(text) = on_switch_text {
+            let seq = self
+                .trace_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let on_switch = PendingInput::Msg {
+                record_id: format!(
+                    "on-switch-{}-{}-{}",
+                    self.session_id, parent_frame.current, seq
+                ),
+                from: "opendan:on_switch".to_string(),
+                from_did: None,
+                from_name: Some("on_switch".to_string()),
+                tunnel_did: None,
+                text: text.clone(),
+                ai_message: AiMessage::text(AiRole::User, text),
+            };
+            if let Err(err) = self.enqueue_pending(on_switch).await {
+                warn!(
+                    "opendan.session[{}]: enqueue on_switch after fork pop failed: {err:#}",
+                    self.session_id
+                );
+            }
         }
         Ok(NextAction::Idle)
     }
