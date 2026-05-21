@@ -173,6 +173,12 @@ pub struct SessionSummary {
 pub struct ProcessFrame {
     pub entry: String,
     pub current: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fork: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

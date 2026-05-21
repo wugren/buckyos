@@ -477,7 +477,7 @@ async fn behavior_loop_assigns_step_metadata() {
 }
 
 #[tokio::test]
-async fn behavior_turn_tail_renders_after_hot_step_and_clears_after_inference() {
+async fn behavior_turn_tail_renders_after_inherited_steps_and_clears_after_inference() {
     let llm = Arc::new(RecordingLlm::new(text_response(
         "<response><thinking>start do</thinking><next_behavior>END</next_behavior></response>",
     )));
@@ -496,7 +496,7 @@ async fn behavior_turn_tail_renders_after_hot_step_and_clears_after_inference() 
         thought: Some("created todos".into()),
         ..Default::default()
     });
-    state.last_step = Some(crate::behavior_loop::StepRecord {
+    state.steps.push(crate::behavior_loop::StepRecord {
         meta: crate::behavior_loop::StepMeta {
             behavior_name: "plan".into(),
             step_index: 1,
@@ -530,13 +530,23 @@ async fn behavior_turn_tail_renders_after_hot_step_and_clears_after_inference() 
         .iter()
         .position(|m| m.text_content().contains("Continue TASK_ANCHOR"))
         .expect("continue message");
-    let assistant_idx = messages
+    let inherited_idx = messages
         .iter()
-        .position(|m| m.text_content().contains("switch to do"))
-        .expect("hot assistant step");
+        .position(|m| {
+            m.role == AiRole::User
+                && m.text_content()
+                    .contains("<step_record behavior=\"plan\" index=\"1\"")
+        })
+        .expect("inherited plan step");
     assert!(
-        assistant_idx < continue_idx,
-        "hot assistant step must render before the turn trigger"
+        inherited_idx < continue_idx,
+        "inherited plan step must render before the turn trigger"
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|m| { m.role != AiRole::Assistant || !m.text_content().contains("switch to do") }),
+        "cross-behavior inherited steps must not render as hot assistant/user pairs"
     );
 
     let snapshot = ctx.snapshot();

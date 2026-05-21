@@ -485,9 +485,6 @@ fn render_history_actions_compact(step: &StepRecord, max_body_chars: usize) -> S
             max_body_chars,
         ));
     }
-    if step.self_report.is_some() {
-        parts.push(("Report".to_string(), "Report acknowledged.".to_string()));
-    }
     for msg in &step.messages_sent {
         parts.push((
             format!("Message sent to {}", msg.target),
@@ -698,6 +695,21 @@ mod tests {
         let text = user_text_of(&u);
         assert!(text.starts_with("<<last_step_action_results"));
         assert!(!text.contains("```output"));
+    }
+
+    #[test]
+    fn inherited_self_report_does_not_render_as_action() {
+        let renderer = XmlStepRenderer::new();
+        let mut step = StepRecord::default();
+        step.meta.behavior_name = "plan".into();
+        step.self_report = Some("checkpoint".into());
+
+        let msgs = renderer.render_history(vec![step], "do", Vec::new());
+        assert_eq!(msgs.len(), 1);
+        let inherited = plain_text(&msgs[0]);
+        assert!(inherited.contains("<actions>\nNo action.\n</actions>"));
+        assert!(!inherited.contains("Report acknowledged"));
+        assert!(!inherited.contains("- Report"));
     }
 
     #[test]

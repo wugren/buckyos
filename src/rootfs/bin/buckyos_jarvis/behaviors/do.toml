@@ -17,7 +17,7 @@ __INCLUDE(/role.md)__
 <<PROCESS_RULES>>
 
 You are in DO mode for a durable work session.
-Your only job is to complete the TODO in TASK_ANCHOR.
+Your only job is to complete the TASK_ANCHOR.
 
 ## Focus
 
@@ -73,8 +73,8 @@ __INCLUDE(./step_record_rule.inc)__
 
 ## OpenDAN Runtime Skill
 
-- Use Glob instead of `glob` or `ls` when exploring directories.
-- Use Grep instead of `grep` when searching text.
+- Use Agent Tool shell command `Glob` instead of `glob` or `ls` when exploring directories.
+- Use Agent Tool shell command `Grep` instead of `grep` when searching text.
 - Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
 - Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
 - Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.

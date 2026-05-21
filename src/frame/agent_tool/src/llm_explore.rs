@@ -69,7 +69,7 @@ Guidelines:
 - Use Glob/find for broad file pattern matching
 - Use Grep/grep for searching file contents with regex
 - Use Read when you know the specific file path you need to read
-- Use exec_bash ONLY for read-only operations: ls, git status, git log, git diff, find, cat, head, tail
+- Use exec_bash ONLY for read-only operations: Glob, Grep, read_file, ls, git status, git log, git diff, find, cat, head, tail
 - NEVER use exec_bash for mkdir, touch, rm, cp, mv, git add, git commit, npm install, pip install, or file modifications
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Communicate your final report directly as a regular message - do NOT attempt to create files

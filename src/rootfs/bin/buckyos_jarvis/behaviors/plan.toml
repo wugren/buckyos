@@ -64,8 +64,8 @@ __INCLUDE(./step_record_rule.inc)__
 <<SKILLS>>
 ## OpenDAN Runtime Skill
 
-- Use Glob instead of `glob` or `ls` when exploring directories.
-- Use Grep instead of `grep` when searching text.
+- Use Agent Tool shell command `Glob` instead of `glob` or `ls` when exploring directories.
+- Use Agent Tool shell command `Grep` instead of `grep` when searching text.
 - Agent RootFS: `{{ paths.agent_root }}`. Runtime-managed root for this Agent.
 - Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
 - Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.

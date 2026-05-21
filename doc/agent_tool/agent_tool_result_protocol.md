@@ -2,13 +2,32 @@
 
 `AgentToolResult` 是 OpenDAN AgentTool 的统一执行结果协议。
 
-它的定位是：**带 Runtime 控制语义的工具执行结果协议**。
+它的定位是：**面向 Agent Loop / StepRecord prompt 渲染，并带 Runtime 控制语义的工具执行结果协议**。
 
 它不是一个通用的 tool-to-tool 业务数据交换协议。工具之间如果需要交换稳定的业务数据，应定义各自的 typed schema、artifact reference 或专用 API；不要从 `title` / `summary` / `output` 里解析业务语义。
 
 ## 设计目标
 
-### 1. 保留关键控制语义
+### 1. 支撑 StepRecord 的分级渲染
+
+Agent Loop 在下一轮 prompt 中消费的不是孤立的工具 stdout，而是 `StepRecord`：一次 LLM intent 加上 dispatcher 执行后的 action results。
+
+`AgentToolResult` 的核心设计目标是让同一个工具结果可以按 StepRecord 所处位置稳定渲染：
+
+- hot tail / 最近 step：保留完整命令表达和完整主返回体
+- compact history：保留可独立理解的多行摘要
+- digest / list：保留一行标题
+- history summary：不再保留单个工具结果，只保留跨 step 的任务语义
+
+因此协议同时提供：
+
+- `cmd_name` / `cmd_args`：Full 渲染所需的原始命令表达
+- `output` / `detail`：Full 渲染所需的完整主返回体
+- `summary`：Medium 渲染所需的多行压缩
+- `title`：Min 渲染所需的一行压缩
+- `status` / `task_id` / `pending_reason` / `check_after` / `return_code`：Runtime 控制字段
+
+### 2. 保留关键控制语义
 
 所有工具结果都收敛到三种状态：
 
@@ -27,7 +46,7 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 
 这些字段是 Runtime 控制字段，不是 prompt 渲染字段。
 
-### 2. 保留命令原始表达
+### 3. 保留命令原始表达
 
 `cmd_name` / `cmd_args` 表示这次工具调用的命令形态。
 
@@ -42,7 +61,7 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 - prompt 渲染器仍可以因为全局 token budget 对最终文本做硬裁剪
 - `cmd_args` 是参数文本，不是 JSON 数组
 
-### 3. 明确完整返回体：`output` 或 `detail`
+### 4. 明确完整返回体：`output` 或 `detail`
 
 同一份主结果不应同时出现在 `output` 和 `detail` 中。默认情况下，一个结果只填其中一个字段作为主返回体。
 
@@ -85,9 +104,9 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 
 `return_code`、`task_id`、`partial_output` 等控制字段独立于主返回体存在，不参与 `output` / `detail` 的选择。
 
-### 4. 明确渲染压缩字段：`title` / `summary`
+### 5. 明确渲染压缩字段：`title` / `summary`
 
-和 prompt 渲染有关的字段只有：
+和 prompt/history 压缩渲染有关的专用字段是：
 
 - `title`
 - `summary`
@@ -96,7 +115,7 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 
 `summary` 是对 `cmd_name` / `cmd_args` 和结果的多行压缩。
 
-二者都是给人和 LLM 读的展示字段，不是 Runtime 控制字段，也不是机器可读业务字段。
+二者都是给人和 LLM 读的展示字段，不是 Runtime 控制字段，也不是机器可读业务字段。它们服务于 `Min` / `Medium` 压缩展示，不替代 Full 渲染中的 `cmd_name` / `cmd_args` / `output` / `detail`。
 
 推荐规则：
 
@@ -105,6 +124,152 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 - `summary` 可以重复 `title` 中的信息，不需要为了避免重叠而牺牲可读性
 - consumer 不应从 `title` / `summary` 中 parse 控制语义
 - `title` / `summary` 可以包含人类可读的状态、退出码、task id 等冗余描述，但 Runtime 判断状态时必须读取 `status` / `return_code` / `task_id` 等控制字段
+
+## StepRecord 渲染规则
+
+`AgentToolResult` 的渲染设计首先服务于 StepRecord prompt。单个工具结果的 `Min` / `Medium` / `Full` 规则只是基础；真正进入下一轮 LLM 输入时，它会被包进 StepRecord 历史结构里。
+
+当前基线实现是 `llm_context::XmlStepRenderer`。本节基于现有实现描述 StepRecord 的渲染基线，并补充目标形态。它使用 XML-like 的边界标记，但渲染文本只给 LLM 消费，不要求是标准 XML 文档。外层 root wrapper 使用 `<<tag_name>>` / `<</tag_name>>`，用于提示 LLM 这是 prompt 协议边界而不是严格 XML；内部字段只在必要位置做转义。
+
+### Message 序列
+
+一次 Behavior 推理前的理想 message 序列是：
+
+```text
+system
+user: behavior init | step_history
+assistant: hot step intent
+user: hot step action results
+assistant: hot step intent
+user: hot step action results
+```
+
+其中：
+
+- `step_history` 是一条 user message，承载已经沉淀的 StepRecord 历史。
+- hot tail 是最近若干个完整 `(assistant, user)` step pair。
+- 当 context 不够时，hot tail 中较旧的一部分会合并进 `step_history`，并在 `step_history` 内压缩或裁剪。
+- `step_history` 是可选的；Behavior 刚开始且没有历史时，可以单独给一条 behavior init user message。
+- 如果既有 `step_history` 又需要注入 behavior init，init 内容应合并到 `step_history` 末尾，保证历史在时间顺序上连续。
+
+### Full Step
+
+一个完整 step 渲染为一组严格相邻的 `(assistant, user)` message：
+
+1. `assistant` message：上一轮 LLM 原始输出，即 `step.assistant_text`。
+2. `user` message：上一轮 action 执行结果，使用 `<<last_step_action_results>>` wrapper。
+
+当前 wrapper 名称为复数：`last_step_action_results`。
+
+````text
+<<last_step_action_results behavior="<behavior_name>" step="<step_index>">>
+- AgentToolResult.title
+
+```output
+AgentToolResult.output | AgentToolResult.detail
+```
+
+- AgentToolResult.title
+
+```output
+AgentToolResult.output | AgentToolResult.detail
+```
+<</last_step_action_results>>
+````
+
+规则：
+
+- `behavior` 来自 `step.meta.behavior_name`。
+- `step` 来自 `step.meta.step_index`。
+- `step.actions[i]` 与 `step.action_results[i]` 按 index 配对渲染。
+- 如果存在未配对的 `action_results`，以 `Step result` / `Step error` 形式渲染。
+- `messages_sent` 追加渲染为 `Message sent to <target>`，body 为 `Message sent.`。
+- Full step 对应 `AgentToolResult.Full`，应展示原始命令表达和完整主返回体：`cmd_name + cmd_args + output/detail`。
+
+### Action 标题
+
+当前实现会把 action 渲染成紧凑的一行 command。后续如果 action result 已经是合法 `AgentToolResult`，标题应优先使用 `AgentToolResult.title`；否则按 action 参数降级构造。
+
+| Action | 降级标题规则 |
+| --- | --- |
+| `exec_bash` | 使用 `command` 参数，压缩空白并截断到 160 字符 |
+| `read` | `read <path-or-uri> [first_chunk=...] [range=...]` |
+| `write_file` | `write_file <path> mode=<mode>` |
+| `edit_file` | `edit_file <path> mode=<mode> [anchor="..."]` |
+| 其它 action | `<name> key=value ...`，key 排序；跳过 `content` / `new_content` / `from_user_did` |
+
+降级标题最终通常是：
+
+```text
+Run <command>
+```
+
+### Action Result Body
+
+当 action result 是合法 `AgentToolResult` 时，body 按展示级别选择：
+
+| Level | Body |
+| --- | --- |
+| `Full` | `output` 或 `detail` |
+| `Medium` | `summary` |
+| `Min` | `title` |
+
+当前实现中的 `Observation` 还不是完整的 `AgentToolResult` 展示器，因此会按 `Observation` 降级映射：
+
+| Observation | Full body |
+| --- | --- |
+| `Success` | `content` 如果是 string 则直接使用，否则 JSON stringify；空内容显示 `Success` |
+| `Error` | `Error: <message>` |
+| `Pending` | `Pending` |
+| `Cancelled` | `Cancelled: <reason>` |
+
+如果结果被截断，在 body 末尾追加：
+
+```text
+[truncated]
+```
+
+当前 full step 中 success body 仍有保护性上限，默认最多渲染 4096 字符。这个上限属于实现参数，不是协议字段。
+
+### Step History
+
+`StepRecord` 进入历史后按当前 behavior 和新旧程度分级渲染：
+
+| 场景 | 渲染形态 |
+| --- | --- |
+| 当前 behavior 的最近 step | 与 Full Step 相同 |
+| 当前 behavior 的较旧 step | 仍渲染 `(assistant, user)` pair，但 assistant text 和 action result body 会截断 |
+| 跨 behavior 继承的 step | 渲染进 `step_history`，不再作为 hot tail pair |
+| History summary | 渲染进 `step_history`，只保留跨 step 摘要语义 |
+
+`step_history` 是一条 user message，推荐外层形态：
+
+````xml
+<<step_history>>
+<step_record behavior="<behavior_name>" index="<step_index>" started_at_ms="<started_at_ms>" ended_at_ms="<ended_at_ms>" compression="<full|compact|summary>">
+<observation>...</observation>
+<thought>...</thought>
+<actions>
+- AgentToolResult.title
+
+```output
+AgentToolResult.summary | AgentToolResult.title
+```
+</actions>
+</step_record>
+<history_summary steps="<start>..<end>" count="<count>" started_at_ms="<started_at_ms>" ended_at_ms="<ended_at_ms>" behaviors="<behavior_names>">...</history_summary>
+<</step_history>>
+````
+
+较旧 step 的 compact action result 仍可以使用 `<<last_step_action_results>>` wrapper，但 body 更短：
+
+- compact history step 优先展示 `AgentToolResult.summary`。
+- inherited step record 可以展示 `summary` 或 `title`。
+- success body 截断后如果为空，显示 `Success`。
+- error / cancelled body 按 compact 上限截断。
+- pending 显示 `Pending`。
+
+跨 behavior 继承的 step 不应继续作为新 behavior 的完整 assistant/user hot tail 出现，否则新 behavior 会在错误的 system prompt 和 action view 下读取旧 intent。
 
 ## JSON 协议
 
@@ -324,9 +489,9 @@ Agent Tool 内部的完整返回。
 
 仅在 `status = pending` 时有意义。
 
-## 渲染规则
+## 单个 AgentToolResult 渲染规则
 
-协议只定义单个 `AgentToolResult` 在不同展示级别下应使用哪些字段。
+本节定义单个 `AgentToolResult` 在不同展示级别下应使用哪些字段。
 
 | Level | 使用字段 | 说明 |
 | --- | --- | --- |
@@ -482,11 +647,12 @@ Agent Tool 的推荐输出：
 
 ## 文档边界
 
-本文只定义 `AgentToolResult` 协议本身。
+本文主要定义 `AgentToolResult` 协议本身，并补充当前 `StepRecord` prompt 渲染基线。
 
 不覆盖以下内容：
 
 - 每个具体工具的 `detail` 业务字段或文本语义定义
 - TaskManager 的完整任务模型
 - WorkLog 的存储 schema
+- WorkLog 的持久化压缩策略
 - 审批流 / 安装流的上层编排策略

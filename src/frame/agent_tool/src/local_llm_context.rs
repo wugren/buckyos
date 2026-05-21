@@ -66,7 +66,7 @@
 //!   │   │   └── worklog.jsonl             ← append-only 事件流(可选,见下文)
 //!   │   └── 20260510-115422-b9e1/
 //!   │       └── ...
-//!   ├── workspace/                        ← 工具 root(read/write/edit/glob/grep + exec_bash cwd)
+//!   ├── workspace/                        ← 工具 root(read/write/edit + exec_bash cwd)
 //!   ├── bin/                              ← exec_bash PATH overlay(用户脚本投放点,chmod +x 后盖过系统 PATH)
 //!   └── .lock                             ← 进程级 flock,防止两个 OneShot 抢同一个 dir
 //! ```
@@ -1202,8 +1202,8 @@ const EXEC_BASH_MAX_TIMEOUT_MS: u64 = 120_000;
 const EXEC_BASH_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 impl LocalDirToolManager {
-    /// 构造:在 `<dir>/workspace` 上注册 ReadFile / WriteFile / EditFile /
-    /// Glob / Grep / ExecBash。`dir` 是 OneShot 根目录(由 `ensure_dir_layout`
+    /// 构造:在 `<dir>/workspace` 上注册 Read / WriteFile / EditFile /
+    /// ExecBash。`dir` 是 OneShot 根目录(由 `ensure_dir_layout`
     /// 保证 `workspace` 和 `bin` 子目录存在)。`run_id` 进
     /// `SessionRuntimeContext.trace_id` / `session_id`,让 agent_tool 的日志
     /// 能跟 OneShot run 关联。

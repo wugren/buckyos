@@ -17,6 +17,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
+use log::warn;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
 use crate::file_tools::FileToolConfig;
@@ -38,6 +40,7 @@ const DEFAULT_LIMIT_BYTES: u64 = 64 * 1024;
 /// Hard cap on a single read regardless of `limit`. 4 MiB is enough for any
 /// realistic single-shot file slice; anything bigger should paginate.
 const MAX_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+const READ_UNCHANGED_MESSAGE: &str = "和上一次read相比没有变化";
 
 #[derive(Clone, Debug)]
 pub struct ReadTool {
@@ -86,7 +89,8 @@ impl AgentTool for ReadTool {
                     "offset": {"type": "integer"},
                     "bytes_read": {"type": "integer"},
                     "total_bytes": {"type": "integer"},
-                    "eof": {"type": "boolean"}
+                    "eof": {"type": "boolean"},
+                    "unchanged": {"type": "boolean"}
                 }
             }),
             usage: Some(format!(
@@ -101,7 +105,7 @@ impl AgentTool for ReadTool {
 
     async fn call(
         &self,
-        _ctx: &SessionRuntimeContext,
+        ctx: &SessionRuntimeContext,
         args: Json,
     ) -> Result<AgentToolResult, AgentToolError> {
         let map = match args {
@@ -130,7 +134,7 @@ impl AgentTool for ReadTool {
         let target = parse_read_target(&uri)?;
         match target.scheme.as_str() {
             "file" => {
-                self.read_file_path(&target.uri, &target.path, offset, limit)
+                self.read_file_path(ctx, &target.uri, &target.path, offset, limit)
                     .await
             }
             other => Err(AgentToolError::InvalidArgs(format!(
@@ -168,6 +172,7 @@ impl ReadTool {
 
     async fn read_file_path(
         &self,
+        ctx: &SessionRuntimeContext,
         uri: &str,
         path_str: &str,
         offset: u64,
@@ -191,6 +196,44 @@ impl ReadTool {
         let total = metadata.len();
         let read_start = offset.min(total);
         let want = limit.min(total.saturating_sub(read_start));
+        let content_hash = hash_file_content(&resolved)?;
+        let read_key = ReadStateKey {
+            path: resolved.to_string_lossy().to_string(),
+            offset: read_start,
+            limit,
+        };
+        let unchanged =
+            detect_and_update_read_state(ctx.session_id.as_str(), &read_key, total, &content_hash)
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "read_tool.state_update_failed: session_id={} path={} err={}",
+                        ctx.session_id,
+                        resolved.display(),
+                        err
+                    );
+                    false
+                });
+        if unchanged {
+            let eof = read_start >= total || read_start.saturating_add(want) >= total;
+            let cmd_line = build_read_cmd_line(uri, offset, limit);
+            let details = json!({
+                "uri": uri,
+                "scheme": "file",
+                "path": resolved.to_string_lossy().to_string(),
+                "content": READ_UNCHANGED_MESSAGE,
+                "offset": read_start,
+                "bytes_read": 0u64,
+                "total_bytes": total,
+                "eof": eof,
+                "unchanged": true,
+            });
+            return Ok(
+                build_builtin_tool_result(details, cmd_line, READ_UNCHANGED_MESSAGE)
+                    .with_tool(TOOL_READ)
+                    .with_status(AgentToolStatus::Success)
+                    .with_output(READ_UNCHANGED_MESSAGE),
+            );
+        }
         let bytes_to_read = usize::try_from(want).map_err(|_| {
             AgentToolError::InvalidArgs(format!(
                 "requested read size exceeds usize on this platform: {want} bytes"
@@ -210,11 +253,7 @@ impl ReadTool {
         let actual_bytes = buf.len() as u64;
         let eof = read_start + actual_bytes >= total;
 
-        let cmd_line = if offset == 0 && limit == DEFAULT_LIMIT_BYTES {
-            format!("read {uri}")
-        } else {
-            format!("read {uri} offset={offset} limit={limit}")
-        };
+        let cmd_line = build_read_cmd_line(uri, offset, limit);
         let summary = format!(
             "read {actual_bytes} bytes at offset {read_start} of {total}{}",
             if eof { " (EOF)" } else { "" }
@@ -228,6 +267,7 @@ impl ReadTool {
             "bytes_read": actual_bytes,
             "total_bytes": total,
             "eof": eof,
+            "unchanged": false,
         });
 
         let mut result = build_builtin_tool_result(details, cmd_line, summary)
@@ -238,6 +278,102 @@ impl ReadTool {
         }
         Ok(result)
     }
+}
+
+fn build_read_cmd_line(uri: &str, offset: u64, limit: u64) -> String {
+    if offset == 0 && limit == DEFAULT_LIMIT_BYTES {
+        format!("read {uri}")
+    } else {
+        format!("read {uri} offset={offset} limit={limit}")
+    }
+}
+
+#[derive(Debug)]
+struct ReadStateKey {
+    path: String,
+    offset: u64,
+    limit: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReadStateRecord {
+    path: String,
+    offset: u64,
+    limit: u64,
+    total_bytes: u64,
+    content_hash: String,
+}
+
+fn hash_file_content(path: &Path) -> Result<String, AgentToolError> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| AgentToolError::ExecFailed(format!("open failed: {e}")))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| AgentToolError::ExecFailed(format!("read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn detect_and_update_read_state(
+    session_id: &str,
+    key: &ReadStateKey,
+    total_bytes: u64,
+    content_hash: &str,
+) -> Result<bool, AgentToolError> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Ok(false);
+    }
+    let state_path = read_state_path(session_id, key);
+    let previous = std::fs::read(&state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ReadStateRecord>(&bytes).ok());
+    let unchanged = previous.as_ref().is_some_and(|record| {
+        record.path == key.path
+            && record.offset == key.offset
+            && record.limit == key.limit
+            && record.total_bytes == total_bytes
+            && record.content_hash == content_hash
+    });
+    let record = ReadStateRecord {
+        path: key.path.clone(),
+        offset: key.offset,
+        limit: key.limit,
+        total_bytes,
+        content_hash: content_hash.to_string(),
+    };
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AgentToolError::ExecFailed(format!("create read state dir failed: {e}"))
+        })?;
+    }
+    let data = serde_json::to_vec(&record)
+        .map_err(|e| AgentToolError::ExecFailed(format!("serialize read state failed: {e}")))?;
+    let tmp_path = state_path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)
+        .map_err(|e| AgentToolError::ExecFailed(format!("write read state failed: {e}")))?;
+    std::fs::rename(&tmp_path, &state_path)
+        .map_err(|e| AgentToolError::ExecFailed(format!("rename read state failed: {e}")))?;
+    Ok(unchanged)
+}
+
+fn read_state_path(session_id: &str, key: &ReadStateKey) -> PathBuf {
+    let session_hash = blake3::hash(session_id.as_bytes()).to_hex().to_string();
+    let key_hash = blake3::hash(format!("{}:{}:{}", key.path, key.offset, key.limit).as_bytes())
+        .to_hex()
+        .to_string();
+    std::env::temp_dir()
+        .join("buckyos_agent_tool")
+        .join("read_state")
+        .join(session_hash)
+        .join(format!("{key_hash}.json"))
 }
 
 /// Pull a non-negative integer out of args. Accepts either a JSON number or
@@ -332,13 +468,17 @@ mod tests {
     use tempfile::tempdir;
 
     fn ctx() -> SessionRuntimeContext {
+        ctx_with_session("s")
+    }
+
+    fn ctx_with_session(session_id: &str) -> SessionRuntimeContext {
         SessionRuntimeContext {
             trace_id: "t".into(),
             agent_name: "a".into(),
             behavior: "b".into(),
             step_idx: 0,
             wakeup_id: "w".into(),
-            session_id: "s".into(),
+            session_id: session_id.into(),
         }
     }
 
@@ -377,6 +517,39 @@ mod tests {
             .expect("call");
         assert_eq!(res.details["scheme"], "file");
         assert_eq!(res.details["content"], "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn repeated_same_session_same_read_returns_unchanged_message() {
+        let (_dir, ws) = ws_with_file("hello.txt", b"hello world\n");
+        let tool = ReadTool::new(FileToolConfig::new(ws.clone()));
+        let args = json!({ "uri": "hello.txt" });
+        let session = ctx_with_session("repeat-read-session");
+
+        let first = tool.call(&session, args.clone()).await.expect("first read");
+        assert_eq!(first.details["content"], "hello world\n");
+        assert_eq!(first.details["unchanged"], false);
+
+        let second = tool
+            .call(&session, args.clone())
+            .await
+            .expect("second read");
+        assert_eq!(second.details["content"], READ_UNCHANGED_MESSAGE);
+        assert_eq!(second.details["unchanged"], true);
+        assert_eq!(second.output.as_deref(), Some(READ_UNCHANGED_MESSAGE));
+        assert_eq!(second.summary, READ_UNCHANGED_MESSAGE);
+
+        let other_session = tool
+            .call(&ctx_with_session("repeat-read-other-session"), args.clone())
+            .await
+            .expect("other session read");
+        assert_eq!(other_session.details["content"], "hello world\n");
+        assert_eq!(other_session.details["unchanged"], false);
+
+        fs::write(ws.join("hello.txt"), b"changed\n").expect("rewrite file");
+        let changed = tool.call(&session, args).await.expect("changed read");
+        assert_eq!(changed.details["content"], "changed\n");
+        assert_eq!(changed.details["unchanged"], false);
     }
 
     #[tokio::test]

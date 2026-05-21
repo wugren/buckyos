@@ -449,16 +449,12 @@ impl TypedTool for WriteFileTool {
     }
 
     fn build_summary(&self, output: &Self::Output) -> String {
-        build_summary_with_optional_block(
-            format!(
-                "{} {}, wrote {} bytes across {}",
-                describe_write_operation(output.operation.as_str()),
-                output.file_path,
-                output.content_len,
-                describe_line_count(output.line_count),
-            ),
-            "content",
-            &output.content_preview,
+        format!(
+            "{} {}, wrote {} bytes across {}",
+            describe_write_operation(output.operation.as_str()),
+            output.file_path,
+            output.content_len,
+            describe_line_count(output.line_count),
         )
     }
 
@@ -1623,6 +1619,29 @@ mod tests {
         assert!(cmd.contains("read_file demo.txt first_chunk=\""));
         assert!(cmd.contains(" range=1-5"));
         assert!(cmd.contains("...(total 80 lines)..."));
+    }
+
+    #[test]
+    fn write_file_summary_omits_content_block() {
+        let tool = WriteFileTool::new(
+            FileToolConfig::new("/tmp"),
+            Arc::new(NoopFileWriteAudit::default()),
+        );
+        let summary = tool.build_summary(&WriteFileOutput {
+            created: true,
+            changed: true,
+            bytes_written: 12,
+            line_count: 2,
+            file_path: "demo.txt".to_string(),
+            operation: "create".to_string(),
+            content_preview: "secret\nbody".to_string(),
+            content_len: 12,
+            bytes_after: 12,
+        });
+
+        assert_eq!(summary, "created demo.txt, wrote 12 bytes across 2 lines");
+        assert!(!summary.contains("```content"));
+        assert!(!summary.contains("secret"));
     }
 
     #[test]

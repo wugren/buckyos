@@ -596,6 +596,19 @@ mod tests {
     }
 
     #[test]
+    fn jarvis_work_session_uses_fork_switch_mode() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rootfs/bin/buckyos_jarvis");
+        let cfg = AgentConfig::open(root).unwrap();
+        let work = cfg.session_class("work").unwrap();
+        assert_eq!(work.kind, SessionKind::Work);
+        assert_eq!(work.loop_mode, LoopMode::Behavior);
+        assert_eq!(work.default_behavior, "plan");
+        assert_eq!(work.switch_mode, SwitchMode::Fork);
+        assert_eq!(work.process_stack_limit, 8);
+    }
+
+    #[test]
     fn class_name_for_kind_prefers_canonical_then_first_match() {
         let dir = tempdir().unwrap();
         std::fs::write(

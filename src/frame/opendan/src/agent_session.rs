@@ -2670,13 +2670,9 @@ impl AgentSession {
                 // apply_switch_independent (push happens under the same lock).
             }
             SwitchMode::Fork => {
-                warn!(
-                    "opendan.session[{}]: switch_mode=Fork not yet wired \
-                     (Phase 4 — treating as Normal for now)",
-                    self.session_id
-                );
-                self.apply_switch_normal(&new_cfg, final_snapshot).await?;
-                self.meta.lock().await.current_behavior = new_cfg.meta.name.clone();
+                self.apply_switch_fork(&new_cfg, final_snapshot).await?;
+                // process_entry / current_behavior already updated inside
+                // apply_switch_fork (push happens under the same lock).
             }
         }
         if let Err(err) = self.flush_meta().await {
@@ -2806,6 +2802,49 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Switch mode = Fork: parent process is suspended and the child behavior
+    /// runs as a one-shot subtask. The child inherits the parent's interpreted
+    /// step records, but starts with the child's own system prompt and hot tail.
+    /// On child `END`, the parent snapshot is restored and the child report is
+    /// handed back as the parent's next input.
+    async fn apply_switch_fork(
+        &self,
+        new_cfg: &BehaviorCfg,
+        final_snapshot: LLMContextSnapshot,
+    ) -> Result<()> {
+        let (parent_entry, parent_current) = {
+            let meta = self.meta.lock().await;
+            (meta.process_entry.clone(), meta.current_behavior.clone())
+        };
+        let parent_path = self.behavior_snap_path(&parent_entry)?;
+        self.persist_snapshot_to(&parent_path, &final_snapshot)
+            .await;
+
+        let request = self.fresh_request_for(new_cfg).await?;
+        let mut state = LLMContextState::from_request(&request, now_ms());
+        state.steps = final_snapshot.state.steps;
+        if let Some(last) = final_snapshot.state.last_step {
+            state.steps.push(last);
+        }
+        state.history_summaries = final_snapshot.state.history_summaries;
+        state.next_step_index = final_snapshot.state.next_step_index;
+
+        self.persist_snapshot(&LLMContextSnapshot { request, state })
+            .await;
+
+        {
+            let mut meta = self.meta.lock().await;
+            meta.process_stack.push(ProcessFrame {
+                entry: parent_entry,
+                current: parent_current,
+                fork: true,
+            });
+            meta.process_entry = new_cfg.meta.name.clone();
+            meta.current_behavior = new_cfg.meta.name.clone();
+        }
+        Ok(())
+    }
+
     /// Switch mode = Independent: each behavior name is its own "process"
     /// with its own step record stream. The parent's `final_snapshot` is
     /// archived to `.meta/behavior_<parent_entry>.snap`; the child resumes
@@ -2863,6 +2902,7 @@ impl AgentSession {
             meta.process_stack.push(ProcessFrame {
                 entry: parent_entry,
                 current: parent_current,
+                fork: false,
             });
             meta.process_entry = new_cfg.meta.name.clone();
             meta.current_behavior = new_cfg.meta.name.clone();
@@ -2899,10 +2939,15 @@ impl AgentSession {
             return Ok(NextAction::End);
         };
 
-        // Persist child's terminal snapshot so a future re-entry sees its
-        // full step record stream.
-        if let Ok(child_path) = self.behavior_snap_path(&child_entry) {
-            self.persist_snapshot_to(&child_path, &final_snapshot).await;
+        let child_report = final_snapshot.state.last_report.clone().unwrap_or_default();
+
+        // Independent children keep their own stream for future re-entry.
+        // Fork children are one-shot calls; only their report is returned to
+        // the parent, so their internal stream is intentionally discarded.
+        if !parent_frame.fork {
+            if let Ok(child_path) = self.behavior_snap_path(&child_entry) {
+                self.persist_snapshot_to(&child_path, &final_snapshot).await;
+            }
         }
 
         // Restore parent's snapshot to state.snap. If the file vanished
@@ -2926,9 +2971,31 @@ impl AgentSession {
             self.discard_snapshot();
         }
 
-        // Inject a marker so the parent's next turn wakes up with something
-        // resembling a user-side hand-off. Going through enqueue_pending
-        // both persists it and fires the Wakeup signal.
+        let marker_text = if parent_frame.fork {
+            match self.agent_config.load_behavior(&parent_frame.current) {
+                Ok(parent_cfg) => self
+                    .render_on_switch_input_text(
+                        child_entry.as_str(),
+                        &parent_cfg,
+                        Some(child_report.as_str()),
+                    )
+                    .await
+                    .unwrap_or_else(|| fork_child_end_marker(&child_entry, &child_report)),
+                Err(err) => {
+                    warn!(
+                        "opendan.session[{}]: load parent behavior `{}` after fork pop failed: {err:#}",
+                        self.session_id, parent_frame.current
+                    );
+                    fork_child_end_marker(&child_entry, &child_report)
+                }
+            }
+        } else {
+            format!("[independent process `{}` ended]", child_entry)
+        };
+
+        // Inject a marker so the parent's next turn wakes up with a user-side
+        // hand-off. Going through enqueue_pending both persists it and fires
+        // the Wakeup signal.
         let marker = PendingInput::Msg {
             record_id: format!(
                 "process-end:{}:{}",
@@ -2939,11 +3006,8 @@ impl AgentSession {
             from_did: None,
             from_name: Some("system".to_string()),
             tunnel_did: None,
-            text: format!("[independent process `{}` ended]", child_entry),
-            ai_message: AiMessage::text(
-                AiRole::User,
-                format!("[independent process `{}` ended]", child_entry),
-            ),
+            text: marker_text.clone(),
+            ai_message: AiMessage::text(AiRole::User, marker_text),
         };
         if let Err(err) = self.enqueue_pending(marker).await {
             warn!(
@@ -3473,7 +3537,12 @@ fn append_turn_message_to_snapshot(
         state.steps = previous_state.steps;
         state.history_summaries = previous_state.history_summaries;
         state.last_step = previous_state.last_step;
-        if state.last_step.is_none() {
+        if state.last_step.is_none()
+            && state
+                .steps
+                .last()
+                .is_some_and(|step| step.meta.behavior_name == snapshot.request.behavior_name)
+        {
             state.last_step = state.steps.pop();
         }
         state.last_report = previous_state.last_report;
@@ -3487,6 +3556,14 @@ fn append_turn_message_to_snapshot(
     };
     snapshot.state = state;
     snapshot
+}
+
+fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {
+    let report = child_report.trim();
+    if report.is_empty() {
+        return format!("[fork process `{child_entry}` ended]");
+    }
+    format!("[fork process `{child_entry}` ended]\n\n## Child Report:\n{report}")
 }
 
 fn now_ms() -> u64 {

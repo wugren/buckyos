@@ -7,7 +7,7 @@
 //!     runner so each AgentSession owns one long-lived `od_<sid>` tmux
 //!     session, and `exec_bash` calls land in that pane
 //!   - `read` / `write_file` / `edit_file`
-//!   - `glob` / `grep`
+//!   - Agent Tool session-bin links (`todo`, `Glob`, `Grep`, `read_file`)
 //!
 //! 4-layer overlay (§2 of NewOpenDANRuntime.md, "渲染规则 2026-05-14 修订"):
 //! System / Runtime / Agent are rendered-free — each is just a bin directory
@@ -73,6 +73,7 @@ const OPENDAN_TRACE_ID_ENV: &str = "OPENDAN_TRACE_ID";
 const OPENDAN_BEHAVIOR_ENV: &str = "OPENDAN_BEHAVIOR";
 const OPENDAN_STEP_IDX_ENV: &str = "OPENDAN_STEP_IDX";
 const OPENDAN_WAKEUP_ID_ENV: &str = "OPENDAN_WAKEUP_ID";
+const BUILTIN_AGENT_TOOL_BINS: &[&str] = &["todo", "Glob", "Grep", "read_file"];
 
 static EXEC_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -383,7 +384,8 @@ pub fn build_default_tool_manager(
     let audit = Arc::new(NoopFileWriteAudit);
     // v2 Action set (see doc/opendan/Agent Actions.md §1):
     // - `read` replaces v1 `read_file`
-    // - `glob` / `grep` removed (LLM uses find/grep/rg via exec_bash)
+    // - `Glob` / `Grep` / `read_file` are links in Session Exec Bin,
+    //   not XML actions.
     // - `write_file` / `edit_file` unchanged
     let _ = manager.register_tool(ReadTool::new(file_cfg.clone()));
     let _ = manager.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()));
@@ -409,7 +411,7 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
     if let Some(renderer) = build.bin_renderer.as_ref() {
         renderer.render_initial(&build.session_dir)?;
     }
-    write_builtin_shell_shims(
+    link_builtin_agent_tool_bins(
         &layout.session_bin,
         &build.agent_root,
         &build.agent_id,
@@ -428,43 +430,44 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
     Ok(manager)
 }
 
-fn write_builtin_shell_shims(
+fn link_builtin_agent_tool_bins(
     session_bin: &Path,
-    agent_root: &Path,
-    agent_id: &str,
-    session_id: &str,
+    _agent_root: &Path,
+    _agent_id: &str,
+    _session_id: &str,
 ) -> std::io::Result<()> {
     let Some(agent_tool) = resolve_agent_tool_cli_path() else {
-        warn!("opendan.agent_bash: skip `todo` shim because agent_tool binary was not found");
+        warn!(
+            "opendan.agent_bash: skip builtin Agent Tool session-bin links because agent_tool binary was not found"
+        );
         return Ok(());
     };
-    let path = session_bin.join("todo");
-    let script = format!(
-        "#!/bin/sh\nexport {agent_env}={agent_root}\nexport {agent_id_env}={agent_id}\nexport {session_env}={session_id}\nexec {agent_tool} todo \"$@\"\n",
-        agent_env = OPENDAN_AGENT_ENV_ENV,
-        agent_root = shell_quote(agent_root.to_string_lossy().as_ref()),
-        agent_id_env = OPENDAN_AGENT_ID_ENV,
-        agent_id = shell_quote(agent_id),
-        session_env = OPENDAN_SESSION_ID_ENV,
-        session_id = shell_quote(session_id),
-        agent_tool = shell_quote(agent_tool.to_string_lossy().as_ref()),
-    );
-    std::fs::write(&path, script)?;
-    make_executable(&path)?;
+    for tool_name in BUILTIN_AGENT_TOOL_BINS {
+        link_agent_tool_bin(session_bin, &agent_tool, tool_name)?;
+    }
     Ok(())
+}
+
+fn link_agent_tool_bin(
+    session_bin: &Path,
+    agent_tool: &Path,
+    tool_name: &str,
+) -> std::io::Result<()> {
+    let path = session_bin.join(tool_name);
+    if path.exists() || path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&path)?;
+    }
+    symlink_agent_tool(agent_tool, &path)
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(path, perms)
+fn symlink_agent_tool(agent_tool: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(agent_tool, path)
 }
 
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn symlink_agent_tool(agent_tool: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(agent_tool, path)
 }
 
 fn session_exec_base_env(
@@ -597,6 +600,7 @@ async fn ensure_tmux_session(name: &str, cwd: &Path) -> Result<(), AgentToolErro
     let created = Command::new("tmux")
         .args(["new-session", "-d", "-s", name, "-c"])
         .arg(cwd)
+        .arg("/bin/bash --noprofile --norc")
         .output()
         .await
         .map_err(|err| AgentToolError::ExecFailed(format!("tmux new-session failed: {err}")))?;
@@ -865,17 +869,15 @@ fn build_exec_script(
         lines.push(format!("  export {}={}", key, shell_quote(value.as_str())));
     }
     // Intent-engine bypass hook: when the session sets OPENDAN_AGENT_TOOL,
-    // install bash's command_not_found_handle so unknown commands are
-    // proxied to `agent_tool __command_not_found__` instead of dying with
-    // 127 immediately. The handler still falls back to bash's native error
-    // message when the proxy itself reports 127, so a fully-failed bypass
-    // looks the same to the LLM as no bypass. Functions defined here are
-    // inherited by the `( ... )` subshell below.
+    // install bash's command-not-found handler so unknown commands are proxied to
+    // `agent_tool __command_not_found__` instead of dying with 127
+    // immediately.
+    // Functions defined here are inherited by the `( ... )` subshell below.
     lines.push(format!(
         "  if [ -n \"${{{env}:-}}\" ]; then",
         env = OPENDAN_AGENT_TOOL_ENV
     ));
-    lines.push("    command_not_found_handle() {".to_string());
+    lines.push("    __opendan_command_not_found_proxy() {".to_string());
     lines.push(format!(
         "      local __od_tool=\"${{{env}:-}}\"",
         env = OPENDAN_AGENT_TOOL_ENV
@@ -890,6 +892,9 @@ fn build_exec_script(
     lines.push("      fi".to_string());
     lines.push("      return \"$__od_cnf_ec\"".to_string());
     lines.push("    }".to_string());
+    lines.push(
+        "    command_not_found_handle() { __opendan_command_not_found_proxy \"$@\"; }".to_string(),
+    );
     lines.push("  fi".to_string());
     lines.push("  (".to_string());
     lines.push(command.to_string());
@@ -985,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_todo_shim() {
+    fn links_builtin_agent_tool_bins() {
         let dir = tempdir().unwrap();
         let session_bin = dir.path().join("session_bin");
         std::fs::create_dir_all(&session_bin).unwrap();
@@ -993,19 +998,19 @@ mod tests {
         std::fs::write(&fake_agent_tool, "#!/bin/sh\n").unwrap();
         let _agent_tool = ScopedEnvVar::set(OPENDAN_AGENT_TOOL_ENV, &fake_agent_tool);
 
-        write_builtin_shell_shims(
+        link_builtin_agent_tool_bins(
             &session_bin,
             &dir.path().join("agent_root"),
             "test-agent",
             "session 1",
         )
-        .expect("write shims");
+        .expect("link bins");
 
-        let shim = session_bin.join("todo");
-        let content = std::fs::read_to_string(&shim).expect("read todo shim");
-        assert!(content.contains(OPENDAN_AGENT_ENV_ENV));
-        assert!(content.contains(OPENDAN_SESSION_ID_ENV));
-        assert!(content.contains(" todo \"$@\""));
+        for tool_name in BUILTIN_AGENT_TOOL_BINS {
+            let bin = session_bin.join(tool_name);
+            let linked = std::fs::read_link(&bin).expect("read symlink");
+            assert_eq!(linked, fake_agent_tool);
+        }
     }
 
     #[test]
@@ -1141,12 +1146,13 @@ mod tests {
         assert!(script.contains(&format!("if [ -n \"${{{}:-}}\" ]", OPENDAN_AGENT_TOOL_ENV)));
         // Proxies to the shared `__command_not_found__` subcommand…
         assert!(script.contains("command_not_found_handle()"));
+        assert!(!script.contains("command_not_found_handler()"));
         assert!(script.contains(agent_tool::CLI_COMMAND_NOT_FOUND_SUBCOMMAND));
         // …and falls back to bash's native error when the proxy returns 127.
         assert!(script.contains("command not found"));
         // Handler is defined inside the outer `{ ... }` group (before the
         // user-command subshell) so the `( ... )` below inherits it.
-        let handler_idx = script.find("command_not_found_handle()").unwrap();
+        let handler_idx = script.find("__opendan_command_not_found_proxy()").unwrap();
         let subshell_idx = script.find("\n  (\n").unwrap();
         assert!(
             handler_idx < subshell_idx,

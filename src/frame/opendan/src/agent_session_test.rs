@@ -116,12 +116,70 @@ fn append_turn_message_preserves_behavior_step_records() {
     assert_eq!(out.request.input.len(), 2);
     assert_eq!(out.state.accumulated.len(), 3);
     assert_eq!(out.state.accumulated[2].text_content(), "continue task");
-    assert!(out.state.steps.is_empty());
-    let last_step = out.state.last_step.as_ref().expect("latest step hot tail");
-    assert!(last_step.assistant_text.contains("todo add"));
-    assert_eq!(last_step.meta.behavior_name, "plan");
+    assert_eq!(out.state.steps.len(), 1);
+    assert!(out.state.steps[0].assistant_text.contains("todo add"));
+    assert_eq!(out.state.steps[0].meta.behavior_name, "plan");
+    assert!(
+        out.state.last_step.is_none(),
+        "cross-behavior inherited steps must not become the new behavior hot tail"
+    );
     assert_eq!(out.state.next_step_index, 1);
     assert_eq!(out.state.rounds_left, out.request.tool_policy.max_rounds);
+}
+
+#[test]
+fn append_turn_message_promotes_current_behavior_step_as_hot_tail() {
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "do".to_string(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><thinking>do work</thinking></response>".to_string(),
+        thought: Some("do work".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 1;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        AiMessage::text(AiRole::User, "continue same behavior"),
+        "new-trace",
+        true,
+    );
+
+    assert!(out.state.steps.is_empty());
+    assert_eq!(
+        out.state
+            .last_step
+            .as_ref()
+            .map(|step| step.meta.behavior_name.as_str()),
+        Some("do")
+    );
+    assert_eq!(out.state.next_step_index, 1);
 }
 
 #[test]
@@ -448,6 +506,7 @@ fn session_meta_round_trips_pending_inputs() {
         process_stack: vec![ProcessFrame {
             entry: "ui_default".to_string(),
             current: "ui_default".to_string(),
+            fork: false,
         }],
     };
     let json = serde_json::to_string(&meta).unwrap();
@@ -491,6 +550,7 @@ fn session_meta_round_trips_pending_inputs() {
     assert_eq!(restored.process_stack.len(), 1);
     assert_eq!(restored.process_stack[0].entry, "ui_default");
     assert_eq!(restored.process_stack[0].current, "ui_default");
+    assert!(!restored.process_stack[0].fork);
 }
 
 #[test]
