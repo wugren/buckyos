@@ -78,8 +78,8 @@ The returned message MUST be parseable by XMLParser. Example:
   <observation>follow process rules</observation>
   <thinking>follow process rules</thinking>
   <actions>
-    <exec_bash timeout_ms="30000"><![CDATA[
-cargo test
+    <exec_bash><![CDATA[
+ls -la
     ]]></exec_bash>
     <write_file path="src/foo.rs"><![CDATA[
 pub fn bar() -> u32 { 42 }
@@ -106,7 +106,7 @@ Message to the user; optional; SHOULD only be provided when there is important p
 ## <actions> Usage Rules
 
 - You SHOULD always prefer `write_file` / `edit_file` / `read` over `exec_bash`.
-- `<exec_bash>` SHOULD contain bash commands in its body, and multi-line commands are allowed. If any command fails, the action MUST stop.
+- `<exec_bash>` SHOULD contain bash commands in its body, and each `<exec_bash>` SHOULD complete exactly one task.
 - You MUST use `<write_file>` or `<edit_file>` to write text files. You MUST NOT use `echo`, `cat`, or heredoc to write files.
 "#;
 

@@ -113,7 +113,7 @@ fn append_turn_message_preserves_behavior_step_records() {
     );
 
     assert_eq!(out.request.trace.as_deref(), Some("new-trace"));
-    assert_eq!(out.request.input.len(), 3);
+    assert_eq!(out.request.input.len(), 2);
     assert_eq!(out.state.accumulated.len(), 3);
     assert_eq!(out.state.accumulated[2].text_content(), "continue task");
     assert!(out.state.steps.is_empty());

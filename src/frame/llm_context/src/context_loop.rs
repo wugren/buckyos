@@ -982,6 +982,7 @@ impl LLMContext {
                 response, usage, ..
             } => {
                 self.state.usage = merge_usage(&self.state.usage, &usage);
+                self.clear_behavior_turn_tail();
                 Ok(response)
             }
             // D7 — inner cooperative yields are not supported in v1.
@@ -1055,10 +1056,44 @@ impl LLMContext {
             messages.push(assistant_msg);
             messages.push(user_msg);
         }
+        messages.extend(self.behavior_turn_tail());
 
         let mut inner = self.request.clone();
         inner.input = messages;
         inner
+    }
+
+    fn behavior_turn_tail(&self) -> Vec<AiMessage> {
+        let prefix_len = self.request.input.len();
+        if self.state.accumulated.len() <= prefix_len {
+            return Vec::new();
+        }
+        if !self
+            .request
+            .input
+            .iter()
+            .zip(self.state.accumulated.iter())
+            .all(|(a, b)| a == b)
+        {
+            return Vec::new();
+        }
+        self.state.accumulated[prefix_len..].to_vec()
+    }
+
+    fn clear_behavior_turn_tail(&mut self) {
+        let prefix_len = self.request.input.len();
+        if self.state.accumulated.len() <= prefix_len {
+            return;
+        }
+        if self
+            .request
+            .input
+            .iter()
+            .zip(self.state.accumulated.iter())
+            .all(|(a, b)| a == b)
+        {
+            self.state.accumulated.truncate(prefix_len);
+        }
     }
 
     /// Push `prev_last_step` (if any) into `steps`, install `new_step` as the

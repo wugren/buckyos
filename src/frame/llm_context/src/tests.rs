@@ -14,7 +14,7 @@ use crate::outcome::{ContextOutput, LLMContextOutcome, ResumeFill};
 use crate::request::{
     ContextOwnerRef, LLMContextRequest, ModelPolicy, OutputSpec, ToolMode, ToolPolicy,
 };
-use crate::state::LLMContextSnapshot;
+use crate::state::{LLMContextSnapshot, LLMContextState};
 use crate::{LLMContext, XmlBehaviorParser, XmlStepRenderer};
 
 /// Scripted LLM responses popped off in order.
@@ -38,6 +38,32 @@ impl LlmClient for ScriptedLlm {
             return Err(LLMComputeError::Internal("script empty".into()));
         }
         Ok(guard.remove(0))
+    }
+}
+
+struct RecordingLlm {
+    response: AiResponse,
+    seen: Mutex<Vec<Vec<AiMessage>>>,
+}
+
+impl RecordingLlm {
+    fn new(response: AiResponse) -> Self {
+        Self {
+            response,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<Vec<AiMessage>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmClient for RecordingLlm {
+    async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
+        self.seen.lock().unwrap().push(req.messages);
+        Ok(self.response.clone())
     }
 }
 
@@ -448,6 +474,77 @@ async fn behavior_loop_assigns_step_metadata() {
     assert!(step.meta.started_at_ms > 0);
     assert!(step.meta.ended_at_ms.is_some());
     assert_eq!(snapshot.state.next_step_index, 1);
+}
+
+#[tokio::test]
+async fn behavior_turn_tail_renders_after_hot_step_and_clears_after_inference() {
+    let llm = Arc::new(RecordingLlm::new(text_response(
+        "<response><thinking>start do</thinking><next_behavior>END</next_behavior></response>",
+    )));
+    let mut req = base_request();
+    req.behavior_name = "do".into();
+    let mut state = LLMContextState::from_request(&req, 1);
+    state.steps.push(crate::behavior_loop::StepRecord {
+        meta: crate::behavior_loop::StepMeta {
+            behavior_name: "plan".into(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><thinking>create todos</thinking></response>".into(),
+        thought: Some("created todos".into()),
+        ..Default::default()
+    });
+    state.last_step = Some(crate::behavior_loop::StepRecord {
+        meta: crate::behavior_loop::StepMeta {
+            behavior_name: "plan".into(),
+            step_index: 1,
+            started_at_ms: 21,
+            ended_at_ms: Some(30),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><thinking>switch to do</thinking><next_behavior>DO</next_behavior></response>".into(),
+        thought: Some("switch to do".into()),
+        ..Default::default()
+    });
+    state
+        .accumulated
+        .push(AiMessage::text(AiRole::User, "Continue TASK_ANCHOR."));
+    let snapshot = LLMContextSnapshot {
+        request: req,
+        state,
+    };
+    let deps = LLMContextDeps::new(llm.clone(), Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()));
+    let mut ctx = LLMContext::resume(snapshot, ResumeFill::ResumeFromMidRun, deps)
+        .expect("resume should accept tail-only behavior turn input");
+
+    let outcome = ctx.run().await;
+    assert!(matches!(outcome, LLMContextOutcome::Done { .. }));
+    let seen = llm.seen();
+    assert_eq!(seen.len(), 1);
+    let messages = &seen[0];
+    let continue_idx = messages
+        .iter()
+        .position(|m| m.text_content().contains("Continue TASK_ANCHOR"))
+        .expect("continue message");
+    let assistant_idx = messages
+        .iter()
+        .position(|m| m.text_content().contains("switch to do"))
+        .expect("hot assistant step");
+    assert!(
+        assistant_idx < continue_idx,
+        "hot assistant step must render before the turn trigger"
+    );
+
+    let snapshot = ctx.snapshot();
+    assert_eq!(
+        snapshot.state.accumulated.len(),
+        snapshot.request.input.len(),
+        "turn tail should be consumed after the first behavior inference"
+    );
 }
 
 #[tokio::test]

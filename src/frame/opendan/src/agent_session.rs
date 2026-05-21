@@ -3464,15 +3464,12 @@ fn append_turn_message_to_snapshot(
     trace_id: &str,
     preserve_behavior_state: bool,
 ) -> LLMContextSnapshot {
-    let mut input = snapshot.state.accumulated.clone();
-    input.push(message);
-
-    snapshot.request.input = input;
     snapshot.request.trace = Some(trace_id.to_string());
 
     let previous_state = snapshot.state;
-    let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
-    if preserve_behavior_state {
+    let state = if preserve_behavior_state {
+        let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
+        state.accumulated.push(message);
         state.steps = previous_state.steps;
         state.history_summaries = previous_state.history_summaries;
         state.last_step = previous_state.last_step;
@@ -3481,7 +3478,13 @@ fn append_turn_message_to_snapshot(
         }
         state.last_report = previous_state.last_report;
         state.next_step_index = previous_state.next_step_index;
-    }
+        state
+    } else {
+        let mut input = previous_state.accumulated;
+        input.push(message);
+        snapshot.request.input = input;
+        LLMContextState::from_request(&snapshot.request, now_ms())
+    };
     snapshot.state = state;
     snapshot
 }

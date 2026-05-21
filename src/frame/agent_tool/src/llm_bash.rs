@@ -301,7 +301,7 @@ fn is_valid_shell_env_key(key: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Default `BashRunner`: spawns `/bin/bash -lc <command>` via
+/// Default `BashRunner`: spawns `/bin/bash -c <command>` via
 /// `tokio::process`, captures stdout/stderr, enforces timeout, and
 /// truncates the merged output to `max_output_bytes`.
 #[derive(Clone, Debug, Default)]
