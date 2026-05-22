@@ -29,6 +29,7 @@ pub mod llm_bash;
 pub mod llm_compress;
 pub mod llm_explore;
 pub mod llm_tool_carft;
+pub mod llm_understand_media;
 pub mod local_llm_context;
 pub mod path_utils;
 pub mod read_tool;
@@ -81,6 +82,7 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 pub use llm_compress::{compress, LlmSummarizeCompressor, DEFAULT_KEEP_RECENT_MESSAGES};
+pub use llm_understand_media::{LlmUnderstandMediaTool, TOOL_LLM_UNDERSTAND_MEDIA};
 pub use local_llm_context::{
     Compressor, FileSnapshotStore, LocalLLMContext, OneShotRequest, RunMetaState, RunStatus,
     SnapshotStore, SuspendKind, DEFAULT_CONTEXT_YIELD_RATIO, DEFAULT_MAX_CONSECUTIVE_ERRORS,

@@ -33,7 +33,7 @@ use agent_tool::{
     GrepTool, NoopFileWriteAudit, ReadFileTool, SessionRuntimeContext, SessionViewBackend,
     TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
 };
-use agent_tool::{llm_explore, run_local_llm};
+use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
 
 const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
@@ -237,6 +237,20 @@ pub async fn run_process() -> CliRunOutput {
             .map(|v| v.to_string_lossy().into_owned())
             .collect();
         let exit_code = llm_explore::run_subcommand(sub_args).await;
+        return CliRunOutput {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    }
+
+    if args.get(1).and_then(|v| v.to_str()) == Some("llm_understand_media") {
+        let sub_args: Vec<String> = args
+            .iter()
+            .skip(2)
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        let exit_code = llm_understand_media::run_subcommand(sub_args).await;
         return CliRunOutput {
             exit_code,
             stdout: String::new(),

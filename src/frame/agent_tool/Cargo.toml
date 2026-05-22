@@ -12,6 +12,7 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 buckyos-api = { path = "../../kernel/buckyos-api" }
 llm_context = { path = "../llm_context" }
+ndn-lib = { workspace = true }
 kRPC = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

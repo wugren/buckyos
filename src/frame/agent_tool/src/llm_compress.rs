@@ -204,7 +204,7 @@ pub async fn compress(
         fallbacks: Vec::new(),
         temperature: Some(0.0),
         max_completion_tokens: Some(summary_budget),
-        force_json: false,
+        force_json: true,
         json_schema: None,
         provider_options: None,
         disable_capabilities: Vec::new(),
@@ -510,6 +510,12 @@ fn parse_llm_compress_output(text: &str) -> LlmCompressOutput {
     if let Ok(parsed) = serde_json::from_str::<LlmCompressOutput>(trimmed) {
         return parsed;
     }
+    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+        return parse_llm_compress_output_value(parsed, text);
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        return parse_llm_compress_output_value(parsed, text);
+    }
     LlmCompressOutput {
         summary: text.to_string(),
         decisions: Vec::new(),
@@ -517,6 +523,46 @@ fn parse_llm_compress_output(text: &str) -> LlmCompressOutput {
         open_questions: Vec::new(),
         important_entities: Vec::new(),
         memory_candidates: Vec::new(),
+    }
+}
+
+fn parse_llm_compress_output_value(value: Value, fallback: &str) -> LlmCompressOutput {
+    let summary = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback)
+        .to_string();
+    LlmCompressOutput {
+        summary,
+        decisions: string_list_field(&value, "decisions"),
+        pending_actions: string_list_field(&value, "pending_actions"),
+        open_questions: string_list_field(&value, "open_questions"),
+        important_entities: string_list_field(&value, "important_entities"),
+        memory_candidates: match value.get("memory_candidates") {
+            Some(Value::Array(items)) => items.clone(),
+            Some(other) => vec![other.clone()],
+            None => Vec::new(),
+        },
+    }
+}
+
+fn string_list_field(value: &Value, name: &str) -> Vec<String> {
+    match value.get(name) {
+        Some(Value::Array(items)) => items.iter().map(value_to_summary_string).collect(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", value_to_summary_string(value)))
+            .collect(),
+        Some(Value::String(text)) => vec![text.to_string()],
+        Some(other) => vec![value_to_summary_string(other)],
+        None => Vec::new(),
+    }
+}
+
+fn value_to_summary_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -901,6 +947,13 @@ mod tests {
         })
     }
 
+    fn first_compressed_summary(messages: &[AiMessage]) -> Option<String> {
+        messages
+            .iter()
+            .map(AiMessage::text_content)
+            .find(|text| text.contains(COMPRESS_SUMMARY_MARKER))
+    }
+
     #[tokio::test]
     #[ignore]
     async fn dev_compress_real_codex_session_jsonl() {
@@ -953,8 +1006,80 @@ mod tests {
             let preview: String = text.chars().take(1_200).collect();
             println!("first_compressed_block_preview:\n{preview}");
         }
+        if let Some(summary) = first_compressed_summary(&out) {
+            println!("first_compressed_summary:\n{summary}");
+        }
 
         assert!(out.len() <= history.len());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn dev_compress_real_codex_session_with_aicc() {
+        let Some(path) = default_codex_session_path() else {
+            eprintln!("skip: set CODEX_SESSION_JSONL=/path/to/session.jsonl");
+            return;
+        };
+        crate::run_local_llm::ensure_buckyos_runtime()
+            .await
+            .expect("init buckyos runtime");
+        let aicc = crate::run_local_llm::acquire_aicc_client()
+            .await
+            .expect("acquire aicc client");
+        let llm: Arc<dyn LlmClient> = Arc::new(crate::run_local_llm::AiccLlmClient::new(aicc));
+        let tools: Arc<dyn llm_context::deps::ToolManager> = Arc::new(StubTools);
+        let deps = LLMContextDeps::new(llm, tools);
+
+        let max_messages = env::var("CODEX_COMPRESS_SAMPLE_MAX_MESSAGES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(120);
+        let target_budget = env::var("CODEX_COMPRESS_TARGET_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8_000);
+        let model_alias = env::var("CODEX_COMPRESS_MODEL_ALIAS")
+            .or_else(|_| env::var("AICC_MODEL_ALIAS"))
+            .unwrap_or_else(|_| "llm.plan.default".to_string());
+        let history = load_codex_session_messages(&path, max_messages);
+        assert!(!history.is_empty(), "no messages parsed from {path:?}");
+
+        let original_tokens = count_history_tokens(&deps, &history);
+        let out = compress(&history, &deps, target_budget, &model_alias)
+            .await
+            .unwrap();
+        let new_tokens = count_history_tokens(&deps, &out);
+
+        println!("session_file={}", path.display());
+        println!("model_alias={model_alias}");
+        println!("target_budget={target_budget}");
+        println!(
+            "messages: before={} after={} delta={}",
+            history.len(),
+            out.len(),
+            out.len() as isize - history.len() as isize
+        );
+        println!(
+            "tokens: before={} after={} saved={}",
+            original_tokens,
+            new_tokens,
+            original_tokens.saturating_sub(new_tokens)
+        );
+        println!("roles_before={:?}", role_counts(&history));
+        println!("roles_after={:?}", role_counts(&out));
+        if let Some(text) = first_compressed_text(&out) {
+            let preview: String = text.chars().take(1_200).collect();
+            println!("first_compressed_block_preview:\n{preview}");
+        }
+        if let Some(summary) = first_compressed_summary(&out) {
+            println!("first_compressed_summary:\n{summary}");
+        }
+
+        assert!(out.len() <= history.len());
+        assert!(
+            first_compressed_summary(&out).is_some(),
+            "expected real AICC compression to produce a summary"
+        );
     }
 
     #[tokio::test]
