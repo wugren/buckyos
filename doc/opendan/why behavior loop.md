@@ -264,6 +264,156 @@ compression_level
 
 这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;`on_switch` 是 Runtime 在 behavior 边界生成的新 UserMessage,也应该在沉淀历史之后出现;fork join 是 Runtime 对已完成子过程的解释,仍归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
 
+## 八、三种切换模式的典型 message list
+
+下面的例子只展示 Behavior 切换边界附近的 messages,省略模型供应商协议里的 `content[]` 细节。重点是看三件事:新的 `system` 属于谁、`step_history` 继承什么、hot tail 是否跨 behavior 复用。
+
+### `fork-join`:从 parent fork 到 child,再 join 回 parent
+
+场景:parent behavior `plan` 发现 Todo `T01` 可以交给 child behavior `do_todo` 执行。child 启动时的典型 message list 是:
+
+```text
+system:
+  behavior = "do_todo"
+  objective + process rules + action view + result protocol for do_todo
+
+user:
+  <<step_history>>
+  <step_record behavior="plan" index="5" compression="full">
+  <observation>Todo T01 is ready and has enough context.</observation>
+  <thought>Fork a child behavior to execute T01, then join its report.</thought>
+  <report>Parent fork point: execute T01 and report result.</report>
+  </step_record>
+  <</step_history>>
+
+user:
+  UserMessage rendered from do_todo.on_switch
+
+assistant:
+  <observation>T01 is the current child task.</observation>
+  <thought>I should complete T01 inside the child context.</thought>
+  <actions>
+  - Run the task-specific actions for T01
+  </actions>
+
+user:
+  <<last_step_action_results behavior="do_todo" step="6">>
+  - T01 completed.
+  <</last_step_action_results>>
+
+assistant:
+  <observation>T01 completed successfully.</observation>
+  <thought>The child can return a concise result to the parent.</thought>
+  <report>T01 completed; changed doc/opendan/why behavior loop.md.</report>
+  <next_behavior>END</next_behavior>
+```
+
+child `END` 后 Runtime 恢复 parent snapshot,把 child 的 `<report>` 渲染成 join handoff,进入 parent 的 `step_history`。parent 恢复后的典型 message list 是:
+
+```text
+system:
+  behavior = "plan"
+  objective + process rules + action view + result protocol for plan
+
+user:
+  <<step_history>>
+  <step_record behavior="plan" index="5" compression="full">
+  <observation>Todo T01 is ready and has enough context.</observation>
+  <thought>Fork a child behavior to execute T01, then join its report.</thought>
+  <report>Parent fork point: execute T01 and report result.</report>
+  </step_record>
+  <history_input type="fork_join" child_behavior="do_todo" child_entry="T01">
+  T01 completed; changed doc/opendan/why behavior loop.md.
+  </history_input>
+  <</step_history>>
+
+assistant:
+  <observation>The child report says T01 completed.</observation>
+  <thought>I should decide whether the parent task has more work.</thought>
+  <actions></actions>
+```
+
+fork-join 的关键点是:child 启动时能读到 parent fork 点之前的解释性历史;join 回 parent 时只带 child report / join marker,不把 child 的完整 step stream 合并成 parent 的 hot tail。
+
+### `normal`:从 `plan` 跳到 `do`
+
+场景:`plan` 已经完成任务拆解,最后一轮输出 `<next_behavior>do</next_behavior>`。Runtime 切到 `do` 后,下一轮请求的典型 message list 是:
+
+```text
+system:
+  behavior = "do"
+  objective + process rules + action view + result protocol for do
+
+user:
+  <<step_history>>
+  <step_record behavior="plan" index="1" compression="full">
+  <observation>User asked to implement the behavior loop doc examples.</observation>
+  <thought>The task should be split into doc inspection, edit, and verification.</thought>
+  <actions>
+  - Read doc/opendan/why behavior loop.md
+  - Inspect related OpenDAN behavior docs
+  </actions>
+  </step_record>
+  <step_record behavior="plan" index="2" compression="full">
+  <observation>The edit scope is one Markdown document.</observation>
+  <thought>The plan phase is complete; execution should start.</thought>
+  <report>Need add normal, fork-join, independent message list examples.</report>
+  <next_behavior>do</next_behavior>
+  </step_record>
+  <</step_history>>
+
+user:
+  UserMessage rendered from do.on_switch
+
+assistant:
+  <observation>I have the inherited plan records.</observation>
+  <thought>I should edit the document now.</thought>
+  <actions>
+  - Apply patch to doc/opendan/why behavior loop.md
+  </actions>
+
+user:
+  <<last_step_action_results behavior="do" step="3">>
+  - Patch applied.
+  <</last_step_action_results>>
+```
+
+这里 `plan` 的历史进入 `do` 的 `step_history`,但 `plan` 的最后一轮不会继续作为 `do` 的 assistant/user hot pair。`do` 的 hot tail 从 `do` 自己的 Step 开始。
+
+### `independent`:切到独立 process
+
+场景:`main` 正在处理用户请求,中途切到长期存在的 `monitor` process。`monitor` 有自己的 snapshot,所以 Runtime 不复制 `main` 的 history。恢复 `monitor` 后的典型 message list 是:
+
+```text
+system:
+  behavior = "monitor"
+  objective + process rules + action view + result protocol for monitor
+
+user:
+  <<step_history>>
+  <step_record behavior="monitor" index="8" compression="compact">
+  Last monitor run checked service health and left one pending follow-up.
+  </step_record>
+  <history_summary behavior_range="monitor:1..7">
+  Previous monitor rounds established baseline health status and alert thresholds.
+  </history_summary>
+  <</step_history>>
+
+assistant:
+  <observation>The monitor snapshot has its own pending follow-up.</observation>
+  <thought>I should continue the monitor workflow from its saved state.</thought>
+  <actions>
+  - Check current service health
+  </actions>
+
+user:
+  <<last_step_action_results behavior="monitor" step="9">>
+  - Health check completed.
+  <</last_step_action_results>>
+```
+
+这里不会出现 `main` 的 `<step_record>`、`main` 的 hot pair 或 `main.on_switch` 生成的消息。`main` 只是被保存到自己的 snapshot;`monitor` 从自己的 snapshot 继续。`monitor` 输出 `<next_behavior>END</next_behavior>` 后,Runtime 再恢复 `main` process;如果 process stack 已空,session 才真正结束。
+
 
 ## 收束
 
