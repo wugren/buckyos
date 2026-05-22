@@ -907,24 +907,58 @@ impl AIAgent {
             }
         }
         let session_dir = self.config.layout.session_dir(&session_id);
-        // Workspace pick:
-        //   - existing_meta with a workspace_id → reuse (restore path).
-        //   - otherwise → mint a workspace keyed off the session id so the
-        //     legacy MVP file layout is preserved.
-        // The proper §8 worksession creation flow will replace this with
-        // `try_create_worksession` picking an existing workspace.
-        let preselected_ws = existing_meta
-            .as_ref()
-            .and_then(|m| m.workspace_id.clone())
-            .filter(|s| !s.trim().is_empty());
-        let workspace_id = preselected_ws.unwrap_or_else(|| session_id.clone());
-        let workspace_rec = self
-            .workspaces
-            .create_or_open(&workspace_id, &workspace_id, Some(&session_id))
-            .await
-            .map_err(|err| anyhow!("open workspace `{workspace_id}`: {err}"))?;
-        let workspace_root = self.workspaces.workspace_dir(&workspace_rec.workspace_id);
         let _ = std::fs::create_dir_all(&session_dir);
+        let mut existing_meta = existing_meta;
+        let legacy_ui_workspace_id = if matches!(kind, SessionKind::Ui) {
+            existing_meta
+                .as_ref()
+                .and_then(|m| m.workspace_id.clone())
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        if matches!(kind, SessionKind::Ui) {
+            if let Some(meta) = existing_meta.as_mut() {
+                meta.workspace_id = None;
+            }
+        }
+        if let Some(legacy_workspace_id) = legacy_ui_workspace_id.as_ref() {
+            match self.workspaces.load_record(legacy_workspace_id).await {
+                Ok(record) if record.current_session.as_deref() == Some(session_id.as_str()) => {
+                    if let Err(err) = self
+                        .workspaces
+                        .set_current_session(legacy_workspace_id, None)
+                        .await
+                    {
+                        warn!(
+                            "opendan.agent[{}]: clear legacy UI workspace `{}` binding failed: {err}",
+                            self.agent_name, legacy_workspace_id
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        let workspace_rec = if matches!(kind, SessionKind::Work) {
+            let preselected_ws = existing_meta
+                .as_ref()
+                .and_then(|m| m.workspace_id.clone())
+                .filter(|s| !s.trim().is_empty());
+            let workspace_id = preselected_ws.unwrap_or_else(|| session_id.clone());
+            let workspace_rec = self
+                .workspaces
+                .create_or_open(&workspace_id, &workspace_id, Some(&session_id))
+                .await
+                .map_err(|err| anyhow!("open workspace `{workspace_id}`: {err}"))?;
+            Some(workspace_rec)
+        } else {
+            None
+        };
+        let tool_root = workspace_rec
+            .as_ref()
+            .map(|rec| self.workspaces.workspace_dir(&rec.workspace_id))
+            .unwrap_or_else(|| session_dir.clone());
 
         // Resolve the behavior name up-front so we can pull its tool plan
         // before building the tool manager. (`behavior_hint` wins so a
@@ -939,7 +973,7 @@ impl AIAgent {
         let bin_renderer = self.build_session_bin_renderer(&agent_id, &session_id, &behavior_name);
 
         let tools = build_session_tools(SessionToolsBuild {
-            workspace_root: workspace_root.clone(),
+            workspace_root: tool_root.clone(),
             session_dir: session_dir.clone(),
             agent_root: self.config.layout.root.clone(),
             agent_id: agent_id.clone(),
@@ -977,27 +1011,29 @@ impl AIAgent {
             event_pump: self.event_pump.clone(),
         });
         let session = Arc::new(session);
-        // Reciprocal binding: session ↔ workspace. Session-side first so
-        // its meta is the source of truth; if the workspace-side update
-        // fails the session still has the correct binding.
-        if let Err(err) = session
-            .set_workspace(Some(workspace_rec.workspace_id.clone()))
-            .await
-        {
-            warn!(
-                "opendan.agent[{}]: bind workspace `{}` on session {} failed: {err:#}",
-                self.agent_name, workspace_rec.workspace_id, session_id
-            );
-        }
-        if let Err(err) = self
-            .workspaces
-            .set_current_session(&workspace_rec.workspace_id, Some(&session_id))
-            .await
-        {
-            warn!(
-                "opendan.agent[{}]: workspace `{}` set_current_session failed: {err}",
-                self.agent_name, workspace_rec.workspace_id
-            );
+        if let Some(workspace_rec) = workspace_rec.as_ref() {
+            // Reciprocal binding: session ↔ workspace. Session-side first so
+            // its meta is the source of truth; if the workspace-side update
+            // fails the session still has the correct binding.
+            if let Err(err) = session
+                .set_workspace(Some(workspace_rec.workspace_id.clone()))
+                .await
+            {
+                warn!(
+                    "opendan.agent[{}]: bind workspace `{}` on session {} failed: {err:#}",
+                    self.agent_name, workspace_rec.workspace_id, session_id
+                );
+            }
+            if let Err(err) = self
+                .workspaces
+                .set_current_session(&workspace_rec.workspace_id, Some(&session_id))
+                .await
+            {
+                warn!(
+                    "opendan.agent[{}]: workspace `{}` set_current_session failed: {err}",
+                    self.agent_name, workspace_rec.workspace_id
+                );
+            }
         }
         if let Err(err) = session.flush_meta().await {
             warn!(
@@ -1387,6 +1423,10 @@ fn truncate(s: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklog::{WorklogService, WorklogToolConfig};
+    use async_trait::async_trait;
+    use buckyos_api::{AiMethodRequest, AiMethodResponse, AiccClient, AiccHandler, CancelResponse};
+    use kRPC::{RPCContext, RPCErrors};
 
     #[test]
     fn sanitizes_session_segment() {
@@ -1422,5 +1462,141 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("abcdefghij", 4), "abcd…");
+    }
+
+    struct NoopAicc;
+
+    #[async_trait]
+    impl AiccHandler for NoopAicc {
+        async fn handle_method(
+            &self,
+            method: &str,
+            _request: AiMethodRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            Err(RPCErrors::UnknownMethod(method.to_string()))
+        }
+
+        async fn handle_cancel(
+            &self,
+            task_id: &str,
+            _ctx: RPCContext,
+        ) -> std::result::Result<CancelResponse, RPCErrors> {
+            Ok(CancelResponse::new(task_id.to_string(), false))
+        }
+    }
+
+    fn test_agent(root: PathBuf) -> Arc<AIAgent> {
+        let worklog = WorklogService::new(WorklogToolConfig::with_db_path(root.join("worklog.db")))
+            .expect("create worklog");
+        let runtime = AgentRuntime::new(
+            Arc::new(AiccClient::new_in_process(Box::new(NoopAicc))),
+            Arc::new(worklog),
+        );
+        AIAgent::open(root, Arc::new(runtime)).expect("open test agent")
+    }
+
+    #[tokio::test]
+    async fn ui_session_creation_does_not_create_or_bind_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+
+        let session_id = agent
+            .clone()
+            .create_ui_session_for_tunnel("did:dev:alice", None, None)
+            .await
+            .expect("create ui session");
+        let session = agent.get_session(&session_id).await.expect("session");
+        assert_eq!(session.summary().await.workspace_id, None);
+        assert!(agent
+            .workspaces()
+            .list()
+            .await
+            .expect("list workspaces")
+            .is_empty());
+        assert!(!agent.workspaces().workspace_dir(&session_id).exists());
+
+        agent
+            .delete_session_physical(&session_id)
+            .await
+            .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn restored_ui_session_ignores_legacy_workspace_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        agent
+            .workspaces()
+            .create_or_open("legacy-ws", "legacy", Some("ui-legacy"))
+            .await
+            .expect("create legacy workspace");
+        let mut meta = SessionMeta::new(
+            "ui-legacy".to_string(),
+            SessionKind::Ui,
+            "ui_default".to_string(),
+            "did:dev:alice".to_string(),
+        );
+        meta.workspace_id = Some("legacy-ws".to_string());
+
+        agent
+            .clone()
+            .restore_session(meta)
+            .await
+            .expect("restore ui session");
+        let session = agent.get_session("ui-legacy").await.expect("session");
+        assert_eq!(session.summary().await.workspace_id, None);
+        let record = agent
+            .workspaces()
+            .load_record("legacy-ws")
+            .await
+            .expect("load legacy workspace");
+        assert_eq!(record.current_session, None);
+
+        agent
+            .delete_session_physical("ui-legacy")
+            .await
+            .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn work_session_still_binds_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "work-1".to_string(),
+            SessionKind::Work,
+            "work_default".to_string(),
+            "ui-1".to_string(),
+        );
+        meta.workspace_id = Some("ws-1".to_string());
+
+        agent
+            .clone()
+            .ensure_session_inner(
+                "work-1".to_string(),
+                SessionKind::Work,
+                "ui-1".to_string(),
+                Some("work_default".to_string()),
+                Some(meta),
+            )
+            .await
+            .expect("create work session");
+        let session = agent.get_session("work-1").await.expect("session");
+        assert_eq!(
+            session.summary().await.workspace_id.as_deref(),
+            Some("ws-1")
+        );
+        let record = agent
+            .workspaces()
+            .load_record("ws-1")
+            .await
+            .expect("load workspace");
+        assert_eq!(record.current_session.as_deref(), Some("work-1"));
+
+        agent
+            .delete_session_physical("work-1")
+            .await
+            .expect("delete session");
     }
 }

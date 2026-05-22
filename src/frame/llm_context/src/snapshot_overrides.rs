@@ -36,6 +36,10 @@ use crate::state::LLMContextSnapshot;
 #[derive(Debug, Clone, Default)]
 pub struct RequestOverrides {
     pub system_messages: Option<Vec<AiMessage>>,
+    /// Replace the non-system input/history segment. Used by fork callers
+    /// that need a clean child context instead of inheriting the parent's
+    /// full accumulated transcript.
+    pub user_messages: Option<Vec<AiMessage>>,
     pub tool_policy: Option<ToolPolicy>,
     pub objective: Option<String>,
     pub behavior_name: Option<String>,
@@ -78,6 +82,16 @@ pub fn apply_overrides_to_snapshot(
     if let Some(new_system) = ov.system_messages {
         replace_leading_system(&mut snap.request.input, &new_system);
         replace_leading_system(&mut snap.state.accumulated, &new_system);
+    }
+    if let Some(new_user) = ov.user_messages {
+        replace_after_leading_system(&mut snap.request.input, &new_user);
+        replace_after_leading_system(&mut snap.state.accumulated, &new_user);
+        snap.state.pending_tool_calls.clear();
+        snap.state.steps.clear();
+        snap.state.history_summaries.clear();
+        snap.state.history_inputs.clear();
+        snap.state.last_step = None;
+        snap.state.last_report = None;
     }
 
     if let Some(tp) = ov.tool_policy {
@@ -149,6 +163,15 @@ fn replace_leading_system(msgs: &mut Vec<AiMessage>, new_system: &[AiMessage]) {
     msgs.clear();
     msgs.extend(new_system.iter().cloned());
     msgs.extend(tail);
+}
+
+fn replace_after_leading_system(msgs: &mut Vec<AiMessage>, new_tail: &[AiMessage]) {
+    let leading = msgs
+        .iter()
+        .position(|m| m.role != AiRole::System)
+        .unwrap_or(msgs.len());
+    msgs.truncate(leading);
+    msgs.extend(new_tail.iter().cloned());
 }
 
 /// Build the next [`LLMContext`] from a base snapshot, inheriting `state` (and
@@ -259,6 +282,19 @@ mod tests {
     }
 
     #[test]
+    fn replace_after_leading_system_keeps_system_and_replaces_tail() {
+        let mut msgs = vec![
+            msg(AiRole::System, "sys"),
+            msg(AiRole::User, "old-u"),
+            msg(AiRole::Assistant, "old-a"),
+        ];
+        replace_after_leading_system(&mut msgs, &[msg(AiRole::User, "new-u")]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text_content(), "sys");
+        assert_eq!(msgs[1].text_content(), "new-u");
+    }
+
+    #[test]
     fn apply_overrides_syncs_system_in_request_and_accumulated() {
         let snap = snap_with(
             vec![msg(AiRole::System, "sys-old"), msg(AiRole::User, "u")],
@@ -280,6 +316,29 @@ mod tests {
         assert_eq!(out.state.accumulated[1].text_content(), "u");
         // Accumulated tail (assistant from earlier rounds) survives.
         assert_eq!(out.state.accumulated[2].text_content(), "a-runtime");
+    }
+
+    #[test]
+    fn apply_overrides_user_messages_replaces_parent_history() {
+        let snap = snap_with(
+            vec![msg(AiRole::System, "sys-old"), msg(AiRole::User, "u")],
+            vec![
+                msg(AiRole::System, "sys-old"),
+                msg(AiRole::User, "u"),
+                msg(AiRole::Assistant, "a-runtime"),
+            ],
+        );
+        let ov = RequestOverrides {
+            system_messages: Some(vec![msg(AiRole::System, "sys-new")]),
+            user_messages: Some(vec![msg(AiRole::User, "parent history")]),
+            ..Default::default()
+        };
+        let out = apply_overrides_to_snapshot(snap, ov);
+
+        assert_eq!(out.request.input.len(), 2);
+        assert_eq!(out.request.input[0].text_content(), "sys-new");
+        assert_eq!(out.request.input[1].text_content(), "parent history");
+        assert_eq!(out.state.accumulated, out.request.input);
     }
 
     #[test]

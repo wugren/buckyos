@@ -2297,6 +2297,7 @@ impl AgentSession {
     async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> Result<RequestOverrides> {
         Ok(RequestOverrides {
             system_messages: Some(self.render_system_messages(behavior).await?),
+            user_messages: None,
             tool_policy: Some(behavior.to_tool_policy()),
             objective: Some(behavior.meta.objective.clone()),
             behavior_name: Some(behavior.meta.name.clone()),
@@ -3134,6 +3135,7 @@ impl AgentSession {
         let new_system = self.render_system_messages(new_cfg).await?;
         let overrides = RequestOverrides {
             system_messages: Some(new_system),
+            user_messages: None,
             tool_policy: Some(new_cfg.to_tool_policy()),
             objective: Some(new_cfg.meta.objective.clone()),
             behavior_name: Some(new_cfg.meta.name.clone()),
