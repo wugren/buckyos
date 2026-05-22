@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use agent_tool::todo_tools::read_todo_records;
-use agent_tool::{AgentToolManager, SessionRuntimeContext, TodoRecord};
+use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
 use llm_context::{
     behavior_loop::{HistoryInputRecord, StepRecord, StepResultHook, StepResultHookOutput},
     context_loop::LLMContext,
@@ -29,7 +29,9 @@ use llm_context::{
 use crate::agent_config::{AgentConfig, LoopMode, SwitchMode};
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
-use crate::behavior_hooks::{self, CtxLimitOutcome, InterruptOutcome, ProviderFailedOutcome};
+use crate::behavior_hooks::{
+    self, CtxLimitOutcome, InterruptOutcome, LlmMessageCompressPolicy, ProviderFailedOutcome,
+};
 use crate::llm_context_helper::{
     apply_overrides_to_snapshot, run_fork_sub_context, ForkSubContextInput, RequestOverrides,
 };
@@ -2005,7 +2007,15 @@ impl AgentSession {
                     }
                     compress_rounds += 1;
                     let before_len = accumulated.len();
-                    let rewritten = compress_messages_for_context_limit(accumulated);
+                    let rewritten = self
+                        .compress_accumulated_for_context_limit(
+                            &accumulated,
+                            &snapshot,
+                            &deps,
+                            &behavior,
+                        )
+                        .await
+                        .unwrap_or_else(|| compress_messages_for_context_limit(accumulated));
                     let after_len = rewritten.len();
                     info!(
                         "opendan.session[{}]: ContextLimitReached ({:?}); compressed history {before_len} → {after_len} messages (round {compress_rounds}/{MAX_COMPRESS_ROUNDS})",
@@ -2027,9 +2037,9 @@ impl AgentSession {
                             kept_head: leading_system,
                             kept_tail,
                             summary_preview: format!(
-                            "context limit ({:?}): compressed {before_len} → {after_len} messages",
-                            which
-                        ),
+                                "context limit ({:?}): compressed {before_len} → {after_len} messages",
+                                which
+                            ),
                         })
                         .await;
                     // Persist the post-compression snapshot before re-running
@@ -2046,19 +2056,29 @@ impl AgentSession {
                     continue;
                 }
                 other => {
-                    let final_snapshot = ctx.snapshot();
+                    let raw_final_snapshot = ctx.snapshot();
                     self.history
                         .record_run_diff(
                             mode,
                             baseline_accumulated_len,
                             baseline_steps_len,
                             baseline_last_step_text,
-                            &final_snapshot,
+                            &raw_final_snapshot,
                             &other,
                             llm_call,
                         )
                         .await;
                     self.history.append_outcome(&other).await;
+                    let final_snapshot = if matches!(other, LLMContextOutcome::Done { .. }) {
+                        self.maybe_auto_compress_after_completed_pair(
+                            raw_final_snapshot,
+                            &deps,
+                            &behavior,
+                        )
+                        .await
+                    } else {
+                        raw_final_snapshot
+                    };
                     if let Some(status) = SessionHistoryRecorder::round_status_for(&other) {
                         self.history.finalize_round(status).await;
                     }
@@ -2073,6 +2093,196 @@ impl AgentSession {
             .trace_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("{}-{}", self.session_id, n)
+    }
+
+    async fn maybe_auto_compress_after_completed_pair(
+        &self,
+        snapshot: LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        behavior: &BehaviorCfg,
+    ) -> LLMContextSnapshot {
+        let policy = match behavior_hooks::resolve_llm_message_compress(
+            behavior.on_llm_message_compress.as_ref(),
+        ) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => return snapshot,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: invalid on_llm_message_compress hook: {err}; skip auto compression",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        };
+
+        let Some(context_window_tokens) = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+        else {
+            warn!(
+                "opendan.session[{}]: skip llm_message_compress: context window tokens unavailable for model `{}`",
+                self.session_id, snapshot.request.model_policy.preferred
+            );
+            return snapshot;
+        };
+
+        let current_tokens = estimate_history_tokens(deps, &snapshot.state.accumulated);
+        let trigger_tokens = ratio_budget(context_window_tokens, policy.trigger_ratio);
+        let hard_limit_tokens = ratio_budget(context_window_tokens, policy.hard_limit_ratio);
+        let above_trigger = current_tokens >= trigger_tokens;
+        let above_hard_limit = current_tokens >= hard_limit_tokens;
+        if !above_trigger && !above_hard_limit {
+            return snapshot;
+        }
+
+        if policy.preserve_cache_stability && !above_hard_limit {
+            let turns_since = turns_since_last_llm_message_compress(&snapshot.state.accumulated);
+            if turns_since < policy.min_turns_between_compress {
+                info!(
+                    "opendan.session[{}]: skip llm_message_compress: {current_tokens}/{context_window_tokens} tokens but only {turns_since} turn(s) since last compression",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        }
+
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        self.compress_snapshot_accumulated(
+            snapshot,
+            deps,
+            target_token_budget,
+            "context_window_ratio",
+        )
+        .await
+    }
+
+    async fn compress_accumulated_for_context_limit(
+        &self,
+        accumulated: &[AiMessage],
+        snapshot: &LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        behavior: &BehaviorCfg,
+    ) -> Option<Vec<AiMessage>> {
+        let policy = match behavior_hooks::resolve_llm_message_compress(
+            behavior.on_llm_message_compress.as_ref(),
+        ) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => LlmMessageCompressPolicy::default(),
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: invalid on_llm_message_compress hook during context-limit compression: {err}; use legacy compressor",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        let context_window_tokens = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+            .or(snapshot.request.budget.max_total_tokens)?;
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            warn!(
+                "opendan.session[{}]: cannot run llm_message_compress: model preferred is empty",
+                self.session_id
+            );
+            return None;
+        }
+        match llm_compress::compress(accumulated, deps, target_token_budget, model_alias).await {
+            Ok(rewritten) => Some(rewritten),
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: llm_message_compress failed during context-limit compression: {err}; use legacy compressor",
+                    self.session_id
+                );
+                None
+            }
+        }
+    }
+
+    async fn compress_snapshot_accumulated(
+        &self,
+        mut snapshot: LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        target_token_budget: u32,
+        reason: &'static str,
+    ) -> LLMContextSnapshot {
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            warn!(
+                "opendan.session[{}]: skip llm_message_compress: model preferred is empty",
+                self.session_id
+            );
+            return snapshot;
+        }
+        let before_len = snapshot.state.accumulated.len();
+        let before_tokens = estimate_history_tokens(deps, &snapshot.state.accumulated);
+        let rewritten = match llm_compress::compress(
+            &snapshot.state.accumulated,
+            deps,
+            target_token_budget,
+            model_alias,
+        )
+        .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: llm_message_compress failed: {err}",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        };
+        let after_len = rewritten.len();
+        let after_tokens = estimate_history_tokens(deps, &rewritten);
+        if after_len == before_len && after_tokens >= before_tokens {
+            info!(
+                "opendan.session[{}]: llm_message_compress made no change ({before_tokens} tokens, target {target_token_budget})",
+                self.session_id
+            );
+            return snapshot;
+        }
+
+        info!(
+            "opendan.session[{}]: llm_message_compress reason={reason} messages {before_len} -> {after_len}, tokens {before_tokens} -> {after_tokens}, target={target_token_budget}",
+            self.session_id
+        );
+        self.history
+            .append_event(HistoryEvent::Compaction {
+                target: CompactionTarget::Accumulated,
+                dropped: before_len.saturating_sub(after_len) as u32,
+                kept_head: leading_system_messages(&rewritten) as u32,
+                kept_tail: after_len.saturating_sub(leading_system_messages(&rewritten)) as u32,
+                summary_preview: format!(
+                    "llm_message_compress({reason}): messages {before_len} -> {after_len}, tokens {before_tokens} -> {after_tokens}"
+                ),
+            })
+            .await;
+        snapshot.state.accumulated = rewritten;
+        snapshot
+    }
+
+    async fn resolve_context_window_tokens(
+        &self,
+        model_alias: &str,
+        policy: &LlmMessageCompressPolicy,
+    ) -> Option<u32> {
+        if let Some(tokens) = policy.context_window_tokens {
+            return Some(tokens);
+        }
+        let directory = match self.runtime.aicc.list_models().await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: models.list failed while resolving context window: {err}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        context_window_tokens_from_model_directory(&directory, model_alias)
     }
 
     /// Build the [`RequestOverrides`] that refreshes a resumed snapshot's
@@ -4216,6 +4426,131 @@ fn trigger_event_kind(event_id: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| event_id.to_string())
+}
+
+fn ratio_budget(context_window_tokens: u32, ratio: f32) -> u32 {
+    ((context_window_tokens as f64) * (ratio as f64))
+        .ceil()
+        .clamp(1.0, u32::MAX as f64) as u32
+}
+
+fn estimate_history_tokens(deps: &llm_context::deps::LLMContextDeps, msgs: &[AiMessage]) -> u32 {
+    msgs.iter().fold(0u32, |total, msg| {
+        total
+            .saturating_add(deps.tokenizer.count_tokens(msg.role.as_str()))
+            .saturating_add(deps.tokenizer.count_tokens(&msg.render_for_debug()))
+    })
+}
+
+fn leading_system_messages(msgs: &[AiMessage]) -> usize {
+    msgs.iter()
+        .take_while(|msg| matches!(msg.role, AiRole::System | AiRole::Developer))
+        .count()
+}
+
+fn turns_since_last_llm_message_compress(msgs: &[AiMessage]) -> u32 {
+    let start = msgs
+        .iter()
+        .rposition(is_llm_message_compress_marker)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    msgs[start..]
+        .iter()
+        .filter(|msg| matches!(msg.role, AiRole::User) && !is_llm_message_compress_marker(msg))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn is_llm_message_compress_marker(msg: &AiMessage) -> bool {
+    let text = msg.text_content();
+    text.contains("[LLM_MESSAGE_COMPRESS_META_V1]")
+        || text.contains("[LLM_MESSAGE_COMPRESS_SUMMARY_V1]")
+        || text.contains("[Conversation summary]")
+}
+
+fn context_window_tokens_from_model_directory(
+    directory: &serde_json::Value,
+    alias: &str,
+) -> Option<u32> {
+    let aliases = model_directory_alias_targets(directory, alias);
+    let mut exact = Vec::new();
+    let mut logical = Vec::new();
+    let providers = directory.get("providers")?.as_array()?;
+    for provider in providers {
+        let Some(models) = provider.get("models").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for model in models {
+            let Some(tokens) = model
+                .pointer("/capabilities/max_context_tokens")
+                .and_then(|value| value.as_u64())
+            else {
+                continue;
+            };
+            if tokens == 0 {
+                continue;
+            }
+            let exact_model = model
+                .get("exact_model")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let provider_model_id = model
+                .get("provider_model_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if aliases
+                .iter()
+                .any(|item| item == exact_model || item == provider_model_id)
+            {
+                exact.push(tokens);
+                continue;
+            }
+            let has_logical_mount = model
+                .get("logical_mounts")
+                .and_then(|value| value.as_array())
+                .map(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount
+                            .as_str()
+                            .map(|mount| aliases.iter().any(|item| item == mount))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if has_logical_mount {
+                logical.push(tokens);
+            }
+        }
+    }
+    exact
+        .into_iter()
+        .chain(logical)
+        .min()
+        .map(|tokens| tokens.min(u32::MAX as u64) as u32)
+}
+
+fn model_directory_alias_targets(directory: &serde_json::Value, alias: &str) -> Vec<String> {
+    let mut out = vec![alias.to_string()];
+    let mut cursor = 0usize;
+    while cursor < out.len() && out.len() < 64 {
+        let current = out[cursor].clone();
+        cursor += 1;
+        if let Some(items) = directory
+            .get("directory")
+            .and_then(|value| value.get(&current))
+            .and_then(|value| value.as_object())
+        {
+            for target in items
+                .values()
+                .filter_map(|item| item.get("target").and_then(|value| value.as_str()))
+            {
+                if !out.iter().any(|item| item == target) {
+                    out.push(target.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Cap on the size of the tail preserved when compressing `accumulated` on

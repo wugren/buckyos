@@ -786,6 +786,65 @@ fn compress_messages_drops_middle_and_keeps_tail() {
 }
 
 #[test]
+fn model_directory_context_window_resolves_logical_mount() {
+    let directory = serde_json::json!({
+        "providers": [{
+            "models": [{
+                "exact_model": "gpt-5@openai",
+                "provider_model_id": "gpt-5",
+                "logical_mounts": ["llm.chat"],
+                "capabilities": {"max_context_tokens": 128000}
+            }, {
+                "exact_model": "tiny@local",
+                "provider_model_id": "tiny",
+                "logical_mounts": ["llm.chat"],
+                "capabilities": {"max_context_tokens": 32000}
+            }]
+        }]
+    });
+    assert_eq!(
+        context_window_tokens_from_model_directory(&directory, "llm.chat"),
+        Some(32000)
+    );
+}
+
+#[test]
+fn model_directory_context_window_follows_directory_targets() {
+    let directory = serde_json::json!({
+        "directory": {
+            "llm.plan": {
+                "opus": {"target": "llm.opus", "weight": 1.0}
+            }
+        },
+        "providers": [{
+            "models": [{
+                "exact_model": "claude-opus@anthropic",
+                "provider_model_id": "claude-opus",
+                "logical_mounts": ["llm.opus"],
+                "capabilities": {"max_context_tokens": 200000}
+            }]
+        }]
+    });
+    assert_eq!(
+        context_window_tokens_from_model_directory(&directory, "llm.plan"),
+        Some(200000)
+    );
+}
+
+#[test]
+fn turns_since_last_compress_counts_user_turns_after_marker() {
+    let msgs = vec![
+        AiMessage::text(AiRole::System, "sys"),
+        AiMessage::text(AiRole::Assistant, "[LLM_MESSAGE_COMPRESS_META_V1]"),
+        AiMessage::text(AiRole::User, "[LLM_MESSAGE_COMPRESS_SUMMARY_V1] summary"),
+        AiMessage::text(AiRole::User, "u1"),
+        AiMessage::text(AiRole::Assistant, "a1"),
+        AiMessage::text(AiRole::User, "u2"),
+    ];
+    assert_eq!(turns_since_last_llm_message_compress(&msgs), 2);
+}
+
+#[test]
 fn merge_env_and_human_combines_both_with_env_first() {
     let m = merge_env_and_human(Some("E".into()), Some("H".into()));
     assert_eq!(m.as_deref(), Some("E\n\nH"));

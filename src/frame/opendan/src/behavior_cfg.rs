@@ -271,6 +271,8 @@ pub struct BehaviorCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_context_limit_reached: Option<HookPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_llm_message_compress: Option<HookPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_provider_failed: Option<HookPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_interrupt_graceful: Option<HookPoint>,
@@ -324,6 +326,11 @@ impl BehaviorCfg {
                 });
             }
         }
+        crate::behavior_hooks::resolve_llm_message_compress(self.on_llm_message_compress.as_ref())
+            .map_err(|err| BehaviorCfgError::Invalid {
+                name: self.meta.name.clone(),
+                reason: err.to_string(),
+            })?;
         Ok(())
     }
 
@@ -547,6 +554,11 @@ mod tests {
             [on_context_limit_reached]
             mode = "compress_then_continue"
 
+            [on_llm_message_compress]
+            mode = "context_window_ratio"
+            trigger_ratio = 0.8
+            target_ratio = 0.6
+
             [on_provider_failed]
             mode = "fallback_behavior"
             target = "safe_mode"
@@ -556,6 +568,10 @@ mod tests {
         assert_eq!(
             cfg.on_context_limit_reached.as_ref().unwrap().mode,
             "compress_then_continue"
+        );
+        assert_eq!(
+            cfg.on_llm_message_compress.as_ref().unwrap().mode,
+            "context_window_ratio"
         );
         assert_eq!(
             cfg.on_provider_failed

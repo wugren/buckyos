@@ -1214,6 +1214,13 @@ impl AiccClient {
             }
         }
     }
+
+    pub async fn list_models(&self) -> std::result::Result<Value, RPCErrors> {
+        match self {
+            Self::InProcess(_) => Err(RPCErrors::UnknownMethod("models.list".to_string())),
+            Self::KRPC(client) => client.call("models.list", serde_json::json!({})).await,
+        }
+    }
 }
 
 #[async_trait]

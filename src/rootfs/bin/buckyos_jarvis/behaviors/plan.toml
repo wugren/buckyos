@@ -125,5 +125,13 @@ preferred = "llm.chat"
 [on_context_limit_reached]
 mode = "compress_then_continue"
 
+[on_llm_message_compress]
+mode = "context_window_ratio"
+trigger_ratio = 0.80
+target_ratio = 0.60
+hard_limit_ratio = 0.95
+min_turns_between_compress = 2
+preserve_cache_stability = true
+
 [on_interrupt_graceful]
 mode = "cancel_pending_tools_then_continue"

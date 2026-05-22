@@ -327,6 +327,14 @@ preferred   = "claude-opus-4-7"
 [on_context_limit_reached]
 mode = "compress_then_continue"         # 唯一支持的模式；填上即启用
 
+[on_llm_message_compress]
+mode = "context_window_ratio"           # 一轮完成后按 context window 使用率触发
+trigger_ratio = 0.80
+target_ratio = 0.60
+hard_limit_ratio = 0.95
+min_turns_between_compress = 2
+preserve_cache_stability = true
+
 [on_provider_failed]
 mode   = "fallback_behavior"
 target = "explorer_safe_mode"
@@ -471,12 +479,16 @@ PATH = SessionExecBin : AgentBin : RuntimeBin : SystemBin : <inherited>
 | `[on_xxx]` 段 | 允许的 `mode` | 含义 |
 |---|---|---|
 | `[on_context_limit_reached]` | `compress_then_continue` | 上下文满 ⇒ 压缩后继续 |
+| `[on_llm_message_compress]` | `context_window_ratio` | 一轮完成后按 context window 使用率自动压缩；不写则不启用自动压缩 |
 | `[on_provider_failed]` | `fallback_behavior`（带 `target = "<name>"`） | provider 失败 ⇒ 切到 target |
 | `[on_interrupt_graceful]` | `cancel_pending_tools_then_continue` | 收到 graceful 中断 ⇒ 注入 Cancelled 后继续 |
 | `[on_interrupt_discard]` | `end` | 收到 discard 中断 ⇒ 直接结束 process |
 
 每个 `[on_xxx]` 段当前**只允许一种 mode**——这是"先做开关，不做策略灵活性"原则的具体体现。需要
-第二种合理策略时再扩；不预先开口子。**未列出的 section 或 mode ⇒ parse error**。
+第二种合理策略时再扩；不预先开口子。`[on_llm_message_compress]` 的可调参数是该固定策略的阈值：
+`trigger_ratio`、`target_ratio`、`hard_limit_ratio`、`min_turns_between_compress`、
+`preserve_cache_stability`，以及调试/兜底用的 `context_window_tokens`。生产环境应优先依赖
+AICC `models.list` 返回的 `capabilities.max_context_tokens`。**未列出的 section 或 mode ⇒ parse error**。
 
 其它枚举字段（`loop_mode` / `switch_mode` / `session_id_strategy` / dispatcher `on` 通配 / `mode = "agent"|"behavior"`）
 分散在各自的 schema 段中，本节不重复罗列。
