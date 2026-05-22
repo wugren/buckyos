@@ -483,7 +483,7 @@ pub struct CreateOrUpdateNotebookResult {
     pub created: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ReadNotebookInput {
     pub scope: OwnerScope,
     pub session_id: Option<String>,
@@ -498,6 +498,26 @@ pub struct ReadNotebookInput {
     pub max_items: Option<usize>,
     pub max_bytes: Option<usize>,
     pub allow_unchanged: bool,
+}
+
+impl Default for ReadNotebookInput {
+    fn default() -> Self {
+        Self {
+            scope: OwnerScope::default(),
+            session_id: None,
+            notebook_id: String::new(),
+            tags: None,
+            title: None,
+            latest_n: None,
+            item_ids: None,
+            since_version: None,
+            include_status: None,
+            include_superseded: false,
+            max_items: None,
+            max_bytes: None,
+            allow_unchanged: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2039,6 +2059,19 @@ impl AgentNotebook {
         }
         for (nb_id, (title, upd, tags, version)) in per_notebook.drain() {
             if has_session_read(&conn, &input.session_id, &input.scope, &nb_id)? {
+                if session_has_unchanged_for_notebook(
+                    &conn,
+                    &input.session_id,
+                    &input.scope,
+                    &nb_id,
+                    &version,
+                )? {
+                    suppressed.push(SuppressedHint {
+                        notebook_id: nb_id,
+                        reason: HintSuppressionReason::AlreadyReadUnchanged,
+                    });
+                    continue;
+                }
                 // Session has touched this notebook → cross-session hint applies.
                 if hints.len() >= max_hints {
                     suppressed.push(SuppressedHint {
@@ -3870,7 +3903,7 @@ mod tests {
     fn cross_session_update_hint_after_remote_append() {
         let (_t, n) = open_tmp();
         // Session A reads the notebook (creates the read cache row).
-        append(&n, "projects/p", "first", "content", &["a"]);
+        append(&n, "projects/p", "first", "content", &["aa"]);
         let _ = n
             .read_notebook(ReadNotebookInput {
                 scope: scope(),
@@ -3896,7 +3929,7 @@ mod tests {
                 valid_from: None,
                 valid_until: None,
                 confidence: None,
-                tags: vec!["a".into()],
+                tags: vec!["aa".into()],
                 metadata: None,
                 detect_conflicts: false,
             })
@@ -3961,7 +3994,7 @@ mod tests {
     #[test]
     fn registry_text_excludes_content() {
         let (_t, n) = open_tmp();
-        append(&n, "user/preferences", "secret", "DO NOT LEAK", &["x"]);
+        append(&n, "user/preferences", "secret", "DO NOT LEAK", &["xx"]);
         let ctx = n
             .build_notebook_registry_context(BuildRegistryContextInput {
                 scope: scope(),

@@ -1297,7 +1297,7 @@ mod tests {
         let (_, u) = renderer.render(&step);
         let user_text = user_text_of(&u);
         assert!(user_text.contains("- #2 read completed"));
-        assert!(user_text.contains("```json\n{"));
+        assert!(user_text.contains("```output\n{"));
         assert!(user_text.contains(r#""content": "line 1""#));
         assert!(!user_text.contains("HUGE_CMD_ARGS_SHOULD_NOT_RENDER"));
         assert!(!user_text.contains("legacy fallback should not render"));

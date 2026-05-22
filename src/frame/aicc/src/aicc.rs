@@ -24,7 +24,7 @@ use buckyos_api::{
     AICC_SERVICE_SERVICE_NAME,
 };
 use log::{debug, error, info, warn};
-use ndn_lib::{ChunkHasher, ChunkId, FileObject, NamedObject, ObjId};
+use ndn_lib::{ChunkHasher, FileObject, NamedObject, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
@@ -962,66 +962,6 @@ pub trait ResourceResolver: Send + Sync {
 #[derive(Default)]
 pub struct PassthroughResourceResolver;
 
-async fn resolve_named_object_resource(
-    resource: &mut ResourceRef,
-) -> std::result::Result<(), RPCErrors> {
-    let obj_id = match resource {
-        ResourceRef::NamedObject { obj_id } => obj_id.clone(),
-        _ => return Ok(()),
-    };
-
-    let runtime = get_buckyos_api_runtime().map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("get buckyos runtime failed: {}", error),
-        )
-    })?;
-    let named_store = runtime.get_named_store().await.map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("get named_store failed: {}", error),
-        )
-    })?;
-    let object_json = named_store.get_object(&obj_id).await.map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("load named_object {} failed: {}", obj_id, error),
-        )
-    })?;
-    let file_obj: FileObject = serde_json::from_str(object_json.as_str()).map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("parse named_object {} as file failed: {}", obj_id, error),
-        )
-    })?;
-    let chunk_id = ChunkId::new(file_obj.content.as_str()).map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("parse named_object {} chunk id failed: {}", obj_id, error),
-        )
-    })?;
-    let bytes = named_store
-        .get_chunk_data(&chunk_id)
-        .await
-        .map_err(|error| {
-            reason_error(
-                "resource_resolve_failed",
-                format!("read named_object {} chunk failed: {}", obj_id, error),
-            )
-        })?;
-    let mime = file_obj
-        .meta
-        .get("mime_type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    *resource = ResourceRef::Base64 {
-        mime,
-        data_base64: general_purpose::STANDARD.encode(bytes),
-    };
-    Ok(())
-}
-
 #[async_trait]
 impl ResourceResolver for PassthroughResourceResolver {
     async fn resolve(
@@ -1029,32 +969,7 @@ impl ResourceResolver for PassthroughResourceResolver {
         _ctx: &InvokeCtx,
         req: &AiMethodRequest,
     ) -> std::result::Result<ResolvedRequest, RPCErrors> {
-        let mut resolved = req.clone();
-        for resource in &mut resolved.payload.resources {
-            resolve_named_object_resource(resource).await?;
-        }
-        for message in &mut resolved.payload.messages {
-            for block in &mut message.content {
-                match block {
-                    AiContent::Image { source } | AiContent::Document { source, .. } => {
-                        resolve_named_object_resource(source).await?;
-                    }
-                    AiContent::ToolResult { content, .. } => {
-                        for item in content {
-                            match item {
-                                buckyos_api::AiToolResultContent::Image { source }
-                                | buckyos_api::AiToolResultContent::Document { source, .. } => {
-                                    resolve_named_object_resource(source).await?;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(ResolvedRequest::new(resolved))
+        Ok(ResolvedRequest::new(req.clone()))
     }
 }
 

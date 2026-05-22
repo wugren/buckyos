@@ -855,13 +855,38 @@ impl VerifyHubApiHandler for VerifyHubServer {
         appid: Option<String>,
     ) -> Result<bool> {
         gc_token_caches().await;
-        let expected_audience = appid.as_deref();
         let first_dot = session_token.find('.');
         if first_dot.is_none() {
             //this is not a jwt token, use token-store to verify
             return Err(RPCErrors::InvalidToken("not a jwt token".to_string()));
         } else {
-            let _json_body = verify_verify_hub_jwt(session_token, expected_audience).await?;
+            let json_body = verify_verify_hub_jwt(session_token, None).await?;
+            let rpc_session_token: RPCSessionToken =
+                serde_json::from_value(json_body).map_err(|error| {
+                    error!(
+                        "Failed to parse RPCSessionToken from JWT payload: {}",
+                        error
+                    );
+                    RPCErrors::ReasonError(
+                        "Failed to parse RPCSessionToken from JWT payload".to_string(),
+                    )
+                })?;
+
+            if rpc_session_token.aud.as_deref() == Some(VERIFY_HUB_UNIQUE_ID) {
+                return Err(RPCErrors::InvalidToken(
+                    "refresh token cannot be used as session token".to_string(),
+                ));
+            }
+
+            if let Some(expected_appid) = appid {
+                let token_appid = rpc_session_token
+                    .appid
+                    .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
+                if token_appid != expected_appid {
+                    return Err(RPCErrors::InvalidToken("appid mismatch".to_string()));
+                }
+            }
+
             Ok(true)
         }
     }

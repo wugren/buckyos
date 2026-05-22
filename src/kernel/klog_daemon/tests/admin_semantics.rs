@@ -6,13 +6,21 @@ use reqwest::StatusCode;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+const ADMIN_RAFT_TIMING: TestRaftTiming = TestRaftTiming {
+    election_timeout_min_ms: 1000,
+    election_timeout_max_ms: 2500,
+    heartbeat_interval_ms: 250,
+    install_snapshot_timeout_ms: 5000,
+};
+
 async fn post_admin(
     client: &reqwest::Client,
     port: u16,
     path: &str,
     query: &[(&str, String)],
 ) -> Result<(StatusCode, String), String> {
-    let mut url = reqwest::Url::parse(&format!("http://127.0.0.1:{}{}", port, path))
+    let admin_port = resolve_admin_port(port);
+    let mut url = reqwest::Url::parse(&format!("http://127.0.0.1:{}{}", admin_port, path))
         .map_err(|e| format!("invalid admin url: {}", e))?;
     {
         let mut qp = url.query_pairs_mut();
@@ -145,8 +153,26 @@ async fn test_admin_remove_learner_repeated_call_keeps_membership_stable() -> Re
         "klog_admin_remove_learner_{}_{}_{}_{}",
         port1, port2, port3, port4
     );
-    let mut nodes = spawn_three_voter_cluster(&cluster_name, port1, port2, port3).await?;
-    nodes.push(spawn_node(4, port4, &cluster_name, false, &[], "learner").await?);
+    let mut nodes = spawn_three_voter_cluster_with_raft_timing(
+        &cluster_name,
+        port1,
+        port2,
+        port3,
+        ADMIN_RAFT_TIMING,
+    )
+    .await?;
+    nodes.push(
+        spawn_node_with_raft_timing(
+            4,
+            port4,
+            &cluster_name,
+            false,
+            &[],
+            "learner",
+            ADMIN_RAFT_TIMING,
+        )
+        .await?,
+    );
 
     let result = async {
         add_learner_with_retry(&[port1, port2, port3], 4, port4, Duration::from_secs(45)).await?;
@@ -228,7 +254,14 @@ async fn test_admin_write_on_follower_returns_not_leader() -> Result<(), String>
     let port2 = ports[1];
     let port3 = ports[2];
     let cluster_name = format!("klog_admin_non_leader_{}_{}_{}", port1, port2, port3);
-    let mut nodes = spawn_three_voter_cluster(&cluster_name, port1, port2, port3).await?;
+    let mut nodes = spawn_three_voter_cluster_with_raft_timing(
+        &cluster_name,
+        port1,
+        port2,
+        port3,
+        ADMIN_RAFT_TIMING,
+    )
+    .await?;
 
     let result = async {
         let leader =
@@ -296,8 +329,26 @@ async fn test_admin_change_membership_retry_after_transient_conflict() -> Result
         "klog_admin_change_retry_{}_{}_{}_{}",
         port1, port2, port3, port4
     );
-    let mut nodes = spawn_three_voter_cluster(&cluster_name, port1, port2, port3).await?;
-    nodes.push(spawn_node(4, port4, &cluster_name, false, &[], "learner").await?);
+    let mut nodes = spawn_three_voter_cluster_with_raft_timing(
+        &cluster_name,
+        port1,
+        port2,
+        port3,
+        ADMIN_RAFT_TIMING,
+    )
+    .await?;
+    nodes.push(
+        spawn_node_with_raft_timing(
+            4,
+            port4,
+            &cluster_name,
+            false,
+            &[],
+            "learner",
+            ADMIN_RAFT_TIMING,
+        )
+        .await?,
+    );
 
     let result = async {
         add_learner_with_retry(&[port1, port2, port3], 4, port4, Duration::from_secs(45)).await?;
