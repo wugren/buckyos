@@ -21,6 +21,7 @@
 //! without forming an Arc cycle (AIAgent → sessions → tool manager →
 //! tools → AIAgent would otherwise pin the agent forever).
 
+use std::collections::HashSet;
 use std::sync::Weak;
 
 use agent_tool::{AgentToolError, AgentToolManager, CallingConventions, ToolCtx, TypedTool};
@@ -28,7 +29,7 @@ use async_trait::async_trait;
 use buckyos_api::{AiContent, AiMessage, AiRole};
 use llm_context::{
     outcome::ContextOutput,
-    request::{ToolMode, ToolPolicy},
+    request::{OutputSpec, ToolMode, ToolPolicy},
 };
 use log::warn;
 use schemars::JsonSchema;
@@ -501,9 +502,15 @@ impl TypedTool for TryCreateWorksessionTool {
     }
 
     fn build_summary(&self, output: &Self::Output) -> String {
-        if let Some(session_id) = json_string(output, "session_id") {
+        if let Some(session_id) = json_string(output, "session_id")
+            .filter(|_| json_string(output, "status").as_deref() == Some("created"))
+        {
             let workspace = json_string(output, "workspace_id").unwrap_or_else(|| "unknown".into());
             format!("created worksession {session_id} on workspace {workspace}")
+        } else if let Some(session_id) = json_string(output, "selected_worksession_id")
+            .or_else(|| json_string(output, "target_worksession_id"))
+        {
+            format!("selected existing worksession {session_id}")
         } else if let Some(decision) = json_string(output, "decision_text") {
             format!(
                 "did not create worksession: {}",
@@ -515,8 +522,15 @@ impl TypedTool for TryCreateWorksessionTool {
     }
 
     fn build_title(&self, output: &Self::Output) -> Option<String> {
-        if json_string(output, "session_id").is_some() {
+        if json_string(output, "session_id").is_some()
+            && json_string(output, "status").as_deref() == Some("created")
+        {
             Some("try_create_worksession => create".to_string())
+        } else if json_string(output, "selected_worksession_id")
+            .or_else(|| json_string(output, "target_worksession_id"))
+            .is_some()
+        {
+            Some("try_create_worksession => select".to_string())
         } else if json_string(output, "decision_text").is_some() {
             Some("try_create_worksession => skip".to_string())
         } else {
@@ -542,9 +556,6 @@ impl TypedTool for TryCreateWorksessionTool {
                     self.source_session_id
                 ))
             })?;
-        // Drive the sub-ctx's deps from the parent's current behavior so
-        // parser/renderer / approval list / one_line_status sink stay
-        // consistent. Only the request side is overridden.
         let parent_behavior = session.meta.lock().await.current_behavior.clone();
         let parent_workspace_id = session.workspace_id().await;
 
@@ -556,6 +567,7 @@ impl TypedTool for TryCreateWorksessionTool {
         let worksession_list = agent
             .list_session_summaries(Some(&self.source_session_id))
             .await;
+        let before_session_ids = session_id_set(&worksession_list);
         let workspace_list = match agent.workspaces().list().await {
             Ok(mut ws) => {
                 // Surface the freshest workspaces first so the sub-LLM
@@ -570,6 +582,7 @@ impl TypedTool for TryCreateWorksessionTool {
                 Vec::new()
             }
         };
+        let before_workspace_ids = workspace_id_set(&workspace_list);
         // Parent snapshot for chat-history extraction. Missing snapshot is
         // not fatal (fork_and_run will produce its own error if it's truly
         // gone) — the sub-prompt just falls through to "no history available".
@@ -588,20 +601,24 @@ impl TypedTool for TryCreateWorksessionTool {
         );
         let sub_system = vec![AiMessage::text(AiRole::System, sub_system_text)];
 
-        // Sub tool whitelist: only the actual landing tool. The parent's
-        // session-aware tools (try_create_worksession, forward_msg) are
-        // explicitly excluded so the sub-ctx can't recurse.
-        let sub_tool_policy = ToolPolicy {
-            mode: ToolMode::Whitelist,
-            whitelist: vec![TOOL_CREATE_WORKSESSION.to_string()],
-            max_rounds: 8,
-            ..ToolPolicy::default()
-        };
+        let sub_tool_policy = parent_snap
+            .as_ref()
+            .map(|snap| replace_try_create_with_create_policy(&snap.request.tool_policy))
+            .unwrap_or_else(|| {
+                let mut policy = ToolPolicy::default();
+                policy.mode = ToolMode::Whitelist;
+                policy.whitelist = vec![TOOL_CREATE_WORKSESSION.to_string()];
+                policy
+            });
 
         let overrides = RequestOverrides {
             system_messages: Some(sub_system),
             tool_policy: Some(sub_tool_policy),
             objective: Some(format!("Decide+create worksession for: {}", args.reason)),
+            output: Some(OutputSpec::Json {
+                schema: None,
+                strict: false,
+            }),
             // Let fork_and_run rewrite trace to `<parent>::fork-<n>`.
             trace: Some(None),
             reset_rounds: true,
@@ -613,16 +630,114 @@ impl TypedTool for TryCreateWorksessionTool {
         };
 
         let output = session
-            .fork_and_run(overrides, &parent_behavior)
+            .fork_and_run_agent_loop(overrides, &parent_behavior)
             .await
             .map_err(|err| AgentToolError::ExecFailed(format!("fork failed: {err:#}")))?;
-        Ok(match output {
-            ContextOutput::Json { content } => content,
-            ContextOutput::Text { content } => serde_json::json!({
-                "decision_text": content,
-            }),
+        let created = created_worksession_output_from_diff(
+            agent.as_ref(),
+            &self.source_session_id,
+            &before_session_ids,
+            &before_workspace_ids,
+        )
+        .await;
+        Ok(match (created, output) {
+            (Some(created), _) => created,
+            (None, ContextOutput::Json { content }) => content,
+            (None, ContextOutput::Text { content }) => parse_jsonish_text(&content)
+                .unwrap_or_else(|| serde_json::json!({ "decision_text": content })),
         })
     }
+}
+
+fn session_id_set(summaries: &[SessionSummary]) -> HashSet<String> {
+    summaries.iter().map(|s| s.session_id.clone()).collect()
+}
+
+fn workspace_id_set(workspaces: &[WorkspaceRecord]) -> HashSet<String> {
+    workspaces.iter().map(|w| w.workspace_id.clone()).collect()
+}
+
+fn replace_try_create_with_create_policy(parent: &ToolPolicy) -> ToolPolicy {
+    let mut sub = parent.clone();
+    if !matches!(sub.mode, ToolMode::Whitelist) {
+        sub.mode = ToolMode::Whitelist;
+        sub.whitelist = vec![TOOL_CREATE_WORKSESSION.to_string()];
+        return sub;
+    }
+
+    let mut replaced = false;
+    let mut whitelist = Vec::with_capacity(sub.whitelist.len().max(1));
+    for name in &sub.whitelist {
+        let next = if name == TOOL_TRY_CREATE_WORKSESSION {
+            replaced = true;
+            TOOL_CREATE_WORKSESSION
+        } else {
+            name.as_str()
+        };
+        if !whitelist.iter().any(|existing: &String| existing == next) {
+            whitelist.push(next.to_string());
+        }
+    }
+    if !replaced && !whitelist.iter().any(|name| name == TOOL_CREATE_WORKSESSION) {
+        whitelist.push(TOOL_CREATE_WORKSESSION.to_string());
+    }
+    sub.whitelist = whitelist;
+    sub
+}
+
+async fn created_worksession_output_from_diff(
+    agent: &AIAgent,
+    source_session_id: &str,
+    before_session_ids: &HashSet<String>,
+    before_workspace_ids: &HashSet<String>,
+) -> Option<serde_json::Value> {
+    let after = agent.list_session_summaries(Some(source_session_id)).await;
+    for summary in after {
+        if before_session_ids.contains(&summary.session_id)
+            || !matches!(summary.kind, SessionKind::Work)
+        {
+            continue;
+        }
+        let owner_matches = match agent.get_session(&summary.session_id).await {
+            Some(session) => session.meta.lock().await.owner == source_session_id,
+            None => false,
+        };
+        if !owner_matches {
+            continue;
+        }
+        let workspace_id = summary.workspace_id.clone().unwrap_or_default();
+        let workspace_status =
+            if !workspace_id.is_empty() && before_workspace_ids.contains(&workspace_id) {
+                "reused"
+            } else {
+                "created"
+            };
+        return Some(serde_json::json!({
+            "session_id": summary.session_id,
+            "title": summary.title,
+            "workspace_id": workspace_id,
+            "workspace_status": workspace_status,
+            "behavior": summary.current_behavior,
+            "status": "created",
+        }));
+    }
+    None
+}
+
+fn parse_jsonish_text(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&trimmed[start..=end]).ok()
 }
 
 fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -682,13 +797,14 @@ fn render_sub_system_prompt(
     let mut out = String::new();
     out.push_str(
         "You are a short-lived fork sub-context spawned by `try_create_worksession`. \
-         Your only job is to decide whether the parent session's situation needs a \
-         new worksession, and if so, create it by calling the `create_worksession` \
-         tool with concrete arguments.\n\n\
-         Decide using this order:\n\
-         1. If one of the existing worksessions below already covers the goal, \
-            **do not call `create_worksession`** — explain the match in your reply.\n\
-         2. Otherwise call `create_worksession` exactly once with:\n   \
+         Step 1: decide whether to select an existing worksession or create a \
+         new worksession.\n\
+         - If one existing worksession below already covers the goal, do not \
+           call `create_worksession`. Return JSON only: \
+           {\"status\":\"selected\",\"selected_worksession_id\":\"...\",\"reason\":\"...\"}.\n\
+         - Otherwise create a worksession.\n\n\
+         Step 2: if creating, decide whether to reuse an existing workspace or \
+         create a fresh workspace. Then call `create_worksession` exactly once with:\n   \
             - `title`: short label you synthesize\n   \
             - `objective`: the work to do, in your own words\n   \
             - `workspace_id`: empty to mint a new workspace, or the id of an \
@@ -697,9 +813,8 @@ fn render_sub_system_prompt(
               you have a strong reason\n   \
             - `reason_message`: 0–3 verbatim user messages from the recent \
               parent history that explain why this worksession is needed\n\
-         3. Always terminate the run with `<next_behavior>END</next_behavior>` \
-            after either creating or declining. Do not call \
-            `try_create_worksession` recursively.\n",
+         After `create_worksession` returns, return JSON only with the final \
+         worksession information from the tool result. ",
     );
     if let Some(ws) = parent_workspace_id {
         out.push_str(&format!(
@@ -1071,11 +1186,46 @@ mod tests {
         assert!(prompt.contains("Existing worksessions"));
         assert!(prompt.contains("Available workspaces"));
         assert!(prompt.contains("Parent recent history"));
+        assert!(prompt.contains("Step 1"));
+        assert!(prompt.contains("Step 2"));
         assert!(prompt.contains("`ws-1`"));
         assert!(prompt.contains("`ws-id`"));
         assert!(prompt.contains("[user] first thing"));
         assert!(prompt.contains("User asked about migrations"));
         // Parent workspace hint is included
         assert!(prompt.contains("currently bound to workspace `ws-id`"));
+    }
+
+    #[test]
+    fn parse_jsonish_text_extracts_embedded_object() {
+        let parsed = parse_jsonish_text("```json\n{\"status\":\"selected\"}\n```").unwrap();
+        assert_eq!(parsed["status"], "selected");
+    }
+
+    #[test]
+    fn sub_policy_replaces_try_create_with_create() {
+        let parent = ToolPolicy {
+            mode: ToolMode::Whitelist,
+            whitelist: vec![
+                "read".to_string(),
+                TOOL_TRY_CREATE_WORKSESSION.to_string(),
+                "forward_msg".to_string(),
+            ],
+            max_rounds: 24,
+            max_calls_per_round: 3,
+            ..ToolPolicy::default()
+        };
+        let sub = replace_try_create_with_create_policy(&parent);
+        assert!(matches!(sub.mode, ToolMode::Whitelist));
+        assert_eq!(
+            sub.whitelist,
+            vec![
+                "read".to_string(),
+                TOOL_CREATE_WORKSESSION.to_string(),
+                "forward_msg".to_string(),
+            ]
+        );
+        assert_eq!(sub.max_rounds, 24);
+        assert_eq!(sub.max_calls_per_round, 3);
     }
 }

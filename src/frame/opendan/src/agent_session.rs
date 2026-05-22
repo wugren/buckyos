@@ -3437,6 +3437,29 @@ impl AgentSession {
         overrides: RequestOverrides,
         sub_behavior_name: &str,
     ) -> Result<ContextOutput> {
+        self.fork_and_run_with_loop_mode(
+            overrides,
+            sub_behavior_name,
+            self.session_class_loop_mode(),
+        )
+        .await
+    }
+
+    pub async fn fork_and_run_agent_loop(
+        &self,
+        overrides: RequestOverrides,
+        sub_behavior_name: &str,
+    ) -> Result<ContextOutput> {
+        self.fork_and_run_with_loop_mode(overrides, sub_behavior_name, LoopMode::Agent)
+            .await
+    }
+
+    async fn fork_and_run_with_loop_mode(
+        &self,
+        overrides: RequestOverrides,
+        sub_behavior_name: &str,
+        loop_mode: LoopMode,
+    ) -> Result<ContextOutput> {
         let parent_snap = self.try_load_snapshot().ok_or_else(|| {
             anyhow!(
                 "fork_and_run: session[{}] has no parent snapshot — fork must be invoked mid-turn",
@@ -3488,7 +3511,7 @@ impl AgentSession {
             parent_snap,
             overrides,
             sub_cfg: &sub_cfg,
-            loop_mode: self.session_class_loop_mode(),
+            loop_mode,
             trace_id: &trace_id,
             depth,
             from_user_did,
