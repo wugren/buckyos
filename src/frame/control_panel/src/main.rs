@@ -1015,6 +1015,7 @@ impl RPCHandler for ControlPanelServer {
             "system.overview" => self.handle_system_overview(req).await,
             "system.status" => self.handle_system_status(req).await,
             "system.metrics" => self.handle_system_metrics(req).await,
+            "network.overview" | "system.network" => self.handle_network_overview(req).await,
 
             //SystemLogs
             "system.logs.list" => self.handle_system_logs_list(req).await,

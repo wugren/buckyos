@@ -12,7 +12,7 @@
 
 use crate::model_session::{LogicalNode, SessionConfig};
 use crate::model_types::{
-    FallbackMode, FallbackRule, LockedValue, ModelItem, ModelItemPatch, SchedulerProfile,
+    FallbackMode, FallbackRule, LockedValue, ModelItemPatch, SchedulerProfile,
 };
 use std::collections::BTreeMap;
 
@@ -26,6 +26,7 @@ struct Level2Item {
 
 enum FallbackPreset {
     Parent,
+    #[allow(dead_code)]
     Strict,
     Disabled,
 }
@@ -327,6 +328,7 @@ pub fn level2_node_count(config: &SessionConfig) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_types::ModelItem;
 
     fn item_targets(items: &BTreeMap<String, ModelItem>) -> Vec<&str> {
         let mut out: Vec<&str> = items.values().map(|item| item.target.as_str()).collect();

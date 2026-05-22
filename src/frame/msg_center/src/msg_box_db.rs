@@ -112,6 +112,7 @@ impl MsgBoxDbMgr {
     /// Test / fallback entry: build a default instance config (sqlite) against
     /// the given connection string. The schema DDL comes from the compiled-in
     /// default for the chosen backend.
+    #[allow(dead_code)]
     pub async fn open_default_sqlite(connection: &str) -> std::result::Result<Self, RPCErrors> {
         let cfg = msg_center_default_rdb_instance_config();
         let schema = cfg.schema.get(&RdbBackend::Sqlite).cloned();

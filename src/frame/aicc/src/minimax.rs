@@ -36,6 +36,7 @@ pub struct MiniMaxInstanceConfig {
     pub models: Vec<String>,
     pub default_model: Option<String>,
     pub features: Vec<Feature>,
+    #[allow(dead_code)]
     pub alias_map: HashMap<String, String>,
 }
 
@@ -124,6 +125,8 @@ impl MiniMaxProvider {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
@@ -379,6 +382,8 @@ fn provider_model_from_exact(exact_model: &str) -> &str {
         .unwrap_or(exact_model)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn json_text_len(value: &Value) -> usize {
     match value {
         Value::String(text) => text.len(),
@@ -561,6 +566,8 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
     Ok(instances)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -600,6 +607,8 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,

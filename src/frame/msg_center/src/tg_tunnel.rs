@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::msg_tunnel::MsgTunnel;
 use anyhow::{bail, Context, Result as AnyResult};
 use async_trait::async_trait;

@@ -454,6 +454,8 @@ impl MemoryTaskEventSink {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn events(&self) -> Vec<TaskEvent> {
         self.events
             .lock()
@@ -2063,7 +2065,6 @@ struct TaskBinding {
 
 pub struct AIComputeCenter {
     registry: Registry,
-    router: Router,
     route_cfg: Arc<RwLock<RouteConfig>>,
     sn_ai_provider_billing: SnAIProviderBillingLedger,
     model_catalog: ModelCatalog,
@@ -2135,7 +2136,6 @@ impl AIComputeCenter {
 
         Self {
             registry,
-            router: Router,
             route_cfg: Arc::new(RwLock::new(RouteConfig::default())),
             sn_ai_provider_billing: SnAIProviderBillingLedger::default(),
             model_catalog,
@@ -4372,6 +4372,7 @@ mod tests {
 
     #[derive(Debug)]
     struct MockProvider {
+        #[allow(dead_code)]
         instance: ProviderInstance,
         inventory: ProviderInventory,
         cost: CostEstimateOutput,

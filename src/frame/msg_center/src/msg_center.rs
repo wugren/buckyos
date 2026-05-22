@@ -83,6 +83,7 @@ impl MessageCenter {
     /// Read-only accessor for the group manager. Used by tests and by the
     /// in-process `MsgCenterClient` adapter so callers do not need to lift
     /// the GroupMgr through every API surface.
+    #[allow(dead_code)]
     pub fn group_mgr(&self) -> &GroupMgr {
         &self.group_mgr
     }

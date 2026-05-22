@@ -105,6 +105,7 @@ impl std::fmt::Display for KLogJoinRetryStrategy {
 pub enum KLogRuntimeConfigSource {
     Env,
     File(PathBuf),
+    #[allow(dead_code)]
     Buckyos,
 }
 
@@ -565,6 +566,7 @@ pub struct KLogRuntimeConfigPatch {
 
 // Placeholder type for future buckyos config integration.
 // It intentionally mirrors daemon runtime fields to keep conversion simple.
+#[allow(dead_code)]
 pub type BuckyosKlogConfig = KLogRuntimeConfigPatch;
 
 impl KLogRuntimeConfig {
@@ -693,10 +695,12 @@ impl KLogRuntimeConfig {
         Self::from_patch(patch)
     }
 
+    #[allow(dead_code)]
     pub fn from_buckyos_config(cfg: &BuckyosKlogConfig) -> Result<Self, String> {
         Self::from_patch(cfg.clone())
     }
 
+    #[allow(dead_code)]
     pub fn load_from_buckyos(
         cfg: &BuckyosKlogConfig,
     ) -> Result<(Self, KLogRuntimeConfigSource), String> {

@@ -41,6 +41,7 @@ pub struct ClaudeInstanceConfig {
     pub models: Vec<String>,
     pub default_model: Option<String>,
     pub features: Vec<Feature>,
+    #[allow(dead_code)]
     pub alias_map: HashMap<String, String>,
 }
 
@@ -391,6 +392,8 @@ impl ClaudeProvider {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
@@ -932,6 +935,8 @@ fn claude_vision_mounts(api_type: ApiType, model: &str) -> Vec<String> {
     ]
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn json_text_len(value: &Value) -> usize {
     match value {
         Value::String(text) => text.len(),
@@ -1062,7 +1067,7 @@ fn claude_model_max_context_tokens(_model_id: &str) -> u64 {
 
 fn effective_features_for_claude_model(model_id: &str, base: &[Feature]) -> Vec<Feature> {
     let mut out: Vec<Feature> = Vec::with_capacity(base.len() + 3);
-    let mut push_unique = |out: &mut Vec<Feature>, value: &str| {
+    let push_unique = |out: &mut Vec<Feature>, value: &str| {
         if !out.iter().any(|item| item == value) {
             out.push(value.to_string());
         }
@@ -1206,6 +1211,8 @@ fn build_claude_instances(settings: &ClaudeSettings) -> Result<Vec<ClaudeInstanc
     Ok(instances)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -1245,6 +1252,8 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,

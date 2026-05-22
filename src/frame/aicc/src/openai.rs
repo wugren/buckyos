@@ -664,6 +664,7 @@ impl OpenAIProvider {
         }
     }
 
+    #[cfg(test)]
     fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
@@ -3675,6 +3676,7 @@ fn value_to_form_field(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+#[cfg(test)]
 fn json_text_len(value: &Value) -> usize {
     match value {
         Value::String(text) => text.len(),
@@ -3903,6 +3905,7 @@ fn build_openai_instances(settings: &OpenAISettings) -> Result<Vec<OpenAIInstanc
     Ok(instances)
 }
 
+#[cfg(test)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -3986,6 +3989,7 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,

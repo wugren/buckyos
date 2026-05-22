@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{bail, Result as AnyResult};
 use async_trait::async_trait;
 use buckyos_api::{DeliveryReportResult, MsgRecordWithObject};

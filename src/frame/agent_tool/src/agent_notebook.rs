@@ -26,10 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json};
+use serde_json::Value as Json;
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: &str = "0.2";
@@ -135,13 +135,6 @@ pub enum NotebookStatus {
 }
 
 impl NotebookStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Archived => "archived",
-            Self::Deleted => "deleted",
-        }
-    }
     fn from_str(s: &str) -> Result<Self> {
         Ok(match s {
             "active" => Self::Active,
@@ -284,16 +277,6 @@ pub enum NotebookItemEdgeType {
     Supersedes,
     Related,
     ConflictsWith,
-}
-
-impl NotebookItemEdgeType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Supersedes => "supersedes",
-            Self::Related => "related",
-            Self::ConflictsWith => "conflicts_with",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
