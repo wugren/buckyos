@@ -150,6 +150,7 @@ WINGET_PACKAGE_CHOICES = {
     "deno": [["DenoLand.Deno"]],
     "docker": [["Docker.DockerDesktop"]],
     "msvc": [["Microsoft.VisualStudio.2022.BuildTools"]],
+    "llvm": [["LLVM.LLVM"]],
 }
 
 WINGET_MSVS_OVERRIDE = "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -484,6 +485,24 @@ class Bootstrapper:
                 Path("/usr/local/opt/llvm/lib"),
             ]
         )
+        if self.system == "Windows":
+            program_files = os.environ.get("ProgramFiles")
+            program_files_x86 = os.environ.get("ProgramFiles(x86)")
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            if program_files:
+                search_roots.extend([Path(program_files) / "LLVM" / "bin", Path(program_files) / "LLVM" / "lib"])
+            if program_files_x86:
+                search_roots.extend([Path(program_files_x86) / "LLVM" / "bin", Path(program_files_x86) / "LLVM" / "lib"])
+            if local_app_data:
+                search_roots.extend(
+                    [
+                        Path(local_app_data) / "Programs" / "LLVM" / "bin",
+                        Path(local_app_data) / "Programs" / "LLVM" / "lib",
+                    ]
+                )
+            for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+                if path_entry:
+                    search_roots.append(Path(path_entry))
         search_roots.extend(sorted(Path("/usr/lib").glob("llvm-*/lib")))
         search_roots.extend(sorted(Path("/usr/lib64").glob("llvm-*/lib")))
 
@@ -494,6 +513,10 @@ class Bootstrapper:
             seen.add(root)
             for pattern in ("libclang.so", "libclang.so.*", "libclang.dylib", "libclang.dll"):
                 matches = sorted(root.glob(pattern))
+                if matches:
+                    return str(matches[0])
+            if self.system == "Windows":
+                matches = sorted(root.glob("clang.dll"))
                 if matches:
                     return str(matches[0])
         return None
@@ -848,8 +871,33 @@ class Bootstrapper:
             else:
                 self.warnings.append("winget could not find Visual Studio Build Tools; native Windows Rust build may fail")
 
+        self.ensure_windows_libclang()
         self.ensure_rust_toolchain()
         self.notes.append("For Linux target cross-compilation on Windows, consider using WSL2")
+
+    def ensure_windows_libclang(self) -> None:
+        package_ids = self.resolve_package_set(WINGET_PACKAGE_CHOICES["llvm"], kind="winget")
+        if package_ids:
+            package_id = package_ids[0]
+            if not self.package_installed(package_id, kind="winget"):
+                self.install_winget_package(package_id)
+        else:
+            self.warnings.append("winget could not find LLVM; crates using bindgen may fail")
+
+        libclang = self.find_libclang()
+        if not libclang:
+            self.warnings.append(
+                "libclang.dll not found; crates using bindgen may fail unless LIBCLANG_PATH points to LLVM's bin directory"
+            )
+            return
+
+        libclang_dir = str(Path(libclang).parent)
+        if os.environ.get("LIBCLANG_PATH") == libclang_dir:
+            return
+
+        os.environ["LIBCLANG_PATH"] = libclang_dir
+        self.run(["setx", "LIBCLANG_PATH", libclang_dir])
+        self.notes.append(f"Set LIBCLANG_PATH to {libclang_dir}; reopen the terminal before rebuilding")
 
     def musl_toolchain_complete(self, prefix: str) -> bool:
         for tool in ("gcc", "g++", "ar", "ranlib"):
