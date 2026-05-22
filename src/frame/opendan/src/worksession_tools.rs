@@ -487,7 +487,7 @@ impl TypedTool for TryCreateWorksessionTool {
     }
 
     fn description(&self) -> &str {
-        "Decide whether the current request warrants a new worksession"
+        "Try to create a worksession when the current topic feels like a long-lived work task rather than a one-off request"
     }
 
     fn calling(&self) -> CallingConventions {
