@@ -646,6 +646,9 @@ impl Compressor for LlmSummarizeCompressor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -720,6 +723,238 @@ mod tests {
                 format!("{}\n{}", COMPRESS_SUMMARY_MARKER, summary),
             ),
         ]
+    }
+
+    fn default_codex_session_path() -> Option<PathBuf> {
+        if let Ok(path) = env::var("CODEX_SESSION_JSONL") {
+            return Some(PathBuf::from(path));
+        }
+        let path = PathBuf::from(
+            "/Users/liuzhicong/.codex/sessions/2026/04/10/rollout-2026-04-10T18-21-57-019d7a21-a2b1-7963-9ae1-f60c32c1bebe.jsonl",
+        );
+        path.exists().then_some(path)
+    }
+
+    fn codex_text_from_content(value: &serde_json::Value) -> String {
+        let Some(items) = value.as_array() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for item in items {
+            let kind = item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let text = match kind {
+                "input_text" | "output_text" => item.get("text").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    fn codex_role(value: &str) -> Option<AiRole> {
+        match value {
+            "system" => Some(AiRole::System),
+            "developer" => Some(AiRole::Developer),
+            "user" => Some(AiRole::User),
+            "assistant" => Some(AiRole::Assistant),
+            _ => None,
+        }
+    }
+
+    fn parse_codex_tool_args(raw: &str) -> HashMap<String, serde_json::Value> {
+        serde_json::from_str::<HashMap<String, serde_json::Value>>(raw).unwrap_or_else(|_| {
+            HashMap::from([(
+                "raw".to_string(),
+                serde_json::Value::String(raw.to_string()),
+            )])
+        })
+    }
+
+    fn load_codex_session_messages(path: &PathBuf, max_messages: usize) -> Vec<AiMessage> {
+        let raw = fs::read_to_string(path).expect("read codex session jsonl");
+        let mut messages = Vec::new();
+        for line in raw.lines() {
+            if messages.len() >= max_messages {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(payload) = value.get("payload") else {
+                continue;
+            };
+            let payload_type = payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match payload_type {
+                "message" => {
+                    let role = payload
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .and_then(codex_role);
+                    let text = payload
+                        .get("content")
+                        .map(codex_text_from_content)
+                        .unwrap_or_default();
+                    if let Some(role) = role {
+                        if !text.trim().is_empty() {
+                            messages.push(AiMessage::text(role, text));
+                        }
+                    }
+                }
+                "function_call" => {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("codex-call");
+                    let name = payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("codex_tool");
+                    let args = payload
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .map(parse_codex_tool_args)
+                        .unwrap_or_default();
+                    messages.push(AiMessage::new(
+                        AiRole::Assistant,
+                        vec![buckyos_api::AiContent::tool_use(call_id, name, args)],
+                    ));
+                }
+                "custom_tool_call" => {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("codex-custom-call");
+                    let name = payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("custom_tool");
+                    let mut args = HashMap::new();
+                    if let Some(input) = payload.get("input").and_then(|v| v.as_str()) {
+                        args.insert(
+                            "input".to_string(),
+                            serde_json::Value::String(input.to_string()),
+                        );
+                    }
+                    if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+                        args.insert(
+                            "status".to_string(),
+                            serde_json::Value::String(status.to_string()),
+                        );
+                    }
+                    messages.push(AiMessage::new(
+                        AiRole::Assistant,
+                        vec![buckyos_api::AiContent::tool_use(call_id, name, args)],
+                    ));
+                }
+                "function_call_output" | "custom_tool_call_output" => {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("codex-call");
+                    let output = payload
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            payload
+                                .get("output")
+                                .map(|v| v.to_string())
+                                .unwrap_or_default()
+                        });
+                    if !output.is_empty() {
+                        messages.push(AiMessage::new(
+                            AiRole::Tool,
+                            vec![buckyos_api::AiContent::tool_result_text(
+                                call_id, output, false,
+                            )],
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        messages
+    }
+
+    fn role_counts(messages: &[AiMessage]) -> HashMap<&'static str, usize> {
+        let mut counts = HashMap::new();
+        for msg in messages {
+            *counts.entry(msg.role.as_str()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn first_compressed_text(messages: &[AiMessage]) -> Option<String> {
+        messages.iter().map(AiMessage::text_content).find(|text| {
+            text.contains(COMPRESS_META_MARKER) || text.contains(COMPRESS_SUMMARY_MARKER)
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn dev_compress_real_codex_session_jsonl() {
+        let Some(path) = default_codex_session_path() else {
+            eprintln!("skip: set CODEX_SESSION_JSONL=/path/to/session.jsonl");
+            return;
+        };
+        let max_messages = env::var("CODEX_COMPRESS_SAMPLE_MAX_MESSAGES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(220);
+        let target_budget = env::var("CODEX_COMPRESS_TARGET_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8_000);
+        let history = load_codex_session_messages(&path, max_messages);
+        assert!(!history.is_empty(), "no messages parsed from {path:?}");
+
+        let deps = make_deps(
+            r#"{
+                "summary": "STUB_REAL_CODEX_SESSION_SUMMARY: real Codex JSONL input was compressed through llm_compress.",
+                "decisions": ["kept head/hot-tail messages", "replaced middle history with compressed pair"],
+                "pending_actions": ["inspect compressed metadata and token delta"],
+                "important_entities": ["Codex session JSONL", "AiMessage", "ToolResult"]
+            }"#,
+        );
+        let original_tokens = count_history_tokens(&deps, &history);
+        let out = compress(&history, &deps, target_budget, "stub-model")
+            .await
+            .unwrap();
+        let new_tokens = count_history_tokens(&deps, &out);
+
+        println!("session_file={}", path.display());
+        println!("target_budget={target_budget}");
+        println!(
+            "messages: before={} after={} delta={}",
+            history.len(),
+            out.len(),
+            out.len() as isize - history.len() as isize
+        );
+        println!(
+            "tokens: before={} after={} saved={}",
+            original_tokens,
+            new_tokens,
+            original_tokens.saturating_sub(new_tokens)
+        );
+        println!("roles_before={:?}", role_counts(&history));
+        println!("roles_after={:?}", role_counts(&out));
+        if let Some(text) = first_compressed_text(&out) {
+            let preview: String = text.chars().take(1_200).collect();
+            println!("first_compressed_block_preview:\n{preview}");
+        }
+
+        assert!(out.len() <= history.len());
     }
 
     #[tokio::test]
