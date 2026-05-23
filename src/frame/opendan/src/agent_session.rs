@@ -260,6 +260,12 @@ struct EventForTurn {
     message: String,
 }
 
+#[derive(Debug, Clone)]
+struct TurnMessage {
+    message: AiMessage,
+    runtime_auto: bool,
+}
+
 struct OpenDanStepResultHook {
     template: String,
     behavior: BehaviorCfg,
@@ -877,7 +883,7 @@ impl AgentSession {
             //     result.
             // Latest peer info wins — the most recent Msg in this batch
             // dictates where outbound replies will be routed.
-            let mut turn_messages: Vec<AiMessage> = Vec::new();
+            let mut turn_messages: Vec<TurnMessage> = Vec::new();
             let mut history_inputs: Vec<HistoryInputRecord> = Vec::new();
             let mut turn_events = Vec::new();
             let mut consumed_keys = Vec::new();
@@ -925,7 +931,10 @@ impl AgentSession {
                                     hist_user_messages.push(message.clone());
                                     msg_count += 1;
                                 }
-                                turn_messages.push(message.clone());
+                                turn_messages.push(TurnMessage {
+                                    message: message.clone(),
+                                    runtime_auto: is_runtime_auto_user_pending(from),
+                                });
                             }
                         }
                         if let Some(did) = from_did.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -1081,7 +1090,10 @@ impl AgentSession {
                 }
             }
 
-            let mut round_inputs = turn_messages;
+            let mut round_inputs = prepare_turn_messages_for_run(
+                turn_messages,
+                matches!(self.kind, SessionKind::Work),
+            );
             if let Some(batch) = format_event_batch_for_turn(&turn_events) {
                 round_inputs.push(AiMessage::text(AiRole::User, batch));
             }
@@ -5295,6 +5307,110 @@ fn compose_turn_message(messages: &[AiMessage], env: Option<String>) -> Option<A
         None
     } else {
         Some(AiMessage::new(AiRole::User, blocks))
+    }
+}
+
+fn prepare_turn_messages_for_run(
+    messages: Vec<TurnMessage>,
+    embed_user_supplement: bool,
+) -> Vec<AiMessage> {
+    if !embed_user_supplement {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    }
+
+    let has_runtime_auto = messages.iter().any(|entry| entry.runtime_auto);
+    let user_messages = messages
+        .iter()
+        .filter(|entry| !entry.runtime_auto)
+        .map(|entry| &entry.message)
+        .collect::<Vec<_>>();
+    if !has_runtime_auto
+        || user_messages.is_empty()
+        || !user_messages
+            .iter()
+            .all(|message| is_plain_text_user_message(message))
+    {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    }
+
+    let Some(supplement) = render_user_supplement_section(&user_messages) else {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    };
+
+    let mut injected = false;
+    messages
+        .into_iter()
+        .filter_map(|entry| {
+            if entry.runtime_auto {
+                if injected {
+                    Some(entry.message)
+                } else {
+                    injected = true;
+                    Some(inject_user_supplement_into_message(
+                        entry.message,
+                        &supplement,
+                    ))
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_plain_text_user_message(message: &AiMessage) -> bool {
+    message.content.iter().all(|block| match block {
+        AiContent::Text { .. } => true,
+        AiContent::Thinking { .. } | AiContent::ProviderState { .. } => true,
+        AiContent::Image { .. }
+        | AiContent::Document { .. }
+        | AiContent::ToolUse { .. }
+        | AiContent::ToolResult { .. } => false,
+    })
+}
+
+fn render_user_supplement_section(messages: &[&AiMessage]) -> Option<String> {
+    let text = messages
+        .iter()
+        .map(|message| message.text_content())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(format!("## 刚刚用户补充的信息\n\n{text}"))
+    }
+}
+
+fn inject_user_supplement_into_message(mut message: AiMessage, supplement: &str) -> AiMessage {
+    for block in &mut message.content {
+        let AiContent::Text { text } = block else {
+            continue;
+        };
+        *text = inject_user_supplement_into_text(text, supplement);
+        return message;
+    }
+    message.content.insert(0, AiContent::text(supplement));
+    message
+}
+
+fn inject_user_supplement_into_text(text: &str, supplement: &str) -> String {
+    const MARKERS: [&str; 2] = ["Continue from PROCESS_RULES.", "Continue TASK_ANCHOR."];
+    for marker in MARKERS {
+        if let Some(pos) = text.find(marker) {
+            let before = text[..pos].trim_end();
+            let after = &text[pos..];
+            return format!("{before}\n\n{supplement}\n\n{after}");
+        }
+    }
+
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        supplement.to_string()
+    } else {
+        format!("{trimmed}\n\n{supplement}")
     }
 }
 

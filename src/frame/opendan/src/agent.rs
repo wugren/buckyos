@@ -708,6 +708,10 @@ impl AIAgent {
             "llm_role".to_string(),
             serde_json::Value::String("system".to_string()),
         );
+        msg.meta.insert(
+            "parse_mode".to_string(),
+            serde_json::Value::String("Plain".to_string()),
+        );
 
         let send_ctx = buckyos_api::SendContext {
             contact_mgr_owner: Some(agent_did),

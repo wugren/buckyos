@@ -264,7 +264,132 @@ compression_level
 
 这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;`on_switch` 是 Runtime 在 behavior 边界生成的新 UserMessage,也应该在沉淀历史之后出现;fork join 是 Runtime 对已完成子过程的解释,仍归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
 
-## 八、三种切换模式的典型 message list
+## 八、状态机和输入构造的精确定义
+
+Behavior Loop 的 Runtime 状态不是 provider message list 本身。message list 只是每轮推理前从状态寄存器渲染出来的视图。实现和日志分析应先看状态寄存器,再看它如何投影成 messages。
+
+### 8.1 状态寄存器
+
+一个 behavior-loop session 至少包含这些状态:
+
+| 寄存器 | 含义 | 是否直接渲染为 message |
+| --- | --- | --- |
+| `request` | 当前 behavior 的 system prompt、objective、Action 视图、模型/预算策略 | system message |
+| `steps` | 已沉淀的 StepRecord 流 | `step_history` 或 compact/summary |
+| `last_step` | 当前 behavior 的 hot step,也就是最近一次 LLM intent 及其 action results | assistant/user hot pair |
+| `history_inputs` | Runtime 解释过的外部状态变更,如 fork join handoff | `step_history` 内的 `history_input` |
+| `pending_inputs` | 尚未喂给本轮推理的输入队列,来源可能是用户、event、on_switch、process-end marker | 本轮 tail 或 history input |
+| `process_stack` | fork / independent 模式下的调用栈 | 不直接渲染,影响 snapshot 恢复 |
+
+`step_index` 是整个 behavior-loop state stream 的单调序号,不是每个 round 或每个 behavior 从 0 重开。`fork` child 可以继承 parent 的 `next_step_index`,所以日志里新 round 的第一条新 step 不要求从 0 开始。
+
+### 8.2 Step 的生命周期
+
+一个 StepRecord 有三个阶段:
+
+1. `building`:当前 LLM 输出刚被解析成 Step intent,Runtime 正在执行 actions。
+2. `hot`:actions 执行完毕后,该 step 存在于 `last_step`,下一次推理以完整 `(assistant, user)` pair 渲染。
+3. `sedimented`:下一次产生新 step 时,旧 `last_step` 被沉淀进 `steps`,之后只能通过 `step_history` / inherited record / summary 渲染。
+
+`<<last_step_action_results>>` 是 hot step 的 user-side 占位。即使 step 没有 actions,也可以渲染为空:
+
+```text
+assistant:
+  <response>
+    <actions/>
+    <next_behavior>DO</next_behavior>
+  </response>
+
+user:
+  <<last_step_action_results behavior="plan" step="3">>
+
+  <</last_step_action_results>>
+```
+
+这个空 block 表示"step 3 的 actions 已经观察完毕,结果为空",不是用户输入,也不是 fork/on_switch 的载体。真实用户补充不应该塞进这个 block。
+
+### 8.3 输入来源分类
+
+进入 `pending_inputs` 的内容按来源分成四类:
+
+| 类别 | 例子 | 语义归属 | 渲染位置 |
+| --- | --- | --- | --- |
+| `runtime_step_result` | action 执行结果 | 上一个 Step 的 observation | `last_step_action_results` |
+| `runtime_history_input` | fork child END、process-end marker | 已完成 runtime 状态变更 | `step_history` 内 |
+| `runtime_auto_user` | `on_switch` / `on_init` 模板输出 | Runtime 生成的继续执行指令 | 本轮 tail |
+| `external_user` | 用户消息、forwarded usermsg | 新事实 / 新约束 / 人类补充 | 本轮 tail,或嵌入 runtime tail 的补充小节 |
+| `external_event` | kevent / msg event | 外部事件唤醒 | 本轮 tail |
+
+这几个类别不能互相混用。尤其是:
+
+- `external_user` 不是 step result,不能放入 `last_step_action_results`。
+- `runtime_auto_user` 不是历史事实,不能放入 `step_history`。
+- `runtime_history_input` 是 Runtime 对已发生状态变更的解释,不应伪装成普通用户补充。
+
+### 8.4 同轮多输入的排序规则
+
+同一轮可能同时 drain 到多种输入。规范顺序如下:
+
+```text
+system: current behavior prompt
+user:   step_history, including inherited steps and runtime_history_input
+assistant/user hot pairs for current behavior
+user:   runtime_auto_user, with embedded external_user supplement if both exist
+user:   external_event, if any
+user:   external_user, only when no runtime_auto_user can carry it
+```
+
+当 `external_user` 和 `runtime_auto_user` 同轮出现时,它们不是两条并列指令。`runtime_auto_user` 是 behavior 状态机恢复/切换后必须执行的锚点,`external_user` 是对这个锚点的新增事实。因此应把用户补充嵌入到 runtime tail 中,位置在继续执行锚点之前:
+
+```text
+## Last Finish Todo Report:
+...
+
+## Current TodoList:
+...
+
+## 刚刚用户补充的信息
+
+玩法上要确定是Nokia玩法
+
+Continue from PROCESS_RULES.
+```
+
+这样 provider message list 仍然只有一个明确的 tail instruction:先吸收补充事实,再按当前 behavior 的 process rules 继续。round history 仍应记录原始 forwarded usermsg,因为它是审计日志,不是 provider prompt 的规范化形态。
+
+如果 `external_user` 含有图片、文档或其它非纯文本 block,Runtime 不应把它嵌入补充小节,以免破坏结构化内容;此时保留为独立 user message。
+
+### 8.5 Canonical message sequence
+
+一个可判定的 provider message list 应满足:
+
+```text
+system:
+  current behavior request
+
+optional user:
+  <<step_history>>
+  inherited StepRecords
+  runtime_history_input
+  summaries
+  <</step_history>>
+
+zero or more hot pairs:
+  assistant: current behavior Step intent
+  user:      <<last_step_action_results behavior="..." step="...">> ... <</...>>
+
+optional user:
+  runtime_auto_user / external_user / external_event tail
+```
+
+不满足这条序列的典型错误包括:
+
+- 跨 behavior 的旧 step 仍作为 assistant/user hot pair 出现在新 behavior 里。
+- fork child 的完整 step stream 被合并回 parent hot tail。
+- 用户补充被放到空的 `last_step_action_results` block 里。
+- `on_switch` 之前出现裸的用户补充,导致模型先读到一个无结构事实,再读到真正的 continue anchor。
+
+## 九、三种切换模式的典型 message list
 
 下面的例子只展示 Behavior 切换边界附近的 messages,省略模型供应商协议里的 `content[]` 细节。重点是看三件事:新的 `system` 属于谁、`step_history` 继承什么、hot tail 是否跨 behavior 复用。
 

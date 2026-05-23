@@ -57,6 +57,68 @@ fn compose_turn_message_preserves_structured_blocks() {
 }
 
 #[test]
+fn prepare_turn_messages_embeds_worksession_user_supplement_before_continue() {
+    let prepared = prepare_turn_messages_for_run(
+        vec![
+            TurnMessage {
+                message: AiMessage::text(AiRole::User, "玩法上要确定是Nokia玩法"),
+                runtime_auto: false,
+            },
+            TurnMessage {
+                message: AiMessage::text(
+                    AiRole::User,
+                    "## Current TodoList:\n\n- T01 [pending current] do it\n\nContinue from PROCESS_RULES.",
+                ),
+                runtime_auto: true,
+            },
+        ],
+        true,
+    );
+
+    assert_eq!(prepared.len(), 1);
+    let text = prepared[0].text_content();
+    assert!(text.contains("## Current TodoList:"));
+    assert!(text.contains("## 刚刚用户补充的信息\n\n玩法上要确定是Nokia玩法"));
+    assert!(
+        text.find("## 刚刚用户补充的信息").unwrap()
+            < text.find("Continue from PROCESS_RULES.").unwrap()
+    );
+    assert!(!text.starts_with("玩法上要确定是Nokia玩法"));
+}
+
+#[test]
+fn prepare_turn_messages_keeps_structured_user_message_outside_supplement() {
+    let prepared = prepare_turn_messages_for_run(
+        vec![
+            TurnMessage {
+                message: AiMessage::new(
+                    AiRole::User,
+                    vec![
+                        AiContent::text("see this"),
+                        AiContent::Image {
+                            source: buckyos_api::ResourceRef::url(
+                                "https://example.test/a.png".to_string(),
+                                Some("image/png".to_string()),
+                            ),
+                        },
+                    ],
+                ),
+                runtime_auto: false,
+            },
+            TurnMessage {
+                message: AiMessage::text(AiRole::User, "Continue from PROCESS_RULES."),
+                runtime_auto: true,
+            },
+        ],
+        true,
+    );
+
+    assert_eq!(prepared.len(), 2);
+    assert_eq!(prepared[0].text_content(), "see this");
+    assert!(matches!(prepared[0].content[1], AiContent::Image { .. }));
+}
+
+#[test]
 fn append_turn_message_preserves_behavior_step_records() {
     let request = LLMContextRequest {
         owner: ContextOwnerRef::Agent {
