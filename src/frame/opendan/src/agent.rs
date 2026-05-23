@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::agent_bash::{build_session_tools, SessionBinLayout, SessionToolsBuild};
 use crate::agent_config::AgentConfig;
-use crate::agent_session::{AgentSession, AgentSessionBuild, SessionReply};
+use crate::agent_session::{AgentSession, AgentSessionBuild, SessionReply, WorksessionReportPhase};
 use crate::ai_runtime::AgentRuntime;
 use crate::contact::ContactLookup;
 use crate::dispatch::{
@@ -1009,6 +1009,7 @@ impl AIAgent {
             reply_tx,
             existing_meta,
             event_pump: self.event_pump.clone(),
+            parent_agent: Arc::downgrade(&self),
         });
         let session = Arc::new(session);
         if let Some(workspace_rec) = workspace_rec.as_ref() {
@@ -1117,10 +1118,17 @@ impl AIAgent {
         if objective.trim().is_empty() {
             return Err(anyhow!("create_work_session: objective must not be empty"));
         }
+        let behavior = behavior.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
         let new_session_id = self.allocate_worksession_id(title.trim()).await;
-        // Workspace resolution: explicit id reuses; absence mints a new
-        // id deterministic-ish on the session id (so a crash mid-create
-        // doesn't strand two half-built workspaces).
+        // Workspace resolution: explicit id reuses; absence mints a readable
+        // id from the task title/name, with a numeric suffix only on conflict.
         let (workspace_id, workspace_status) = match workspace_id {
             Some(id) if !id.trim().is_empty() => match self.workspaces.load_record(&id).await {
                 Ok(_) => (id, "reused".to_string()),
@@ -1135,12 +1143,8 @@ impl AIAgent {
                 }
             },
             _ => {
-                let new_ws_id = mint_session_id("ws");
-                let name = if title.trim().is_empty() {
-                    new_ws_id.clone()
-                } else {
-                    title.trim().to_string()
-                };
+                let name = meaningful_workspace_name(title.trim(), objective.trim());
+                let new_ws_id = self.allocate_workspace_id(&name).await;
                 self.workspaces
                     .create_or_open(&new_ws_id, &name, Some(&new_session_id))
                     .await
@@ -1200,6 +1204,22 @@ impl AIAgent {
             workspace_status,
             behavior: behavior_name,
         })
+    }
+
+    pub(crate) async fn allocate_workspace_id(&self, name: &str) -> String {
+        let base = sanitize_worksession_title(name);
+        let mut suffix = 1usize;
+        loop {
+            let candidate = if suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base} {suffix}")
+            };
+            if !self.workspaces.workspace_dir(&candidate).exists() {
+                return candidate;
+            }
+            suffix += 1;
+        }
     }
 
     async fn allocate_worksession_id(&self, title: &str) -> String {
@@ -1320,6 +1340,15 @@ pub fn mint_session_id(prefix: &str) -> String {
 fn build_worksession_id(date: &str, title: &str) -> String {
     let readable_title = sanitize_worksession_title(title);
     format!("{date} {readable_title}")
+}
+
+fn meaningful_workspace_name(title: &str, objective: &str) -> String {
+    let source = if title.trim().is_empty() {
+        objective
+    } else {
+        title
+    };
+    sanitize_worksession_title(source)
 }
 
 fn sanitize_worksession_title(raw: &str) -> String {
@@ -1451,6 +1480,18 @@ mod tests {
         assert_eq!(
             build_worksession_id("2026-05-20", "../"),
             "2026-05-20 未命名任务"
+        );
+    }
+
+    #[test]
+    fn meaningful_workspace_name_prefers_title_then_objective() {
+        assert_eq!(
+            meaningful_workspace_name("Frontend Snake Game", "ignored"),
+            "Frontend Snake Game"
+        );
+        assert_eq!(
+            meaningful_workspace_name("", "Build a pure front-end Snake mini-game"),
+            "Build a pure front-end Snake mini-game"
         );
     }
 
@@ -1598,5 +1639,168 @@ mod tests {
             .delete_session_physical("work-1")
             .await
             .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn work_session_final_report_does_not_enqueue_ui_pending_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let ui_session_id = agent
+            .clone()
+            .create_ui_session_for_tunnel("did:dev:alice", None, None)
+            .await
+            .expect("create ui session");
+        let ui = agent.get_session(&ui_session_id).await.expect("ui session");
+        ui.abort_worker().await;
+        let mut meta = SessionMeta::new(
+            "work-report".to_string(),
+            SessionKind::Work,
+            "work_default".to_string(),
+            ui_session_id.clone(),
+        );
+        meta.title = "draft report".to_string();
+        meta.objective = "finish the report".to_string();
+        meta.workspace_id = Some("ws-report".to_string());
+        agent
+            .clone()
+            .ensure_session_inner(
+                "work-report".to_string(),
+                SessionKind::Work,
+                ui_session_id.clone(),
+                Some("work_default".to_string()),
+                Some(meta),
+            )
+            .await
+            .expect("create work session");
+        let work = agent
+            .get_session("work-report")
+            .await
+            .expect("work session");
+        work.abort_worker().await;
+        let request = llm_context::request::LLMContextRequest {
+            owner: llm_context::request::ContextOwnerRef::Agent {
+                session_id: "work-report".to_string(),
+            },
+            trace: Some("trace-1".to_string()),
+            objective: "finish the report".to_string(),
+            behavior_name: "work_default".to_string(),
+            input: vec![],
+            model_policy: Default::default(),
+            tool_policy: Default::default(),
+            output: Default::default(),
+            budget: Default::default(),
+            human_policy: Default::default(),
+            error_policy: Default::default(),
+            forbid_next_behavior: false,
+        };
+        let mut state = llm_context::state::LLMContextState::from_request(&request, 1);
+        state.last_report = Some("final answer".to_string());
+        let snapshot = llm_context::state::LLMContextSnapshot { request, state };
+
+        work.maybe_publish_worksession_report(
+            &snapshot,
+            WorksessionReportPhase::Final,
+            Some("END"),
+            "trace-1",
+        )
+        .await
+        .expect("publish report");
+        work.maybe_publish_worksession_report(
+            &snapshot,
+            WorksessionReportPhase::Final,
+            Some("END"),
+            "trace-1",
+        )
+        .await
+        .expect("second publish remains a no-op without msg-center");
+
+        let pending = ui.meta.lock().await.pending_inputs.clone();
+        assert!(pending.is_empty());
+        assert!(work.meta.lock().await.last_report_delivery.is_none());
+        let report_md = std::fs::read_to_string(work.session_dir.join("report.md"))
+            .expect("report.md should be written even when outbound is unavailable");
+        assert!(report_md.contains("final answer"));
+
+        agent
+            .delete_session_physical("work-report")
+            .await
+            .expect("delete work session");
+        agent
+            .delete_session_physical(&ui_session_id)
+            .await
+            .expect("delete ui session");
+    }
+
+    #[tokio::test]
+    async fn create_work_session_without_workspace_id_uses_meaningful_workspace_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+
+        let outcome = agent
+            .clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: "Frontend Snake Game".to_string(),
+                objective: "Build the first pure front-end version".to_string(),
+                workspace_id: None,
+                behavior: None,
+                created_by_session_id: "ui-1".to_string(),
+                reason_messages: Vec::new(),
+            })
+            .await
+            .expect("create work session");
+        assert_eq!(outcome.workspace_id, "Frontend Snake Game");
+        assert!(agent
+            .workspaces()
+            .workspace_dir("Frontend Snake Game")
+            .exists());
+
+        agent
+            .delete_session_physical(&outcome.session_id)
+            .await
+            .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn create_work_session_treats_empty_behavior_as_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+
+        let outcome = agent
+            .clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: "Frontend Snake Game".to_string(),
+                objective: "Build the first pure front-end version".to_string(),
+                workspace_id: None,
+                behavior: Some("  ".to_string()),
+                created_by_session_id: "ui-1".to_string(),
+                reason_messages: Vec::new(),
+            })
+            .await
+            .expect("create work session");
+        assert_eq!(outcome.behavior, "work_default");
+        let session = agent
+            .get_session(&outcome.session_id)
+            .await
+            .expect("session");
+        assert_eq!(session.summary().await.current_behavior, "work_default");
+
+        agent
+            .delete_session_physical(&outcome.session_id)
+            .await
+            .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn allocate_workspace_id_adds_suffix_on_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        agent
+            .workspaces()
+            .create_or_open("Frontend Snake Game", "Frontend Snake Game", None)
+            .await
+            .expect("create workspace");
+
+        let workspace_id = agent.allocate_workspace_id("Frontend Snake Game").await;
+        assert_eq!(workspace_id, "Frontend Snake Game 2");
     }
 }

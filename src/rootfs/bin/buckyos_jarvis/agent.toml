@@ -63,3 +63,4 @@ switch_mode = "fork"
 process_stack_limit = 8
 keep_alive = false
 inject_background_environment = false
+report_delivery = "final_only"

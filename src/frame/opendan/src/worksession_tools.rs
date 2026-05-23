@@ -38,7 +38,7 @@ use log::warn;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{mint_session_id, AIAgent, CreateWorkSessionParams};
+use crate::agent::{AIAgent, CreateWorkSessionParams};
 use crate::llm_context_helper::RequestOverrides;
 use crate::local_workspace::{WorkspaceRecord, WorkspaceStatus};
 use crate::session_model::{SessionKind, SessionStatus, SessionSummary};
@@ -109,6 +109,16 @@ pub struct CreateWorksessionOutput {
     /// Always `"created"` on the happy path — signals to the parent LLM
     /// that the session is now live (its worker has started).
     pub status: String,
+    pub worker_status: String,
+    pub auto_started: bool,
+    pub followup_routing: WorksessionFollowupRouting,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorksessionFollowupRouting {
+    pub tool: String,
+    pub target_worksession_id: String,
+    pub instruction: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -183,7 +193,7 @@ impl TypedTool for CreateWorkspaceTool {
             .agent
             .upgrade()
             .ok_or_else(|| AgentToolError::ExecFailed("agent is shutting down".to_string()))?;
-        let workspace_id = mint_session_id("ws");
+        let workspace_id = agent.allocate_workspace_id(name).await;
         let record = agent
             .workspaces()
             .create_or_open(&workspace_id, name, None)
@@ -258,12 +268,13 @@ impl TypedTool for CreateWorksessionTool {
 
     fn build_summary(&self, output: &Self::Output) -> String {
         format!(
-            "created worksession {} titled `{}` on workspace {} ({}) with behavior {}",
+            "created and started worksession {} titled `{}` on workspace {} ({}) with behavior {}. Future user follow-up for this task must be forwarded automatically with forward_msg target_worksession_id={}",
             output.session_id,
             output.title,
             output.workspace_id,
             output.workspace_status,
-            output.behavior
+            output.behavior,
+            output.session_id
         )
     }
 
@@ -294,6 +305,7 @@ impl TypedTool for CreateWorksessionTool {
             })
             .await
             .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let followup_routing = worksession_followup_routing(&outcome.session_id);
         Ok(CreateWorksessionOutput {
             session_id: outcome.session_id,
             title: outcome.title,
@@ -301,6 +313,9 @@ impl TypedTool for CreateWorksessionTool {
             workspace_status: outcome.workspace_status,
             behavior: outcome.behavior,
             status: "created".to_string(),
+            worker_status: "started".to_string(),
+            auto_started: true,
+            followup_routing,
         })
     }
 }
@@ -602,7 +617,9 @@ impl TypedTool for TryCreateWorksessionTool {
             .filter(|_| json_string(output, "status").as_deref() == Some("created"))
         {
             let workspace = json_string(output, "workspace_id").unwrap_or_else(|| "unknown".into());
-            format!("created worksession {session_id} on workspace {workspace}")
+            format!(
+                "created and started worksession {session_id} on workspace {workspace}. Future user follow-up for this task must be forwarded automatically with forward_msg target_worksession_id={session_id}"
+            )
         } else if let Some(session_id) = json_string(output, "selected_worksession_id")
             .or_else(|| json_string(output, "target_worksession_id"))
         {
@@ -818,9 +835,22 @@ async fn created_worksession_output_from_diff(
             "workspace_status": workspace_status,
             "behavior": summary.current_behavior,
             "status": "created",
+            "worker_status": "started",
+            "auto_started": true,
+            "followup_routing": worksession_followup_routing(&summary.session_id),
         }));
     }
     None
+}
+
+fn worksession_followup_routing(session_id: &str) -> WorksessionFollowupRouting {
+    WorksessionFollowupRouting {
+        tool: TOOL_FORWARD_MSG.to_string(),
+        target_worksession_id: session_id.to_string(),
+        instruction: format!(
+            "The worksession has already started. Future user follow-up information for this task must be forwarded automatically with forward_msg target_worksession_id={session_id}."
+        ),
+    }
 }
 
 fn parse_jsonish_text(text: &str) -> Option<serde_json::Value> {
@@ -1150,6 +1180,25 @@ mod tests {
         register_worksession_tools(&manager, Weak::new(), "ui-session");
         assert!(manager.get_tool_spec(TOOL_CREATE_WORKSPACE).is_some());
         assert!(manager.get_tool_spec(TOOL_CREATE_WORKSESSION).is_some());
+    }
+
+    #[test]
+    fn try_create_summary_tells_parent_session_work_started_and_how_to_route_followups() {
+        let tool = TryCreateWorksessionTool::new(Weak::new(), "ui-session");
+        let output = serde_json::json!({
+            "session_id": "work-1",
+            "workspace_id": "workspace-1",
+            "status": "created",
+            "worker_status": "started",
+            "auto_started": true,
+            "followup_routing": worksession_followup_routing("work-1"),
+        });
+
+        let summary = tool.build_summary(&output);
+
+        assert!(summary.contains("created and started worksession work-1"));
+        assert!(summary.contains("Future user follow-up"));
+        assert!(summary.contains("forward_msg target_worksession_id=work-1"));
     }
 
     fn summary(

@@ -118,6 +118,8 @@ pub struct SessionMeta {
     pub process_entry: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_stack: Vec<ProcessFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_report_delivery: Option<ReportDeliveryState>,
 }
 
 impl SessionMeta {
@@ -145,8 +147,17 @@ impl SessionMeta {
             bootstrap_done: false,
             process_entry: current_behavior,
             process_stack: Vec::new(),
+            last_report_delivery: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportDeliveryState {
+    pub report_hash: String,
+    pub phase: String,
+    pub report_id: String,
+    pub delivered_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

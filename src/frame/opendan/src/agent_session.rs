@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use buckyos_api::{
     UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
+use ndn_lib::{MsgContent, MsgContentFormat, MsgObjKind, MsgObject};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -26,7 +27,8 @@ use llm_context::{
     StepRenderer,
 };
 
-use crate::agent_config::{AgentConfig, LoopMode, SwitchMode};
+use crate::agent::AIAgent;
+use crate::agent_config::{AgentConfig, LoopMode, ReportDeliveryMode, SwitchMode};
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
 use crate::behavior_hooks::{
@@ -42,8 +44,8 @@ use crate::round_history::{
 };
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
-    EventSubscription, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame, SessionInput,
-    SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    EventSubscription, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
+    ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
 
@@ -54,6 +56,22 @@ use crate::task_dispatch::TaskDispatch;
 /// an opaque jump-target string.
 pub const NEXT_BEHAVIOR_WAIT_USER_MSG: &str = "WAIT_USER_MSG";
 const MAX_PENDING_INPUTS: usize = 256;
+const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorksessionReportPhase {
+    Checkpoint,
+    Final,
+}
+
+impl WorksessionReportPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorksessionReportPhase::Checkpoint => "checkpoint",
+            WorksessionReportPhase::Final => "final",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SessionReply {
@@ -184,6 +202,7 @@ pub struct AgentSession {
     /// list here whenever `subscribe_event` / `unsubscribe_event` mutates
     /// `event_subscriptions`, so the agent-wide reader rebuilds promptly.
     event_pump: Option<Arc<SessionEventPump>>,
+    parent_agent: Weak<AIAgent>,
 
     trace_seq: Arc<std::sync::atomic::AtomicU64>,
 
@@ -376,6 +395,7 @@ pub struct AgentSessionBuild {
     /// subscription patterns directly through the pump so additions take
     /// effect without going through the AIAgent layer first.
     pub event_pump: Option<Arc<SessionEventPump>>,
+    pub parent_agent: Weak<AIAgent>,
 }
 
 impl AgentSession {
@@ -434,6 +454,7 @@ impl AgentSession {
             meta: Arc::new(Mutex::new(meta)),
             status: Arc::new(InMemoryStatus::new(ui_session_sync)),
             event_pump: b.event_pump,
+            parent_agent: b.parent_agent,
             trace_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fork_stack: Arc::new(std::sync::Mutex::new(Vec::new())),
             current_origin_msg: Arc::new(std::sync::Mutex::new(None)),
@@ -1829,12 +1850,169 @@ impl AgentSession {
             .unwrap_or(SwitchMode::Normal)
     }
 
+    fn session_class_report_delivery(&self) -> ReportDeliveryMode {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.report_delivery)
+            .unwrap_or_default()
+    }
+
     fn session_class_inject_background_environment(&self) -> bool {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
             .map(|c| c.inject_background_environment)
             .unwrap_or(true)
+    }
+
+    pub(crate) async fn maybe_publish_worksession_report(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        phase: WorksessionReportPhase,
+        next_behavior: Option<&str>,
+        trace_id: &str,
+    ) -> Result<()> {
+        if !matches!(self.kind, SessionKind::Work) {
+            return Ok(());
+        }
+        let report = final_snapshot
+            .state
+            .last_report
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if report.is_empty() {
+            return Ok(());
+        }
+        let meta = self.meta.lock().await.clone();
+        let context_depth = meta.process_stack.len();
+        if !worksession_report_delivery_allows(
+            self.session_class_report_delivery(),
+            phase,
+            context_depth,
+        ) {
+            return Ok(());
+        }
+        let target_session_id = meta.owner.trim().to_string();
+        if target_session_id.is_empty() {
+            warn!(
+                "opendan.session[{}]: worksession report has no owner UI session",
+                self.session_id
+            );
+            return Ok(());
+        }
+        let report_hash = stable_report_hash(&report);
+        if meta
+            .last_report_delivery
+            .as_ref()
+            .is_some_and(|state| state.report_hash == report_hash && state.phase == phase.as_str())
+        {
+            return Ok(());
+        }
+        let report_id = format!(
+            "report:{}:{}:{}",
+            self.session_id,
+            phase.as_str(),
+            report_hash
+        );
+        let parent_process_entry = meta
+            .process_stack
+            .last()
+            .map(|frame| frame.entry.clone())
+            .filter(|entry| !entry.trim().is_empty());
+        let created_at_ms = now_ms();
+        let data = serde_json::json!({
+            "type": WORKSESSION_REPORT_EVENT_TYPE,
+            "report_id": report_id,
+            "source_session_id": self.session_id,
+            "source_kind": "worksession",
+            "target_session_id": target_session_id,
+            "title": meta.title,
+            "objective": meta.objective,
+            "workspace_id": meta.workspace_id,
+            "behavior": meta.current_behavior,
+            "context_depth": context_depth,
+            "process_entry": meta.process_entry,
+            "parent_process_entry": parent_process_entry,
+            "phase": phase.as_str(),
+            "report": report,
+            "next_behavior": next_behavior,
+            "is_final": matches!(phase, WorksessionReportPhase::Final),
+            "trace_id": trace_id,
+            "created_at_ms": created_at_ms,
+        });
+        self.write_worksession_report_file(&data).await;
+        let Some(agent) = self.parent_agent.upgrade() else {
+            warn!(
+                "opendan.session[{}]: worksession report target {} unavailable because parent agent is gone",
+                self.session_id, target_session_id
+            );
+            return Ok(());
+        };
+        let Some(target) = agent.get_session(&target_session_id).await else {
+            warn!(
+                "opendan.session[{}]: worksession report target UI session {} not found",
+                self.session_id, target_session_id
+            );
+            return Ok(());
+        };
+        if !matches!(target.kind, SessionKind::Ui) {
+            warn!(
+                "opendan.session[{}]: worksession report target {} is not a UI session",
+                self.session_id, target_session_id
+            );
+            return Ok(());
+        }
+        let posted = target
+            .post_worksession_report_outbound(&data, Some(report_id.clone()))
+            .await?;
+        if posted {
+            {
+                let mut meta = self.meta.lock().await;
+                if meta.last_report_delivery.as_ref().is_some_and(|state| {
+                    state.report_hash == report_hash && state.phase == phase.as_str()
+                }) {
+                    return Ok(());
+                }
+                meta.last_report_delivery = Some(ReportDeliveryState {
+                    report_hash,
+                    phase: phase.as_str().to_string(),
+                    report_id,
+                    delivered_at_ms: now_ms(),
+                });
+            }
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush report delivery state failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_worksession_report_file(&self, data: &serde_json::Value) {
+        let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
+        let content = format!(
+            "# WorkSession Report\n\n- phase: {}\n- source_session_id: {}\n- target_session_id: {}\n- behavior: {}\n- context_depth: {}\n- created_at_ms: {}\n\n{}",
+            data.get("phase").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("source_session_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("target_session_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("behavior").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("context_depth").and_then(|v| v.as_u64()).unwrap_or(0),
+            data.get("created_at_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            report
+        );
+        let path = self.session_dir.join("report.md");
+        if let Err(err) = tokio::fs::write(&path, content).await {
+            warn!(
+                "opendan.session[{}]: write {} failed: {err}",
+                self.session_id,
+                path.display()
+            );
+        }
     }
 
     /// Map a `BehaviorCfg` to the round-history mode tag (parser-presence is
@@ -2728,6 +2906,7 @@ impl AgentSession {
                 output,
                 response,
                 behavior_result,
+                trace,
                 ..
             } => {
                 self.post_outbound_message(&response.message).await;
@@ -2737,12 +2916,35 @@ impl AgentSession {
                         .send(SessionReply::AssistantText { text })
                         .await;
                 }
-                if let Some(next) = behavior_result.and_then(|r| r.next_behavior) {
+                let next_behavior = behavior_result
+                    .as_ref()
+                    .and_then(|r| r.next_behavior.as_deref())
+                    .map(str::to_string);
+                if let Some(next) = next_behavior.as_deref() {
                     let trimmed = next.trim();
                     if trimmed.eq_ignore_ascii_case("END") {
                         // Independent-mode call-stack-aware End: pop a
                         // parent frame if one is waiting; only an empty
                         // stack means the session itself is done.
+                        let phase = if self.meta.lock().await.process_stack.is_empty() {
+                            WorksessionReportPhase::Final
+                        } else {
+                            WorksessionReportPhase::Checkpoint
+                        };
+                        if let Err(err) = self
+                            .maybe_publish_worksession_report(
+                                &final_snapshot,
+                                phase,
+                                Some(trimmed),
+                                &trace.trace_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "opendan.session[{}]: publish worksession report failed: {err:#}",
+                                self.session_id
+                            );
+                        }
                         return self.handle_process_end(final_snapshot).await;
                     }
                     if trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_USER_MSG) {
@@ -2758,6 +2960,20 @@ impl AgentSession {
                         // `SessionStatus::WaitingInput`, which is what
                         // forward_msg's inbox routing uses to find this
                         // session.
+                        if let Err(err) = self
+                            .maybe_publish_worksession_report(
+                                &final_snapshot,
+                                WorksessionReportPhase::Checkpoint,
+                                Some(trimmed),
+                                &trace.trace_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "opendan.session[{}]: publish worksession report failed: {err:#}",
+                                self.session_id
+                            );
+                        }
                         self.persist_snapshot(&final_snapshot).await;
                         return Ok(NextAction::WaitForMsg);
                     }
@@ -2765,6 +2981,20 @@ impl AgentSession {
                     // snapshot to switch_behavior (which applies the new
                     // behavior's overrides and persists). Do **not** discard
                     // here; next turn resumes from the rebuilt snapshot.
+                    if let Err(err) = self
+                        .maybe_publish_worksession_report(
+                            &final_snapshot,
+                            WorksessionReportPhase::Checkpoint,
+                            Some(trimmed),
+                            &trace.trace_id,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "opendan.session[{}]: publish worksession report failed: {err:#}",
+                            self.session_id
+                        );
+                    }
                     self.switch_behavior(trimmed, behavior, final_snapshot)
                         .await?;
                     return Ok(NextAction::Idle);
@@ -2772,6 +3002,20 @@ impl AgentSession {
                 // Natural Done (no next_behavior). Persist the completed
                 // snapshot so the next round starts from the previous round's
                 // accumulated state instead of rebuilding from round-history.
+                let phase = if self.meta.lock().await.process_stack.is_empty() {
+                    WorksessionReportPhase::Final
+                } else {
+                    WorksessionReportPhase::Checkpoint
+                };
+                if let Err(err) = self
+                    .maybe_publish_worksession_report(&final_snapshot, phase, None, &trace.trace_id)
+                    .await
+                {
+                    warn!(
+                        "opendan.session[{}]: publish worksession report failed: {err:#}",
+                        self.session_id
+                    );
+                }
                 self.persist_snapshot(&final_snapshot).await;
                 if matches!(self.kind, SessionKind::Ui) {
                     Ok(NextAction::WaitForMsg)
@@ -3916,6 +4160,77 @@ impl AgentSession {
             ),
         }
     }
+
+    async fn post_worksession_report_outbound(
+        &self,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        if !matches!(self.kind, SessionKind::Ui) {
+            return Ok(false);
+        }
+        let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let peer_did_raw = self.meta.lock().await.peer_did.clone();
+        let Some(peer_did_raw) = peer_did_raw.as_deref().filter(|s| !s.trim().is_empty()) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — UI session has no peer DID",
+                self.session_id
+            );
+            return Ok(false);
+        };
+        let Ok(peer_did) = name_lib::DID::from_str(peer_did_raw) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — invalid peer DID `{}`",
+                self.session_id, peer_did_raw
+            );
+            return Ok(false);
+        };
+        let agent_did_raw = self.agent_config.toml.identity.agent_did.trim();
+        if agent_did_raw.is_empty() {
+            return Ok(false);
+        }
+        let Ok(agent_did) = name_lib::DID::from_str(agent_did_raw) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — invalid agent DID `{}`",
+                self.session_id, agent_did_raw
+            );
+            return Ok(false);
+        };
+        if agent_did == peer_did {
+            return Ok(false);
+        }
+        let tunnel = self
+            .meta
+            .lock()
+            .await
+            .peer_tunnel_did
+            .as_deref()
+            .and_then(|raw| name_lib::DID::from_str(raw).ok());
+        let msg = build_worksession_report_msg(&agent_did, &peer_did, &self.session_id, data);
+        let send_ctx = buckyos_api::SendContext {
+            contact_mgr_owner: Some(agent_did),
+            preferred_tunnel: tunnel,
+            context_id: Some(self.session_id.clone()),
+            extra: Some(data.clone()),
+            ..Default::default()
+        };
+        match msg_center
+            .post_send(msg, Some(send_ctx), idempotency_key)
+            .await
+        {
+            Ok(result) if result.ok => Ok(true),
+            Ok(result) => {
+                warn!(
+                    "opendan.session[{}]: worksession report outbound rejected — reason={:?}",
+                    self.session_id, result.reason
+                );
+                Ok(false)
+            }
+            Err(err) => Err(anyhow!("worksession report post_send failed: {err}")),
+        }
+    }
 }
 
 enum NextAction {
@@ -4047,6 +4362,120 @@ fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {
         return format!("[fork process `{child_entry}` ended]");
     }
     format!("[fork process `{child_entry}` ended]\n\n## Child Report:\n{report}")
+}
+
+fn worksession_report_delivery_allows(
+    mode: ReportDeliveryMode,
+    phase: WorksessionReportPhase,
+    context_depth: usize,
+) -> bool {
+    match mode {
+        ReportDeliveryMode::FinalOnly => {
+            context_depth == 0 && matches!(phase, WorksessionReportPhase::Final)
+        }
+        ReportDeliveryMode::TopLevel => context_depth == 0,
+        ReportDeliveryMode::All => true,
+    }
+}
+
+fn stable_report_hash(report: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in report.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn build_worksession_report_msg(
+    agent_did: &name_lib::DID,
+    peer_did: &name_lib::DID,
+    target_session_id: &str,
+    data: &serde_json::Value,
+) -> MsgObject {
+    let report = json_str(data, "report");
+    let title = json_str(data, "title");
+    let source_session_id = json_str(data, "source_session_id");
+    let content_title = if title.is_empty() {
+        format!("WorkSession report: {source_session_id}")
+    } else {
+        format!("WorkSession report: {title}")
+    };
+    let mut msg = MsgObject {
+        from: agent_did.clone(),
+        to: vec![peer_did.clone()],
+        kind: MsgObjKind::Chat,
+        created_at_ms: data
+            .get("created_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(now_ms),
+        content: MsgContent {
+            title: Some(content_title),
+            format: Some(MsgContentFormat::TextMarkdown),
+            content: report,
+            ..MsgContent::default()
+        },
+        ..MsgObject::default()
+    };
+    msg.thread.topic = Some(target_session_id.to_string());
+    msg.thread.correlation_id = Some(source_session_id.clone());
+    msg.meta.insert(
+        "llm_role".to_string(),
+        serde_json::Value::String(WORKSESSION_REPORT_EVENT_TYPE.to_string()),
+    );
+    msg.meta.insert(
+        "message_type".to_string(),
+        serde_json::Value::String(WORKSESSION_REPORT_EVENT_TYPE.to_string()),
+    );
+    msg.meta.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(target_session_id.to_string()),
+    );
+    msg.meta.insert(
+        "owner_session_id".to_string(),
+        serde_json::Value::String(target_session_id.to_string()),
+    );
+    msg.meta.insert(
+        "source_session_id".to_string(),
+        serde_json::Value::String(source_session_id.clone()),
+    );
+    msg.meta.insert(
+        "source_kind".to_string(),
+        serde_json::Value::String("worksession".to_string()),
+    );
+    msg.meta.insert(
+        "source".to_string(),
+        serde_json::json!({
+            "kind": "worksession",
+            "session_id": source_session_id,
+            "title": title,
+            "objective": data.get("objective").cloned().unwrap_or(serde_json::Value::Null),
+            "workspace_id": data.get("workspace_id").cloned().unwrap_or(serde_json::Value::Null),
+            "behavior": data.get("behavior").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    for key in [
+        "report_id",
+        "phase",
+        "is_final",
+        "context_depth",
+        "process_entry",
+        "parent_process_entry",
+        "trace_id",
+    ] {
+        if let Some(value) = data.get(key) {
+            msg.meta.insert(key.to_string(), value.clone());
+        }
+    }
+    msg
+}
+
+fn json_str(data: &serde_json::Value, key: &str) -> String {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn now_ms() -> u64 {

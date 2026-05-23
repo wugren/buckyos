@@ -92,6 +92,7 @@ pub(crate) struct ChatMessageView {
     pub(crate) direction: &'static str,
     pub(crate) peer_did: String,
     pub(crate) peer_name: Option<String>,
+    pub(crate) source: Option<ChatMessageSourceView>,
     pub(crate) state: &'static str,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
@@ -99,6 +100,14 @@ pub(crate) struct ChatMessageView {
     pub(crate) thread_id: Option<String>,
     pub(crate) content: String,
     pub(crate) content_format: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct ChatMessageSourceView {
+    pub(crate) kind: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) workspace_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -351,6 +360,53 @@ impl ControlPanelServer {
             })
     }
 
+    fn chat_message_source(record: &MsgRecordWithObject) -> Option<ChatMessageSourceView> {
+        let msg = record.msg.as_ref()?;
+        if let Some(source) = msg.meta.get("source").and_then(|value| value.as_object()) {
+            let kind = source
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Some(ChatMessageSourceView {
+                kind,
+                session_id: source
+                    .get("session_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                title: source
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                workspace_id: source
+                    .get("workspace_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            });
+        }
+        msg.meta
+            .get("source_session_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|session_id| ChatMessageSourceView {
+                kind: msg
+                    .meta
+                    .get("source_kind")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "worksession".to_string()),
+                session_id: Some(session_id),
+                title: None,
+                workspace_id: None,
+            })
+    }
+
     pub(crate) fn chat_record_matches_peer(
         record: &MsgRecordWithObject,
         owner_did: &DID,
@@ -439,6 +495,7 @@ impl ControlPanelServer {
             direction,
             peer_did,
             peer_name,
+            source: Self::chat_message_source(record),
             state: Self::chat_msg_state_label(&record.record.state),
             created_at_ms: record.record.created_at_ms,
             updated_at_ms: record.record.updated_at_ms,
@@ -710,6 +767,7 @@ impl ControlPanelServer {
                 direction: "outbound",
                 peer_did: target_did.to_string(),
                 peer_name,
+                source: None,
                 state: "sent",
                 created_at_ms: message.created_at_ms,
                 updated_at_ms: message.created_at_ms,

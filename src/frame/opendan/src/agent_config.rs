@@ -231,6 +231,20 @@ impl Default for SwitchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportDeliveryMode {
+    FinalOnly,
+    TopLevel,
+    All,
+}
+
+impl Default for ReportDeliveryMode {
+    fn default() -> Self {
+        ReportDeliveryMode::FinalOnly
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SessionClassCfg {
@@ -255,6 +269,7 @@ pub struct SessionClassCfg {
     pub keep_alive: bool,
     #[serde(default = "default_inject_background_environment")]
     pub inject_background_environment: bool,
+    pub report_delivery: ReportDeliveryMode,
 }
 
 fn default_inject_background_environment() -> bool {
@@ -273,6 +288,7 @@ impl Default for SessionClassCfg {
             process_stack_limit: 0,
             keep_alive: false,
             inject_background_environment: true,
+            report_delivery: ReportDeliveryMode::FinalOnly,
         }
     }
 }
@@ -561,6 +577,7 @@ mod tests {
                 process_stack_limit = 8
                 keep_alive = false
                 inject_background_environment = false
+                report_delivery = "top_level"
             "#,
         )
         .unwrap();
@@ -592,7 +609,9 @@ mod tests {
         assert_eq!(work.process_stack_limit, 8);
         assert!(!work.keep_alive);
         assert!(!work.inject_background_environment);
+        assert_eq!(work.report_delivery, ReportDeliveryMode::TopLevel);
         assert!(ui.inject_background_environment);
+        assert_eq!(ui.report_delivery, ReportDeliveryMode::FinalOnly);
     }
 
     #[test]
@@ -606,6 +625,7 @@ mod tests {
         assert_eq!(work.default_behavior, "plan");
         assert_eq!(work.switch_mode, SwitchMode::Fork);
         assert_eq!(work.process_stack_limit, 8);
+        assert_eq!(work.report_delivery, ReportDeliveryMode::FinalOnly);
     }
 
     #[test]

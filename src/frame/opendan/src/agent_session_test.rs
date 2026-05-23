@@ -541,6 +541,90 @@ fn pending_event_replacement_keeps_terminal_over_progress() {
 }
 
 #[test]
+fn worksession_report_delivery_modes_match_context_depth() {
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Final,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Checkpoint,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Final,
+        1
+    ));
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::TopLevel,
+        WorksessionReportPhase::Checkpoint,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::TopLevel,
+        WorksessionReportPhase::Checkpoint,
+        1
+    ));
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::All,
+        WorksessionReportPhase::Checkpoint,
+        3
+    ));
+}
+
+#[test]
+fn worksession_report_msg_carries_source_metadata() {
+    let agent = name_lib::DID::from_str("did:dev:agent").unwrap();
+    let peer = name_lib::DID::from_str("did:dev:alice").unwrap();
+    let data = serde_json::json!({
+        "type": "worksession_report",
+        "report_id": "report:work-1:final:abc",
+        "source_session_id": "work-1",
+        "target_session_id": "ui-1",
+        "title": "build demo",
+        "objective": "ship the demo",
+        "workspace_id": "ws-1",
+        "behavior": "plan",
+        "context_depth": 0,
+        "phase": "final",
+        "report": "done",
+        "is_final": true,
+        "trace_id": "trace-1",
+        "created_at_ms": 42u64,
+    });
+
+    let msg = build_worksession_report_msg(&agent, &peer, "ui-1", &data);
+
+    assert_eq!(msg.content.content, "done");
+    assert_eq!(
+        msg.content.title.as_deref(),
+        Some("WorkSession report: build demo")
+    );
+    assert_eq!(msg.thread.topic.as_deref(), Some("ui-1"));
+    assert_eq!(msg.thread.correlation_id.as_deref(), Some("work-1"));
+    assert_eq!(
+        msg.meta.get("message_type").and_then(|v| v.as_str()),
+        Some("worksession_report")
+    );
+    assert_eq!(
+        msg.meta
+            .get("source")
+            .and_then(|v| v.pointer("/kind"))
+            .and_then(|v| v.as_str()),
+        Some("worksession")
+    );
+    assert_eq!(
+        msg.meta
+            .get("source")
+            .and_then(|v| v.pointer("/session_id"))
+            .and_then(|v| v.as_str()),
+        Some("work-1")
+    );
+}
+
+#[test]
 fn pending_queue_limit_drops_events_then_non_mentions() {
     let mut pending = vec![
         PendingInput::Msg {
@@ -622,6 +706,7 @@ fn session_meta_round_trips_pending_inputs() {
             current: "ui_default".to_string(),
             fork: false,
         }],
+        last_report_delivery: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let restored: SessionMeta = serde_json::from_str(&json).unwrap();
