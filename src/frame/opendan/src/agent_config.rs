@@ -269,6 +269,7 @@ pub struct SessionDriverCfg {
     pub on_init: HookPointCfg,
     pub on_behavior_switch: HookPointCfg,
     pub on_behavior_step_ob: HookPointCfg,
+    #[serde(alias = "on_wakeup")]
     pub on_wait: HookPointCfg,
 }
 

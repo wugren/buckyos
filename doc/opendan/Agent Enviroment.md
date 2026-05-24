@@ -452,6 +452,7 @@ Behavior 模板应使用 `__INCLUDE__` 引入文件内容，不再依赖 `role_m
 ## 10. 测试入口
 
 - 单元测试在 [`prompt_env::tests`](../../src/frame/opendan/src/prompt_env.rs) 模块。
+- 变量契约主测试是 `prompt_env::tests::contract_renders_main_variables_and_control_flow`。本文任意新增、删除、重命名或改变语义的 prompt env 变量，必须同步更新这个测试；新增常用模板写法（尤其是 `if` / `for` / 数组索引 / 旧 alias 兼容）也必须在该测试或同级契约测试中覆盖。
 - `cargo test -p opendan --lib prompt_env::` 可单独跑。
 - 完整 opendan 单元测试：`cargo test -p opendan --lib`。
 

@@ -646,6 +646,7 @@ impl AgentSession {
                 meta.background_events.push(BgEventSnapshot {
                     event_id,
                     data,
+                    reason: None,
                     observed_at_ms: now_ms(),
                 });
                 const MAX_BG_EVENTS: usize = 32;
@@ -816,7 +817,7 @@ impl AgentSession {
                         }
                     };
                     let bootstrap_message = self
-                        .render_on_switch_input_text("none", &behavior, None)
+                        .render_on_switch_input_text("none", &behavior, None, None)
                         .await
                         .map(|text| AiMessage::text(AiRole::User, text));
                     let bootstrap_messages = bootstrap_message.into_iter().collect::<Vec<_>>();
@@ -1984,8 +1985,11 @@ impl AgentSession {
         pending: &[PendingInput],
     ) -> LlmContextEnv {
         let cfg = driver.hook(point);
-        let (events, consumed_event_keys) = self.pull_events_for_env(cfg, pending).await;
-        let (msgs, _) = self.pull_msgs_for_env(cfg, pending);
+        let observed_at_ms = now_ms();
+        let (events, consumed_event_keys) =
+            self.pull_events_for_env(cfg, pending, observed_at_ms).await;
+        let (msgs, _) = self.pull_msgs_for_env(cfg, pending, observed_at_ms);
+        let msg_count = msgs.len();
         let snapshot = self.try_load_snapshot_for_prompt();
         let agent_global_state = if let Some(agent) = self.parent_agent.upgrade() {
             agent.snapshot_global_state(Some(&self.session_id)).await
@@ -1995,27 +1999,36 @@ impl AgentSession {
                 "session_id": self.session_id,
             })
         };
-        LlmContextEnv {
-            events,
-            bg_events: self.meta.lock().await.background_events.clone(),
-            last_step: snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.state.last_step.clone())
-                .and_then(|step| serde_json::to_value(step).ok()),
-            behavior_history: snapshot
-                .map(|snapshot| {
+        let (last_step, last_report, behavior_history) = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot
+                        .state
+                        .last_step
+                        .as_ref()
+                        .map(prompt_env::step_record_prompt_value),
+                    snapshot.state.last_report.clone(),
                     snapshot
                         .state
                         .steps
-                        .into_iter()
-                        .filter_map(|step| serde_json::to_value(step).ok())
-                        .collect()
-                })
-                .unwrap_or_default(),
+                        .iter()
+                        .map(prompt_env::step_record_prompt_value)
+                        .collect(),
+                )
+            })
+            .unwrap_or((None, None, Vec::new()));
+        LlmContextEnv {
+            msgs,
+            events,
+            bg_events: self.meta.lock().await.background_events.clone(),
+            last_step,
+            last_report,
+            behavior_history,
             agent_global_state: merge_global_state_hook_stats(
                 agent_global_state,
                 point.as_key(),
-                msgs.len(),
+                msg_count,
                 consumed_event_keys.len(),
             ),
         }
@@ -2025,6 +2038,7 @@ impl AgentSession {
         &self,
         cfg: &HookPointCfg,
         pending: &[PendingInput],
+        received_at_ms: u64,
     ) -> (Vec<serde_json::Value>, Vec<String>) {
         let limit = match cfg.pull_msg {
             PullMsgPolicy::None => return (Vec::new(), Vec::new()),
@@ -2034,22 +2048,10 @@ impl AgentSession {
         let mut values = Vec::new();
         let mut keys = Vec::new();
         for input in pending {
-            let PendingInput::Msg {
-                record_id,
-                from,
-                text,
-                ai_message,
-                ..
-            } = input
-            else {
+            let Some(msg) = prompt_env::msg_ref_from_pending(input, received_at_ms) else {
                 continue;
             };
-            values.push(serde_json::json!({
-                "record_id": record_id,
-                "from": from,
-                "text": text,
-                "content": ai_message.text_content(),
-            }));
+            values.push(msg);
             keys.push(input.dedup_key());
             if limit.is_some_and(|limit| values.len() >= limit) {
                 break;
@@ -2062,6 +2064,7 @@ impl AgentSession {
         &self,
         cfg: &HookPointCfg,
         pending: &[PendingInput],
+        observed_at_ms: u64,
     ) -> (Vec<EventRef>, Vec<String>) {
         let subscriptions = self.meta.lock().await.event_subscriptions.clone();
         let mut events = Vec::new();
@@ -2087,9 +2090,16 @@ impl AgentSession {
                 }
             };
             if matched {
+                let reason = subscriptions
+                    .iter()
+                    .find(|sub| sub.matches(event_id))
+                    .and_then(|sub| sub.message_template.as_ref())
+                    .cloned();
                 events.push(EventRef {
                     event_id: event_id.clone(),
                     data: data.clone(),
+                    reason,
+                    observed_at_ms,
                 });
                 keys.push(input.dedup_key());
             }
@@ -3675,6 +3685,7 @@ impl AgentSession {
         // §4.2 of the config-rewrite doc: switch_mode is a session-class
         // property — the LLM picks `<next_behavior>`, the runtime decides
         // whether to go Normal / Fork / Independent.
+        let from_context = prompt_env::context_snapshot_prompt_value(&final_snapshot);
         let from_context_report = final_snapshot.state.last_report.clone().unwrap_or_default();
         match self.session_class_switch_mode() {
             SwitchMode::Normal => {
@@ -3699,8 +3710,13 @@ impl AgentSession {
                 self.session_id
             );
         }
-        self.enqueue_on_switch_input(prev, &new_cfg, Some(from_context_report.as_str()))
-            .await;
+        self.enqueue_on_switch_input(
+            prev,
+            &new_cfg,
+            Some(from_context_report.as_str()),
+            Some(from_context),
+        )
+        .await;
         Ok(())
     }
 
@@ -3709,6 +3725,7 @@ impl AgentSession {
         prev_name: &str,
         next: &BehaviorCfg,
         from_context_report: Option<&str>,
+        from_context: Option<serde_json::Value>,
     ) -> Option<String> {
         let template = next.prompt.on_switch.as_deref().map(str::trim)?;
         if template.is_empty() {
@@ -3726,19 +3743,25 @@ impl AgentSession {
         let report = from_context_report
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let from_context = report
-            .map(|value| {
-                serde_json::json!({
-                    "report": value,
+        let from_context = from_context.unwrap_or_else(|| {
+            report
+                .map(|value| {
+                    serde_json::json!({
+                        "last_report": value,
+                        "report": value,
+                    })
                 })
-            })
-            .unwrap_or(serde_json::Value::Null);
+                .unwrap_or(serde_json::Value::Null)
+        });
+        let to_context = prompt_env::context_snapshot_prompt_value_from_env(&env);
         let extras = [
             (
                 "switch",
                 serde_json::json!({
                     "from": prev_name,
                     "to": next.meta.name.clone(),
+                    "from_context": from_context.clone(),
+                    "to_context": to_context.clone(),
                 }),
             ),
             (
@@ -3746,6 +3769,7 @@ impl AgentSession {
                 serde_json::Value::String(prev_name.to_string()),
             ),
             ("from_context", from_context),
+            ("to_context", to_context),
         ];
         match prompt_env::render_template(template, &env, &extras).await {
             Ok(text) => Some(text.trim().to_string()),
@@ -3765,9 +3789,10 @@ impl AgentSession {
         prev: &BehaviorCfg,
         next: &BehaviorCfg,
         from_context_report: Option<&str>,
+        from_context: Option<serde_json::Value>,
     ) {
         let Some(text) = self
-            .render_on_switch_input_text(&prev.meta.name, next, from_context_report)
+            .render_on_switch_input_text(&prev.meta.name, next, from_context_report, from_context)
             .await
         else {
             return;
@@ -4006,6 +4031,7 @@ impl AgentSession {
                         child_entry.as_str(),
                         &parent_cfg,
                         Some(child_report.as_str()),
+                        None,
                     )
                     .await
                 }

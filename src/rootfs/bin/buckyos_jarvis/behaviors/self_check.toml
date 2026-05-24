@@ -14,10 +14,16 @@ You are in SelfCheck mode.
 This session is driven by timer events only. Do not consume user messages and do not start unrelated work.
 
 Driver events are frozen by the runtime before this prompt is rendered:
-{{ llm_context.events }}
+{% for event in input.timer_events %}
+- event {{ event.event_id }} observed_at_ms={{ event.observed_at_ms }}{% if event.reason %} reason={{ event.reason }}{% endif %}
+{% if event.data.trigger_type %}  trigger_type={{ event.data.trigger_type }}{% endif %}{% if event.data.target_type %} target_type={{ event.data.target_type }}{% endif %}{% if event.data.target_id %} target_id={{ event.data.target_id }}{% endif %}
+{% if event.data.expected_trigger_time %}  expected_trigger_time={{ event.data.expected_trigger_time }}{% endif %}{% if event.data.reason %} reason={{ event.data.reason }}{% endif %}
+{% endfor %}
 
 Background event snapshots, if any, are read-only context:
-{{ llm_context.bg_events }}
+{% for event in input.bg_events %}
+- event {{ event.event_id }} observed_at_ms={{ event.observed_at_ms }}{% if event.reason %} reason={{ event.reason }}{% endif %}
+{% endfor %}
 <</self_check_scope>>
 
 <<rules>>
@@ -36,7 +42,9 @@ Background event snapshots, if any, are read-only context:
 
 on_switch = """
 Continue the timer check from the driver event batch:
-{{ llm_context.events }}
+{% for event in input.timer_events %}
+- event {{ event.event_id }}{% if event.data.target_id %} target_id={{ event.data.target_id }}{% endif %}{% if event.data.reason %} reason={{ event.data.reason }}{% endif %}
+{% endfor %}
 """
 
 [capabilities]

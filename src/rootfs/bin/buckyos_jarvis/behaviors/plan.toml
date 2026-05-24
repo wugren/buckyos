@@ -105,32 +105,32 @@ on_behavior_step_ob = """
 {{ default_last_step_action_results_text }}
 <</last_step_results>>
 
-{{%if input.has_msgs}}
+{% if input.has_msgs %}
 <<new_user_msgs>>
-{{%for msg in input.msgs%}}
+{% for msg in input.msgs %}
 <message from={{msg.from}}>
-{{msg.content}}
+{{msg.text}}
 </message>
-{{%endfor}}
+{% endfor %}
 <</new_user_msgs>>
-{{%endif%}}
+{% endif %}
 """
 
 # 这条路径其实不会进入，用来做DEMO
 on_wakeup = """
-{{%if input.has_msg%}}
-input.text
-{{%endif%}}
+{% if input.has_msgs %}
+{{ input.text }}
+{% endif %}
 
-{{%if input.has_events%}}
+{% if input.has_events %}
 <<new_events>>
-{{%for event in input.events%}}
+{% for event in input.events %}
 <event id={{event.event_id}}>
-{{event.data}}
+{% if event.reason %}reason={{ event.reason }}{% endif %}
 </event>
-{{%endfor%}}
-<</new_events
-{{%endif%}}
+{% endfor %}
+<</new_events>>
+{% endif %}
 """
 
 [capabilities]

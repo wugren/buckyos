@@ -286,12 +286,18 @@ pub struct SessionSummary {
 pub struct EventRef {
     pub event_id: String,
     pub data: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BgEventSnapshot {
     pub event_id: String,
     pub data: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default)]
     pub observed_at_ms: u64,
 }
