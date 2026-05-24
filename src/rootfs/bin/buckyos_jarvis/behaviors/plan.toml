@@ -24,8 +24,6 @@ PLAN -> DO -> PLAN -> DO -> PLAN -> END.
 - If the TodoList is empty, create the next plan.
 - If any todo failed, replan from the new facts.
 - If a delegated task is still open, fetch its latest details before deciding.
-- If `llm_context.events` is not empty, treat it as the driver-frozen event batch for this turn. Read it before planning and consume only the facts relevant to this work session.
-- Treat `llm_context.bg_events` as background snapshots only; do not assume they were consumed as triggers.
 - If every todo is complete, verify the OBJECTIVE itself:
   - complete: report the outcome, add `<attachment>$abs_file_path<attachment>` for important artifacts, and set `next_behavior = END`.
   - incomplete: replan.
@@ -87,6 +85,7 @@ Read global state only when it can change the plan. Do not repeat large state du
 <</RESULT_PROTOCOL>>
 """
 
+# 
 on_behavior_switch = """
 {% if from_context %}
 ## Last Finish Todo Report:
@@ -97,13 +96,10 @@ on_behavior_switch = """
 
 {{ session.current_todo_list }}
 
-## Driver Events:
-
-{{ llm_context.events }}
-
 Continue from PROCESS_RULES.
 """
 
+# Plan模式可以在每个step都读取可能的用户输入和事件
 on_behavior_step_ob = """
 <<last_step_action_results>>
 {{ default_last_step_action_results_text }}
@@ -120,6 +116,7 @@ on_behavior_step_ob = """
 {{%endif%}}
 """
 
+# 这条路径其实不会进入，用来做DEMO
 on_wakeup = """
 {{%if input.has_msg%}}
 input.text
