@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::agent_bash::{build_session_tools, SessionBinLayout, SessionToolsBuild};
 use crate::agent_config::AgentConfig;
-use crate::agent_session::{AgentSession, AgentSessionBuild, SessionReply, WorksessionReportPhase};
+use crate::agent_session::{AgentSession, AgentSessionBuild, SessionReply};
 use crate::ai_runtime::AgentRuntime;
 use crate::contact::ContactLookup;
 use crate::dispatch::{
@@ -118,6 +118,72 @@ pub enum Inbound {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardRouteStrategy {
+    ExplicitTargetOnly,
+    MostRecentWaitingInput,
+    NewWorkSessionOnInterrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardRouteDecision {
+    Forward(String),
+    CreateNewWorkSession,
+    KeepInUi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRouteCandidate {
+    pub session_id: String,
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub status_changed_at_ms: u64,
+}
+
+/// forwardMessage routing decision table:
+/// - explicit target: forward only when it is a non-Ended Work session
+/// - no explicit target: at most one message is forwarded
+/// - multiple WaitForInput Work sessions: choose the most recently entered
+///   WaitingInput state
+/// - Running Work sessions are not implicit targets
+/// - user interrupt without explicit target creates a new Work session
+pub fn decide_forward_route(
+    strategy: ForwardRouteStrategy,
+    explicit_target: Option<&str>,
+    user_interrupt: bool,
+    candidates: &[ForwardRouteCandidate],
+) -> ForwardRouteDecision {
+    if let Some(target) = explicit_target {
+        return candidates
+            .iter()
+            .find(|candidate| {
+                candidate.session_id == target
+                    && matches!(candidate.kind, SessionKind::Work)
+                    && !matches!(candidate.status, SessionStatus::Ended)
+            })
+            .map(|candidate| ForwardRouteDecision::Forward(candidate.session_id.clone()))
+            .unwrap_or(ForwardRouteDecision::KeepInUi);
+    }
+
+    if user_interrupt && matches!(strategy, ForwardRouteStrategy::NewWorkSessionOnInterrupt) {
+        return ForwardRouteDecision::CreateNewWorkSession;
+    }
+
+    if matches!(strategy, ForwardRouteStrategy::MostRecentWaitingInput) {
+        return candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(candidate.kind, SessionKind::Work)
+                    && matches!(candidate.status, SessionStatus::WaitingInput)
+            })
+            .max_by_key(|candidate| candidate.status_changed_at_ms)
+            .map(|candidate| ForwardRouteDecision::Forward(candidate.session_id.clone()))
+            .unwrap_or(ForwardRouteDecision::KeepInUi);
+    }
+
+    ForwardRouteDecision::KeepInUi
+}
+
 /// Shutdown signal. Owners drop the sender or `send(())` to start a graceful
 /// shutdown.
 type ShutdownRx = mpsc::Receiver<()>;
@@ -130,6 +196,7 @@ pub struct AIAgent {
     /// Map tunnel/from → UI session id.
     tunnel_to_ui_session: Arc<Mutex<HashMap<String, String>>>,
     sessions: Arc<Mutex<HashMap<String, Arc<AgentSession>>>>,
+    session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     inbox_tx: mpsc::Sender<Inbound>,
     inbox_rx: Arc<Mutex<Option<mpsc::Receiver<Inbound>>>>,
     shutdown_tx: ShutdownTx,
@@ -186,6 +253,7 @@ impl AIAgent {
             agent_name,
             tunnel_to_ui_session: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_locks: Arc::new(Mutex::new(HashMap::new())),
             inbox_tx,
             inbox_rx: Arc::new(Mutex::new(Some(inbox_rx))),
             shutdown_tx,
@@ -344,24 +412,44 @@ impl AIAgent {
         info!("opendan.agent[{}]: starting AIAgent::run", self.agent_name);
         self.clone().restore_active_sessions().await;
 
-        let mut inbox_rx = self
-            .inbox_rx
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| anyhow!("AIAgent::run called twice (inbox already taken)"))?;
-        let mut shutdown_rx = self
-            .shutdown_rx
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| anyhow!("AIAgent::run called twice (shutdown already taken)"))?;
-
         let pump_handle = self.clone().spawn_msg_center_pump();
         let event_pump_handle = self.event_pump.as_ref().map(|p| {
             let p = p.clone();
             tokio::spawn(async move { p.run().await })
         });
+
+        if std::env::var("AGENT_MAIN_LOOP").ok().as_deref() == Some("1") {
+            info!(
+                "opendan.agent[{}]: AGENT_MAIN_LOOP=1 enabled",
+                self.agent_name
+            );
+        }
+        self.clone().main_loop().await?;
+        self.pump_shutdown.notify_waiters();
+        if let Some(handle) = pump_handle {
+            // Best-effort: pump task observes `pump_shutdown` and exits on its
+            // own; we just wait so the kevent reader is fully closed before
+            // the agent drops.
+            let _ = handle.await;
+        }
+        if let Some(handle) = event_pump_handle {
+            let _ = handle.await;
+        }
+        self.stop_all_sessions().await;
+        Ok(())
+    }
+
+    pub async fn main_loop(self: Arc<Self>) -> Result<()> {
+        let mut inbox_rx = self
+            .inbox_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| anyhow!("AIAgent::main_loop called twice (inbox already taken)"))?;
+        let mut shutdown_rx =
+            self.shutdown_rx.lock().await.take().ok_or_else(|| {
+                anyhow!("AIAgent::main_loop called twice (shutdown already taken)")
+            })?;
 
         loop {
             tokio::select! {
@@ -380,17 +468,6 @@ impl AIAgent {
                 }
             }
         }
-        self.pump_shutdown.notify_waiters();
-        if let Some(handle) = pump_handle {
-            // Best-effort: pump task observes `pump_shutdown` and exits on its
-            // own; we just wait so the kevent reader is fully closed before
-            // the agent drops.
-            let _ = handle.await;
-        }
-        if let Some(handle) = event_pump_handle {
-            let _ = handle.await;
-        }
-        self.stop_all_sessions().await;
         Ok(())
     }
 
@@ -494,6 +571,38 @@ impl AIAgent {
             .unwrap_or_else(|| self.config.toml.dispatch.default_class.clone())
     }
 
+    fn route_msg(&self, event_type: &str) -> String {
+        self.route_to_class(event_type)
+    }
+
+    fn route_event_target(&self, data: &serde_json::Value) -> Option<String> {
+        data.get("reason")
+            .and_then(|value| {
+                serde_json::from_value::<crate::session_model::TimerReason>(value.clone()).ok()
+            })
+            .and_then(|reason| {
+                let target_id = reason.target_id.trim();
+                if target_id.is_empty() {
+                    None
+                } else {
+                    Some(target_id.to_string())
+                }
+            })
+            .or_else(|| {
+                data.get("target_session_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+    }
+
+    fn route_event_class(&self, event_id: &str) -> Option<String> {
+        if event_id.starts_with("timer.") || event_id.starts_with("/timer/") {
+            Some(self.config.class_name_for_kind(SessionKind::SelfCheck))
+        } else {
+            None
+        }
+    }
+
     /// Mint or look up the session id this inbound goes to, given its
     /// resolved session class. Returns `None` when the strategy's required
     /// fields aren't present in the inbound (e.g. PerPeer with no `from`).
@@ -522,7 +631,7 @@ impl AIAgent {
                 } else {
                     "msg.chat"
                 };
-                let class = self.route_to_class(event_type);
+                let class = self.route_msg(event_type);
                 let kind = self
                     .config
                     .session_class(&class)
@@ -569,7 +678,7 @@ impl AIAgent {
                 // Once it returns we're safe to ack upstream — a crash from
                 // here on leaves the input owned by the session, not lost.
                 session
-                    .enqueue_pending(PendingInput::Msg {
+                    .push_msg(PendingInput::Msg {
                         record_id: record_id.clone(),
                         from,
                         from_did,
@@ -630,27 +739,35 @@ impl AIAgent {
                 // pre-routed events (carrier sets `target_session_id`) are
                 // delivered. Broadcast / pattern-matched event delivery
                 // lands with `session_sub_kevent`.
-                let Some(sid) = target_session_id else {
+                let explicit_target = target_session_id.or_else(|| self.route_event_target(&data));
+                let session = if let Some(sid) = explicit_target {
+                    match self.clone().ensure_session(&sid).await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            warn!(
+                                "opendan.agent[{}]: event {} target session {} unavailable: {err:#}",
+                                self.agent_name, event_id, sid
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else if let Some(class) = self.route_event_class(&event_id) {
+                    let kind = self
+                        .config
+                        .session_class(&class)
+                        .map(|cfg| cfg.kind)
+                        .unwrap_or(SessionKind::SelfCheck);
+                    self.clone()
+                        .get_or_create_session(class.clone(), "system".to_string(), kind, &class)
+                        .await?
+                } else {
                     warn!(
                         "opendan.agent[{}]: event {} dropped — no target_session_id and broadcast routing not yet wired",
                         self.agent_name, event_id
                     );
                     return Ok(());
                 };
-                let session = {
-                    let map = self.sessions.lock().await;
-                    map.get(&sid).cloned()
-                };
-                let Some(session) = session else {
-                    warn!(
-                        "opendan.agent[{}]: event {} target session {} unknown, dropping",
-                        self.agent_name, event_id, sid
-                    );
-                    return Ok(());
-                };
-                session
-                    .enqueue_pending(PendingInput::Event { event_id, data })
-                    .await?;
+                session.notify_event(event_id, data).await?;
                 Ok(())
             }
         }
@@ -896,6 +1013,54 @@ impl AIAgent {
             .await
     }
 
+    async fn session_build_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn ensure_session(self: Arc<Self>, session_id: &str) -> Result<Arc<AgentSession>> {
+        if let Some(s) = self.sessions.lock().await.get(session_id).cloned() {
+            return Ok(s);
+        }
+        let meta_path = self
+            .config
+            .layout
+            .session_dir(session_id)
+            .join(".meta")
+            .join("session.json");
+        let bytes = std::fs::read(&meta_path)
+            .map_err(|err| anyhow!("ensure_session: read {} failed: {err}", meta_path.display()))?;
+        let meta: SessionMeta = serde_json::from_slice(&bytes).map_err(|err| {
+            anyhow!(
+                "ensure_session: parse {} failed: {err}",
+                meta_path.display()
+            )
+        })?;
+        let kind = meta.kind;
+        let owner = meta.owner.clone();
+        let behavior = meta.current_behavior.clone();
+        self.ensure_session_inner(
+            session_id.to_string(),
+            kind,
+            owner,
+            Some(behavior),
+            Some(meta),
+        )
+        .await
+    }
+
+    pub async fn retire_idle_session(&self, session_id: &str) {
+        let removed = self.sessions.lock().await.remove(session_id);
+        if removed.is_some() {
+            if let Some(pump) = self.event_pump.as_ref() {
+                pump.remove_session(session_id).await;
+            }
+        }
+    }
+
     async fn ensure_session_inner(
         self: Arc<Self>,
         session_id: String,
@@ -904,6 +1069,14 @@ impl AIAgent {
         behavior_hint: Option<String>,
         existing_meta: Option<SessionMeta>,
     ) -> Result<Arc<AgentSession>> {
+        {
+            let map = self.sessions.lock().await;
+            if let Some(s) = map.get(&session_id) {
+                return Ok(s.clone());
+            }
+        }
+        let build_lock = self.session_build_lock(&session_id).await;
+        let _guard = build_lock.lock().await;
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&session_id) {
@@ -944,7 +1117,7 @@ impl AIAgent {
                 Err(_) => {}
             }
         }
-        let workspace_rec = if matches!(kind, SessionKind::Work) {
+        let workspace_rec = if kind.is_work_family() {
             let preselected_ws = existing_meta
                 .as_ref()
                 .and_then(|m| m.workspace_id.clone())
@@ -973,6 +1146,23 @@ impl AIAgent {
             let class = self.config.class_name_for_kind(kind);
             self.config.default_behavior_for_class(&class)
         });
+        let class_name = self.config.class_name_for_kind(kind);
+        let class_keep_alive = self
+            .config
+            .session_class(&class_name)
+            .map(|cfg| cfg.driver.keep_alive)
+            .unwrap_or(matches!(kind, SessionKind::Ui));
+        if let Some(meta) = existing_meta.as_mut() {
+            if meta.status_changed_at_ms == 0 {
+                meta.status_changed_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+            }
+            if matches!(kind, SessionKind::Ui) || class_keep_alive {
+                meta.keep_alive = class_keep_alive;
+            }
+        }
         let agent_id = self.agent_id();
         let bin_renderer = self.build_session_bin_renderer(&agent_id, &session_id, &behavior_name);
 
@@ -1016,6 +1206,16 @@ impl AIAgent {
             parent_agent: Arc::downgrade(&self),
         });
         let session = Arc::new(session);
+        {
+            let mut meta = session.meta.lock().await;
+            meta.keep_alive = class_keep_alive;
+            if meta.status_changed_at_ms == 0 {
+                meta.status_changed_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+            }
+        }
         if let Some(workspace_rec) = workspace_rec.as_ref() {
             // Reciprocal binding: session ↔ workspace. Session-side first so
             // its meta is the source of truth; if the workspace-side update
@@ -1046,8 +1246,6 @@ impl AIAgent {
                 self.agent_name, session_id
             );
         }
-        session.clone().start(inbox_rx).await;
-
         // Reply collector: for MVP just log + (if we had a way) forward to the
         // tunnel. Spawn it under the session id.
         let log_sid = session_id.clone();
@@ -1084,6 +1282,7 @@ impl AIAgent {
             let patterns = session.subscription_patterns().await;
             pump.set_session_subscriptions(&session_id, patterns).await;
         }
+        session.clone().start(inbox_rx).await;
         Ok(session)
     }
 
@@ -1456,6 +1655,7 @@ fn truncate(s: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_session::WorksessionReportPhase;
     use crate::worklog::{WorklogService, WorklogToolConfig};
     use async_trait::async_trait;
     use buckyos_api::{AiMethodRequest, AiMethodResponse, AiccClient, AiccHandler, CancelResponse};
@@ -1507,6 +1707,71 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("abcdefghij", 4), "abcd…");
+    }
+
+    #[test]
+    fn forward_route_selects_latest_waiting_work_session() {
+        let candidates = vec![
+            ForwardRouteCandidate {
+                session_id: "work-old".to_string(),
+                kind: SessionKind::Work,
+                status: SessionStatus::WaitingInput,
+                status_changed_at_ms: 10,
+            },
+            ForwardRouteCandidate {
+                session_id: "work-new".to_string(),
+                kind: SessionKind::Work,
+                status: SessionStatus::WaitingInput,
+                status_changed_at_ms: 20,
+            },
+            ForwardRouteCandidate {
+                session_id: "ui".to_string(),
+                kind: SessionKind::Ui,
+                status: SessionStatus::WaitingInput,
+                status_changed_at_ms: 30,
+            },
+        ];
+        assert_eq!(
+            decide_forward_route(
+                ForwardRouteStrategy::MostRecentWaitingInput,
+                None,
+                false,
+                &candidates
+            ),
+            ForwardRouteDecision::Forward("work-new".to_string())
+        );
+    }
+
+    #[test]
+    fn forward_route_does_not_implicit_forward_to_running_work() {
+        let candidates = vec![ForwardRouteCandidate {
+            session_id: "work-running".to_string(),
+            kind: SessionKind::Work,
+            status: SessionStatus::Running,
+            status_changed_at_ms: 20,
+        }];
+        assert_eq!(
+            decide_forward_route(
+                ForwardRouteStrategy::MostRecentWaitingInput,
+                None,
+                false,
+                &candidates
+            ),
+            ForwardRouteDecision::KeepInUi
+        );
+    }
+
+    #[test]
+    fn forward_route_interrupt_creates_new_work_session() {
+        assert_eq!(
+            decide_forward_route(
+                ForwardRouteStrategy::NewWorkSessionOnInterrupt,
+                None,
+                true,
+                &[]
+            ),
+            ForwardRouteDecision::CreateNewWorkSession
+        );
     }
 
     struct NoopAicc;

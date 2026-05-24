@@ -23,6 +23,8 @@ Your only job is to complete the TASK_ANCHOR (Todo Task).
 
 - You MUST work on TASK_ANCHOR only. Use the work session todo list to understand the TASK_ANCHOR boundary more accurately.
 - You MUST treat prior Step Record History as context, not as the task itself.
+- If `llm_context.events` is not empty, treat it as the driver-frozen event batch for this step and only use events relevant to TASK_ANCHOR.
+- Treat `llm_context.bg_events` as non-consuming background snapshots.
 - You MUST NOT send external messages unless the task is blocked by missing user input.
 - This worksession already has a workspace: `{{ paths.workspace_root }}`.
 - You SHOULD use `{{ paths.session_root }}` only for session-local runtime state, temporary notes, and internal execution records.
@@ -87,6 +89,9 @@ Read global state only when it can change execution. Do not dump large state int
 """
 on_switch = """
 Continue TASK_ANCHOR.
+
+Driver events for this turn:
+{{ llm_context.events }}
 """
 
 on_input_event = """

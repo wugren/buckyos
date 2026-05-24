@@ -64,7 +64,7 @@ mini_agent_demo/
 
 - 在 `agent.toml` 写 `when = "..."` 之类的表达式 ⇒ 不支持
 - 在 `behaviors/*.toml` 给 `session_id` 写模板插值 ⇒ 不支持(strategy 是 4 选 1 的枚举)
-- 让 LLM 决定 `switch_mode = "fork"` 还是 `"normal"` ⇒ LLM 只挑 `<next_behavior>`,模式归 session 类
+- 让 LLM 决定 `driver.switch_mode = "fork"` 还是 `"normal"` ⇒ LLM 只挑 `<next_behavior>`,模式归 session driver
 
 复杂状态机请整体跳到 Workflow LLMContext DSL,不要在这份 schema 上叠 `when` / 脚本钩子。
 

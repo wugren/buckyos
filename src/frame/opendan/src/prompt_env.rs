@@ -21,7 +21,29 @@ use llm_context::{
 };
 use serde_json::{json, Value as Json};
 
-use crate::session_model::SessionKind;
+use crate::session_model::{BgEventSnapshot, EventRef, SessionKind};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LlmContextEnv {
+    pub events: Vec<EventRef>,
+    pub bg_events: Vec<BgEventSnapshot>,
+    pub last_step: Option<Json>,
+    pub behavior_history: Vec<Json>,
+    pub agent_global_state: Json,
+}
+
+impl Default for LlmContextEnv {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            bg_events: Vec::new(),
+            last_step: None,
+            behavior_history: Vec::new(),
+            agent_global_state: Json::Null,
+        }
+    }
+}
 
 /// Phase-1 snapshot of the variables the loader / `RenderVars` can serve.
 /// Built once per turn at the egress boundary so the value set is stable
@@ -58,15 +80,13 @@ pub struct AgentSessionEnv {
 
     pub recent_activity: String,
     pub clock_unix_ms: u64,
+    pub llm_context: LlmContextEnv,
 }
 
 impl AgentSessionEnv {
     /// Normalize a raw `SessionKind` to the stable string used in templates.
     pub fn kind_str(kind: SessionKind) -> &'static str {
-        match kind {
-            SessionKind::Ui => "ui",
-            SessionKind::Work => "work",
-        }
+        kind.as_str()
     }
 
     fn has_title(&self) -> bool {
@@ -108,6 +128,21 @@ pub fn build_render_vars(env: &AgentSessionEnv) -> RenderVars {
         .with_var("paths", paths_object(env))
         .with_var("input", input_object(env))
         .with_var("runtime", runtime_object(env))
+        .with_var("llm_context", llm_context_object(env))
+        .with_var("events", events_array(env))
+        .with_var("bg_events", bg_events_array(env))
+        .with_var(
+            "last_step",
+            env.llm_context.last_step.clone().unwrap_or(Json::Null),
+        )
+        .with_var(
+            "behavior_history",
+            Json::Array(env.llm_context.behavior_history.clone()),
+        )
+        .with_var(
+            "agent_global_state",
+            env.llm_context.agent_global_state.clone(),
+        )
         .with_var(
             "result_protocol",
             Json::String(XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string()),
@@ -203,6 +238,19 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "runtime.recent_activity" => Some(Json::String(env.recent_activity.clone())),
         "runtime.has_activity" => Some(Json::Bool(env.has_recent_activity())),
 
+        "llm_context" => Some(llm_context_object(env)),
+        "llm_context.events" | "events" => Some(events_array(env)),
+        "llm_context.bg_events" | "bg_events" => Some(bg_events_array(env)),
+        "llm_context.last_step" | "last_step" => {
+            Some(env.llm_context.last_step.clone().unwrap_or(Json::Null))
+        }
+        "llm_context.behavior_history" | "behavior_history" => {
+            Some(Json::Array(env.llm_context.behavior_history.clone()))
+        }
+        "llm_context.agent_global_state" | "agent_global_state" => {
+            Some(env.llm_context.agent_global_state.clone())
+        }
+
         "result_protocol" | "xml_behavior_result_protocol" => Some(Json::String(
             XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string(),
         )),
@@ -279,6 +327,24 @@ fn runtime_object(env: &AgentSessionEnv) -> Json {
         "recent_activity": env.recent_activity,
         "has_activity": env.has_recent_activity(),
     })
+}
+
+fn llm_context_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "events": events_array(env),
+        "bg_events": bg_events_array(env),
+        "last_step": env.llm_context.last_step.clone().unwrap_or(Json::Null),
+        "behavior_history": env.llm_context.behavior_history.clone(),
+        "agent_global_state": env.llm_context.agent_global_state.clone(),
+    })
+}
+
+fn events_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.llm_context.events).unwrap_or(Json::Array(Vec::new()))
+}
+
+fn bg_events_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.llm_context.bg_events).unwrap_or(Json::Array(Vec::new()))
 }
 
 /// Render `template` through `PromptRenderEngine` with the Phase-1 variable
@@ -359,6 +425,20 @@ mod tests {
             input_has_events: false,
             recent_activity: "running tool".into(),
             clock_unix_ms: 123,
+            llm_context: LlmContextEnv {
+                events: vec![EventRef {
+                    event_id: "timer.reminder_check".into(),
+                    data: json!({"target_id": "r1"}),
+                }],
+                bg_events: vec![BgEventSnapshot {
+                    event_id: "presence.changed".into(),
+                    data: json!({"online": true}),
+                    observed_at_ms: 122,
+                }],
+                last_step: Some(json!({"step_index": 7})),
+                behavior_history: vec![json!({"step_index": 6})],
+                agent_global_state: json!({"mood": "steady"}),
+            },
         }
     }
 
@@ -384,6 +464,7 @@ mod tests {
             input_has_events: false,
             recent_activity: String::new(),
             clock_unix_ms: 999,
+            llm_context: LlmContextEnv::default(),
         }
     }
 
@@ -434,6 +515,14 @@ mod tests {
             Some(Json::String(
                 XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string()
             ))
+        );
+        assert_eq!(
+            loader.load("$llm_context.events").await.unwrap(),
+            Some(json!([{"event_id": "timer.reminder_check", "data": {"target_id": "r1"}}]))
+        );
+        assert_eq!(
+            loader.load("$agent_global_state").await.unwrap(),
+            Some(json!({"mood": "steady"}))
         );
         assert_eq!(loader.load("$unknown.path").await.unwrap(), None);
     }

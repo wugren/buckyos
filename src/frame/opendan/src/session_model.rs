@@ -1,5 +1,16 @@
-use buckyos_api::AiMessage;
-use serde::{Deserialize, Serialize};
+use buckyos_api::{match_event_patterns, AiMessage};
+use chrono::{DateTime, FixedOffset};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+// AgentSession lifecycle invariants.
+//
+// END is terminal for the current worker run: `on_wait` is not triggered after
+// END, and implicit routing must not reopen the same session. Follow-up user
+// input that belongs to the same topic creates a new Work-family session and
+// may copy/read old context explicitly at a higher layer. Routing metadata is
+// kept in `.meta/session.json` for audit/debug after END, but it is not an
+// active dispatch target. `keep_alive=true` keeps non-END workers warm while
+// idle; it never changes END into a resumable state.
 
 /// Internal wake-up signal for the session worker. The worker consumes the
 /// actual payload from `SessionMeta::pending_inputs` (which is persisted) —
@@ -68,11 +79,58 @@ impl PendingInput {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Ui,
     Work,
+    SelfCheck,
+    SelfImprove,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Ui => "ui",
+            SessionKind::Work => "work",
+            SessionKind::SelfCheck => "self_check",
+            SessionKind::SelfImprove => "self_improve",
+        }
+    }
+
+    pub fn is_work_family(self) -> bool {
+        matches!(
+            self,
+            SessionKind::Work | SessionKind::SelfCheck | SessionKind::SelfImprove
+        )
+    }
+}
+
+impl Serialize for SessionKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.trim() {
+            "ui" => SessionKind::Ui,
+            "work" => SessionKind::Work,
+            "self_check" => SessionKind::SelfCheck,
+            "self_improve" => SessionKind::SelfImprove,
+            // Migration guard: old or experimental data must not fail a
+            // restore just because the kind string drifted. Unknown
+            // non-UI sessions get the Work body semantics.
+            _ => SessionKind::Work,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,7 +151,11 @@ pub struct SessionMeta {
     pub current_behavior: String,
     pub status: SessionStatus,
     #[serde(default)]
+    pub status_changed_at_ms: u64,
+    #[serde(default)]
     pub owner: String,
+    #[serde(default)]
+    pub keep_alive: bool,
     #[serde(default)]
     pub one_line_status: String,
     #[serde(default)]
@@ -104,6 +166,8 @@ pub struct SessionMeta {
     pub peer_tunnel_did: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_subscriptions: Vec<EventSubscription>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_events: Vec<BgEventSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -134,12 +198,15 @@ impl SessionMeta {
             kind,
             current_behavior: current_behavior.clone(),
             status: SessionStatus::Idle,
+            status_changed_at_ms: 0,
             owner,
+            keep_alive: false,
             one_line_status: String::new(),
             pending_inputs: Vec::new(),
             peer_did: None,
             peer_tunnel_did: None,
             event_subscriptions: Vec::new(),
+            background_events: Vec::new(),
             workspace_id: None,
             pending_task_calls: Vec::new(),
             title: String::new(),
@@ -180,6 +247,20 @@ pub struct SessionSummary {
     pub current_behavior: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventRef {
+    pub event_id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BgEventSnapshot {
+    pub event_id: String,
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub observed_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessFrame {
     pub entry: String,
@@ -197,6 +278,117 @@ pub struct EventSubscription {
     pub pattern: String,
     #[serde(default)]
     pub subscribed_at_ms: u64,
+    #[serde(default)]
+    pub mode: EventSubscriptionMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_template: Option<String>,
+}
+
+impl EventSubscription {
+    pub fn matches(&self, event_id: &str) -> bool {
+        match_event_patterns(std::slice::from_ref(&self.pattern), event_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSubscriptionMode {
+    Full,
+    BackgroundOnly,
+}
+
+impl Default for EventSubscriptionMode {
+    fn default() -> Self {
+        EventSubscriptionMode::Full
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimerReason {
+    pub trigger_type: TimerTriggerType,
+    pub target_type: TimerTargetType,
+    pub target_id: String,
+    pub expected_trigger_time: DateTime<FixedOffset>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerTriggerType {
+    HardBarrier,
+    PreciseTrigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimerTargetType {
+    Reminder,
+    ScheduledTask,
+    Other,
+    Named(String),
+}
+
+impl Serialize for TimerTargetType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = match self {
+            TimerTargetType::Reminder => "reminder",
+            TimerTargetType::ScheduledTask => "scheduled_task",
+            TimerTargetType::Other => "other",
+            TimerTargetType::Named(value) => value.as_str(),
+        };
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for TimerTargetType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(de::Error::custom("timer target_type must not be empty"));
+        }
+        Ok(match trimmed {
+            "reminder" => TimerTargetType::Reminder,
+            "scheduled_task" => TimerTargetType::ScheduledTask,
+            "other" => TimerTargetType::Other,
+            value => TimerTargetType::Named(value.to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_kind_unknown_deserializes_to_work() {
+        let kind: SessionKind = serde_json::from_str("\"old_experiment\"").unwrap();
+        assert_eq!(kind, SessionKind::Work);
+        assert_eq!(
+            serde_json::to_string(&SessionKind::SelfCheck).unwrap(),
+            "\"self_check\""
+        );
+    }
+
+    #[test]
+    fn timer_reason_round_trips_fixed_schema() {
+        let value = json!({
+            "trigger_type": "precise_trigger",
+            "target_type": "reminder",
+            "target_id": "reminder_123",
+            "expected_trigger_time": "2026-05-24T15:00:00-07:00",
+            "reason": "check whether reminder_123 should be delivered"
+        });
+        let reason: TimerReason = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(reason.trigger_type, TimerTriggerType::PreciseTrigger);
+        assert_eq!(reason.target_type, TimerTargetType::Reminder);
+        assert_eq!(reason.target_id, "reminder_123");
+        assert_eq!(serde_json::to_value(reason).unwrap(), value);
+    }
 }

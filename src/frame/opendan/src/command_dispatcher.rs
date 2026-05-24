@@ -10,7 +10,7 @@
 //! the registry without duplicating documentation.
 
 use crate::agent::AIAgent;
-use crate::session_model::{InterruptMode, SessionKind, SessionSummary};
+use crate::session_model::{InterruptMode, SessionSummary};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -168,10 +168,7 @@ async fn list_sessions(agent: &Arc<AIAgent>) -> Result<CommandOutcome> {
     }
     let mut out = String::from("active sessions:\n");
     for s in summaries {
-        let kind = match s.kind {
-            SessionKind::Ui => "ui",
-            SessionKind::Work => "work",
-        };
+        let kind = s.kind.as_str();
         let title = if s.title.is_empty() {
             "(no title)".to_string()
         } else {
@@ -186,10 +183,7 @@ async fn list_sessions(agent: &Arc<AIAgent>) -> Result<CommandOutcome> {
 }
 
 fn render_summary(s: &SessionSummary) -> String {
-    let kind = match s.kind {
-        SessionKind::Ui => "ui",
-        SessionKind::Work => "work",
-    };
+    let kind = s.kind.as_str();
     let title = if s.title.is_empty() {
         "(no title)"
     } else {
@@ -216,10 +210,7 @@ async fn render_agent_status(agent: &Arc<AIAgent>, from: &str) -> String {
     if !summaries.is_empty() {
         out.push('\n');
         for s in summaries {
-            let kind = match s.kind {
-                SessionKind::Ui => "ui",
-                SessionKind::Work => "work",
-            };
+            let kind = s.kind.as_str();
             out.push_str(&format!("  - {} [{kind}] {:?}\n", s.session_id, s.status));
         }
         if out.ends_with('\n') {

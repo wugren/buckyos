@@ -409,6 +409,7 @@ fn format_event_for_turn_uses_subscription_template() {
     let subscriptions = vec![EventSubscription {
         pattern: "/approval/**".to_string(),
         subscribed_at_ms: 0,
+        mode: EventSubscriptionMode::Full,
         message_template: Some("Approval changed to {status}: {message}".to_string()),
     }];
     let s = format_event_for_turn_with_subscriptions(
@@ -550,6 +551,7 @@ __INCLUDE(/role.md)__
         input_has_events: false,
         recent_activity: String::new(),
         clock_unix_ms: 1,
+        llm_context: LlmContextEnv::default(),
     };
     let detail = render_template_failure_detail(
         &behavior,
@@ -728,7 +730,9 @@ fn session_meta_round_trips_pending_inputs() {
         kind: SessionKind::Ui,
         current_behavior: "ui_default".to_string(),
         status: SessionStatus::WaitingInput,
+        status_changed_at_ms: 0,
         owner: "alice".to_string(),
+        keep_alive: false,
         one_line_status: String::new(),
         pending_inputs: vec![
             PendingInput::Msg {
@@ -750,8 +754,10 @@ fn session_meta_round_trips_pending_inputs() {
         event_subscriptions: vec![EventSubscription {
             pattern: "/timer/**".to_string(),
             subscribed_at_ms: 0,
+            mode: EventSubscriptionMode::Full,
             message_template: None,
         }],
+        background_events: Vec::new(),
         workspace_id: Some("ws-1".to_string()),
         pending_task_calls: vec![PendingTaskCall {
             call_id: "call-1".to_string(),

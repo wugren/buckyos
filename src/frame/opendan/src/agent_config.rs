@@ -8,9 +8,8 @@
 //! [runtime]             cancel_reason / language / preserve_attachment_tag_in_egress / filesystem_policy
 //! [[channel]]           Gateway inbound sources (msg_center / kevent / ...)
 //! [dispatch]            default_class + ordered match-rule list
-//! [session.<class>]     per-class loop_mode / default_behavior / subscribe /
-//!                       session_id_strategy / switch_mode / keep_alive /
-//!                       inject_background_environment / kind
+//! [session.<class>]     per-class kind / loop_mode / default_behavior /
+//!                       session_id_strategy / process_stack_limit / driver
 //! ```
 //!
 //! Loaded once at `AIAgent::open(root)`. `[session]` is a map keyed by
@@ -23,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::behavior_cfg::{BehaviorCfg, BehaviorCfgError};
 use crate::i18n::AgentI18n;
@@ -239,6 +238,201 @@ pub enum ReportDeliveryMode {
     All,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHookPoint {
+    OnInit,
+    OnBehaviorSwitch,
+    OnBehaviorStepOb,
+    OnWait,
+}
+
+impl SessionHookPoint {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            SessionHookPoint::OnInit => "on_init",
+            SessionHookPoint::OnBehaviorSwitch => "on_behavior_switch",
+            SessionHookPoint::OnBehaviorStepOb => "on_behavior_step_ob",
+            SessionHookPoint::OnWait => "on_wait",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionDriverCfg {
+    pub keep_alive: bool,
+    pub switch_mode: SwitchMode,
+    pub inject_background_environment: bool,
+    pub report_delivery: ReportDeliveryMode,
+    pub on_init: HookPointCfg,
+    pub on_behavior_switch: HookPointCfg,
+    pub on_behavior_step_ob: HookPointCfg,
+    pub on_wait: HookPointCfg,
+}
+
+impl Default for SessionDriverCfg {
+    fn default() -> Self {
+        Self {
+            keep_alive: false,
+            switch_mode: SwitchMode::Normal,
+            inject_background_environment: true,
+            report_delivery: ReportDeliveryMode::FinalOnly,
+            on_init: HookPointCfg {
+                filter: BehaviorFilter::All,
+                pull_msg: PullMsgPolicy::None,
+                pull_event: PullEventPolicy::None,
+            },
+            on_behavior_switch: HookPointCfg {
+                filter: BehaviorFilter::Top,
+                pull_msg: PullMsgPolicy::All,
+                pull_event: PullEventPolicy::All,
+            },
+            on_behavior_step_ob: HookPointCfg {
+                filter: BehaviorFilter::Top,
+                pull_msg: PullMsgPolicy::All,
+                pull_event: PullEventPolicy::None,
+            },
+            on_wait: HookPointCfg {
+                filter: BehaviorFilter::Top,
+                pull_msg: PullMsgPolicy::All,
+                pull_event: PullEventPolicy::None,
+            },
+        }
+    }
+}
+
+impl SessionDriverCfg {
+    pub fn hook(&self, point: SessionHookPoint) -> &HookPointCfg {
+        match point {
+            SessionHookPoint::OnInit => &self.on_init,
+            SessionHookPoint::OnBehaviorSwitch => &self.on_behavior_switch,
+            SessionHookPoint::OnBehaviorStepOb => &self.on_behavior_step_ob,
+            SessionHookPoint::OnWait => &self.on_wait,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HookPointCfg {
+    pub filter: BehaviorFilter,
+    pub pull_msg: PullMsgPolicy,
+    pub pull_event: PullEventPolicy,
+}
+
+impl Default for HookPointCfg {
+    fn default() -> Self {
+        Self {
+            filter: BehaviorFilter::None,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BehaviorFilter {
+    Top,
+    DefaultOnly,
+    All,
+    None,
+    Behavior(String),
+}
+
+impl Default for BehaviorFilter {
+    fn default() -> Self {
+        BehaviorFilter::None
+    }
+}
+
+impl Serialize for BehaviorFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            BehaviorFilter::Top => "top",
+            BehaviorFilter::DefaultOnly => "default_only",
+            BehaviorFilter::All => "all",
+            BehaviorFilter::None => "none",
+            BehaviorFilter::Behavior(name) => name.as_str(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for BehaviorFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let trimmed = raw.trim();
+        Ok(match trimmed {
+            "top" => BehaviorFilter::Top,
+            "default_only" => BehaviorFilter::DefaultOnly,
+            "all" => BehaviorFilter::All,
+            "none" | "" => BehaviorFilter::None,
+            name => BehaviorFilter::Behavior(name.to_string()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullMsgPolicy {
+    None,
+    One,
+    All,
+}
+
+impl Default for PullMsgPolicy {
+    fn default() -> Self {
+        PullMsgPolicy::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullEventPolicy {
+    None,
+    All,
+    Filter(String),
+}
+
+impl Default for PullEventPolicy {
+    fn default() -> Self {
+        PullEventPolicy::None
+    }
+}
+
+impl Serialize for PullEventPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            PullEventPolicy::None => "none",
+            PullEventPolicy::All => "all",
+            PullEventPolicy::Filter(name) => name.as_str(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PullEventPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let trimmed = raw.trim();
+        Ok(match trimmed {
+            "none" | "" => PullEventPolicy::None,
+            "all" => PullEventPolicy::All,
+            name => PullEventPolicy::Filter(name.to_string()),
+        })
+    }
+}
+
 impl Default for ReportDeliveryMode {
     fn default() -> Self {
         ReportDeliveryMode::FinalOnly
@@ -256,24 +450,11 @@ pub struct SessionClassCfg {
     /// Behavior name new sessions of this class start with. Empty ⇒
     /// `"<class>_default"` is the implicit fallback.
     pub default_behavior: String,
-    /// Kevent patterns every session of this class auto-subscribes to on
-    /// creation. Replaces the pre-beta2.2 global `subscribe_events`.
-    pub subscribe_events: Vec<String>,
     pub session_id_strategy: SessionIdStrategy,
-    pub switch_mode: SwitchMode,
     /// Maximum depth of the process stack inside one session (independent
     /// switches push frames). 0 ⇒ unbounded (v0 still accepts this).
     pub process_stack_limit: u32,
-    /// `true` ⇒ session is always "active" (UI). `false` ⇒ active iff
-    /// `status != Ended` (Work).
-    pub keep_alive: bool,
-    #[serde(default = "default_inject_background_environment")]
-    pub inject_background_environment: bool,
-    pub report_delivery: ReportDeliveryMode,
-}
-
-fn default_inject_background_environment() -> bool {
-    true
+    pub driver: SessionDriverCfg,
 }
 
 impl Default for SessionClassCfg {
@@ -282,13 +463,9 @@ impl Default for SessionClassCfg {
             kind: SessionKind::Work,
             loop_mode: LoopMode::Agent,
             default_behavior: String::new(),
-            subscribe_events: Vec::new(),
             session_id_strategy: SessionIdStrategy::default(),
-            switch_mode: SwitchMode::Normal,
             process_stack_limit: 0,
-            keep_alive: false,
-            inject_background_environment: true,
-            report_delivery: ReportDeliveryMode::FinalOnly,
+            driver: SessionDriverCfg::default(),
         }
     }
 }
@@ -395,6 +572,8 @@ impl AgentConfig {
         let canonical = match kind {
             SessionKind::Ui => "ui",
             SessionKind::Work => "work",
+            SessionKind::SelfCheck => "self_check",
+            SessionKind::SelfImprove => "self_improve",
         };
         if self
             .toml
@@ -563,21 +742,36 @@ mod tests {
                 kind = "ui"
                 loop_mode = "agent"
                 default_behavior = "alice_ui"
-                subscribe_events = ["msg.incoming"]
                 session_id_strategy = "per_peer"
-                switch_mode = "normal"
+
+                [session.ui.driver]
                 keep_alive = true
+                switch_mode = "normal"
+                inject_background_environment = true
+                report_delivery = "final_only"
 
                 [session.work]
                 kind = "work"
                 loop_mode = "behavior"
                 default_behavior = "work_default"
                 session_id_strategy = "per_event_session"
-                switch_mode = "normal"
                 process_stack_limit = 8
+
+                [session.work.driver]
                 keep_alive = false
                 inject_background_environment = false
                 report_delivery = "top_level"
+                switch_mode = "normal"
+
+                [session.work.driver.on_behavior_switch]
+                filter = "top"
+                pull_msg = "all"
+                pull_event = "ban_lifted"
+
+                [session.work.driver.on_wait]
+                filter = "none"
+                pull_msg = "none"
+                pull_event = "none"
             "#,
         )
         .unwrap();
@@ -600,18 +794,66 @@ mod tests {
         assert_eq!(ui.kind, SessionKind::Ui);
         assert_eq!(ui.loop_mode, LoopMode::Agent);
         assert_eq!(ui.default_behavior, "alice_ui");
-        assert!(ui.keep_alive);
-        assert_eq!(ui.subscribe_events, vec!["msg.incoming"]);
+        assert!(ui.driver.keep_alive);
         let work = cfg.session_class("work").unwrap();
         assert_eq!(work.kind, SessionKind::Work);
         assert_eq!(work.loop_mode, LoopMode::Behavior);
         assert_eq!(work.session_id_strategy, SessionIdStrategy::PerEventSession);
         assert_eq!(work.process_stack_limit, 8);
-        assert!(!work.keep_alive);
-        assert!(!work.inject_background_environment);
-        assert_eq!(work.report_delivery, ReportDeliveryMode::TopLevel);
-        assert!(ui.inject_background_environment);
-        assert_eq!(ui.report_delivery, ReportDeliveryMode::FinalOnly);
+        assert!(!work.driver.keep_alive);
+        assert!(!work.driver.inject_background_environment);
+        assert_eq!(work.driver.report_delivery, ReportDeliveryMode::TopLevel);
+        assert_eq!(
+            work.driver.on_behavior_switch.pull_event,
+            PullEventPolicy::Filter("ban_lifted".to_string())
+        );
+        assert_eq!(work.driver.on_wait.filter, BehaviorFilter::None);
+        assert!(ui.driver.inject_background_environment);
+        assert_eq!(ui.driver.report_delivery, ReportDeliveryMode::FinalOnly);
+    }
+
+    #[test]
+    fn driver_hook_point_round_trips() {
+        let src = r#"
+            [on_init]
+            filter = "all"
+            pull_msg = "none"
+            pull_event = "none"
+
+            [on_behavior_switch]
+            filter = "top"
+            pull_msg = "all"
+            pull_event = "timer.reminder_check"
+
+            [on_behavior_step_ob]
+            filter = "plan"
+            pull_msg = "one"
+            pull_event = "all"
+
+            [on_wait]
+            filter = "default_only"
+            pull_msg = "all"
+            pull_event = "none"
+        "#;
+        let cfg: SessionDriverCfg = toml::from_str(src).unwrap();
+        assert_eq!(cfg.on_init.filter, BehaviorFilter::All);
+        assert_eq!(cfg.on_behavior_switch.pull_msg, PullMsgPolicy::All);
+        assert_eq!(
+            cfg.on_behavior_switch.pull_event,
+            PullEventPolicy::Filter("timer.reminder_check".to_string())
+        );
+        assert_eq!(
+            cfg.on_behavior_step_ob.filter,
+            BehaviorFilter::Behavior("plan".to_string())
+        );
+        assert_eq!(
+            cfg.hook(SessionHookPoint::OnWait).pull_msg,
+            PullMsgPolicy::All
+        );
+
+        let out = toml::to_string(&cfg).unwrap();
+        let reparsed: SessionDriverCfg = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed, cfg);
     }
 
     #[test]
@@ -623,9 +865,9 @@ mod tests {
         assert_eq!(work.kind, SessionKind::Work);
         assert_eq!(work.loop_mode, LoopMode::Behavior);
         assert_eq!(work.default_behavior, "plan");
-        assert_eq!(work.switch_mode, SwitchMode::Fork);
+        assert_eq!(work.driver.switch_mode, SwitchMode::Fork);
         assert_eq!(work.process_stack_limit, 8);
-        assert_eq!(work.report_delivery, ReportDeliveryMode::FinalOnly);
+        assert_eq!(work.driver.report_delivery, ReportDeliveryMode::FinalOnly);
     }
 
     #[test]
@@ -725,7 +967,7 @@ mod tests {
         assert_eq!(cfg.toml.dispatch.default_class, "ui");
         let ui = cfg.session_class("ui").expect("demo defines [session.ui]");
         assert_eq!(ui.default_behavior, "ui_default");
-        assert!(ui.keep_alive);
+        assert!(ui.driver.keep_alive);
 
         let beh = cfg.load_behavior("ui_default").expect("load demo behavior");
         assert_eq!(beh.name(), "ui_default");

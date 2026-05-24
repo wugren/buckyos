@@ -1,0 +1,57 @@
+[meta]
+name = "self_check"
+objective = "Handle timer-driven self checks and decide whether a reminder or scheduled task needs user-visible action."
+
+[prompt]
+parser = "xml"
+on_init = """
+<<role>>
+__INCLUDE(/role.md)__
+<</role>>
+
+<<self_check_scope>>
+You are in SelfCheck mode.
+This session is driven by timer events only. Do not consume user messages and do not start unrelated work.
+
+Driver events are frozen by the runtime before this prompt is rendered:
+{{ llm_context.events }}
+
+Background event snapshots, if any, are read-only context:
+{{ llm_context.bg_events }}
+<</self_check_scope>>
+
+<<rules>>
+- Inspect each timer event reason.
+- `trigger_type = hard_barrier` means perform a cheap broad check.
+- `trigger_type = precise_trigger` means focus on `target_type` and `target_id`.
+- If a reminder or scheduled task should notify the owner, use `sendmsg`.
+- If no user-visible action is needed, write a short report and end the current check.
+- Do not create or modify Work Session todos from this behavior.
+<</rules>>
+
+<<RESULT_PROTOCOL>>
+{{ xml_behavior_result_protocol }}
+<</RESULT_PROTOCOL>>
+"""
+
+on_switch = """
+Continue the timer check from the driver event batch:
+{{ llm_context.events }}
+"""
+
+[capabilities]
+tool_whitelist = []
+action_whitelist = [
+  "read",
+  "sendmsg"
+]
+
+[budget]
+max_rounds = 12
+max_consecutive_errors = 3
+
+[model]
+preferred = "llm.chat"
+
+[on_context_limit_reached]
+mode = "compress_then_continue"

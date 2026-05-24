@@ -984,7 +984,8 @@ fn render_worksession_inventory(summaries: &[SessionSummary]) -> String {
     // context only.
     live.sort_by_key(|s| match s.kind {
         SessionKind::Work => 0,
-        SessionKind::Ui => 1,
+        SessionKind::SelfCheck | SessionKind::SelfImprove => 1,
+        SessionKind::Ui => 2,
     });
     if live.is_empty() {
         return "(no live sessions)\n".to_string();
@@ -992,10 +993,7 @@ fn render_worksession_inventory(summaries: &[SessionSummary]) -> String {
     let truncated = live.len() > MAX_WORKSESSION_LIST;
     let mut buf = String::new();
     for s in live.iter().take(MAX_WORKSESSION_LIST) {
-        let kind_tag = match s.kind {
-            SessionKind::Ui => "ui",
-            SessionKind::Work => "work",
-        };
+        let kind_tag = s.kind.as_str();
         let title = if s.title.trim().is_empty() {
             "(no title)"
         } else {

@@ -12,7 +12,7 @@ type = "msg_center"
 
 [[channel]]
 type = "kevent"
-filters = ["task_mgr/**", "kvdoc/**"]
+filters = ["task_mgr/**", "kvdoc/**", "timer/**"]
 
 [dispatch]
 default_class = "ui"
@@ -33,34 +33,171 @@ session_class = "work"
 on = "kvdoc.*"
 session_class = "work"
 
+[[dispatch.rule]]
+on = "timer.*"
+session_class = "self_check"
+
 [session.ui]
 kind = "ui"
 loop_mode = "agent"
 default_behavior = "chat_route"
-subscribe_events = ["msg.incoming"]
 session_id_strategy = "per_peer"
-switch_mode = "normal"
 process_stack_limit = 4
+
+[session.ui.driver]
 keep_alive = true
+switch_mode = "normal"
+inject_background_environment = true
+report_delivery = "final_only"
+
+[session.ui.driver.on_init]
+filter = "all"
+pull_msg = "none"
+pull_event = "none"
+
+[session.ui.driver.on_behavior_switch]
+filter = "top"
+pull_msg = "all"
+pull_event = "none"
+
+[session.ui.driver.on_behavior_step_ob]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.ui.driver.on_wait]
+filter = "top"
+pull_msg = "all"
+pull_event = "none"
 
 [session.group]
 kind = "ui"
 loop_mode = "agent"
 default_behavior = "groupchat_route"
-subscribe_events = ["msg.group"]
 session_id_strategy = "per_group"
-switch_mode = "normal"
 process_stack_limit = 4
+
+[session.group.driver]
 keep_alive = true
+switch_mode = "normal"
+inject_background_environment = true
+report_delivery = "final_only"
+
+[session.group.driver.on_init]
+filter = "all"
+pull_msg = "none"
+pull_event = "none"
+
+[session.group.driver.on_behavior_switch]
+filter = "top"
+pull_msg = "all"
+pull_event = "none"
+
+[session.group.driver.on_behavior_step_ob]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.group.driver.on_wait]
+filter = "top"
+pull_msg = "all"
+pull_event = "none"
 
 [session.work]
 kind = "work"
 loop_mode = "behavior"
 default_behavior = "plan"
-subscribe_events = ["task_mgr.*", "kvdoc.*"]
 session_id_strategy = "per_event_session"
-switch_mode = "fork"
 process_stack_limit = 8
+
+[session.work.driver]
 keep_alive = false
+switch_mode = "fork"
 inject_background_environment = false
 report_delivery = "final_only"
+
+[session.work.driver.on_init]
+filter = "all"
+pull_msg = "none"
+pull_event = "none"
+
+[session.work.driver.on_behavior_switch]
+filter = "top"
+pull_msg = "all"
+pull_event = "all"
+
+[session.work.driver.on_behavior_step_ob]
+filter = "top"
+pull_msg = "all"
+pull_event = "all"
+
+[session.work.driver.on_wait]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_check]
+kind = "self_check"
+loop_mode = "behavior"
+default_behavior = "self_check"
+session_id_strategy = "singleton"
+process_stack_limit = 2
+
+[session.self_check.driver]
+keep_alive = false
+switch_mode = "normal"
+inject_background_environment = false
+report_delivery = "final_only"
+
+[session.self_check.driver.on_init]
+filter = "all"
+pull_msg = "none"
+pull_event = "timer.*"
+
+[session.self_check.driver.on_behavior_switch]
+filter = "top"
+pull_msg = "none"
+pull_event = "timer.*"
+
+[session.self_check.driver.on_behavior_step_ob]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_check.driver.on_wait]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_improve]
+kind = "self_improve"
+loop_mode = "behavior"
+default_behavior = "self_improve"
+session_id_strategy = "singleton"
+process_stack_limit = 2
+
+[session.self_improve.driver]
+keep_alive = false
+switch_mode = "normal"
+inject_background_environment = false
+report_delivery = "final_only"
+
+[session.self_improve.driver.on_init]
+filter = "all"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_improve.driver.on_behavior_switch]
+filter = "top"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_improve.driver.on_behavior_step_ob]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"
+
+[session.self_improve.driver.on_wait]
+filter = "none"
+pull_msg = "none"
+pull_event = "none"

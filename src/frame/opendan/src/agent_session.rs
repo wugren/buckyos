@@ -28,7 +28,10 @@ use llm_context::{
 };
 
 use crate::agent::AIAgent;
-use crate::agent_config::{AgentConfig, LoopMode, ReportDeliveryMode, SwitchMode};
+use crate::agent_config::{
+    AgentConfig, HookPointCfg, LoopMode, PullEventPolicy, PullMsgPolicy, ReportDeliveryMode,
+    SessionDriverCfg, SessionHookPoint, SwitchMode,
+};
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
 use crate::behavior_hooks::{
@@ -37,15 +40,16 @@ use crate::behavior_hooks::{
 use crate::llm_context_helper::{
     apply_overrides_to_snapshot, run_fork_sub_context, ForkSubContextInput, RequestOverrides,
 };
-use crate::prompt_env::{self, AgentSessionEnv, ENVIRONMENT_BLOCK_TEMPLATE};
+use crate::prompt_env::{self, AgentSessionEnv, LlmContextEnv, ENVIRONMENT_BLOCK_TEMPLATE};
 use crate::round_history::{
     CompactionTarget, ContextMode, HistoryEvent, InterruptMode as HistoryInterruptMode,
     RoundStatus, RoundTrigger, SessionHistoryRecorder,
 };
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
-    EventSubscription, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
-    ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode, InterruptMode,
+    PendingInput, PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput, SessionKind,
+    SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
 
@@ -589,6 +593,52 @@ impl AgentSession {
         Ok(())
     }
 
+    pub async fn push_msg(&self, input: PendingInput) -> Result<()> {
+        if !matches!(input, PendingInput::Msg { .. }) {
+            return Err(anyhow!("push_msg expects PendingInput::Msg"));
+        }
+        self.enqueue_pending(input).await
+    }
+
+    pub async fn notify_event(&self, event_id: String, data: serde_json::Value) -> Result<bool> {
+        let interested = {
+            let meta = self.meta.lock().await;
+            meta.event_subscriptions
+                .iter()
+                .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(&event_id))
+        };
+        if interested {
+            self.enqueue_pending(PendingInput::Event { event_id, data })
+                .await?;
+            return Ok(true);
+        }
+
+        {
+            let mut meta = self.meta.lock().await;
+            if let Some(existing) = meta
+                .background_events
+                .iter_mut()
+                .find(|item| item.event_id == event_id)
+            {
+                existing.data = data;
+                existing.observed_at_ms = now_ms();
+            } else {
+                meta.background_events.push(BgEventSnapshot {
+                    event_id,
+                    data,
+                    observed_at_ms: now_ms(),
+                });
+                const MAX_BG_EVENTS: usize = 32;
+                if meta.background_events.len() > MAX_BG_EVENTS {
+                    let drop_count = meta.background_events.len() - MAX_BG_EVENTS;
+                    meta.background_events.drain(0..drop_count);
+                }
+            }
+        }
+        self.flush_meta().await?;
+        Ok(false)
+    }
+
     /// Enqueue an interrupt barrier. The worker drains its queue strictly
     /// in order: items enqueued *before* this call are processed first
     /// (within the same logical turn), then the interrupt fires, then any
@@ -703,7 +753,7 @@ impl AgentSession {
             while let Ok(signal) = inbox_rx.try_recv() {
                 if matches!(signal, SessionInput::Cancel) {
                     self.set_status(SessionStatus::Idle).await;
-                    if matches!(self.kind, SessionKind::Work) {
+                    if self.kind.is_work_family() {
                         info!(
                             "opendan.session[{}]: cancel received on work session, exiting worker",
                             self.session_id
@@ -725,7 +775,7 @@ impl AgentSession {
                 // After the first successful turn this branch falls through
                 // to the normal recv()-blocking path.
                 let needs_bootstrap =
-                    matches!(self.kind, SessionKind::Work) && self.needs_bootstrap_turn().await;
+                    self.kind.is_work_family() && self.needs_bootstrap_turn().await;
                 if needs_bootstrap {
                     self.set_status(SessionStatus::Running).await;
                     let behavior = match self.load_current_behavior().await {
@@ -799,6 +849,22 @@ impl AgentSession {
                     }
                     continue;
                 }
+                if self.should_exit_when_idle().await {
+                    if let Err(err) = self.flush_meta().await {
+                        warn!(
+                            "opendan.session[{}]: flush before idle worker exit failed: {err:#}",
+                            self.session_id
+                        );
+                    }
+                    if let Some(agent) = self.parent_agent.upgrade() {
+                        agent.retire_idle_session(&self.session_id).await;
+                    }
+                    info!(
+                        "opendan.session[{}]: idle transient worker exiting",
+                        self.session_id
+                    );
+                    return;
+                }
                 match inbox_rx.recv().await {
                     None => {
                         info!(
@@ -809,7 +875,7 @@ impl AgentSession {
                     }
                     Some(SessionInput::Cancel) => {
                         self.set_status(SessionStatus::Idle).await;
-                        if matches!(self.kind, SessionKind::Work) {
+                        if self.kind.is_work_family() {
                             return;
                         }
                         continue;
@@ -1060,7 +1126,7 @@ impl AgentSession {
                                 None => return,
                                 Some(SessionInput::Cancel) => {
                                     self.set_status(SessionStatus::Idle).await;
-                                    if matches!(self.kind, SessionKind::Work) {
+                                    if self.kind.is_work_family() {
                                         return;
                                     }
                                 }
@@ -1080,7 +1146,7 @@ impl AgentSession {
                         None => return,
                         Some(SessionInput::Cancel) => {
                             self.set_status(SessionStatus::Idle).await;
-                            if matches!(self.kind, SessionKind::Work) {
+                            if self.kind.is_work_family() {
                                 return;
                             }
                         }
@@ -1090,10 +1156,8 @@ impl AgentSession {
                 }
             }
 
-            let mut round_inputs = prepare_turn_messages_for_run(
-                turn_messages,
-                matches!(self.kind, SessionKind::Work),
-            );
+            let mut round_inputs =
+                prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
             if let Some(batch) = format_event_batch_for_turn(&turn_events) {
                 round_inputs.push(AiMessage::text(AiRole::User, batch));
             }
@@ -1111,7 +1175,7 @@ impl AgentSession {
                     None => return,
                     Some(SessionInput::Cancel) => {
                         self.set_status(SessionStatus::Idle).await;
-                        if matches!(self.kind, SessionKind::Work) {
+                        if self.kind.is_work_family() {
                             return;
                         }
                     }
@@ -1155,6 +1219,13 @@ impl AgentSession {
                 user_messages: hist_user_messages,
                 system_events: hist_system_events,
             };
+            let _hook_env = self
+                .apply_hook(
+                    SessionHookPoint::OnWait,
+                    &self.session_class_driver(),
+                    &pending,
+                )
+                .await;
             let round_result = self
                 .run_one_round(
                     round_inputs,
@@ -1205,7 +1276,7 @@ impl AgentSession {
                         None => return,
                         Some(SessionInput::Cancel) => {
                             self.set_status(SessionStatus::Idle).await;
-                            if matches!(self.kind, SessionKind::Work) {
+                            if self.kind.is_work_family() {
                                 return;
                             }
                         }
@@ -1242,6 +1313,13 @@ impl AgentSession {
     async fn needs_bootstrap_turn(&self) -> bool {
         let meta = self.meta.lock().await;
         !meta.bootstrap_done && !meta.objective.trim().is_empty()
+    }
+
+    async fn should_exit_when_idle(&self) -> bool {
+        let meta = self.meta.lock().await;
+        !meta.keep_alive
+            && meta.pending_inputs.is_empty()
+            && !matches!(meta.status, SessionStatus::WaitingTool)
     }
 
     /// Flip `bootstrap_done = true` and flush. Idempotent — calling twice
@@ -1848,9 +1926,10 @@ impl AgentSession {
             // Matches the pre-config-rewrite hardcoded behavior so an
             // `agent.toml` without `[session.<class>]` entries still
             // boots into the expected loop shape.
-            .unwrap_or(match self.kind {
-                SessionKind::Ui => LoopMode::Agent,
-                SessionKind::Work => LoopMode::Behavior,
+            .unwrap_or(if matches!(self.kind, SessionKind::Ui) {
+                LoopMode::Agent
+            } else {
+                LoopMode::Behavior
             })
     }
 
@@ -1858,7 +1937,7 @@ impl AgentSession {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
-            .map(|c| c.switch_mode)
+            .map(|c| c.driver.switch_mode)
             .unwrap_or(SwitchMode::Normal)
     }
 
@@ -1866,7 +1945,7 @@ impl AgentSession {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
-            .map(|c| c.report_delivery)
+            .map(|c| c.driver.report_delivery)
             .unwrap_or_default()
     }
 
@@ -1874,8 +1953,129 @@ impl AgentSession {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
-            .map(|c| c.inject_background_environment)
+            .map(|c| c.driver.inject_background_environment)
             .unwrap_or(true)
+    }
+
+    fn session_class_driver(&self) -> SessionDriverCfg {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.driver.clone())
+            .unwrap_or_default()
+    }
+
+    async fn apply_hook(
+        &self,
+        point: SessionHookPoint,
+        driver: &SessionDriverCfg,
+        pending: &[PendingInput],
+    ) -> LlmContextEnv {
+        let cfg = driver.hook(point);
+        let (events, consumed_event_keys) = self.pull_events_for_env(cfg, pending).await;
+        let (msgs, _) = self.pull_msgs_for_env(cfg, pending);
+        LlmContextEnv {
+            events,
+            bg_events: self.meta.lock().await.background_events.clone(),
+            last_step: self
+                .try_load_snapshot_for_prompt()
+                .and_then(|snapshot| snapshot.state.last_step)
+                .and_then(|step| serde_json::to_value(step).ok()),
+            behavior_history: self
+                .try_load_snapshot_for_prompt()
+                .map(|snapshot| {
+                    snapshot
+                        .state
+                        .steps
+                        .into_iter()
+                        .filter_map(|step| serde_json::to_value(step).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            agent_global_state: serde_json::json!({
+                "agent_name": self.agent_name,
+                "session_id": self.session_id,
+                "hook_point": point.as_key(),
+                "pulled_msg_count": msgs.len(),
+                "pulled_event_count": consumed_event_keys.len(),
+            }),
+        }
+    }
+
+    fn pull_msgs_for_env(
+        &self,
+        cfg: &HookPointCfg,
+        pending: &[PendingInput],
+    ) -> (Vec<serde_json::Value>, Vec<String>) {
+        let limit = match cfg.pull_msg {
+            PullMsgPolicy::None => return (Vec::new(), Vec::new()),
+            PullMsgPolicy::One => Some(1usize),
+            PullMsgPolicy::All => None,
+        };
+        let mut values = Vec::new();
+        let mut keys = Vec::new();
+        for input in pending {
+            let PendingInput::Msg {
+                record_id,
+                from,
+                text,
+                ai_message,
+                ..
+            } = input
+            else {
+                continue;
+            };
+            values.push(serde_json::json!({
+                "record_id": record_id,
+                "from": from,
+                "text": text,
+                "content": ai_message.text_content(),
+            }));
+            keys.push(input.dedup_key());
+            if limit.is_some_and(|limit| values.len() >= limit) {
+                break;
+            }
+        }
+        (values, keys)
+    }
+
+    async fn pull_events_for_env(
+        &self,
+        cfg: &HookPointCfg,
+        pending: &[PendingInput],
+    ) -> (Vec<EventRef>, Vec<String>) {
+        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        let mut events = Vec::new();
+        let mut keys = Vec::new();
+        for input in pending {
+            let PendingInput::Event { event_id, data } = input else {
+                continue;
+            };
+            let matched = match &cfg.pull_event {
+                PullEventPolicy::None => false,
+                PullEventPolicy::All => true,
+                PullEventPolicy::Filter(name) => {
+                    let filter = name
+                        .strip_suffix(".*")
+                        .or_else(|| name.strip_suffix("/**"))
+                        .unwrap_or(name);
+                    event_id == filter
+                        || event_id.starts_with(&format!("{filter}."))
+                        || event_id.starts_with(&format!("{filter}/"))
+                        || subscriptions.iter().any(|sub| {
+                            sub.mode == EventSubscriptionMode::Full && sub.matches(event_id)
+                        })
+                }
+            };
+            if matched {
+                events.push(EventRef {
+                    event_id: event_id.clone(),
+                    data: data.clone(),
+                });
+                keys.push(input.dedup_key());
+            }
+        }
+        (events, keys)
     }
 
     pub(crate) async fn maybe_publish_worksession_report(
@@ -2108,6 +2308,14 @@ impl AgentSession {
         let llm_call = self
             .trace_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Commit-pop boundary: once build_or_resume has rendered the turn and
+        // produced a context that is about to enter `ctx.run()`, the input is
+        // no longer replayable. Keeping it queued after this point risks
+        // duplicating tool side effects after a crash or provider panic.
+        if !in_flight_input_keys.is_empty() {
+            self.discard_consumed(&in_flight_input_keys).await;
+        }
 
         // ContextLimitReached re-entry loop: compress the accumulated
         // history (opendan-side, message-level) and resume the same
@@ -2801,7 +3009,15 @@ impl AgentSession {
     }
 
     async fn compose_environment_message(&self, behavior: &BehaviorCfg) -> Option<String> {
-        let env = self.build_prompt_env(behavior).await;
+        let mut env = self.build_prompt_env(behavior).await;
+        let pending = self.meta.lock().await.pending_inputs.clone();
+        env.llm_context = self
+            .apply_hook(
+                SessionHookPoint::OnInit,
+                &self.session_class_driver(),
+                &pending,
+            )
+            .await;
         match prompt_env::render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[]).await {
             Ok(text) => Some(text),
             Err(err) => {
@@ -3304,7 +3520,15 @@ impl AgentSession {
         if template.is_empty() {
             return None;
         }
-        let env = self.build_prompt_env(next).await;
+        let mut env = self.build_prompt_env(next).await;
+        let pending = self.meta.lock().await.pending_inputs.clone();
+        env.llm_context = self
+            .apply_hook(
+                SessionHookPoint::OnBehaviorSwitch,
+                &self.session_class_driver(),
+                &pending,
+            )
+            .await;
         let report = from_context_report
             .map(str::trim)
             .filter(|value| !value.is_empty());
@@ -3830,6 +4054,7 @@ impl AgentSession {
         {
             let mut g = self.meta.lock().await;
             g.status = status;
+            g.status_changed_at_ms = now_ms();
             g.one_line_status = one_line_status.clone();
         }
         let typing = matches!(status, SessionStatus::Running | SessionStatus::WaitingTool);
@@ -3940,6 +4165,7 @@ impl AgentSession {
                 meta.event_subscriptions.push(EventSubscription {
                     pattern: trimmed.to_string(),
                     subscribed_at_ms: now,
+                    mode: EventSubscriptionMode::Full,
                     message_template: template,
                 });
                 changed = true;
@@ -4266,7 +4492,7 @@ async fn build_agent_session_env(
     session_dir: &Path,
     behavior: &BehaviorCfg,
 ) -> AgentSessionEnv {
-    let (kind, title, objective, owner, workspace_id, one_line) = {
+    let (kind, title, objective, owner, workspace_id, one_line, bg_events) = {
         let meta = meta.lock().await;
         (
             meta.kind,
@@ -4275,6 +4501,7 @@ async fn build_agent_session_env(
             meta.owner.clone(),
             meta.workspace_id.clone(),
             meta.one_line_status.clone(),
+            meta.background_events.clone(),
         )
     };
     let session_objective = if objective.trim().is_empty() {
@@ -4310,6 +4537,10 @@ async fn build_agent_session_env(
         input_has_events: false,
         recent_activity: one_line.trim().to_string(),
         clock_unix_ms: now_ms(),
+        llm_context: LlmContextEnv {
+            bg_events,
+            ..Default::default()
+        },
     }
 }
 
