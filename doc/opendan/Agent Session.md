@@ -92,7 +92,7 @@ pub struct SessionMeta {
     pub event_subscriptions: Vec<EventSubscription>,
     pub workspace_id: Option<String>,
     pub pending_task_calls: Vec<PendingTaskCall>,
-    pub title: String,
+    pub title: String,//与目录名相同
     pub objective: String,
     pub bootstrap_done: bool,
     pub process_entry: String,

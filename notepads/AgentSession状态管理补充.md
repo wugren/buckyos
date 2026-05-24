@@ -370,7 +370,91 @@ GlobalStateSnapshot -> SelfCheck condition evaluation
 
 ---
 
-## 8. Session 状态与事件消费矩阵
+## 8. Session 唤醒：Agent Main Loop 主导
+
+### 8.1 现状与问题
+
+现有实现中，`session.worker` 持续在跑，消息和事件的分发逻辑嵌在 session loop 内部。这意味着：
+
+- Session 必须**常驻内存**（即使长期无事件）
+- Session 状态与运行结构紧耦合（worker 不存在 = session 接不到事件）
+- Agent 启动 = spin up 所有 session worker，启动成本随 session 数量线性增长
+
+### 8.2 新架构：Agent.main_loop 是唯一 pump
+
+由 Agent.main_loop 统一拉取并路由 message 和 event，session.worker 按需从磁盘加载启动。
+
+```python
+# 只有 agent main loop 有真正的 pump
+def agent.main_loop():
+    # message pump
+    msg = self.pull_msg()
+    target_session_id = route_msg(msg)
+    # 从磁盘恢复（仅在需要时启动 worker）
+    target_session = self.ensure_session(target_session_id)
+    # 只是放入 session 的 pending；如果是 read-only 可以拒绝
+    push_ok = target_session.push_msg(msg)
+
+    # event pump
+    event = self.pull_events()
+    target_session_ids = route_event(event.eventid)
+    for sid in target_session_ids:
+        target_session = self.ensure_session(sid)
+        # session 内部根据自己的订阅逻辑，决定是触发推理还是更新 background_env
+        # event 是 notify 机制；main_loop 是尽力通知，不关心后续
+        target_session.notify_event(event)
+```
+
+关键变化：
+
+1. **Agent.main_loop 是事件/消息的唯一 pump**，负责拉取 + 路由
+2. **Dispatch 包含两步**：route → `ensure_session`（按需从磁盘加载并启动 worker）
+3. **session.worker 是 transient**：处理完一批工作可休眠/退出，释放内存
+4. **Session 状态唯一真相源 = 磁盘**，worker 只是 ephemeral 的状态机 + 缓存
+
+### 8.3 关键 invariant
+
+- **Session 状态完全持久化在磁盘**：worker 启停不丢任何状态
+- **worker 是 ephemeral**：启停不影响 session 的逻辑生命周期
+- **dispatch 只 push 不假设 worker 存在**：push msg = 写 pending queue + 唤醒 worker；不是 forward 给某个 running coroutine
+
+### 8.4 ensure_session 的并发与生命周期
+
+- **并发**：多个 event 同时分发给同一 `session_id` → per-session 锁，序列化处理
+- **退出时机**（候选策略）：
+  - 处理完当前 batch 即退出（最省内存，但每次唤醒有冷启动成本）
+  - 空闲超时退出（兼顾热路径 + 长尾节省）
+  - 显式 shutdown（如 session 走到 END）
+- **`keep_alive` 字段在新架构下的语义**：
+  - `keep_alive = true` → worker 处理完不退出，持续在内存中等待下一轮
+  - `keep_alive = false` → 一 batch 处理完即退出，下次有 event 到达再 ensure_session 重新加载
+
+### 8.5 跟 §7 事件分发的关系
+
+§7 描述的"事件分发到 session"在新架构下精确化为：
+
+1. `agent.main_loop` 拉取 event/msg
+2. `route_*` 决定目标 `session_id`
+3. `ensure_session` 把 session 从磁盘恢复到内存（如未在内存）
+4. `push_msg` / `notify_event` 到 session pending queue
+5. session.worker 醒来按 Driver 配置消费（见 §11）
+
+§7 的所有 forward 规则继续适用，只是触发载体从"running session worker"变成"dispatcher + on-demand worker"。
+
+### 8.6 跟 §11 Driver 配置的解耦
+
+§11 描述的 Driver 配置（hook point × filter × pull policy）讨论的是"worker 在跑时怎么消费 pending queue"。Worker 启停是本章（§8）的事，**Driver 行为不受影响**——它依然是 session 在跑时的内部状态机。
+
+两层正交：
+
+- **§8 决定 worker 什么时候在跑**
+- **§11 决定 worker 跑起来后怎么消费**
+
+整体形成一个完整的"事件 → 推理"链路。
+
+---
+
+## 9. Session 状态与事件消费矩阵
 
 | 状态 / Session | UI Session | 普通 Work Session | SelfCheck Session | SelfImprove Session |
 | --- | --- | --- | --- | --- |
@@ -384,7 +468,7 @@ GlobalStateSnapshot -> SelfCheck condition evaluation
 
 ---
 
-## 9. 需要明确的设计点
+## 10. 需要明确的设计点
 
 后续实现时建议补充以下约束，避免状态管理歧义。
 
@@ -430,7 +514,203 @@ GlobalStateSnapshot -> SelfCheck condition evaluation
 
 ---
 
-## 10. 总结
+## 11. Driver 配置：把 Session 类型差异显式化
+
+### 11.1 核心观察
+
+前面 §3-6 描述的 4 类 Session 本质是同一个 Session 抽象的不同 specialization。它们的差异（等待什么、消费什么、何时触发推理、何时 END）可以**统一抽象成一组 driver 配置**——把"哪些事件能成为推理驱动力"作为 session 的一等配置项。
+
+agent.toml 已经在分散字段里做这件事：
+
+| 现有字段 | driver 性质 |
+| --- | --- |
+| `subscribe_events` | 输入 filter，决定什么进 pending queue |
+| `inject_background_environment` | 半订阅 event 是否进 user message |
+| `switch_mode` | behavior 切换的驱动策略 |
+| `report_delivery` | sub-behavior 报告投递时机 |
+| `keep_alive` | END 后是否被新输入唤醒 |
+
+把这些零散字段统一进一个 `[session.<kind>.driver]` 块，是自然终态。
+
+### 11.2 Driver 的核心抽象：Hook Point × Filter × Pull Policy
+
+当前 work session 已经具备 4 个 hook point，每个 hook 上挂极少几个 enum 配置：
+
+```text
+on_init
+
+on_behavior_step_ob
+
+on_behavior_switch
+    filter = "top"
+    pull_msg = "all"
+    pull_event = "all"
+
+on_wait
+    filter = "top"
+    pull_msg = "all"
+```
+
+每个 hook point 是 llm_context **物理状态机**上"有机会渲染 user_message 并启动新一轮推理"的窗口。Hook point 数量有物理上限，不会膨胀——这是相对"开放 fire 表达式"的根本简化。
+
+| Hook Point | 触发时机 |
+| --- | --- |
+| `on_init` | session 启动时一次性触发，渲染初始 system prompt |
+| `on_behavior_switch` | 每次 behavior switch / fork / 独立切换时触发，渲染新 behavior 的入口 user_message |
+| `on_behavior_step_ob` | Behavior Loop 内每个 step 边界（观察阶段）触发 |
+| `on_wait` | session 处于 idle 状态、新 pending input 到达时触发 |
+
+每个 hook point 上挂三个 enum 配置：
+
+| 配置 | 含义 | 取值集合 |
+| --- | --- | --- |
+| `filter` | 哪些 behavior 启用本 hook | `top` / `default_only` / `all` / `none` / `<behavior_name>` |
+| `pull_msg` | 从 pending message queue 拉取的策略 | `none` / `one` / `all` |
+| `pull_event` | 从 pending event queue 拉取的策略 | `none` / `<filter_name>` / `all` |
+
+`filter` 前 4 个是固定 enum，`<behavior_name>` 是闭集合标识符（startup 时对照 session 的 behavior 列表 validate）——整体仍属"受限标识符 + 枚举"，不是开放表达式。
+
+**Session.worker 运行逻辑（伪代码）**：
+
+```python
+def session.worker():
+    # 在推理的间隙，根据当前 hook point 配置从 pending queue pull
+    # 示例：on_behavior_switch
+    pull_msg_policy   = get_current_pull_msg_policy()
+    pull_msgs         = self.pull_msgs(pull_msg_policy)
+    pull_event_policy = get_current_pull_event_policy()
+    pull_events       = self.pull_events(pull_event_policy)
+
+    llm_context_env = self.prepare_context_env(pull_msgs, pull_events)
+    user_msg = render_prompt(self.current_behavior.on_switch, llm_context_env)
+
+    new_llm_context = create_llm_context(current_llm_context)
+    new_llm_context.append_user_msg(user_msg)
+    new_llm_context.drive_to_end()
+    # ↑ 进入此调用 = pull 拿到的 input 立即 commit pop（见 §11.5）
+```
+
+`llm_context_env` 的 schema 是**固定的**（framework-level 决策），不是 per-config declared：
+
+| Key | 来源 |
+| --- | --- |
+| `msgs` | `pull_msgs` 结果 |
+| `events` | `pull_events` 结果 |
+| `bg_events` | 半订阅 event 当前快照（不消费） |
+| `session_state` | session 状态机当前状态 |
+| `last_step` | step observation 阶段的 last_step_result（仅 Behavior Loop） |
+| `behavior_history` | StepRecord history（仅 Behavior Loop） |
+
+模板从这个固定 env 自由读，按需引用。**没有 binding name 契约，没有 binding usage 校验**——env schema 是框架级 invariant，不是每个 driver/behavior 单独声明。
+
+### 11.3 为什么驱动力必须在 Session 层而不是 Behavior 层
+
+1. **同一 behavior 在不同 session 下驱动力不同**：`chat_route` 在 UI session 是 `per_peer`，在 group session 是 `per_group`。绑死在 behavior 上无法跨 session 复用。
+2. **同一 session 多个 behavior 通常共享驱动策略**：每个 behavior 重复声明是 DRY 违反。
+3. **Behavior 配置只剩纯渲染**：心智模型干净，可独立测试。
+
+### 11.4 Driver / Behavior 契约：固定 env schema + 模板幂等
+
+Driver 和 Behavior 在新架构下的契约非常薄：
+
+1. **Driver 负责**：按 hook point 配置 pull + 构造 `llm_context_env`
+2. **Behavior 模板负责**：从 `llm_context_env` 读取所需字段，渲染 user_message
+3. **`llm_context_env` schema 固定**（由框架定义），不是 per-behavior declared
+
+没有 binding name 校验、没有 binding usage tracking、没有"必须引用某 binding"的硬契约——因为模板**自由读取**固定 schema 即可，未读取的字段直接忽略。
+
+> **模板引擎必须是幂等的**：同一个 `llm_context_env` 渲染 N 次结果必须完全一致。**模板不幂等就是 bug**，没有例外。
+
+直接代价：
+
+- 模板不能产生副作用
+- 模板不能依赖随机 / 时间 / 外部状态
+- 时间 / 半订阅事件快照 / pending tool result 等所有外部状态由 Driver 在构造 env 时 freeze 进去
+
+### 11.5 关键 invariant：进入推理 = commit pop
+
+> **一旦 render 成功且 user_msg 喂给 `llm_context.drive_to_end()`，本次 pull 拿到的 input 立即从 pending queue 消失**。  
+> Commit pop 不依赖推理成功 / 失败，不依赖 tool 调用结果，不依赖 drive_to_end 返回值。
+
+直接推论：
+
+- **推理失败 → input 丢失**，by design，框架**不**自动重放
+- **Crash recovery 不允许自动重新触发未完成的推理**——上次崩在哪一步无法精确还原，重放等于把 tool 调用风险翻倍
+- **重试只能由上层显式做**——用户重发消息 / scheduler 重新 push event；**永远不能是框架隐式重放**
+
+为什么不选 peek + 后置 commit（推理完成后再消费）：
+
+| 风险 | 代价 | 可恢复性 |
+| --- | --- | --- |
+| Input 丢失（推理挂了 msg 没了） | 中 | ✅ 用户/scheduler 可重新 push |
+| Tool 调用副作用重复（rollback 后 msg 回 queue → 下次推理重新触发同一 tool） | **灾难** | ❌ 账户扣两次 / 邮件发两次 / 文件改两次——不可逆 |
+
+推理过程中的 tool 调用**本身就不幂等**，重放比丢消息危险得多。早 commit pop 是用"可恢复的小风险"换"不可恢复的大风险"——这是有意识的设计抉择。
+
+### 11.6 取值集合
+
+`pull_msg`：
+
+| 取值 | 语义 |
+| --- | --- |
+| `none` | 本 hook 不消费 message |
+| `one` | 取队列头部一条 |
+| `all` | 取队列中所有 message |
+
+`pull_event`：
+
+| 取值 | 语义 |
+| --- | --- |
+| `none` | 本 hook 不消费 event |
+| `<filter_name>` | 取队列中匹配该 filter 的 event（如 `ban_lifted` / `timer.reminder_check` 等命名空间）|
+| `all` | 取队列所有 event |
+
+`filter`：
+
+| 取值 | 语义 |
+| --- | --- |
+| `top` | 只在顶层 behavior 启用 |
+| `default_only` | 只在 default behavior 启用 |
+| `all` | 所有 behavior 启用 |
+| `none` | 全禁用 |
+| `<behavior_name>` | 在指定 behavior 启用（startup 时校验名字存在） |
+
+每加一个 pull policy enum，对模板的语法要求增加一项（字段访问 / 数组迭代 / 计数 / 边界判断 / ...）。这条耦合决定了 pull policy 必须 enum 化、可枚举、可契约校验——不能走开放表达式 / 脚本路线。
+
+### 11.7 四类 Session 在 Hook Point 视角下的配置
+
+把 §3-6 的 session 差异翻译成具体 hook point 配置：
+
+| Session 类型 | on_init | on_behavior_switch | on_behavior_step_ob | on_wait |
+| --- | --- | --- | --- | --- |
+| UI Session | 标准初始化 | `filter=top, pull_msg=all` | — | `filter=top, pull_msg=all` |
+| 普通 Work Session | 标准初始化 | `filter=top, pull_msg=all, pull_event=ban_lifted` | `filter=top, pull_msg=all` | — |
+| SelfCheck Session | timer-aware 初始化 | `filter=top, pull_event=timer.*` | — | — |
+| SelfImprove Session | global-state 初始化 | `filter=top, pull_msg=none, pull_event=none` | — | — |
+
+观察：
+
+- **SelfImprove 全程 `pull_msg=none / pull_event=none`**——它"不消费外部输入"的具体表达。history 和 global_state 通过 env 自动注入（不在 pull 范畴内）。
+- **SelfCheck 的事件路由**（按 `timer.reason` 区分提醒类型）通过 `pull_event` 的 filter 名称命名空间参数化——具体 filter 集合属于 schema 设计点（见 §11.8）。
+- **UI Session 的 on_wait 是核心**——它常态在 idle + 监听 pending input；on_behavior_switch 在 UI 内基本对应路由判断。
+- **普通 Work Session 的 on_behavior_step_ob 是 Behavior Loop 独有**——step 边界拉新 message 是允许在 step 中段感知用户追加输入的关键。
+
+### 11.8 §10 设计点 = Hook Point 配置取值集合的设计题
+
+§10 列出的四个待明确点，本质都是 hook point 配置的**取值集合设计**：
+
+| §10 待明确点 | Hook Point 视角 |
+| --- | --- |
+| forwardMessage 路由策略 | dispatch 层 driver（见 §8 Session 唤醒），不是 session 内 driver |
+| Work Session END 语义 | `keep_alive` + "END 状态下 on_wait 是否触发"开关 |
+| SelfCheck timer reason schema | `pull_event` 的 filter 名称命名空间设计（`timer.reminder_check` / `timer.hard_barrier` / ...） |
+| SelfImprove budget 与续跑 | `on_init` 阶段对 `pending_improvement_tasks` 的读取规则 + budget 状态机 |
+
+§10 的设计点都在向"完整 hook point 配置取值集合"逼近。一旦 hook point + filter + pull policy 的取值集合定义清楚，§10 的歧义会自动收敛。
+
+---
+
+## 12. 总结
 
 从状态管理角度看：
 
@@ -440,3 +720,10 @@ GlobalStateSnapshot -> SelfCheck condition evaluation
 - **SelfImprove Session** 是 global state 驱动的特殊 Work Session，不消费外部输入，只读取 history 和 global state，在 budget 限制下增量地产生和下达改进任务。
 
 整体上，AgentSession 的关键不是静态分类，而是事件消费方式和状态转移规则：谁等待什么、谁能被什么激活、谁能接收 forwardMessage、谁会 END，以及谁只依赖 timer 或 global state。
+
+这些差异最终通过两层正交架构统一表达：
+
+- **§8 Session 唤醒**：Agent.main_loop 是唯一的 event/msg pump；session.worker 按需从磁盘加载启动，session 状态唯一真相源 = 磁盘
+- **§11 Driver 配置**：hook point × filter × pull policy，决定 worker 跑起来后如何消费 pending queue
+
+两层职责清晰分离：**唤醒**决定 worker 何时在跑、**Driver** 决定 worker 跑起来后如何消费。**Session 类型的差异 = (worker 生命周期策略) × (driver 配置)**——这是 AgentSession 设计的核心 invariant。
