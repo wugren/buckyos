@@ -87,7 +87,7 @@ Read global state only when it can change the plan. Do not repeat large state du
 <</RESULT_PROTOCOL>>
 """
 
-on_switch = """
+on_behavior_switch = """
 {% if from_context %}
 ## Last Finish Todo Report:
 {{from_context.report}}
@@ -104,9 +104,36 @@ on_switch = """
 Continue from PROCESS_RULES.
 """
 
-on_input_event = """
-[event {event_id}]
-{event_data}
+on_behavior_step_ob = """
+<<last_step_action_results>>
+{{ default_last_step_action_results_text }}
+<</last_step_results>>
+
+{{%if input.has_msgs}}
+<<new_user_msgs>>
+{{%for msg in input.msgs%}}
+<message from={{msg.from}}>
+{{msg.content}}
+</message>
+{{%endfor}}
+<</new_user_msgs>>
+{{%endif%}}
+"""
+
+on_wakeup = """
+{{%if input.has_msg%}}
+input.text
+{{%endif%}}
+
+{{%if input.has_events%}}
+<<new_events>>
+{{%for event in input.events%}}
+<event id={{event.event_id}}>
+{{event.data}}
+</event>
+{{%endfor%}}
+<</new_events
+{{%endif%}}
 """
 
 [capabilities]

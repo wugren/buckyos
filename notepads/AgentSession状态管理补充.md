@@ -536,6 +536,8 @@ agent.toml 已经在分散字段里做这件事：
 
 当前 work session 已经具备 4 个 hook point，每个 hook 上挂极少几个 enum 配置：
 
+命名上用 `on_wakeup` 表示“session 从 idle / waiting 状态被 pending input 唤醒后触发”。早期实现和配置里叫 `on_wait`，迁移时应保留为 deprecated alias。
+
 ```text
 on_init
 
@@ -546,7 +548,7 @@ on_behavior_switch
     pull_msg = "all"
     pull_event = "all"
 
-on_wait
+on_wakeup
     filter = "top"
     pull_msg = "all"
 ```
@@ -558,7 +560,7 @@ on_wait
 | `on_init` | session 启动时一次性触发，渲染初始 system prompt |
 | `on_behavior_switch` | 每次 behavior switch / fork / 独立切换时触发，渲染新 behavior 的入口 user_message |
 | `on_behavior_step_ob` | Behavior Loop 内每个 step 边界（观察阶段）触发 |
-| `on_wait` | session 处于 idle 状态、新 pending input 到达时触发 |
+| `on_wakeup` | session 处于 idle 状态、新 pending input 到达时触发 |
 
 每个 hook point 上挂三个 enum 配置：
 
@@ -681,7 +683,7 @@ Driver 和 Behavior 在新架构下的契约非常薄：
 
 把 §3-6 的 session 差异翻译成具体 hook point 配置：
 
-| Session 类型 | on_init | on_behavior_switch | on_behavior_step_ob | on_wait |
+| Session 类型 | on_init | on_behavior_switch | on_behavior_step_ob | on_wakeup |
 | --- | --- | --- | --- | --- |
 | UI Session | 标准初始化 | `filter=top, pull_msg=all` | — | `filter=top, pull_msg=all` |
 | 普通 Work Session | 标准初始化 | `filter=top, pull_msg=all, pull_event=ban_lifted` | `filter=top, pull_msg=all` | — |
@@ -692,7 +694,7 @@ Driver 和 Behavior 在新架构下的契约非常薄：
 
 - **SelfImprove 全程 `pull_msg=none / pull_event=none`**——它"不消费外部输入"的具体表达。history 和 global_state 通过 env 自动注入（不在 pull 范畴内）。
 - **SelfCheck 的事件路由**（按 `timer.reason` 区分提醒类型）通过 `pull_event` 的 filter 名称命名空间参数化——具体 filter 集合属于 schema 设计点（见 §11.8）。
-- **UI Session 的 on_wait 是核心**——它常态在 idle + 监听 pending input；on_behavior_switch 在 UI 内基本对应路由判断。
+- **UI Session 的 on_wakeup 是核心**——它常态在 idle + 监听 pending input；on_behavior_switch 在 UI 内基本对应路由判断。
 - **普通 Work Session 的 on_behavior_step_ob 是 Behavior Loop 独有**——step 边界拉新 message 是允许在 step 中段感知用户追加输入的关键。
 
 ### 11.8 §10 设计点 = Hook Point 配置取值集合的设计题
@@ -702,7 +704,7 @@ Driver 和 Behavior 在新架构下的契约非常薄：
 | §10 待明确点 | Hook Point 视角 |
 | --- | --- |
 | forwardMessage 路由策略 | dispatch 层 driver（见 §8 Session 唤醒），不是 session 内 driver |
-| Work Session END 语义 | `keep_alive` + "END 状态下 on_wait 是否触发"开关 |
+| Work Session END 语义 | `keep_alive` + "END 状态下 on_wakeup 是否触发"开关 |
 | SelfCheck timer reason schema | `pull_event` 的 filter 名称命名空间设计（`timer.reminder_check` / `timer.hard_barrier` / ...） |
 | SelfImprove budget 与续跑 | `on_init` 阶段对 `pending_improvement_tasks` 的读取规则 + budget 状态机 |
 

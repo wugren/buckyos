@@ -132,8 +132,8 @@ pull_msg = "all"
 pull_event = "all"
 
 [session.work.driver.on_wait]
-filter = "none"
-pull_msg = "none"
+filter = "top"
+pull_msg = "one"
 pull_event = "none"
 
 [session.self_check]

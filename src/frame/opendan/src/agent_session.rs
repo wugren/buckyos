@@ -298,6 +298,8 @@ impl StepResultHook for OpenDanStepResultHook {
 
         let (_, default_user) = XmlStepRenderer::new().render(step);
         let default_user_message = default_user.text_content();
+        let default_last_step_action_results_content =
+            serde_json::to_value(&step.action_results).unwrap_or(serde_json::Value::Null);
         let pending_inputs = self.pending_input_values().await;
         let pending_input_text = render_pending_input_values(&pending_inputs);
         let env = build_agent_session_env(
@@ -320,11 +322,19 @@ impl StepResultHook for OpenDanStepResultHook {
                     "step_index": step.meta.step_index,
                     "action_count": step.actions.len(),
                     "result_count": step.action_results.len(),
-                    "default_user_message": default_user_message,
+                    "default_user_message": default_user_message.clone(),
                     "actions": step.actions,
                     "action_results": step.action_results,
                     "messages_sent": step.messages_sent,
                 }),
+            ),
+            (
+                "default_last_step_action_results_text",
+                serde_json::Value::String(default_user_message),
+            ),
+            (
+                "default_last_step_action_results_content",
+                default_last_step_action_results_content,
             ),
             (
                 "pending_inputs",

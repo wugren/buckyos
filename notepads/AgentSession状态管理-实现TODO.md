@@ -32,7 +32,7 @@
 
 - [ ] **0.4 END + keep_alive 语义表**（§10.9.2 / §8.4）
   待明确：
-  - END 后 `on_wait` 是否触发？
+  - END 后 `on_wakeup` 是否触发？
   - reopen = fork 新 session 还是恢复旧的？
   - END 后是否保留 routing metadata？
   - 产物：`session_model.rs` 头部状态表注释（纯 invariant，非可执行 doc）
@@ -68,7 +68,7 @@
     - `on_init`（session 启动一次）
     - `on_behavior_switch`（每次 behavior switch / fork）
     - `on_behavior_step_ob`（Behavior Loop step 观察阶段）
-    - `on_wait`（idle + 新 pending 到达）
+    - `on_wakeup`（idle + 新 pending 到达）
   - 内部按 `pull_msg / pull_event` enum 拉数据，统一走 `pull_msgs(policy)` / `pull_events(policy)` 两个方法
 
 - [ ] **1.5 commit-pop 边界 audit**（§11.5）

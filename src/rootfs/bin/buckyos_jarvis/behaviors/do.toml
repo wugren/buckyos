@@ -87,17 +87,18 @@ Read global state only when it can change execution. Do not dump large state int
 <</SKILLS>>
 
 """
-on_switch = """
+
+# TODO 需要在这里加入parent context(from_context)的最后5条step history
+on_behavior_switch = """
 Continue TASK_ANCHOR.
-
-Driver events for this turn:
-{{ llm_context.events }}
 """
 
-on_input_event = """
-[event {event_id}]
-{event_data}
+on_behavior_step_ob = """
+<<last_step_action_results>>
+{{ default_last_step_action_results_text }}
+<</last_step_results>>
 """
+
 
 [capabilities]
 tool_whitelist = []
