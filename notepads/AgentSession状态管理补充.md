@@ -727,3 +727,75 @@ Driver 和 Behavior 在新架构下的契约非常薄：
 - **§11 Driver 配置**：hook point × filter × pull policy，决定 worker 跑起来后如何消费 pending queue
 
 两层职责清晰分离：**唤醒**决定 worker 何时在跑、**Driver** 决定 worker 跑起来后如何消费。**Session 类型的差异 = (worker 生命周期策略) × (driver 配置)**——这是 AgentSession 设计的核心 invariant。
+
+---
+
+## 13. 实现映射（Phase 3 - Phase 5）
+
+### 13.1 SelfCheck Session
+
+- §5.3 hard barrier timer / precise trigger timer：
+  - `src/frame/opendan/src/agent.rs`
+    - `AIAgent::ensure_self_check_hard_barrier_timer`
+    - `AIAgent::schedule_precise_timer`
+  - `src/frame/opendan/src/session_model.rs`
+    - `TimerReason`
+    - `TimerTriggerType`
+    - `TimerTargetType`
+    - `TimerEventKind`
+- §5.4 TimerReason schema：
+  - `src/frame/opendan/src/session_model.rs::TimerReason`
+  - 测试：`session_model::tests::timer_reason_round_trips_fixed_schema`
+- §5.5 reminder trigger path：
+  - `src/frame/opendan/src/agent_session.rs`
+    - `AgentSession::dispatch_behavior_send_messages`
+    - `AgentSession::post_send_message_record`
+  - 行为模板：`src/rootfs/bin/buckyos_jarvis/behaviors/self_check.toml`
+- §11.6 timer pull_event filter 命名空间：
+  - `src/frame/opendan/src/session_model.rs::TimerEventKind`
+  - `src/frame/opendan/src/agent_config.rs::validate_driver_filters`
+- §11.7 SelfCheck driver 默认配置：
+  - `src/frame/opendan/src/agent_config.rs::default_self_check_driver`
+  - 模板：`src/rootfs/bin/buckyos_jarvis/agent.toml [session.self_check]`
+
+### 13.2 SelfImprove Session
+
+- §6.3 budget 状态机：
+  - `src/frame/opendan/src/session_model.rs`
+    - `ImprovementBudget`
+    - `ImprovementBudgetUnit`
+    - `ImprovementTask`
+    - `ImprovementTaskStatus`
+    - `SessionMeta.improvement_budget`
+    - `SessionMeta.pending_improvement_tasks`
+  - `src/frame/opendan/src/agent_session.rs`
+    - `AgentSession::mark_improvement_budget_exhausted`
+- §11.4 / §11.7 history + global_state 注入：
+  - `src/frame/opendan/src/prompt_env.rs::LlmContextEnv`
+  - `src/frame/opendan/src/agent.rs::AIAgent::snapshot_global_state`
+  - `src/frame/opendan/src/agent_session.rs::AgentSession::apply_hook`
+- §6.3 改进任务 dispatch：
+  - `src/frame/opendan/src/agent_session.rs::dispatch_self_improvement_tasks`
+  - 最小落地：写 `improvement_tasks.jsonl`，并同步更新 `SessionMeta.pending_improvement_tasks`
+  - 行为模板：`src/rootfs/bin/buckyos_jarvis/behaviors/self_improve.toml`
+- §11.7 SelfImprove driver 默认配置：
+  - `src/frame/opendan/src/agent_config.rs::default_self_improve_driver`
+  - 模板：`src/rootfs/bin/buckyos_jarvis/agent.toml [session.self_improve]`
+
+### 13.3 收尾与回归
+
+- 旧字段 deprecation warning：
+  - `src/frame/opendan/src/agent_config.rs::warn_deprecated_session_keys`
+  - 覆盖字段：`subscribe_events` / `inject_background_environment` / `switch_mode` / `report_delivery`
+- `/timer/wake` 测试迁移到新 TimerReason schema：
+  - `src/frame/opendan/src/agent_session_test.rs`
+    - `format_event_for_turn_includes_id_and_data`
+    - `session_meta_round_trips_pending_inputs`
+- Driver 配置与 baseline 组合测试：
+  - `src/frame/opendan/src/agent_config.rs`
+    - `defaults_when_no_toml`
+    - `driver_hook_point_round_trips`
+    - `rejects_unknown_timer_driver_filter`
+    - `jarvis_work_session_uses_fork_switch_mode`
+- 运行验证：
+  - `cargo test -p opendan`

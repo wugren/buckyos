@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use buckyos_api::{AiMessage, AiRole};
-use chrono::Local;
+use buckyos_api::{AiMessage, AiRole, TimerOptions};
+use chrono::{Local, Utc};
 use log::{info, warn};
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -42,12 +42,16 @@ use crate::local_workspace::LocalWorkspaceManager;
 use crate::msg_center_pump::{self, PumpConfig};
 use crate::paths;
 use crate::session_event_pump::SessionEventPump;
-use crate::session_model::{PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary};
+use crate::session_model::{
+    PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary, TimerEventKind,
+    TimerReason, TimerTargetType, TimerTriggerType,
+};
 use crate::tool_plan::{self, ResolvedToolPlan, SessionBinRenderer, ToolPlanToml};
 
 /// Reason string we tag msg-center ack updates with so audit logs can tell
 /// "the opendan agent picked this up" apart from other consumers.
 const MSG_ROUTED_REASON: &str = "routed_by_opendan_runtime";
+const SELF_CHECK_HARD_BARRIER_INTERVAL_MS: u64 = 60_000;
 
 /// One inbound item to route to a session. Tagged so messages and events
 /// share the same tokio queue into the dispatcher — keeping with the
@@ -411,6 +415,7 @@ impl AIAgent {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("opendan.agent[{}]: starting AIAgent::run", self.agent_name);
         self.clone().restore_active_sessions().await;
+        self.clone().ensure_self_check_hard_barrier_timer().await;
 
         let pump_handle = self.clone().spawn_msg_center_pump();
         let event_pump_handle = self.event_pump.as_ref().map(|p| {
@@ -568,7 +573,16 @@ impl AIAgent {
     fn route_to_class(&self, event_type: &str) -> String {
         self.dispatcher
             .route(event_type)
-            .unwrap_or_else(|| self.config.toml.dispatch.default_class.clone())
+            .filter(|class| self.config.session_class_enabled(class))
+            .or_else(|| {
+                let default = self.config.toml.dispatch.default_class.clone();
+                if self.config.session_class_enabled(&default) {
+                    Some(default)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "ui".to_string())
     }
 
     fn route_msg(&self, event_type: &str) -> String {
@@ -576,28 +590,184 @@ impl AIAgent {
     }
 
     fn route_event_target(&self, data: &serde_json::Value) -> Option<String> {
-        data.get("reason")
-            .and_then(|value| {
-                serde_json::from_value::<crate::session_model::TimerReason>(value.clone()).ok()
+        data.get("target_session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                data.get("reason")
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::session_model::TimerReason>(value.clone())
+                            .ok()
+                    })
+                    .and_then(|reason| {
+                        let target_id = reason.target_id.trim();
+                        if target_id.is_empty() {
+                            None
+                        } else {
+                            Some(target_id.to_string())
+                        }
+                    })
             })
-            .and_then(|reason| {
-                let target_id = reason.target_id.trim();
-                if target_id.is_empty() {
-                    None
+    }
+
+    pub async fn schedule_precise_timer(
+        &self,
+        session_id: &str,
+        reason: TimerReason,
+    ) -> Result<String> {
+        let Some(client) = self.runtime.kevent_client.as_ref() else {
+            return Err(anyhow!("schedule_precise_timer: kevent client unavailable"));
+        };
+        let now = Utc::now();
+        let expected = reason.expected_trigger_time.with_timezone(&Utc);
+        let delay_ms = expected
+            .signed_duration_since(now)
+            .num_milliseconds()
+            .max(1) as u64;
+        let event_kind = match reason.target_type {
+            TimerTargetType::Reminder => TimerEventKind::ReminderCheck,
+            TimerTargetType::ScheduledTask => TimerEventKind::ScheduledTaskCheck,
+            TimerTargetType::Other | TimerTargetType::Named(_) => TimerEventKind::ReminderCheck,
+        };
+        let timer_id = client
+            .create_timer(
+                event_kind.event_id(),
+                TimerOptions {
+                    interval_ms: delay_ms,
+                    repeat: false,
+                    initial_delay_ms: Some(delay_ms),
+                    data: Some(serde_json::json!({
+                        "target_session_id": session_id,
+                        "reason": reason,
+                    })),
+                },
+            )
+            .await
+            .map_err(|err| anyhow!("schedule_precise_timer: create_timer failed: {err:?}"))?;
+        Ok(timer_id)
+    }
+
+    async fn ensure_self_check_hard_barrier_timer(self: Arc<Self>) {
+        let Some(client) = self.runtime.kevent_client.as_ref() else {
+            return;
+        };
+        let mut classes = self
+            .config
+            .toml
+            .session
+            .iter()
+            .filter_map(|(name, cfg)| {
+                if cfg.enabled && matches!(cfg.kind, SessionKind::SelfCheck) {
+                    Some(name.clone())
                 } else {
-                    Some(target_id.to_string())
+                    None
                 }
             })
-            .or_else(|| {
-                data.get("target_session_id")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
+            .collect::<Vec<_>>();
+        let has_configured_self_check = self
+            .config
+            .toml
+            .session
+            .values()
+            .any(|cfg| matches!(cfg.kind, SessionKind::SelfCheck));
+        if classes.is_empty() && !has_configured_self_check {
+            classes.push(self.config.class_name_for_kind(SessionKind::SelfCheck));
+        }
+        classes.sort();
+        classes.dedup();
+
+        for class in classes {
+            let session_id = class.clone();
+            let session = match self
+                .clone()
+                .get_or_create_session(
+                    session_id.clone(),
+                    "system".to_string(),
+                    SessionKind::SelfCheck,
+                    &class,
+                )
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    warn!(
+                        "opendan.agent[{}]: create self_check session {} for hard barrier failed: {err:#}",
+                        self.agent_name, session_id
+                    );
+                    continue;
+                }
+            };
+            for event_kind in [
+                TimerEventKind::ReminderCheck,
+                TimerEventKind::HardBarrier,
+                TimerEventKind::ScheduledTaskCheck,
+            ] {
+                let event_id = event_kind.event_id();
+                if let Err(err) = session.subscribe_event(event_id).await {
+                    warn!(
+                        "opendan.agent[{}]: subscribe self_check {} failed: {err:#}",
+                        self.agent_name, event_id
+                    );
+                }
+            }
+            let reason = TimerReason {
+                trigger_type: TimerTriggerType::HardBarrier,
+                target_type: TimerTargetType::Other,
+                target_id: session_id.clone(),
+                expected_trigger_time: Utc::now().fixed_offset(),
+                reason: "periodic hard barrier self-check".to_string(),
+            };
+            if let Err(err) = client
+                .create_timer(
+                    TimerEventKind::HardBarrier.event_id(),
+                    TimerOptions {
+                        interval_ms: SELF_CHECK_HARD_BARRIER_INTERVAL_MS,
+                        repeat: true,
+                        initial_delay_ms: Some(1),
+                        data: Some(serde_json::json!({
+                            "target_session_id": session_id,
+                            "reason": reason,
+                        })),
+                    },
+                )
+                .await
+            {
+                warn!(
+                    "opendan.agent[{}]: create self_check hard barrier timer failed: {err:?}",
+                    self.agent_name
+                );
+            }
+        }
+    }
+
+    pub async fn snapshot_global_state(
+        &self,
+        exclude_session_id: Option<&str>,
+    ) -> serde_json::Value {
+        let summaries = self.list_session_summaries(exclude_session_id).await;
+        serde_json::json!({
+            "agent_name": self.agent_name,
+            "agent_id": self.agent_id(),
+            "session_count": summaries.len(),
+            "sessions": summaries.into_iter().map(|s| {
+                serde_json::json!({
+                    "session_id": s.session_id,
+                    "kind": s.kind.as_str(),
+                    "title": s.title,
+                    "objective": s.objective,
+                    "status": format!("{:?}", s.status).to_ascii_lowercase(),
+                    "one_line_status": s.one_line_status,
+                    "workspace_id": s.workspace_id,
+                    "current_behavior": s.current_behavior,
+                })
+            }).collect::<Vec<_>>(),
+        })
     }
 
     fn route_event_class(&self, event_id: &str) -> Option<String> {
         if event_id.starts_with("timer.") || event_id.starts_with("/timer/") {
-            Some(self.config.class_name_for_kind(SessionKind::SelfCheck))
+            let class = self.config.class_name_for_kind(SessionKind::SelfCheck);
+            self.config.session_class_enabled(&class).then_some(class)
         } else {
             None
         }

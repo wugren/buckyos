@@ -12,7 +12,7 @@ type = "msg_center"
 
 [[channel]]
 type = "kevent"
-filters = ["task_mgr/**", "kvdoc/**", "timer/**"]
+filters = ["task_mgr/**", "kvdoc/**", "timer.hard_barrier", "timer.reminder_check", "timer.scheduled_task_check"]
 
 [dispatch]
 default_class = "ui"
@@ -137,6 +137,7 @@ pull_msg = "none"
 pull_event = "none"
 
 [session.self_check]
+enabled = false
 kind = "self_check"
 loop_mode = "behavior"
 default_behavior = "self_check"
@@ -170,6 +171,7 @@ pull_msg = "none"
 pull_event = "none"
 
 [session.self_improve]
+enabled = false
 kind = "self_improve"
 loop_mode = "behavior"
 default_behavior = "self_improve"

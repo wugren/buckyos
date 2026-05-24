@@ -172,6 +172,10 @@ pub struct SessionMeta {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_task_calls: Vec<PendingTaskCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub improvement_budget: Option<ImprovementBudget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_improvement_tasks: Vec<ImprovementTask>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -209,6 +213,8 @@ impl SessionMeta {
             background_events: Vec::new(),
             workspace_id: None,
             pending_task_calls: Vec::new(),
+            improvement_budget: None,
+            pending_improvement_tasks: Vec::new(),
             title: String::new(),
             objective: String::new(),
             bootstrap_done: false,
@@ -233,6 +239,35 @@ pub struct PendingTaskCall {
     pub tool_name: String,
     pub task_id: i64,
     pub event_pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImprovementBudget {
+    pub unit: ImprovementBudgetUnit,
+    pub remaining: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementBudgetUnit {
+    Token,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImprovementTask {
+    pub task_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_report: String,
+    pub created_at_ms: u64,
+    pub status: ImprovementTaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementTaskStatus {
+    Pending,
+    Dispatched,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +354,33 @@ pub enum TimerTriggerType {
     PreciseTrigger,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerEventKind {
+    ReminderCheck,
+    HardBarrier,
+    ScheduledTaskCheck,
+}
+
+impl TimerEventKind {
+    pub fn event_id(self) -> &'static str {
+        match self {
+            TimerEventKind::ReminderCheck => "timer.reminder_check",
+            TimerEventKind::HardBarrier => "timer.hard_barrier",
+            TimerEventKind::ScheduledTaskCheck => "timer.scheduled_task_check",
+        }
+    }
+
+    pub fn parse_event_id(value: &str) -> Option<Self> {
+        match value.trim() {
+            "timer.reminder_check" => Some(TimerEventKind::ReminderCheck),
+            "timer.hard_barrier" => Some(TimerEventKind::HardBarrier),
+            "timer.scheduled_task_check" => Some(TimerEventKind::ScheduledTaskCheck),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerTargetType {
     Reminder,
@@ -390,5 +452,14 @@ mod tests {
         assert_eq!(reason.target_type, TimerTargetType::Reminder);
         assert_eq!(reason.target_id, "reminder_123");
         assert_eq!(serde_json::to_value(reason).unwrap(), value);
+    }
+
+    #[test]
+    fn timer_event_kind_is_closed_namespace() {
+        assert_eq!(
+            TimerEventKind::parse_event_id("timer.reminder_check"),
+            Some(TimerEventKind::ReminderCheck)
+        );
+        assert!(TimerEventKind::parse_event_id("timer.anything_else").is_none());
     }
 }

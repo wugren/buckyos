@@ -10,13 +10,16 @@ use buckyos_api::{
 };
 use log::{info, warn};
 use ndn_lib::{MsgContent, MsgContentFormat, MsgObjKind, MsgObject};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
 use llm_context::{
-    behavior_loop::{HistoryInputRecord, StepRecord, StepResultHook, StepResultHookOutput},
+    behavior_loop::{
+        HistoryInputRecord, SendMessageRecord, StepRecord, StepResultHook, StepResultHookOutput,
+    },
     context_loop::LLMContext,
     interrupt::LLMContextInterruptHandle,
     observation::Observation,
@@ -47,9 +50,10 @@ use crate::round_history::{
 };
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
-    BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode, InterruptMode,
-    PendingInput, PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput, SessionKind,
-    SessionMeta, SessionStatus, SessionSummary,
+    BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode, ImprovementBudget,
+    ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus, InterruptMode, PendingInput,
+    PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput, SessionKind, SessionMeta,
+    SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
 
@@ -417,7 +421,7 @@ impl AgentSession {
         // Restore path: keep persistent fields (pending_inputs, peer info,
         // event_subscriptions) but reset transient status to Idle so the
         // worker re-enters the main loop cleanly.
-        let meta = if let Some(mut existing) = b.existing_meta {
+        let mut meta = if let Some(mut existing) = b.existing_meta {
             existing.session_id = b.session_id.clone();
             existing.kind = b.kind;
             existing.current_behavior = b.current_behavior.clone();
@@ -440,6 +444,12 @@ impl AgentSession {
                 b.owner.clone(),
             )
         };
+        if matches!(b.kind, SessionKind::SelfImprove) && meta.improvement_budget.is_none() {
+            meta.improvement_budget = Some(ImprovementBudget {
+                unit: ImprovementBudgetUnit::Token,
+                remaining: 32_000,
+            });
+        }
         let history = Arc::new(SessionHistoryRecorder::new(
             b.session_id.clone(),
             session_dir.clone(),
@@ -1922,15 +1932,7 @@ impl AgentSession {
         self.agent_config
             .session_class(&class)
             .map(|c| c.loop_mode)
-            // Built-in defaults: UI ⇒ Agent loop, Work ⇒ Behavior loop.
-            // Matches the pre-config-rewrite hardcoded behavior so an
-            // `agent.toml` without `[session.<class>]` entries still
-            // boots into the expected loop shape.
-            .unwrap_or(if matches!(self.kind, SessionKind::Ui) {
-                LoopMode::Agent
-            } else {
-                LoopMode::Behavior
-            })
+            .unwrap_or_else(|| self.agent_config.default_loop_mode_for_kind(self.kind))
     }
 
     fn session_class_switch_mode(&self) -> SwitchMode {
@@ -1962,7 +1964,7 @@ impl AgentSession {
         self.agent_config
             .session_class(&class)
             .map(|c| c.driver.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| self.agent_config.default_driver_for_kind(self.kind))
     }
 
     async fn apply_hook(
@@ -1974,15 +1976,23 @@ impl AgentSession {
         let cfg = driver.hook(point);
         let (events, consumed_event_keys) = self.pull_events_for_env(cfg, pending).await;
         let (msgs, _) = self.pull_msgs_for_env(cfg, pending);
+        let snapshot = self.try_load_snapshot_for_prompt();
+        let agent_global_state = if let Some(agent) = self.parent_agent.upgrade() {
+            agent.snapshot_global_state(Some(&self.session_id)).await
+        } else {
+            serde_json::json!({
+                "agent_name": self.agent_name,
+                "session_id": self.session_id,
+            })
+        };
         LlmContextEnv {
             events,
             bg_events: self.meta.lock().await.background_events.clone(),
-            last_step: self
-                .try_load_snapshot_for_prompt()
-                .and_then(|snapshot| snapshot.state.last_step)
+            last_step: snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.state.last_step.clone())
                 .and_then(|step| serde_json::to_value(step).ok()),
-            behavior_history: self
-                .try_load_snapshot_for_prompt()
+            behavior_history: snapshot
                 .map(|snapshot| {
                     snapshot
                         .state
@@ -1992,13 +2002,12 @@ impl AgentSession {
                         .collect()
                 })
                 .unwrap_or_default(),
-            agent_global_state: serde_json::json!({
-                "agent_name": self.agent_name,
-                "session_id": self.session_id,
-                "hook_point": point.as_key(),
-                "pulled_msg_count": msgs.len(),
-                "pulled_event_count": consumed_event_keys.len(),
-            }),
+            agent_global_state: merge_global_state_hook_stats(
+                agent_global_state,
+                point.as_key(),
+                msgs.len(),
+                consumed_event_keys.len(),
+            ),
         }
     }
 
@@ -3138,6 +3147,12 @@ impl AgentSession {
                 ..
             } => {
                 self.post_outbound_message(&response.message).await;
+                if matches!(self.kind, SessionKind::SelfCheck) {
+                    self.dispatch_behavior_send_messages(&final_snapshot).await;
+                }
+                if matches!(self.kind, SessionKind::SelfImprove) {
+                    self.dispatch_self_improvement_tasks(&final_snapshot).await;
+                }
                 if let Some(text) = output_to_text(&output) {
                     let _ = self
                         .reply_tx
@@ -3364,6 +3379,10 @@ impl AgentSession {
                     })
                     .await;
                 self.discard_snapshot();
+                if matches!(self.kind, SessionKind::SelfImprove) {
+                    self.mark_improvement_budget_exhausted().await;
+                    return Ok(NextAction::End);
+                }
                 Ok(NextAction::WaitForMsg)
             }
             LLMContextOutcome::Error { error, .. } => {
@@ -3435,6 +3454,171 @@ impl AgentSession {
                     .await;
                 Ok(NextAction::WaitForMsg)
             }
+        }
+    }
+
+    async fn mark_improvement_budget_exhausted(&self) {
+        {
+            let mut meta = self.meta.lock().await;
+            let budget = meta.improvement_budget.get_or_insert(ImprovementBudget {
+                unit: ImprovementBudgetUnit::Token,
+                remaining: 0,
+            });
+            budget.remaining = 0;
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush improvement budget failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn dispatch_self_improvement_tasks(&self, snapshot: &LLMContextSnapshot) {
+        let Some(report) = snapshot
+            .state
+            .last_report
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let seq = self
+            .trace_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let task = ImprovementTask {
+            task_id: format!("improve-{}-{seq}", now_ms()),
+            summary: first_non_empty_line(report)
+                .unwrap_or("self improvement task")
+                .to_string(),
+            source_report: report.to_string(),
+            created_at_ms: now_ms(),
+            status: ImprovementTaskStatus::Dispatched,
+        };
+        {
+            let mut meta = self.meta.lock().await;
+            meta.pending_improvement_tasks.push(task.clone());
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush improvement task failed: {err:#}",
+                self.session_id
+            );
+        }
+
+        let path = self.session_dir.join("improvement_tasks.jsonl");
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                let mut line = match serde_json::to_string(&task) {
+                    Ok(line) => line,
+                    Err(err) => {
+                        warn!(
+                            "opendan.session[{}]: encode improvement task failed: {err}",
+                            self.session_id
+                        );
+                        return;
+                    }
+                };
+                line.push('\n');
+                if let Err(err) = file.write_all(line.as_bytes()).await {
+                    warn!(
+                        "opendan.session[{}]: write {} failed: {err}",
+                        self.session_id,
+                        path.display()
+                    );
+                } else {
+                    info!(
+                        "opendan.session[{}]: dispatched self improvement task {}",
+                        self.session_id, task.task_id
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "opendan.session[{}]: open {} failed: {err}",
+                self.session_id,
+                path.display()
+            ),
+        }
+    }
+
+    async fn dispatch_behavior_send_messages(&self, snapshot: &LLMContextSnapshot) {
+        let messages = snapshot
+            .state
+            .steps
+            .iter()
+            .flat_map(|step| step.messages_sent.iter())
+            .chain(
+                snapshot
+                    .state
+                    .last_step
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|step| step.messages_sent.iter()),
+            )
+            .collect::<Vec<_>>();
+        for message in messages {
+            self.post_send_message_record(message).await;
+        }
+    }
+
+    async fn post_send_message_record(&self, record: &SendMessageRecord) {
+        let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
+            return;
+        };
+        let target = record.target.trim();
+        let body = record.body.trim();
+        if target.is_empty() || body.is_empty() {
+            return;
+        }
+        let Ok(peer_did) = name_lib::DID::from_str(target) else {
+            warn!(
+                "opendan.session[{}]: sendmsg target `{}` is not a DID",
+                self.session_id, target
+            );
+            return;
+        };
+        let agent_did_raw = self.agent_config.toml.identity.agent_did.trim();
+        if agent_did_raw.is_empty() {
+            return;
+        }
+        let Ok(agent_did) = name_lib::DID::from_str(agent_did_raw) else {
+            return;
+        };
+        let msg = ndn_lib::MsgObject {
+            from: agent_did.clone(),
+            to: vec![peer_did],
+            kind: ndn_lib::MsgObjKind::Chat,
+            created_at_ms: now_ms(),
+            content: ndn_lib::MsgContent {
+                format: Some(ndn_lib::MsgContentFormat::TextPlain),
+                content: body.to_string(),
+                ..ndn_lib::MsgContent::default()
+            },
+            ..ndn_lib::MsgObject::default()
+        };
+        let send_ctx = buckyos_api::SendContext {
+            contact_mgr_owner: Some(agent_did),
+            ..Default::default()
+        };
+        match msg_center.post_send(msg, Some(send_ctx), None).await {
+            Ok(result) if result.ok => {}
+            Ok(result) => warn!(
+                "opendan.session[{}]: sendmsg rejected — reason={:?}",
+                self.session_id, result.reason
+            ),
+            Err(err) => warn!(
+                "opendan.session[{}]: sendmsg post_send failed: {err}",
+                self.session_id
+            ),
         }
     }
 
@@ -4542,6 +4726,33 @@ async fn build_agent_session_env(
             ..Default::default()
         },
     }
+}
+
+fn merge_global_state_hook_stats(
+    mut state: serde_json::Value,
+    hook_point: &str,
+    pulled_msg_count: usize,
+    pulled_event_count: usize,
+) -> serde_json::Value {
+    let stats = serde_json::json!({
+        "hook_point": hook_point,
+        "pulled_msg_count": pulled_msg_count,
+        "pulled_event_count": pulled_event_count,
+    });
+    match &mut state {
+        serde_json::Value::Object(map) => {
+            map.insert("driver".to_string(), stats);
+            state
+        }
+        _ => serde_json::json!({
+            "value": state,
+            "driver": stats,
+        }),
+    }
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn append_turn_message_to_snapshot(

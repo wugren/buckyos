@@ -392,15 +392,26 @@ fn pending_input_dedup_key_distinguishes_variants() {
 
 #[test]
 fn format_event_for_turn_includes_id_and_data() {
-    let s = format_event_for_turn("/timer/wake", &serde_json::json!({"tick": 1}));
-    assert!(s.contains("/timer/wake"));
-    assert!(s.contains("tick"));
+    let s = format_event_for_turn(
+        "timer.reminder_check",
+        &serde_json::json!({
+            "reason": {
+                "trigger_type": "precise_trigger",
+                "target_type": "reminder",
+                "target_id": "reminder-1",
+                "expected_trigger_time": "2026-05-24T15:00:00-07:00",
+                "reason": "check reminder-1"
+            }
+        }),
+    );
+    assert!(s.contains("timer.reminder_check"));
+    assert!(s.contains("reminder-1"));
 }
 
 #[test]
 fn format_event_for_turn_handles_null_payload() {
-    let s = format_event_for_turn("/timer/wake", &serde_json::Value::Null);
-    assert!(s.contains("/timer/wake"));
+    let s = format_event_for_turn("timer.hard_barrier", &serde_json::Value::Null);
+    assert!(s.contains("timer.hard_barrier"));
     assert!(!s.contains("null"));
 }
 
@@ -745,14 +756,22 @@ fn session_meta_round_trips_pending_inputs() {
                 ai_message: AiMessage::text(AiRole::User, "hi"),
             },
             PendingInput::Event {
-                event_id: "/timer/wake".to_string(),
-                data: serde_json::json!({"tick": 7}),
+                event_id: "timer.reminder_check".to_string(),
+                data: serde_json::json!({
+                    "reason": {
+                        "trigger_type": "precise_trigger",
+                        "target_type": "reminder",
+                        "target_id": "reminder-7",
+                        "expected_trigger_time": "2026-05-24T15:00:00-07:00",
+                        "reason": "check reminder-7"
+                    }
+                }),
             },
         ],
         peer_did: Some("did:dev:alice".to_string()),
         peer_tunnel_did: Some("did:dev:tunnel".to_string()),
         event_subscriptions: vec![EventSubscription {
-            pattern: "/timer/**".to_string(),
+            pattern: "timer.reminder_check".to_string(),
             subscribed_at_ms: 0,
             mode: EventSubscriptionMode::Full,
             message_template: None,
@@ -765,6 +784,8 @@ fn session_meta_round_trips_pending_inputs() {
             task_id: 42,
             event_pattern: "/task_mgr/42".to_string(),
         }],
+        improvement_budget: None,
+        pending_improvement_tasks: Vec::new(),
         title: "design review".to_string(),
         objective: "draft the rollout plan".to_string(),
         bootstrap_done: true,
@@ -798,14 +819,20 @@ fn session_meta_round_trips_pending_inputs() {
     }
     match &restored.pending_inputs[1] {
         PendingInput::Event { event_id, data } => {
-            assert_eq!(event_id, "/timer/wake");
-            assert_eq!(data.get("tick").and_then(|v| v.as_i64()), Some(7));
+            assert_eq!(event_id, "timer.reminder_check");
+            assert_eq!(
+                data.pointer("/reason/target_id").and_then(|v| v.as_str()),
+                Some("reminder-7")
+            );
         }
         _ => panic!("expected Event variant second"),
     }
     assert_eq!(restored.peer_did.as_deref(), Some("did:dev:alice"));
     assert_eq!(restored.event_subscriptions.len(), 1);
-    assert_eq!(restored.event_subscriptions[0].pattern, "/timer/**");
+    assert_eq!(
+        restored.event_subscriptions[0].pattern,
+        "timer.reminder_check"
+    );
     assert_eq!(restored.workspace_id.as_deref(), Some("ws-1"));
     assert_eq!(restored.pending_task_calls.len(), 1);
     assert_eq!(restored.pending_task_calls[0].task_id, 42);

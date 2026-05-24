@@ -22,11 +22,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use log::warn;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::behavior_cfg::{BehaviorCfg, BehaviorCfgError};
 use crate::i18n::AgentI18n;
-use crate::session_model::SessionKind;
+use crate::session_model::{SessionKind, TimerEventKind};
 
 /// Subdirectories under the agent root the runtime needs to know about.
 /// All paths are absolute, resolved at load time.
@@ -442,6 +443,10 @@ impl Default for ReportDeliveryMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SessionClassCfg {
+    /// Disabled classes stay parseable but are ignored by dispatch and
+    /// startup-owned background workers. This keeps beta rollbacks as a
+    /// config-only change.
+    pub enabled: bool,
     /// Maps the class to the on-disk [`SessionKind`] enum that lifecycle
     /// code branches on (UI vs Work). Default is `Work` — every new class
     /// is autonomous unless explicitly tagged as UI.
@@ -460,6 +465,7 @@ pub struct SessionClassCfg {
 impl Default for SessionClassCfg {
     fn default() -> Self {
         Self {
+            enabled: true,
             kind: SessionKind::Work,
             loop_mode: LoopMode::Agent,
             default_behavior: String::new(),
@@ -506,6 +512,8 @@ pub enum AgentConfigError {
     Io { path: String, err: std::io::Error },
     #[error("parse {path}: {err}")]
     Parse { path: String, err: toml::de::Error },
+    #[error("invalid driver filter in {path}: {message}")]
+    InvalidDriverFilter { path: String, message: String },
     #[error(transparent)]
     Behavior(#[from] BehaviorCfgError),
 }
@@ -530,15 +538,51 @@ impl AgentConfig {
                     path: toml_path.display().to_string(),
                     err,
                 })?;
-            toml::from_str(&bytes).map_err(|err| AgentConfigError::Parse {
-                path: toml_path.display().to_string(),
-                err,
-            })?
+            let raw_value =
+                toml::from_str::<toml::Value>(&bytes).map_err(|err| AgentConfigError::Parse {
+                    path: toml_path.display().to_string(),
+                    err,
+                })?;
+            warn_deprecated_session_keys(&toml_path, &raw_value);
+            let parsed: AgentTomlFile =
+                toml::from_str(&bytes).map_err(|err| AgentConfigError::Parse {
+                    path: toml_path.display().to_string(),
+                    err,
+                })?;
+            validate_driver_filters(&toml_path, &parsed)?;
+            parsed
         } else {
             AgentTomlFile::default()
         };
         let i18n = AgentI18n::load(&layout.root, toml.runtime.language.as_str());
         Ok(Self { layout, toml, i18n })
+    }
+
+    pub fn default_driver_for_kind(&self, kind: SessionKind) -> SessionDriverCfg {
+        match kind {
+            SessionKind::SelfCheck => self
+                .session_class(&self.class_name_for_kind(kind))
+                .map(|cfg| cfg.driver.clone())
+                .unwrap_or_else(default_self_check_driver),
+            SessionKind::SelfImprove => self
+                .session_class(&self.class_name_for_kind(kind))
+                .map(|cfg| cfg.driver.clone())
+                .unwrap_or_else(default_self_improve_driver),
+            _ => self
+                .session_class(&self.class_name_for_kind(kind))
+                .map(|cfg| cfg.driver.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn default_loop_mode_for_kind(&self, kind: SessionKind) -> LoopMode {
+        self.session_class(&self.class_name_for_kind(kind))
+            .map(|cfg| cfg.loop_mode)
+            .unwrap_or(if matches!(kind, SessionKind::Ui) {
+                LoopMode::Agent
+            } else {
+                LoopMode::Behavior
+            })
     }
 
     /// Text used as `Observation::Cancelled.reason` during session-layer
@@ -564,6 +608,12 @@ impl AgentConfig {
         self.toml.session.get(name)
     }
 
+    pub fn session_class_enabled(&self, name: &str) -> bool {
+        self.session_class(name)
+            .map(|cfg| cfg.enabled)
+            .unwrap_or(true)
+    }
+
     /// Resolve a class for an on-disk [`SessionKind`]. Used by the restore
     /// path which only has the persisted kind to go on. Prefer the canonical
     /// "ui" / "work" class when present, then pick the first configured class
@@ -579,13 +629,13 @@ impl AgentConfig {
             .toml
             .session
             .get(canonical)
-            .map(|cfg| cfg.kind == kind)
+            .map(|cfg| cfg.enabled && cfg.kind == kind)
             .unwrap_or(false)
         {
             return canonical.to_string();
         }
         for (name, cfg) in self.toml.session.iter() {
-            if cfg.kind == kind {
+            if cfg.enabled && cfg.kind == kind {
                 return name.clone();
             }
         }
@@ -597,6 +647,7 @@ impl AgentConfig {
     pub fn default_behavior_for_class(&self, class: &str) -> String {
         match self.session_class(class) {
             Some(cfg) => cfg.default_behavior_or(class),
+            None if class == "self_check" || class == "self_improve" => class.to_string(),
             None => format!("{class}_default"),
         }
     }
@@ -688,6 +739,100 @@ pub fn open_agent_root(root: impl AsRef<Path>) -> Result<AgentConfig, AgentConfi
     AgentConfig::open(root.as_ref().to_path_buf())
 }
 
+fn default_self_check_driver() -> SessionDriverCfg {
+    SessionDriverCfg {
+        keep_alive: false,
+        inject_background_environment: false,
+        on_init: HookPointCfg {
+            filter: BehaviorFilter::All,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+        },
+        on_behavior_switch: HookPointCfg {
+            filter: BehaviorFilter::Top,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+        },
+        on_behavior_step_ob: HookPointCfg::default(),
+        on_wait: HookPointCfg::default(),
+        ..SessionDriverCfg::default()
+    }
+}
+
+fn default_self_improve_driver() -> SessionDriverCfg {
+    SessionDriverCfg {
+        keep_alive: false,
+        inject_background_environment: false,
+        on_init: HookPointCfg {
+            filter: BehaviorFilter::All,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::None,
+        },
+        on_behavior_switch: HookPointCfg {
+            filter: BehaviorFilter::Top,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::None,
+        },
+        on_behavior_step_ob: HookPointCfg::default(),
+        on_wait: HookPointCfg::default(),
+        ..SessionDriverCfg::default()
+    }
+}
+
+fn validate_driver_filters(path: &Path, cfg: &AgentTomlFile) -> Result<(), AgentConfigError> {
+    for (class, session) in &cfg.session {
+        for (hook, hook_cfg) in [
+            ("on_init", &session.driver.on_init),
+            ("on_behavior_switch", &session.driver.on_behavior_switch),
+            ("on_behavior_step_ob", &session.driver.on_behavior_step_ob),
+            ("on_wait", &session.driver.on_wait),
+        ] {
+            let PullEventPolicy::Filter(name) = &hook_cfg.pull_event else {
+                continue;
+            };
+            if name == "timer.*" || !name.starts_with("timer.") {
+                continue;
+            }
+            if TimerEventKind::parse_event_id(name).is_none() {
+                return Err(AgentConfigError::InvalidDriverFilter {
+                    path: path.display().to_string(),
+                    message: format!(
+                        "[session.{class}.driver.{hook}].pull_event uses unknown timer filter `{name}`"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn warn_deprecated_session_keys(path: &Path, raw: &toml::Value) {
+    let Some(session_table) = raw.get("session").and_then(|v| v.as_table()) else {
+        return;
+    };
+    for (class, value) in session_table {
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        for key in [
+            "subscribe_events",
+            "inject_background_environment",
+            "switch_mode",
+            "report_delivery",
+        ] {
+            if table.contains_key(key) {
+                warn!(
+                    "deprecated agent.toml key {} [session.{}].{}: move it under [session.{}.driver]",
+                    path.display(),
+                    class,
+                    key,
+                    class
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +847,19 @@ mod tests {
         assert_eq!(cfg.language(), "en");
         assert_eq!(cfg.default_behavior_for_class("ui"), "ui_default");
         assert_eq!(cfg.default_behavior_for_class("work"), "work_default");
+        assert_eq!(cfg.default_behavior_for_class("self_check"), "self_check");
+        assert_eq!(
+            cfg.default_driver_for_kind(SessionKind::SelfCheck)
+                .on_behavior_switch
+                .pull_event,
+            PullEventPolicy::Filter("timer.*".to_string())
+        );
+        assert_eq!(
+            cfg.default_driver_for_kind(SessionKind::SelfImprove)
+                .on_behavior_switch
+                .pull_event,
+            PullEventPolicy::None
+        );
     }
 
     #[test]
@@ -791,6 +949,7 @@ mod tests {
         assert_eq!(cfg.toml.dispatch.rules.len(), 2);
         assert_eq!(cfg.toml.dispatch.rules[0].on, "msg.chat");
         let ui = cfg.session_class("ui").unwrap();
+        assert!(ui.enabled);
         assert_eq!(ui.kind, SessionKind::Ui);
         assert_eq!(ui.loop_mode, LoopMode::Agent);
         assert_eq!(ui.default_behavior, "alice_ui");
@@ -857,6 +1016,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_timer_driver_filter() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            r#"
+                [session.self_check]
+                kind = "self_check"
+
+                [session.self_check.driver.on_behavior_switch]
+                pull_event = "timer.unknown"
+            "#,
+        )
+        .unwrap();
+        let err = AgentConfig::open(dir.path().to_path_buf()).unwrap_err();
+        assert!(matches!(err, AgentConfigError::InvalidDriverFilter { .. }));
+    }
+
+    #[test]
     fn jarvis_work_session_uses_fork_switch_mode() {
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rootfs/bin/buckyos_jarvis");
@@ -868,6 +1045,20 @@ mod tests {
         assert_eq!(work.driver.switch_mode, SwitchMode::Fork);
         assert_eq!(work.process_stack_limit, 8);
         assert_eq!(work.driver.report_delivery, ReportDeliveryMode::FinalOnly);
+        let self_check = cfg.session_class("self_check").unwrap();
+        assert!(!self_check.enabled);
+        assert_eq!(self_check.kind, SessionKind::SelfCheck);
+        assert_eq!(
+            self_check.driver.on_behavior_switch.pull_event,
+            PullEventPolicy::Filter("timer.*".to_string())
+        );
+        let self_improve = cfg.session_class("self_improve").unwrap();
+        assert!(!self_improve.enabled);
+        assert_eq!(self_improve.kind, SessionKind::SelfImprove);
+        assert_eq!(
+            self_improve.driver.on_behavior_switch.pull_event,
+            PullEventPolicy::None
+        );
     }
 
     #[test]
@@ -901,6 +1092,26 @@ mod tests {
         let cfg = AgentConfig::open(dir.path().to_path_buf()).unwrap();
         assert_eq!(cfg.class_name_for_kind(SessionKind::Ui), "ui");
         assert_eq!(cfg.class_name_for_kind(SessionKind::Work), "work");
+    }
+
+    #[test]
+    fn disabled_session_class_is_not_selected_for_kind_lookup() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            r#"
+                [session.self_check]
+                enabled = false
+                kind = "self_check"
+            "#,
+        )
+        .unwrap();
+        let cfg = AgentConfig::open(dir.path().to_path_buf()).unwrap();
+        assert!(!cfg.session_class_enabled("self_check"));
+        assert_eq!(
+            cfg.class_name_for_kind(SessionKind::SelfCheck),
+            "self_check"
+        );
     }
 
     #[test]

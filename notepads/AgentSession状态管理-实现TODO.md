@@ -117,24 +117,24 @@
 
 依赖 0.2 TimerReason + Phase 1 driver 框架。
 
-- [ ] **3.1 SelfCheck 默认 driver 配置**（§11.7）
+- [x] **3.1 SelfCheck 默认 driver 配置**（§11.7）
   - `on_init = timer-aware`
   - `on_behavior_switch.filter=top, pull_event=timer.*`
   - 其他 hook 关闭
   - 落到 agent.toml 模板 + 默认 fallback
 
-- [ ] **3.2 硬栅栏 timer + 精确 trigger timer**（§5.3）
+- [x] **3.2 硬栅栏 timer + 精确 trigger timer**（§5.3）
   - Agent 启动时为每个 SelfCheck session 注册固定频率 hard barrier timer
   - SelfCheck 推理产物允许 schedule 精确 timer（带 reason）
   - 文件：
     - `src/frame/opendan/src/session_event_pump.rs`（timer 订阅）
     - `src/frame/opendan/src/agent.rs`（暴露 `schedule_precise_timer(session_id, TimerReason)` API）
 
-- [ ] **3.3 `pull_event` filter 命名空间**（§11.6 / §11.8）
+- [x] **3.3 `pull_event` filter 命名空间**（§11.6 / §11.8）
   - `timer.reminder_check` / `timer.hard_barrier` / ... 闭集合定义在 `session_model.rs`
   - startup 校验 driver 配置里的 filter 名字
 
-- [ ] **3.4 提醒触发 path**（§5.5）
+- [x] **3.4 提醒触发 path**（§5.5）
   - SelfCheck 推理结果允许调 `send_message` agent_tool（确认现有能力 mapping）
   - 检查不需要触发时直接进入下一轮 `WaitingForTimer`，不消耗 budget
 
@@ -144,22 +144,22 @@
 
 依赖 Phase 1 driver 框架；和 SelfCheck 独立，可并行推进。
 
-- [ ] **4.1 SelfImprove driver 配置**（§11.7）
+- [x] **4.1 SelfImprove driver 配置**（§11.7）
   - 全程 `pull_msg=none, pull_event=none`
   - history + global_state 通过 env 自动注入
 
-- [ ] **4.2 Budget 状态机**（§6.3 / §10.9.4）
+- [x] **4.2 Budget 状态机**（§6.3 / §10.9.4）
   - 文件：`src/frame/opendan/src/session_model.rs` SessionMeta
   - 加 `improvement_budget`（单位先定 token，留 enum 容易扩展）
   - 加 `pending_improvement_tasks: Vec<ImprovementTask>`
   - budget 用尽 → flush + 退出 worker → 等下次 trigger
 
-- [ ] **4.3 history + global_state 注入**
+- [x] **4.3 history + global_state 注入**
   - 文件：`src/frame/opendan/src/prompt_env.rs`
   - `LlmContextEnv` 增加 `agent_global_state` 字段（Phase 1.3 已留好接口）
   - Driver 构造 env 时调 `agent.snapshot_global_state()`
 
-- [ ] **4.4 改进任务 dispatch**
+- [x] **4.4 改进任务 dispatch**
   - SelfImprove 推理产物 → ImprovementTask 列表 → 由 Agent 转成具体 Work Session 或后台任务
   - 最小化：dispatch = 写文件 + log
   - 后续再接 task_mgr
@@ -168,20 +168,20 @@
 
 ## Phase 5 — 收尾 & 回归
 
-- [ ] **5.1 旧字段 deprecate**
+- [x] **5.1 旧字段 deprecate**
   - `subscribe_events / inject_background_environment / switch_mode / report_delivery` 在 agent.toml 加 deprecation warning
   - 仍可读，但建议迁移到 `[session.*.driver]`
   - Beta2.2 允许 breaking（参考 memory `project_agent_tool_breaking_change`），但本块改动用户可见，给一个 minor 过渡更友好
 
-- [ ] **5.2 升级 `/timer/wake` 测试**
+- [x] **5.2 升级 `/timer/wake` 测试**
   - 文件：`src/frame/opendan/src/agent_session_test.rs:395`
   - 切到新 TimerReason schema
 
-- [ ] **5.3 Driver 配置 + hook point 集成测试**
+- [x] **5.3 Driver 配置 + hook point 集成测试**
   - 矩阵测试：四类 session × 四个 hook point × 三个 pull_msg × 三个 pull_event
   - 至少覆盖 §11.7 表里的四个 baseline 组合
 
-- [ ] **5.4 实现映射文档**
+- [x] **5.4 实现映射文档**
   - 在 [AgentSession状态管理补充.md](AgentSession状态管理补充.md) 末尾追"实现映射"节
   - 每个 §x.y 指到落地文件 + 关键函数
 
