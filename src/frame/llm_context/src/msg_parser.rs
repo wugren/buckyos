@@ -504,7 +504,11 @@ fn ref_item_to_text_attachment(
     } else {
         "document"
     };
-    let mut fields = vec![format!("{kind} attachment"), format!("obj_id={obj_id}")];
+    let display_obj_id = attachment_display_obj_id(obj_id, uri_hint.as_deref());
+    let mut fields = vec![
+        format!("{kind} attachment"),
+        format!("obj_id=\"{}\"", escape_text_field(&display_obj_id)),
+    ];
     if let Some(label) = item
         .label
         .as_deref()
@@ -513,17 +517,16 @@ fn ref_item_to_text_attachment(
     {
         fields.push(format!("label=\"{}\"", escape_text_field(label)));
     }
-    if let Some(uri_hint) = uri_hint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        fields.push(format!("uri_hint=\"{}\"", escape_text_field(uri_hint)));
-    }
-    if kind == "image" {
-        let media = json!({
-            "kind": "named_object",
-            "obj_id": obj_id.to_string(),
-        });
-        fields.push(format!("inspect_with=llm_understand_media(media={media})"));
-    }
     Some(format!("[{}]", fields.join("; ")))
+}
+
+fn attachment_display_obj_id(obj_id: &ObjId, uri_hint: Option<&str>) -> String {
+    uri_hint
+        .map(str::trim)
+        .and_then(|value| value.strip_prefix("cyfs://"))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| obj_id.to_string())
 }
 
 fn collect_resource_ref(
@@ -1105,13 +1108,42 @@ mod tests {
         let text = out.text_content();
         assert!(!text.contains("[attachment]\n"));
         assert!(text.contains("image attachment"));
-        assert!(text.contains(&format!("obj_id={}", obj_id())));
+        assert!(text.contains("obj_id=\""));
         assert!(text.contains("label=\"photo.png\""));
-        assert!(text.contains("llm_understand_media"));
+        assert!(!text.contains("uri_hint="));
+        assert!(!text.contains("llm_understand_media"));
         assert!(!out
             .content
             .iter()
             .any(|block| matches!(block, AiContent::Image { .. })));
+    }
+
+    #[test]
+    fn text_attachment_uses_cyfs_uri_hint_as_display_obj_id() {
+        let msg = MsgObject {
+            content: MsgContent {
+                format: Some(MsgContentFormat::ImageJpeg),
+                content: "San Jose能参加活动么".to_string(),
+                refs: vec![RefItem {
+                    role: RefRole::Input,
+                    target: RefTarget::DataObj {
+                        obj_id: obj_id(),
+                        uri_hint: Some("cyfs://cyfile:20ace92837ced8d14805d63cb5305ca5d7f2df5a56d9d8cd288ed8118d098cc3".to_string()),
+                    },
+                    label: Some("image/jpeg".to_string()),
+                }],
+                ..MsgContent::default()
+            },
+            ..MsgObject::default()
+        };
+
+        let out = msg_object_to_ai_message_text_attachments(&msg);
+        let text = out.text_content();
+        assert!(text.contains(
+            "[image attachment; obj_id=\"cyfile:20ace92837ced8d14805d63cb5305ca5d7f2df5a56d9d8cd288ed8118d098cc3\"; label=\"image/jpeg\"]"
+        ));
+        assert!(!text.contains("uri_hint="));
+        assert!(!text.contains("inspect_with="));
     }
 
     #[test]

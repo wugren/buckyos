@@ -335,14 +335,21 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
     let outcome = match ctx.drive_to_terminal(&compressor).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            return (
-                build_error_result(&opts, format!("drive_to_terminal failed: {err}")),
-                CLI_EXIT_ERROR,
+            let message = format!("drive_to_terminal failed: {err}");
+            log::error!(
+                "llm_understand_media: {}; work_dir={} run_id={} goal={}",
+                message,
+                work_dir.display(),
+                run_id,
+                opts.goal
             );
+            let mut result = build_error_result(&opts, message);
+            add_run_context(&mut result, &work_dir, &run_id, Some(&mime));
+            return (result, CLI_EXIT_ERROR);
         }
     };
 
-    build_outcome_result(outcome, &mime)
+    build_outcome_result(outcome, &mime, &work_dir, &run_id, &opts.goal)
 }
 
 fn build_request(
@@ -375,6 +382,7 @@ fn build_request(
         action_mode: ToolMode::None,
         max_rounds: 0,
         max_calls_per_round: 0,
+        disable_capabilities: vec!["web_search".to_string()],
         allow_deferred: false,
         ..ToolPolicy::default()
     });
@@ -393,7 +401,13 @@ fn build_request(
     req
 }
 
-fn build_outcome_result(outcome: LLMContextOutcome, mime: &str) -> (AgentToolResult, i32) {
+fn build_outcome_result(
+    outcome: LLMContextOutcome,
+    mime: &str,
+    work_dir: &PathBuf,
+    run_id: &str,
+    goal: &str,
+) -> (AgentToolResult, i32) {
     match outcome {
         LLMContextOutcome::Done {
             output,
@@ -425,32 +439,43 @@ fn build_outcome_result(outcome: LLMContextOutcome, mime: &str) -> (AgentToolRes
                     CLI_EXIT_SUCCESS,
                 )
             }
-            Err(err) => (
-                AgentToolResult {
-                    agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                    tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                    cmd_name: None,
-                    status: AgentToolStatus::Error,
-                    task_id: None,
-                    pending_reason: None,
-                    check_after: None,
-                    estimated_wait: None,
-                    title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => parse_error"),
-                    summary: format!("parse understanding report failed: {err}"),
-                    details: json!({
-                        "error": err,
-                        "mime": mime,
-                        "raw_output": output_to_text(&output),
-                        "usage": usage,
-                        "latency_ms": trace.latency_ms,
-                    }),
-                    cmd_args: None,
-                    return_code: None,
-                    partial_output: None,
-                    output: None,
-                },
-                CLI_EXIT_ERROR,
-            ),
+            Err(err) => {
+                log::error!(
+                    "llm_understand_media: parse understanding report failed: {}; work_dir={} run_id={} goal={}",
+                    err,
+                    work_dir.display(),
+                    run_id,
+                    goal
+                );
+                (
+                    AgentToolResult {
+                        agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                        tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
+                        cmd_name: None,
+                        status: AgentToolStatus::Error,
+                        task_id: None,
+                        pending_reason: None,
+                        check_after: None,
+                        estimated_wait: None,
+                        title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => parse_error"),
+                        summary: format!("parse understanding report failed: {err}"),
+                        details: json!({
+                            "error": err,
+                            "mime": mime,
+                            "work_dir": work_dir.display().to_string(),
+                            "run_id": run_id,
+                            "raw_output": output_to_text(&output),
+                            "usage": usage,
+                            "latency_ms": trace.latency_ms,
+                        }),
+                        cmd_args: None,
+                        return_code: None,
+                        partial_output: None,
+                        output: None,
+                    },
+                    CLI_EXIT_ERROR,
+                )
+            }
         },
         LLMContextOutcome::PendingTool { pending, .. } => (
             AgentToolResult {
@@ -500,26 +525,43 @@ fn build_outcome_result(outcome: LLMContextOutcome, mime: &str) -> (AgentToolRes
             },
             CLI_EXIT_ERROR,
         ),
-        LLMContextOutcome::Error { error, usage } => (
-            AgentToolResult {
-                agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                cmd_name: None,
-                status: AgentToolStatus::Error,
-                task_id: None,
-                pending_reason: None,
-                check_after: None,
-                estimated_wait: None,
-                title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => error"),
-                summary: format!("llm error: {error}"),
-                details: json!({ "error": format!("{error}"), "usage": usage }),
-                cmd_args: None,
-                return_code: None,
-                partial_output: None,
-                output: None,
-            },
-            CLI_EXIT_ERROR,
-        ),
+        LLMContextOutcome::Error { error, usage } => {
+            log::error!(
+                "llm_understand_media: llm outcome error: {}; work_dir={} run_id={} goal={}",
+                error,
+                work_dir.display(),
+                run_id,
+                goal
+            );
+            (
+                AgentToolResult {
+                    agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                    tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
+                    cmd_name: None,
+                    status: AgentToolStatus::Error,
+                    task_id: None,
+                    pending_reason: None,
+                    check_after: None,
+                    estimated_wait: None,
+                    title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => error"),
+                    summary: format!("llm error: {error}"),
+                    details: json!({
+                        "error": format!("{error}"),
+                        "error_detail": serde_json::to_value(&error)
+                            .unwrap_or_else(|_| json!({ "message": format!("{error}") })),
+                        "mime": mime,
+                        "work_dir": work_dir.display().to_string(),
+                        "run_id": run_id,
+                        "usage": usage,
+                    }),
+                    cmd_args: None,
+                    return_code: None,
+                    partial_output: None,
+                    output: None,
+                },
+                CLI_EXIT_ERROR,
+            )
+        }
         LLMContextOutcome::ContextLimitReached { which, .. } => (
             AgentToolResult {
                 agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
@@ -916,6 +958,24 @@ fn build_error_result(opts: &RunOpts, message: impl Into<String>) -> AgentToolRe
     }
 }
 
+fn add_run_context(
+    result: &mut AgentToolResult,
+    work_dir: &PathBuf,
+    run_id: &str,
+    mime: Option<&str>,
+) {
+    if let Value::Object(map) = &mut result.details {
+        map.insert(
+            "work_dir".to_string(),
+            Value::String(work_dir.display().to_string()),
+        );
+        map.insert("run_id".to_string(), Value::String(run_id.to_string()));
+        if let Some(mime) = mime {
+            map.insert("mime".to_string(), Value::String(mime.to_string()));
+        }
+    }
+}
+
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_chars {
@@ -1123,5 +1183,36 @@ mod tests {
         let text = render_report(&report);
         assert!(text.contains("Observations:"));
         assert!(text.contains("Confidence: Observed"));
+    }
+
+    #[test]
+    fn build_request_disables_web_search_for_media_side_context() {
+        let opts = RunOpts {
+            media_value: json!({}),
+            goal: "describe image".to_string(),
+            parent_history: Vec::new(),
+            work_dir: None,
+            model: None,
+            summary_model: DEFAULT_SUMMARY_MODEL_ALIAS.to_string(),
+            target_tokens: DEFAULT_TARGET_TOKENS,
+            max_completion_tokens: DEFAULT_MAX_COMPLETION_TOKENS,
+        };
+
+        let request = build_request(
+            &opts,
+            ResourceRef::Base64 {
+                mime: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+            },
+            DEFAULT_MODEL_ALIAS.to_string(),
+            Vec::new(),
+        );
+
+        let tool_policy = request.tool_policy.expect("tool policy");
+        assert_eq!(tool_policy.mode, ToolMode::None);
+        assert_eq!(tool_policy.action_mode, ToolMode::None);
+        assert!(tool_policy
+            .disable_capabilities
+            .contains(&"web_search".to_string()));
     }
 }
