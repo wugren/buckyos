@@ -81,7 +81,7 @@ impl BehaviorOutput {
 
 /// Prompt templates per "renders the prompt" event.
 ///
-/// `on_init` / `on_behavior_switch` / `on_behavior_step_ob` are rendered through
+/// `on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wakeup` are rendered through
 /// `llm_context::PromptRenderEngine` (upon
 /// `{{ var }}` placeholders, `__VAR__` / `__ENV__` / `__INCLUDE__`
 /// directives) with the Phase-1 variable contract from
@@ -98,6 +98,7 @@ impl BehaviorOutput {
 /// | `on_init`              | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
 /// | `on_behavior_switch`   | after `next_behavior` switch          | no synthetic input |
 /// | `on_behavior_step_ob`  | after behavior-loop action results    | default `<<last_step_action_results>>` user message |
+/// | `on_wakeup`            | idle / waiting pending-input wakeup   | built-in message / event formatting |
 /// | `on_input_event`  | behavior-wide event-format fallback   | falls through to subscription template, then to `format_event_for_turn_with_subscriptions` default |
 ///
 /// Available variables:
@@ -114,6 +115,8 @@ impl BehaviorOutput {
 ///   * `on_behavior_step_ob` (upon syntax): full Phase-1 contract plus render-time
 ///     extras `{{ step }}`, `{{ step_result.default_user_message }}`,
 ///     `{{ pending_inputs }}`, and `{{ pending_input_text }}`.
+///   * `on_wakeup` (upon syntax): full Phase-1 contract, with `input.*`
+///     populated from the driver-selected pending input.
 ///
 /// `__INCLUDE__` path rules for `on_init`:
 ///   * `/role.md` resolves from AgentRootFS, e.g. `<agent_root>/role.md`.
@@ -134,6 +137,8 @@ pub struct PromptCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_behavior_step_ob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_wakeup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_input_event: Option<String>,
     pub output: BehaviorOutput,
 }
@@ -146,6 +151,7 @@ impl Default for PromptCfg {
             on_init: String::new(),
             on_behavior_switch: None,
             on_behavior_step_ob: None,
+            on_wakeup: None,
             on_input_event: None,
             output: BehaviorOutput::Text,
         }
@@ -589,6 +595,7 @@ mod tests {
             on_init = "Hello {agent_name}, you are {behavior_name}."
             on_behavior_switch = "Continue as {{ behavior.name }}."
             on_behavior_step_ob = "Observe {{ step_result.default_user_message }}."
+            on_wakeup = "{{ input.text }}"
         "#;
         let cfg = BehaviorCfg::from_toml_str(toml_src).unwrap();
         assert!(cfg.prompt.on_init.contains("{agent_name}"));
@@ -600,6 +607,7 @@ mod tests {
             cfg.prompt.on_behavior_step_ob.as_deref(),
             Some("Observe {{ step_result.default_user_message }}.")
         );
+        assert_eq!(cfg.prompt.on_wakeup.as_deref(), Some("{{ input.text }}"));
     }
 
     #[test]
@@ -625,6 +633,16 @@ mod tests {
                 "{} must define [prompt].on_behavior_step_ob",
                 path.display()
             );
+            if name == "plan" {
+                assert!(
+                    cfg.prompt
+                        .on_wakeup
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "{} must keep [prompt].on_wakeup parseable",
+                    path.display()
+                );
+            }
         }
     }
 }

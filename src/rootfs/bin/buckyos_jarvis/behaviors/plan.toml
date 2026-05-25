@@ -96,6 +96,17 @@ on_behavior_switch = """
 
 {{ session.current_todo_list }}
 
+
+{% if input.has_msgs %}
+## New User Messages
+{% for msg in input.msgs %}
+<message>
+{{msg.text}}
+</message>
+{% endfor %}
+
+{% endif %}
+
 Continue from PROCESS_RULES.
 """
 

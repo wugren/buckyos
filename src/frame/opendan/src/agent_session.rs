@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use buckyos_api::{
     match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient,
-    UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
+    UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
 use ndn_lib::{MsgContent, MsgContentFormat, MsgObjKind, MsgObject};
@@ -280,6 +280,7 @@ struct OpenDanStepResultHook {
     template: String,
     behavior: BehaviorCfg,
     agent_config: Arc<AgentConfig>,
+    driver: SessionDriverCfg,
     meta: Arc<Mutex<SessionMeta>>,
     session_id: String,
     session_dir: PathBuf,
@@ -290,7 +291,7 @@ struct OpenDanStepResultHook {
 impl StepResultHook for OpenDanStepResultHook {
     async fn on_behavior_step_ob(
         &self,
-        _snapshot: &LLMContextSnapshot,
+        snapshot: &LLMContextSnapshot,
         step: &StepRecord,
     ) -> std::result::Result<StepResultHookOutput, String> {
         let template = self.template.trim();
@@ -302,18 +303,36 @@ impl StepResultHook for OpenDanStepResultHook {
         let default_user_message = default_user.text_content();
         let default_last_step_action_results_content =
             serde_json::to_value(&step.action_results).unwrap_or(serde_json::Value::Null);
-        let pending_inputs = self.pending_input_values().await;
+        let selected_pending = self.selected_pending_inputs().await;
+        let selected_keys = selected_pending
+            .iter()
+            .map(PendingInput::dedup_key)
+            .collect::<Vec<_>>();
+        let pending_inputs = selected_pending
+            .iter()
+            .map(pending_input_hook_value)
+            .collect::<Vec<_>>();
         let pending_input_text = render_pending_input_values(&pending_inputs);
+        let observed_at_ms = now_ms();
+        let msg_refs = selected_pending
+            .iter()
+            .filter_map(|input| prompt_env::msg_ref_from_pending(input, observed_at_ms))
+            .collect::<Vec<_>>();
+        let event_refs = self
+            .event_refs_from_selected(&selected_pending, observed_at_ms)
+            .await;
         info!(
-            "opendan.session[{}]: build user message hook=on_behavior_step_ob behavior=`{}` actions={} results={} pending_inputs={} template_chars={}",
+            "opendan.session[{}]: build user message hook=on_behavior_step_ob behavior=`{}` actions={} results={} pending_inputs={} env_msgs={} env_events={} template_chars={}",
             self.session_id,
             self.behavior.meta.name,
             step.actions.len(),
             step.action_results.len(),
             pending_inputs.len(),
+            msg_refs.len(),
+            event_refs.len(),
             template.chars().count()
         );
-        let env = build_agent_session_env(
+        let mut env = build_agent_session_env(
             &self.session_id,
             &self.agent_config,
             &self.meta,
@@ -321,6 +340,29 @@ impl StepResultHook for OpenDanStepResultHook {
             &self.behavior,
         )
         .await;
+        env.llm_context.msgs = msg_refs;
+        env.llm_context.events = event_refs;
+        env.llm_context.last_step = snapshot
+            .state
+            .last_step
+            .as_ref()
+            .map(prompt_env::step_record_prompt_value);
+        env.llm_context.last_report = snapshot.state.last_report.clone();
+        env.llm_context.behavior_history = snapshot
+            .state
+            .steps
+            .iter()
+            .map(prompt_env::step_record_prompt_value)
+            .collect();
+        env.llm_context.agent_global_state = merge_global_state_hook_stats(
+            serde_json::json!({
+                "agent_name": self.agent_config.toml.identity.display_name,
+                "session_id": self.session_id,
+            }),
+            SessionHookPoint::OnBehaviorStepOb.as_key(),
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+        );
         let extras = [
             (
                 "step",
@@ -365,6 +407,7 @@ impl StepResultHook for OpenDanStepResultHook {
             return Ok(StepResultHookOutput::default());
         }
 
+        self.discard_selected_pending(&selected_keys).await;
         info!(
             "opendan.session[{}]: rendered user message hook=on_behavior_step_ob behavior=`{}` chars={} preview=`{}`",
             self.session_id,
@@ -380,13 +423,96 @@ impl StepResultHook for OpenDanStepResultHook {
 }
 
 impl OpenDanStepResultHook {
-    async fn pending_input_values(&self) -> Vec<serde_json::Value> {
+    async fn selected_pending_inputs(&self) -> Vec<PendingInput> {
+        let cfg = self.driver.hook(SessionHookPoint::OnBehaviorStepOb);
         let meta = self.meta.lock().await;
-        meta.pending_inputs
+        let pending = meta
+            .pending_inputs
             .iter()
             .filter(|input| !self.excluded_pending_keys.contains(&input.dedup_key()))
-            .map(pending_input_hook_value)
+            .cloned()
+            .collect::<Vec<_>>();
+        select_pending_for_hook_with_subscriptions(
+            cfg,
+            &pending,
+            &HashMap::new(),
+            &meta.event_subscriptions,
+        )
+    }
+
+    async fn event_refs_from_selected(
+        &self,
+        selected: &[PendingInput],
+        observed_at_ms: u64,
+    ) -> Vec<EventRef> {
+        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        selected
+            .iter()
+            .filter_map(|input| {
+                let PendingInput::Event { event_id, data } = input else {
+                    return None;
+                };
+                let reason = subscriptions
+                    .iter()
+                    .find(|sub| sub.matches(event_id))
+                    .and_then(|sub| sub.message_template.as_ref())
+                    .cloned();
+                Some(EventRef {
+                    event_id: event_id.clone(),
+                    data: data.clone(),
+                    reason,
+                    observed_at_ms,
+                })
+            })
             .collect()
+    }
+
+    async fn discard_selected_pending(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        {
+            let mut meta = self.meta.lock().await;
+            meta.pending_inputs
+                .retain(|input| !keys.contains(&input.dedup_key()));
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush after on_behavior_step_ob consume failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn flush_meta(&self) -> Result<()> {
+        let dir = self.session_dir.join(".meta");
+        tokio::fs::create_dir_all(&dir).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: mkdir {} failed: {err}",
+                self.session_id,
+                dir.display()
+            )
+        })?;
+        let meta = self.meta.lock().await.clone();
+        let bytes = serde_json::to_vec_pretty(&meta)
+            .map_err(|err| anyhow!("session[{}]: serialize meta failed: {err}", self.session_id))?;
+        let path = dir.join("session.json");
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, &bytes).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: write {} failed: {err}",
+                self.session_id,
+                tmp.display()
+            )
+        })?;
+        tokio::fs::rename(&tmp, &path).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: rename to {} failed: {err}",
+                self.session_id,
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -1397,11 +1523,49 @@ impl AgentSession {
                 }
             }
 
-            let mut round_inputs =
-                prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
-            if let Some(batch) = format_event_batch_for_turn(&turn_events) {
-                round_inputs.push(AiMessage::text(AiRole::User, batch));
-            }
+            let hook_env = self
+                .apply_hook(SessionHookPoint::OnWakeup, &driver, &pending)
+                .await;
+            let wakeup_template_text = match self
+                .render_on_wakeup_input_text(hook_env.clone())
+                .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    warn!(
+                        "opendan.session[{}]: render on_wakeup failed (pending kept for retry): {err:#}",
+                        self.session_id
+                    );
+                    self.set_status(SessionStatus::Error).await;
+                    let _ = self
+                        .reply_tx
+                        .send(SessionReply::Error {
+                            message: format!("render on_wakeup failed: {err:#}"),
+                        })
+                        .await;
+                    match inbox_rx.recv().await {
+                        None => return,
+                        Some(SessionInput::Cancel) => {
+                            self.set_status(SessionStatus::Idle).await;
+                            if self.kind.is_work_family() {
+                                return;
+                            }
+                        }
+                        Some(SessionInput::Wakeup) => {}
+                    }
+                    continue;
+                }
+            };
+            let round_inputs = if let Some(text) = wakeup_template_text {
+                vec![AiMessage::text(AiRole::User, text)]
+            } else {
+                let mut round_inputs =
+                    prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
+                if let Some(batch) = format_event_batch_for_turn(&turn_events) {
+                    round_inputs.push(AiMessage::text(AiRole::User, batch));
+                }
+                round_inputs
+            };
             info!(
                 "opendan.session[{}]: build user input hook=on_wakeup msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
                 self.session_id,
@@ -1473,9 +1637,6 @@ impl AgentSession {
                 user_messages: hist_user_messages,
                 system_events: hist_system_events,
             };
-            let _hook_env = self
-                .apply_hook(SessionHookPoint::OnWakeup, &driver, &pending)
-                .await;
             let round_result = self
                 .run_one_round(
                     round_inputs,
@@ -3197,6 +3358,7 @@ impl AgentSession {
             template: template.to_string(),
             behavior: behavior.clone(),
             agent_config: self.agent_config.clone(),
+            driver: self.session_class_driver(),
             meta: self.meta.clone(),
             session_id: self.session_id.clone(),
             session_dir: self.session_dir.clone(),
@@ -4085,6 +4247,50 @@ impl AgentSession {
         .filter(|text| !text.is_empty())
     }
 
+    async fn render_on_wakeup_input_text(
+        &self,
+        llm_context: LlmContextEnv,
+    ) -> Result<Option<String>> {
+        let behavior = self.load_current_behavior().await?;
+        let Some(template) = behavior.prompt.on_wakeup.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if template.is_empty() {
+            return Ok(None);
+        }
+        let mut env = self.build_prompt_env(&behavior).await;
+        env.llm_context = llm_context;
+        info!(
+            "opendan.session[{}]: build user message hook=on_wakeup behavior=`{}` env_msgs={} env_events={} template_chars={}",
+            self.session_id,
+            behavior.meta.name,
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+            template.chars().count()
+        );
+        let rendered = prompt_env::render_template(template, &env, &[])
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "render prompt.on_wakeup for behavior `{}` failed: {err}",
+                    behavior.meta.name
+                )
+            })?;
+        let rendered = rendered.trim().to_string();
+        if !rendered.is_empty() {
+            info!(
+                "opendan.session[{}]: rendered user message hook=on_wakeup behavior=`{}` chars={} preview=`{}`",
+                self.session_id,
+                behavior.meta.name,
+                rendered.chars().count(),
+                text_log_preview(&rendered)
+            );
+            Ok(Some(rendered))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Switch mode = Normal: keep accumulated history + step records, swap
     /// system messages and behavior policies via [`apply_overrides_to_snapshot`],
     /// persist as the new `state.snap`. Next turn's `build_or_resume` picks it
@@ -4836,6 +5042,7 @@ impl AgentSession {
         let send_ctx = buckyos_api::SendContext {
             contact_mgr_owner: Some(agent_did),
             preferred_tunnel: tunnel,
+            extra: tg_route_extra_for_session(&self.session_id),
             ..Default::default()
         };
 
@@ -4904,7 +5111,7 @@ impl AgentSession {
             contact_mgr_owner: Some(agent_did),
             preferred_tunnel: tunnel,
             context_id: Some(self.session_id.clone()),
-            extra: Some(data.clone()),
+            extra: Some(with_tg_route_chat_id(data.clone(), &self.session_id)),
             ..Default::default()
         };
         match msg_center
@@ -5055,22 +5262,39 @@ fn append_turn_message_to_snapshot(
     let previous_state = snapshot.state;
     let state = if preserve_behavior_state {
         let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
-        if let Some(message) = message {
-            state.accumulated.push(message);
-        }
-        state.steps = previous_state.steps;
-        state.history_summaries = previous_state.history_summaries;
-        state.history_inputs = previous_state.history_inputs;
-        state.history_inputs.extend(history_inputs);
-        state.last_step = previous_state.last_step;
-        if state.last_step.is_none()
-            && state
-                .steps
+        let mut steps = previous_state.steps;
+        let mut last_step = previous_state.last_step;
+        if last_step.is_none()
+            && steps
                 .last()
                 .is_some_and(|step| step.meta.behavior_name == snapshot.request.behavior_name)
         {
-            state.last_step = state.steps.pop();
+            last_step = steps.pop();
         }
+        // Behavior-switch pair (Agent Context Messages.md §状态机切换): when
+        // the resolved hot tail ended with `<next_behavior>`, the incoming
+        // user message IS that step's on_behavior_switch payload, not a
+        // free-floating next-turn input. Attach it as `next_user_message`
+        // so the rendered shape is `[assistant:next_behavior=X user:on_switch]`
+        // instead of `[assistant:next_behavior=X user:empty][user:on_switch]`
+        // (two consecutive user messages — the bug).
+        if let Some(message) = message {
+            let attach_to_switch_step = last_step
+                .as_ref()
+                .is_some_and(|s| s.next_behavior.is_some() && s.next_user_message.is_none());
+            if attach_to_switch_step {
+                if let Some(last) = last_step.as_mut() {
+                    last.next_user_message = Some(message);
+                }
+            } else {
+                state.accumulated.push(message);
+            }
+        }
+        state.steps = steps;
+        state.history_summaries = previous_state.history_summaries;
+        state.history_inputs = previous_state.history_inputs;
+        state.history_inputs.extend(history_inputs);
+        state.last_step = last_step;
         state.last_report = previous_state.last_report;
         state.next_step_index = previous_state.next_step_index;
         state.next_action_id = previous_state.next_action_id;
@@ -5225,6 +5449,53 @@ fn build_worksession_report_msg(
         }
     }
     msg
+}
+
+fn tg_route_extra_for_session(session_id: &str) -> Option<serde_json::Value> {
+    telegram_chat_id_from_ui_session_id(session_id)
+        .map(|chat_id| serde_json::json!({ "route": { "chat_id": chat_id } }))
+}
+
+fn with_tg_route_chat_id(mut extra: serde_json::Value, session_id: &str) -> serde_json::Value {
+    let Some(chat_id) = telegram_chat_id_from_ui_session_id(session_id) else {
+        return extra;
+    };
+    let Some(obj) = extra.as_object_mut() else {
+        return serde_json::json!({
+            "payload": extra,
+            "route": { "chat_id": chat_id },
+        });
+    };
+
+    match obj.get_mut("route").and_then(|route| route.as_object_mut()) {
+        Some(route) => {
+            route
+                .entry("chat_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(chat_id));
+        }
+        None => {
+            obj.insert(
+                "route".to_string(),
+                serde_json::json!({ "chat_id": chat_id }),
+            );
+        }
+    }
+    extra
+}
+
+fn telegram_chat_id_from_ui_session_id(session_id: &str) -> Option<String> {
+    let mut parts = session_id.splitn(3, ':');
+    let platform = parts.next()?.trim();
+    if platform != UI_SESSION_PLATFORM_TELEGRAM {
+        return None;
+    }
+    parts.next()?;
+    let chat_id = parts.next()?.trim();
+    if chat_id.is_empty() {
+        None
+    } else {
+        Some(chat_id.to_string())
+    }
 }
 
 fn json_str(data: &serde_json::Value, key: &str) -> String {

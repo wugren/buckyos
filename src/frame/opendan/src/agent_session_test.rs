@@ -39,6 +39,109 @@ fn pending_event(event_id: &str) -> PendingInput {
     }
 }
 
+#[tokio::test]
+async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "plan"
+
+        [prompt]
+        on_behavior_step_ob = """
+{{ default_last_step_action_results_text }}
+{% if input.has_msgs %}
+<<new_user_msgs>>
+{% for msg in input.msgs %}
+<message from={{msg.from}}>
+{{msg.text}}
+</message>
+{% endfor %}
+<</new_user_msgs>>
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/plan.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "plan".to_string(),
+        "owner".to_string(),
+    );
+    meta.pending_inputs
+        .push(pending_msg("m1", "follow-up details"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+    let text = output
+        .user_message
+        .expect("rendered user message")
+        .text_content();
+
+    assert!(text.contains("<<new_user_msgs>>"));
+    assert!(text.contains("<message from=alice>"));
+    assert!(text.contains("follow-up details"));
+    assert!(meta.lock().await.pending_inputs.is_empty());
+    assert!(session_dir.join(".meta/session.json").exists());
+}
+
 #[test]
 fn compose_human_text_skips_empties() {
     let v = vec!["  ".to_string(), "hello".to_string(), "".to_string()];
@@ -267,6 +370,81 @@ fn append_turn_message_promotes_current_behavior_step_as_hot_tail() {
 }
 
 #[test]
+fn append_turn_message_attaches_to_switch_step_next_user_message() {
+    // Behavior switch pair (Agent Context Messages.md §状态机切换):
+    // when the hot tail ended with `<next_behavior>`, the incoming
+    // on_behavior_switch user message must land on the step's
+    // `next_user_message` so the render shape stays
+    // `[assistant:next_behavior=X user:on_switch]` — never two
+    // consecutive user messages.
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 3,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><next_behavior>DO</next_behavior></response>".to_string(),
+        next_behavior: Some("DO".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 4;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        Some(AiMessage::text(
+            AiRole::User,
+            "## Last Finish Todo Report: ...".to_string(),
+        )),
+        Vec::new(),
+        "new-trace",
+        true,
+    );
+
+    // The switch step is promoted to last_step, and the on_behavior_switch
+    // message is attached to its next_user_message — NOT pushed to accumulated.
+    assert!(out.state.steps.is_empty());
+    let last = out
+        .state
+        .last_step
+        .as_ref()
+        .expect("switch step must be the hot tail");
+    assert_eq!(last.meta.behavior_name, "plan");
+    assert_eq!(last.next_behavior.as_deref(), Some("DO"));
+    assert_eq!(
+        last.next_user_message
+            .as_ref()
+            .map(|msg| msg.text_content()),
+        Some("## Last Finish Todo Report: ...".to_string())
+    );
+    // accumulated stays at the system+initial prefix only — no trailing
+    // user message that would render as a second consecutive user turn.
+    assert_eq!(out.state.accumulated.len(), out.request.input.len());
+}
+
+#[test]
 fn append_process_end_history_input_preserves_steps_without_user_tail() {
     let request = LLMContextRequest {
         owner: ContextOwnerRef::Agent {
@@ -461,7 +639,10 @@ fn driver_pull_selects_only_configured_pending_inputs() {
         &std::collections::HashMap::new(),
         &[],
     );
-    let keys = selected.iter().map(PendingInput::dedup_key).collect::<Vec<_>>();
+    let keys = selected
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
     assert_eq!(keys, vec!["msg:m1", "event:timer.reminder_check"]);
 }
 
@@ -484,7 +665,10 @@ fn driver_pull_keeps_task_events_internal_even_when_event_pull_is_none() {
         },
     );
     let selected = select_pending_for_hook_with_subscriptions(&cfg, &pending, &task_index, &[]);
-    let keys = selected.iter().map(PendingInput::dedup_key).collect::<Vec<_>>();
+    let keys = selected
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
     assert_eq!(keys, vec!["event:/task_mgr/7"]);
 }
 
@@ -794,6 +978,34 @@ fn worksession_report_msg_carries_source_metadata() {
             .and_then(|v| v.pointer("/session_id"))
             .and_then(|v| v.as_str()),
         Some("work-1")
+    );
+}
+
+#[test]
+fn tg_route_extra_uses_chat_id_from_ui_session_id() {
+    let extra = tg_route_extra_for_session("tg:lzc_jarvis:-100123456").unwrap();
+    assert_eq!(
+        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
+        Some("-100123456")
+    );
+    assert!(tg_route_extra_for_session("ui-1").is_none());
+}
+
+#[test]
+fn worksession_report_extra_preserves_payload_and_adds_tg_route() {
+    let payload = serde_json::json!({
+        "type": "worksession_report",
+        "report_id": "report-1",
+        "report": "done"
+    });
+    let extra = with_tg_route_chat_id(payload, "tg:jarvis_bot:5397330802");
+    assert_eq!(
+        extra.get("report_id").and_then(|v| v.as_str()),
+        Some("report-1")
+    );
+    assert_eq!(
+        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
+        Some("5397330802")
     );
 }
 
