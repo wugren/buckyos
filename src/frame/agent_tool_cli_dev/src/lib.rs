@@ -2758,8 +2758,8 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
 
 fn build_cli_file_tool_config(env: &CliRuntimeEnv) -> FileToolConfig {
     let mut cfg = FileToolConfig::new(env.current_dir.clone());
+    cfg.allowed_read_roots.clear();
     if !env.has_agent_env {
-        cfg.allowed_read_roots.clear();
         cfg.allowed_write_roots.clear();
     }
     cfg
@@ -4032,6 +4032,101 @@ mod tests {
         let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
         assert_eq!(payload["status"], "success");
         assert_eq!(payload["detail"]["content"], "free\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_with_agent_env_has_no_scope_limit() {
+        let temp = tempdir().expect("create tempdir");
+        let agent_root = temp.path().join("agent");
+        let cwd = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&agent_root).await.expect("create agent");
+        fs::create_dir_all(&cwd).await.expect("create cwd");
+        fs::create_dir_all(&outside)
+            .await
+            .expect("create outside dir");
+        fs::write(outside.join("demo.txt"), "free\n")
+            .await
+            .expect("write outside file");
+
+        let output = execute(
+            vec![
+                OsString::from("/tmp/read_file"),
+                OsString::from(outside.join("demo.txt")),
+            ],
+            test_env(agent_root, cwd),
+            None,
+        )
+        .await
+        .expect("run read_file");
+
+        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["detail"]["content"], "free\n");
+    }
+
+    #[tokio::test]
+    async fn glob_with_agent_env_has_no_scope_limit() {
+        let temp = tempdir().expect("create tempdir");
+        let agent_root = temp.path().join("agent");
+        let cwd = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&agent_root).await.expect("create agent");
+        fs::create_dir_all(&cwd).await.expect("create cwd");
+        fs::create_dir_all(&outside)
+            .await
+            .expect("create outside dir");
+        fs::write(outside.join("demo.txt"), "free\n")
+            .await
+            .expect("write outside file");
+
+        let output = execute(
+            vec![
+                OsString::from("/tmp/Glob"),
+                OsString::from("pattern=*.txt"),
+                OsString::from(format!("path={}", outside.display())),
+            ],
+            test_env(agent_root, cwd),
+            None,
+        )
+        .await
+        .expect("run Glob");
+
+        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["detail"]["numFiles"], 1);
+    }
+
+    #[tokio::test]
+    async fn grep_with_agent_env_has_no_scope_limit() {
+        let temp = tempdir().expect("create tempdir");
+        let agent_root = temp.path().join("agent");
+        let cwd = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&agent_root).await.expect("create agent");
+        fs::create_dir_all(&cwd).await.expect("create cwd");
+        fs::create_dir_all(&outside)
+            .await
+            .expect("create outside dir");
+        fs::write(outside.join("demo.txt"), "free\n")
+            .await
+            .expect("write outside file");
+
+        let output = execute(
+            vec![
+                OsString::from("/tmp/Grep"),
+                OsString::from("pattern=free"),
+                OsString::from(format!("path={}", outside.display())),
+            ],
+            test_env(agent_root, cwd),
+            None,
+        )
+        .await
+        .expect("run Grep");
+
+        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["detail"]["numFiles"], 1);
     }
 
     #[tokio::test]

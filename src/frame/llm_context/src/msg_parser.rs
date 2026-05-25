@@ -149,11 +149,26 @@ pub fn parse_msg_object(msg: &MsgObject, registered_commands: &[&str]) -> MsgPar
     }
 }
 
+pub fn parse_msg_object_text_attachments(
+    msg: &MsgObject,
+    registered_commands: &[&str],
+) -> MsgParseOutput {
+    if let Some(command) = msg_object_control_command(msg, registered_commands) {
+        MsgParseOutput::ControlCommand(command)
+    } else {
+        MsgParseOutput::Message(msg_object_to_ai_message_text_attachments(msg))
+    }
+}
+
 /// Lower a `MsgObject` into a provider-neutral `AiMessage` using `User` role.
 /// This function does not interpret `/` commands; callers that need control
 /// semantics should use `parse_msg_object`.
 pub fn msg_object_to_ai_message(msg: &MsgObject) -> AiMessage {
     msg_object_to_ai_message_with_role(msg, AiRole::User)
+}
+
+pub fn msg_object_to_ai_message_text_attachments(msg: &MsgObject) -> AiMessage {
+    msg_object_to_ai_message_with_role_text_attachments(msg, AiRole::User)
 }
 
 pub fn msg_object_to_ai_message_with_role(msg: &MsgObject, role: AiRole) -> AiMessage {
@@ -167,6 +182,46 @@ pub fn msg_object_to_ai_message_with_role(msg: &MsgObject, role: AiRole) -> AiMe
         if let Some(block) = ref_item_to_ai_content(item, msg.content.format.as_ref()) {
             blocks.push(block);
         }
+    }
+
+    if let Some(machine) = &msg.content.machine {
+        if let Ok(value) = serde_json::to_value(machine) {
+            blocks.push(AiContent::ProviderState {
+                provider: PROVIDER_MSG_MACHINE.to_string(),
+                value,
+            });
+        }
+    }
+
+    if blocks.is_empty() {
+        blocks.push(AiContent::text(String::new()));
+    }
+    AiMessage::new(role, blocks)
+}
+
+pub fn msg_object_to_ai_message_with_role_text_attachments(
+    msg: &MsgObject,
+    role: AiRole,
+) -> AiMessage {
+    let mut blocks = Vec::new();
+    let mut text_parts = Vec::new();
+    let text = msg.content.content.trim();
+    let generic_attachment_text = matches!(text, "[attachment]" | "[image]" | "[document]");
+    if !text.is_empty() && !(generic_attachment_text && !msg.content.refs.is_empty()) {
+        text_parts.push(text.to_string());
+    }
+
+    for item in &msg.content.refs {
+        if let Some(text) = ref_item_to_text_attachment(item, msg.content.format.as_ref()) {
+            text_parts.push(text);
+        } else if let Some(block) = ref_item_to_ai_content(item, msg.content.format.as_ref()) {
+            blocks.push(block);
+        }
+    }
+
+    let text = text_parts.join("\n");
+    if !text.trim().is_empty() {
+        blocks.insert(0, AiContent::text(text));
     }
 
     if let Some(machine) = &msg.content.machine {
@@ -435,6 +490,40 @@ fn ref_item_to_ai_content(
             }),
         }),
     }
+}
+
+fn ref_item_to_text_attachment(
+    item: &RefItem,
+    msg_format: Option<&MsgContentFormat>,
+) -> Option<String> {
+    let RefTarget::DataObj { obj_id, uri_hint } = &item.target else {
+        return None;
+    };
+    let kind = if looks_like_image(msg_format, item.label.as_deref(), uri_hint.as_deref()) {
+        "image"
+    } else {
+        "document"
+    };
+    let mut fields = vec![format!("{kind} attachment"), format!("obj_id={obj_id}")];
+    if let Some(label) = item
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        fields.push(format!("label=\"{}\"", escape_text_field(label)));
+    }
+    if let Some(uri_hint) = uri_hint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        fields.push(format!("uri_hint=\"{}\"", escape_text_field(uri_hint)));
+    }
+    if kind == "image" {
+        let media = json!({
+            "kind": "named_object",
+            "obj_id": obj_id.to_string(),
+        });
+        fields.push(format!("inspect_with=llm_understand_media(media={media})"));
+    }
+    Some(format!("[{}]", fields.join("; ")))
 }
 
 fn collect_resource_ref(
@@ -848,6 +937,10 @@ fn escape_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn escape_text_field(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn unescape_attr(value: &str) -> String {
     value
         .replace("&quot;", "\"")
@@ -985,6 +1078,57 @@ mod tests {
         assert_eq!(out.role, AiRole::User);
         assert!(matches!(out.content[0], AiContent::Text { .. }));
         assert!(matches!(out.content[1], AiContent::Image { .. }));
+    }
+
+    #[test]
+    fn msg_object_text_attachment_mode_renders_ref_as_text() {
+        let msg = MsgObject {
+            content: MsgContent {
+                format: Some(MsgContentFormat::ImagePng),
+                content: "[attachment]".to_string(),
+                refs: vec![RefItem {
+                    role: RefRole::Input,
+                    target: RefTarget::DataObj {
+                        obj_id: obj_id(),
+                        uri_hint: Some("photo.png".to_string()),
+                    },
+                    label: Some("photo.png".to_string()),
+                }],
+                ..MsgContent::default()
+            },
+            ..MsgObject::default()
+        };
+
+        let out = msg_object_to_ai_message_text_attachments(&msg);
+        assert_eq!(out.role, AiRole::User);
+        assert_eq!(out.content.len(), 1);
+        let text = out.text_content();
+        assert!(!text.contains("[attachment]\n"));
+        assert!(text.contains("image attachment"));
+        assert!(text.contains(&format!("obj_id={}", obj_id())));
+        assert!(text.contains("label=\"photo.png\""));
+        assert!(text.contains("llm_understand_media"));
+        assert!(!out
+            .content
+            .iter()
+            .any(|block| matches!(block, AiContent::Image { .. })));
+    }
+
+    #[test]
+    fn parse_text_attachment_mode_keeps_registered_commands() {
+        let msg = MsgObject {
+            content: MsgContent {
+                format: Some(MsgContentFormat::TextPlain),
+                content: "/help".to_string(),
+                ..MsgContent::default()
+            },
+            ..MsgObject::default()
+        };
+
+        match parse_msg_object_text_attachments(&msg, &["help"]) {
+            MsgParseOutput::ControlCommand(cmd) => assert_eq!(cmd.command, "help"),
+            other => panic!("expected control command, got {other:?}"),
+        }
     }
 
     #[test]

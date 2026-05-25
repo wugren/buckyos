@@ -3,11 +3,11 @@
 //! egress lane (TG tunnel, MessageHub, …) can upload them like any
 //! externally-sourced attachment.
 //!
-//! Strategy: register the file in **LocalLink** mode — no bytes are
+//! Strategy: register large files in **LocalLink** mode — no bytes are
 //! copied, the store just records a content-addressed pointer to the
-//! original path. Identical files yield identical ObjIds, so re-sending
-//! the same log file from many agents is naturally deduped without a
-//! separate cache.
+//! original path. NamedStore's LocalLink path requires a qcid, and qcid is
+//! unavailable for tiny files, so small files are stored directly in
+//! NamedStore.
 //!
 //! Path-policy enforcement (workspace fence, `..` traversal,
 //! symlink-escape) lives in [`crate::attachment_policy`]; by the time
@@ -22,6 +22,8 @@ use buckyos_api::get_buckyos_api_runtime;
 use llm_context::LocalFileResolver;
 use ndn_lib::{FileObject, ObjId, StoreMode};
 use ndn_toolkit::{cacl_file_object, CheckMode};
+
+const LOCAL_LINK_MIN_FILE_SIZE: u64 = 3 * 4096;
 
 pub struct NamedStoreLocalLinkResolver {
     workspace_root: Option<PathBuf>,
@@ -71,28 +73,68 @@ impl LocalFileResolver for NamedStoreLocalLinkResolver {
             .map_err(|e| format!("named_store unavailable: {e}"))?;
 
         // `cacl_file_object` re-derives per-chunk ChunkLocalInfo from the
-        // actual file; the `path`/`range` carried inside `StoreMode::LocalFile`
-        // is only used as a discriminator for the LocalLink write path, not
-        // as data — but we mirror the conventional shape used elsewhere in
-        // the codebase (see `repo_service::store_creates_local_pinned_record`).
+        // actual file. LocalLink requires qcid, which is only defined for
+        // files at least `LOCAL_LINK_MIN_FILE_SIZE` bytes; tiny files are
+        // copied into NamedStore instead of being rejected.
         let template = FileObject::default();
+        let store_mode = store_mode_for_attachment_file(&absolute, file_size);
+        let store_mode_label = store_mode_label(&store_mode);
         let (_file_obj, file_obj_id, _file_obj_str) = cacl_file_object(
             Some(&store_mgr),
             &absolute,
             &template,
             true,
             &CheckMode::ByFullHash,
-            StoreMode::LocalFile(absolute.clone(), 0..file_size, false),
+            store_mode,
             None,
         )
         .await
         .map_err(|e| {
             format!(
-                "register `{}` into NamedStore (LocalLink) failed: {e}",
-                absolute.display()
+                "register `{}` into NamedStore ({store_mode_label}) failed: {e}",
+                absolute.display(),
             )
         })?;
 
         Ok(file_obj_id)
+    }
+}
+
+fn store_mode_for_attachment_file(path: &std::path::Path, file_size: u64) -> StoreMode {
+    if file_size < LOCAL_LINK_MIN_FILE_SIZE {
+        StoreMode::StoreInNamedMgr
+    } else {
+        StoreMode::LocalFile(path.to_path_buf(), 0..file_size, false)
+    }
+}
+
+fn store_mode_label(mode: &StoreMode) -> &'static str {
+    match mode {
+        StoreMode::LocalFile(_, _, _) => "LocalLink",
+        StoreMode::StoreInNamedMgr => "StoreInNamedMgr",
+        StoreMode::NoStore => "NoStore",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_attachment_files_store_inline() {
+        let path = std::path::Path::new("/tmp/small.txt");
+        assert!(matches!(
+            store_mode_for_attachment_file(path, LOCAL_LINK_MIN_FILE_SIZE - 1),
+            StoreMode::StoreInNamedMgr
+        ));
+    }
+
+    #[test]
+    fn large_attachment_files_use_local_link() {
+        let path = std::path::Path::new("/tmp/large.bin");
+        assert!(matches!(
+            store_mode_for_attachment_file(path, LOCAL_LINK_MIN_FILE_SIZE),
+            StoreMode::LocalFile(_, _, false)
+        ));
     }
 }
