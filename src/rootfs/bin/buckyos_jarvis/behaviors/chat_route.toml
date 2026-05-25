@@ -25,7 +25,7 @@ Keep the UI session focused on understanding intent, reporting status, and routi
 使用forward_msg 把当前消息发送到确定的WorkSession
 
 Driver policy for this UI session:
-- New user messages arrive through `on_wait` and `on_behavior_switch`.
+- New user messages arrive through `on_wakeup` and `on_behavior_switch`.
 - Implicit routing may choose at most one waiting Work Session.
 - Running Work Sessions are not implicit targets; use `forward_msg` only when the target is explicit and relevant.
 - If the user changes topic or interrupts with a new task, create a new Work Session instead of overwriting old context.

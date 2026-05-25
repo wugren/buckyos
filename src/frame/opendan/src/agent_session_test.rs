@@ -378,6 +378,39 @@ fn append_on_switch_message_after_step_history_as_user_tail() {
 }
 
 #[test]
+fn prune_legacy_internal_pending_inputs_keeps_external_inputs() {
+    let mut pending = vec![
+        PendingInput::Msg {
+            record_id: "on-behavior-switch-s-1-plan-1".to_string(),
+            from: "opendan:on_behavior_switch".to_string(),
+            from_did: None,
+            from_name: Some("on_behavior_switch".to_string()),
+            tunnel_did: None,
+            text: "old handoff".to_string(),
+            ai_message: AiMessage::text(AiRole::User, "old handoff"),
+        },
+        PendingInput::Msg {
+            record_id: "process-end:do:abc".to_string(),
+            from: "system".to_string(),
+            from_did: None,
+            from_name: Some("system".to_string()),
+            tunnel_did: None,
+            text: "[fork process `do` ended]".to_string(),
+            ai_message: AiMessage::text(AiRole::User, "[fork process `do` ended]"),
+        },
+        pending_msg("m1", "hello"),
+        pending_event("timer.reminder_check"),
+    ];
+
+    assert_eq!(prune_legacy_internal_pending_inputs(&mut pending), 2);
+    let keys = pending
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["msg:m1", "event:timer.reminder_check"]);
+}
+
+#[test]
 fn output_text_extraction() {
     let out = ContextOutput::Text {
         content: "hi".to_string(),
@@ -860,6 +893,7 @@ fn session_meta_round_trips_pending_inputs() {
             fork: false,
         }],
         last_report_delivery: None,
+        internal_continuation: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let restored: SessionMeta = serde_json::from_str(&json).unwrap();

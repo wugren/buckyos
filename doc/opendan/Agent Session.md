@@ -441,7 +441,7 @@ Session 在物理状态机上有 4 个 hook point,每个 hook 是一次"渲染 u
 | `on_init` | session / context 启动时一次性触发,渲染初始 system prompt |
 | `on_behavior_switch` | 每次 behavior switch / fork / independent 切换时触发,渲染新 behavior 的入口 user_message |
 | `on_behavior_step_ob` | Behavior Loop 内每个 step 边界(观察阶段)触发 |
-| `on_wait` (alias `on_wakeup`) | session 处于 idle / waiting 状态、新 pending input 到达时触发 |
+| `on_wakeup` | session 处于 idle / waiting 状态、新 pending input 到达时触发 |
 
 每个 hook point 上挂三个配置:
 
@@ -493,7 +493,7 @@ Driver 和 Behavior 在新架构下的契约非常薄:
 
 `agent.toml` 中可显式重写;以下是当前 `default_*_driver` 给出的默认值:
 
-| Session | on_init | on_behavior_switch | on_behavior_step_ob | on_wait |
+| Session | on_init | on_behavior_switch | on_behavior_step_ob | on_wakeup |
 | --- | --- | --- | --- | --- |
 | UI | `filter=all, pull_msg=none, pull_event=none` | `filter=top, pull_msg=all` | — | `filter=top, pull_msg=all` |
 | 普通 Work | 同上 | `filter=top, pull_msg=all, pull_event=all` | `filter=top, pull_msg=all, pull_event=all` | `filter=top, pull_msg=one` |
@@ -506,7 +506,7 @@ Driver 和 Behavior 在新架构下的契约非常薄:
   history 和 global_state 通过 env 自动注入(不在 pull 范畴内)。
 - **SelfCheck 的事件路由**(按 `timer.reason` 区分提醒类型)通过 `pull_event` 的 filter 名称命名空间
   参数化。
-- **UI Session 的 `on_wait` 是核心**——它常态在 idle + 监听 pending input;`on_behavior_switch` 在
+- **UI Session 的 `on_wakeup` 是核心**——它常态在 idle + 监听 pending input;`on_behavior_switch` 在
   UI 内基本对应路由判断。
 - **普通 Work Session 的 `on_behavior_step_ob` 是 Behavior Loop 独有**——step 边界拉新 message 是允许
   在 step 中段感知用户追加输入的关键。

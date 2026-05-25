@@ -64,7 +64,7 @@ filter = "none"
 pull_msg = "none"
 pull_event = "none"
 
-[session.ui.driver.on_wait]
+[session.ui.driver.on_wakeup]
 filter = "top"
 pull_msg = "all"
 pull_event = "none"
@@ -96,7 +96,7 @@ filter = "none"
 pull_msg = "none"
 pull_event = "none"
 
-[session.group.driver.on_wait]
+[session.group.driver.on_wakeup]
 filter = "top"
 pull_msg = "all"
 pull_event = "none"
@@ -128,7 +128,7 @@ filter = "top"
 pull_msg = "all"
 pull_event = "all"
 
-[session.work.driver.on_wait]
+[session.work.driver.on_wakeup]
 filter = "top"
 pull_msg = "one"
 pull_event = "none"
@@ -161,7 +161,7 @@ filter = "none"
 pull_msg = "none"
 pull_event = "none"
 
-[session.self_check.driver.on_wait]
+[session.self_check.driver.on_wakeup]
 filter = "none"
 pull_msg = "none"
 pull_event = "none"
@@ -194,7 +194,7 @@ filter = "none"
 pull_msg = "none"
 pull_event = "none"
 
-[session.self_improve.driver.on_wait]
+[session.self_improve.driver.on_wakeup]
 filter = "none"
 pull_msg = "none"
 pull_event = "none"

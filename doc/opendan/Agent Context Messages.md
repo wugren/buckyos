@@ -94,7 +94,7 @@ OpenDAN WorkSession 的 END 是 route 层的设计抉择，核心假设：
 但配置形态在本节早期草案后做了**大幅简化**，当前在用的形态（beta2.2 落地）：
 
 - `[session.<class>.driver]` 顶层挂 `keep_alive` / `switch_mode` / `inject_background_environment` / `report_delivery`
-- 四个 hook point 子表：`on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wait`
+- 四个 hook point 子表：`on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wakeup`
 - 每个 hook 只暴露三个枚举字段：`filter`、`pull_msg`（None/One/All）、`pull_event`（None/All/Filter）
 
 被砍掉的早期设计（git history 里能查到原草案）：
@@ -116,7 +116,7 @@ OpenDAN WorkSession 的 END 是 route 层的设计抉择，核心假设：
 | 维度 | 标准 Agent Loop | Behavior Loop |
 |---|---|---|
 | 自动产生 UserMessage | ❌ 不会 | ✅ step 观察阶段可由 hook 触发 |
-| Driver hook 时机 | `on_init` / `on_wait` | `on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wait` |
+| Driver hook 时机 | `on_init` / `on_wakeup` | `on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wakeup` |
 | Pending input 消费时机 | 只在 round 边界 | round 边界 + step 边界 |
 | Render context 构造 | hook 触发时按 `pull_msg` / `pull_event` 拉取，喂给模板 | 同左 |
 

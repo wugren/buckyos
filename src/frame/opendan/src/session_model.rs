@@ -4,7 +4,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // AgentSession lifecycle invariants.
 //
-// END is terminal for the current worker run: `on_wait` is not triggered after
+// END is terminal for the current worker run: `on_wakeup` is not triggered after
 // END, and implicit routing must not reopen the same session. Follow-up user
 // input that belongs to the same topic creates a new Work-family session and
 // may copy/read old context explicitly at a higher layer. Routing metadata is
@@ -185,6 +185,8 @@ pub struct SessionMeta {
     pub process_stack: Vec<ProcessFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_report_delivery: Option<ReportDeliveryState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_continuation: Option<InternalContinuation>,
 }
 
 impl SessionMeta {
@@ -217,6 +219,7 @@ impl SessionMeta {
             process_entry: current_behavior,
             process_stack: Vec::new(),
             last_report_delivery: None,
+            internal_continuation: None,
         }
     }
 }
@@ -304,6 +307,13 @@ pub struct ProcessFrame {
     pub current: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fork: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InternalContinuation {
+    pub reason: String,
+    #[serde(default)]
+    pub user_messages: Vec<AiMessage>,
 }
 
 fn is_false(value: &bool) -> bool {

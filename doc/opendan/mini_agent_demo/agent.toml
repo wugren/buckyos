@@ -54,7 +54,7 @@ filter = "none"
 pull_msg = "none"
 pull_event = "none"
 
-[session.ui.driver.on_wait]
+[session.ui.driver.on_wakeup]
 filter = "top"
 pull_msg = "all"
 pull_event = "none"

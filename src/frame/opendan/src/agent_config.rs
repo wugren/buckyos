@@ -244,7 +244,7 @@ pub enum SessionHookPoint {
     OnInit,
     OnBehaviorSwitch,
     OnBehaviorStepOb,
-    OnWait,
+    OnWakeup,
 }
 
 impl SessionHookPoint {
@@ -253,7 +253,7 @@ impl SessionHookPoint {
             SessionHookPoint::OnInit => "on_init",
             SessionHookPoint::OnBehaviorSwitch => "on_behavior_switch",
             SessionHookPoint::OnBehaviorStepOb => "on_behavior_step_ob",
-            SessionHookPoint::OnWait => "on_wait",
+            SessionHookPoint::OnWakeup => "on_wakeup",
         }
     }
 }
@@ -267,8 +267,7 @@ pub struct SessionDriverCfg {
     pub on_init: HookPointCfg,
     pub on_behavior_switch: HookPointCfg,
     pub on_behavior_step_ob: HookPointCfg,
-    #[serde(alias = "on_wakeup")]
-    pub on_wait: HookPointCfg,
+    pub on_wakeup: HookPointCfg,
 }
 
 impl Default for SessionDriverCfg {
@@ -292,7 +291,7 @@ impl Default for SessionDriverCfg {
                 pull_msg: PullMsgPolicy::All,
                 pull_event: PullEventPolicy::None,
             },
-            on_wait: HookPointCfg {
+            on_wakeup: HookPointCfg {
                 filter: BehaviorFilter::Top,
                 pull_msg: PullMsgPolicy::All,
                 pull_event: PullEventPolicy::None,
@@ -307,7 +306,7 @@ impl SessionDriverCfg {
             SessionHookPoint::OnInit => &self.on_init,
             SessionHookPoint::OnBehaviorSwitch => &self.on_behavior_switch,
             SessionHookPoint::OnBehaviorStepOb => &self.on_behavior_step_ob,
-            SessionHookPoint::OnWait => &self.on_wait,
+            SessionHookPoint::OnWakeup => &self.on_wakeup,
         }
     }
 }
@@ -745,7 +744,7 @@ fn default_self_check_driver() -> SessionDriverCfg {
             pull_event: PullEventPolicy::Filter("timer.*".to_string()),
         },
         on_behavior_step_ob: HookPointCfg::default(),
-        on_wait: HookPointCfg::default(),
+        on_wakeup: HookPointCfg::default(),
         ..SessionDriverCfg::default()
     }
 }
@@ -764,7 +763,7 @@ fn default_self_improve_driver() -> SessionDriverCfg {
             pull_event: PullEventPolicy::None,
         },
         on_behavior_step_ob: HookPointCfg::default(),
-        on_wait: HookPointCfg::default(),
+        on_wakeup: HookPointCfg::default(),
         ..SessionDriverCfg::default()
     }
 }
@@ -775,7 +774,7 @@ fn validate_driver_filters(path: &Path, cfg: &AgentTomlFile) -> Result<(), Agent
             ("on_init", &session.driver.on_init),
             ("on_behavior_switch", &session.driver.on_behavior_switch),
             ("on_behavior_step_ob", &session.driver.on_behavior_step_ob),
-            ("on_wait", &session.driver.on_wait),
+            ("on_wakeup", &session.driver.on_wakeup),
         ] {
             let PullEventPolicy::Filter(name) = &hook_cfg.pull_event else {
                 continue;
@@ -887,7 +886,7 @@ mod tests {
                 pull_msg = "all"
                 pull_event = "ban_lifted"
 
-                [session.work.driver.on_wait]
+                [session.work.driver.on_wakeup]
                 filter = "none"
                 pull_msg = "none"
                 pull_event = "none"
@@ -925,7 +924,7 @@ mod tests {
             work.driver.on_behavior_switch.pull_event,
             PullEventPolicy::Filter("ban_lifted".to_string())
         );
-        assert_eq!(work.driver.on_wait.filter, BehaviorFilter::None);
+        assert_eq!(work.driver.on_wakeup.filter, BehaviorFilter::None);
         assert!(ui.driver.inject_background_environment);
         assert_eq!(ui.driver.report_delivery, ReportDeliveryMode::FinalOnly);
     }
@@ -948,7 +947,7 @@ mod tests {
             pull_msg = "one"
             pull_event = "all"
 
-            [on_wait]
+            [on_wakeup]
             filter = "default_only"
             pull_msg = "all"
             pull_event = "none"
@@ -965,11 +964,12 @@ mod tests {
             BehaviorFilter::Behavior("plan".to_string())
         );
         assert_eq!(
-            cfg.hook(SessionHookPoint::OnWait).pull_msg,
+            cfg.hook(SessionHookPoint::OnWakeup).pull_msg,
             PullMsgPolicy::All
         );
 
         let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[on_wakeup]"));
         let reparsed: SessionDriverCfg = toml::from_str(&out).unwrap();
         assert_eq!(reparsed, cfg);
     }

@@ -52,9 +52,9 @@ use crate::round_history::{
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
     BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode, ImprovementBudget,
-    ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus, InterruptMode, PendingInput,
-    PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput, SessionKind, SessionMeta,
-    SessionStatus, SessionSummary,
+    ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus, InternalContinuation,
+    InterruptMode, PendingInput, PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput,
+    SessionKind, SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
 
@@ -631,6 +631,78 @@ impl AgentSession {
         Ok(())
     }
 
+    async fn set_internal_continuation(&self, continuation: InternalContinuation) -> Result<()> {
+        {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation = Some(continuation);
+        }
+        self.flush_meta().await?;
+        Ok(())
+    }
+
+    async fn take_internal_continuation(&self) -> Option<InternalContinuation> {
+        let continuation = {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation.take()
+        };
+        if continuation.is_some() {
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush after taking internal continuation failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+        continuation
+    }
+
+    async fn restore_internal_continuation(&self, continuation: InternalContinuation) {
+        {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation = Some(continuation);
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush after restoring internal continuation failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn prune_legacy_internal_pending_inputs(&self) {
+        let removed = {
+            let mut meta = self.meta.lock().await;
+            prune_legacy_internal_pending_inputs(&mut meta.pending_inputs)
+        };
+        if removed > 0 {
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush after pruning legacy internal pending inputs failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+    }
+
+    async fn run_internal_continuation(
+        &self,
+        continuation: InternalContinuation,
+    ) -> Result<NextAction> {
+        let messages = continuation.user_messages;
+        let seed = RoundSeed {
+            trigger: RoundTrigger::SystemEvent {
+                source: "session.internal_continuation".to_string(),
+                event_kind: continuation.reason,
+            },
+            input_keys: Vec::new(),
+            user_messages: messages.clone(),
+            system_events: Vec::new(),
+        };
+        self.set_current_origin_msg(messages.first().map(|message| message.text_content()));
+        self.run_one_round(messages, Vec::new(), Some(seed), false)
+            .await
+    }
+
     pub async fn push_msg(&self, input: PendingInput) -> Result<()> {
         if !matches!(input, PendingInput::Msg { .. }) {
             return Err(anyhow!("push_msg expects PendingInput::Msg"));
@@ -810,10 +882,56 @@ impl AgentSession {
                 }
             }
 
+            if let Some(continuation) = self.take_internal_continuation().await {
+                self.set_status(SessionStatus::Running).await;
+                let round_result = self.run_internal_continuation(continuation.clone()).await;
+                match round_result {
+                    Ok(action) => match action {
+                        NextAction::Continue => continue,
+                        NextAction::WaitForMsg => {
+                            self.set_status(SessionStatus::WaitingInput).await
+                        }
+                        NextAction::WaitForTool => {
+                            self.set_status(SessionStatus::WaitingTool).await
+                        }
+                        NextAction::End => {
+                            self.finish_ended().await;
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        self.restore_internal_continuation(continuation).await;
+                        warn!(
+                            "opendan.session[{}]: internal continuation failed (kept for retry): {err:#}",
+                            self.session_id
+                        );
+                        self.set_status(SessionStatus::Error).await;
+                        let _ = self
+                            .reply_tx
+                            .send(SessionReply::Error {
+                                message: format!("{err:#}"),
+                            })
+                            .await;
+                        match inbox_rx.recv().await {
+                            None => return,
+                            Some(SessionInput::Cancel) => {
+                                self.set_status(SessionStatus::Idle).await;
+                                if self.kind.is_work_family() {
+                                    return;
+                                }
+                            }
+                            Some(SessionInput::Wakeup) => {}
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Snapshot current pending queue. We DON'T remove items from
             // `meta.pending_inputs` here — that happens only after the turn
             // succeeds, so a crash mid-round leaves the
             // inputs durable and they'll be replayed next boot.
+            self.prune_legacy_internal_pending_inputs().await;
             let mut pending = self.meta.lock().await.pending_inputs.clone();
             if pending.is_empty() {
                 // Work session bootstrap: if a freshly-created Work session
@@ -867,7 +985,7 @@ impl AgentSession {
                     self.mark_bootstrap_done().await;
                     match round_result {
                         Ok(action) => match action {
-                            NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                            NextAction::Continue => continue,
                             NextAction::WaitForMsg => {
                                 self.set_status(SessionStatus::WaitingInput).await
                             }
@@ -1015,24 +1133,24 @@ impl AgentSession {
             let driver = self.session_class_driver();
             let selected_pending = self
                 .select_pending_for_hook(
-                    SessionHookPoint::OnWait,
+                    SessionHookPoint::OnWakeup,
                     &driver,
                     &pending,
                     &pending_task_index,
                 )
                 .await;
-            let on_wait_cfg = driver.hook(SessionHookPoint::OnWait);
+            let on_wakeup_cfg = driver.hook(SessionHookPoint::OnWakeup);
             let selected_stats = pending_input_stats(&selected_pending);
             info!(
-                "opendan.session[{}]: driver hook=on_wait pending_total={} selected_total={} selected_msg={} selected_event={} selected_interrupt={} pull_msg={:?} pull_event={:?}",
+                "opendan.session[{}]: driver hook=on_wakeup pending_total={} selected_total={} selected_msg={} selected_event={} selected_interrupt={} pull_msg={:?} pull_event={:?}",
                 self.session_id,
                 pending.len(),
                 selected_pending.len(),
                 selected_stats.msg,
                 selected_stats.event,
                 selected_stats.interrupt,
-                on_wait_cfg.pull_msg,
-                on_wait_cfg.pull_event
+                on_wakeup_cfg.pull_msg,
+                on_wakeup_cfg.pull_event
             );
             if selected_pending.is_empty() {
                 self.set_status(SessionStatus::WaitingInput).await;
@@ -1218,7 +1336,7 @@ impl AgentSession {
                             // and `run_one_round` handles them normally.
                             self.discard_consumed(&consumed_event_keys).await;
                             match action {
-                                NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                                NextAction::Continue => continue,
                                 NextAction::WaitForMsg => {
                                     self.set_status(SessionStatus::WaitingInput).await
                                 }
@@ -1285,7 +1403,7 @@ impl AgentSession {
                 round_inputs.push(AiMessage::text(AiRole::User, batch));
             }
             info!(
-                "opendan.session[{}]: build user input hook=on_wait msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
+                "opendan.session[{}]: build user input hook=on_wakeup msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
                 self.session_id,
                 msg_count,
                 event_count,
@@ -1356,7 +1474,7 @@ impl AgentSession {
                 system_events: hist_system_events,
             };
             let _hook_env = self
-                .apply_hook(SessionHookPoint::OnWait, &driver, &pending)
+                .apply_hook(SessionHookPoint::OnWakeup, &driver, &pending)
                 .await;
             let round_result = self
                 .run_one_round(
@@ -1372,7 +1490,7 @@ impl AgentSession {
                     // LLM from the persistent queue.
                     self.discard_consumed(&consumed_keys).await;
                     match action {
-                        NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                        NextAction::Continue => continue,
                         NextAction::WaitForMsg => {
                             self.set_status(SessionStatus::WaitingInput).await
                         }
@@ -3409,9 +3527,9 @@ impl AgentSession {
                             self.session_id
                         );
                     }
-                    self.switch_behavior(trimmed, behavior, final_snapshot)
-                        .await?;
-                    return Ok(NextAction::Idle);
+                    return self
+                        .switch_behavior(trimmed, behavior, final_snapshot)
+                        .await;
                 }
                 // Natural Done (no next_behavior). Persist the completed
                 // snapshot so the next round starts from the previous round's
@@ -3828,7 +3946,7 @@ impl AgentSession {
         next: &str,
         prev: &BehaviorCfg,
         final_snapshot: LLMContextSnapshot,
-    ) -> Result<()> {
+    ) -> Result<NextAction> {
         let new_cfg = self
             .agent_config
             .load_behavior(next)
@@ -3861,14 +3979,23 @@ impl AgentSession {
                 self.session_id
             );
         }
-        self.enqueue_on_behavior_switch_input(
-            prev,
-            &new_cfg,
-            Some(from_context_report.as_str()),
-            Some(from_context),
-        )
-        .await;
-        Ok(())
+        let messages = self
+            .render_on_behavior_switch_input_text(
+                &prev.meta.name,
+                &new_cfg,
+                Some(from_context_report.as_str()),
+                Some(from_context),
+            )
+            .await
+            .map(|text| AiMessage::text(AiRole::User, text))
+            .into_iter()
+            .collect();
+        self.set_internal_continuation(InternalContinuation {
+            reason: format!("behavior_switch:{}->{}", prev.meta.name, new_cfg.meta.name),
+            user_messages: messages,
+        })
+        .await?;
+        Ok(NextAction::Continue)
     }
 
     async fn render_on_behavior_switch_input_text(
@@ -3956,54 +4083,6 @@ impl AgentSession {
             }
         }
         .filter(|text| !text.is_empty())
-    }
-
-    async fn enqueue_on_behavior_switch_input(
-        &self,
-        prev: &BehaviorCfg,
-        next: &BehaviorCfg,
-        from_context_report: Option<&str>,
-        from_context: Option<serde_json::Value>,
-    ) {
-        let Some(text) = self
-            .render_on_behavior_switch_input_text(
-                &prev.meta.name,
-                next,
-                from_context_report,
-                from_context,
-            )
-            .await
-        else {
-            return;
-        };
-        let seq = self
-            .trace_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let input = PendingInput::Msg {
-            record_id: format!(
-                "on-behavior-switch-{}-{}-{}",
-                self.session_id, next.meta.name, seq
-            ),
-            from: "opendan:on_behavior_switch".to_string(),
-            from_did: None,
-            from_name: Some("on_behavior_switch".to_string()),
-            tunnel_did: None,
-            text: text.clone(),
-            ai_message: AiMessage::text(AiRole::User, text),
-        };
-        info!(
-            "opendan.session[{}]: enqueue user message hook=on_behavior_switch from=`{}` to=`{}` key={}",
-            self.session_id,
-            prev.meta.name,
-            next.meta.name,
-            input.dedup_key()
-        );
-        if let Err(err) = self.enqueue_pending(input).await {
-            warn!(
-                "opendan.session[{}]: enqueue on_behavior_switch input for behavior `{}` failed: {err:#}",
-                self.session_id, next.meta.name
-            );
-        }
     }
 
     /// Switch mode = Normal: keep accumulated history + step records, swap
@@ -4155,9 +4234,8 @@ impl AgentSession {
     /// Drive the independent-mode call-stack pop on `END`. If a parent
     /// frame is waiting, persist this process's terminal state (so a future
     /// re-entry resumes its stream), restore the parent's snapshot to
-    /// `state.snap`, inject a marker `[independent process `<X>` ended]`
-    /// message into the parent's `pending_inputs` so the parent's next turn
-    /// has something to wake on, and return `NextAction::Idle`.
+    /// `state.snap`, and persist an internal continuation for the parent's next
+    /// turn. This hand-off is session state, not external pending input.
     ///
     /// Returns `NextAction::End` only when the call stack is empty — i.e.
     /// the top-level process itself ended.
@@ -4236,69 +4314,28 @@ impl AgentSession {
             None
         };
 
-        let marker_text = if parent_frame.fork {
-            if on_behavior_switch_text.is_some() {
-                format!("[fork process `{}` ended]", child_entry)
-            } else {
-                fork_child_end_marker(&child_entry, &child_report)
-            }
+        let (reason, user_messages) = if let Some(text) = on_behavior_switch_text {
+            (
+                format!("process_return:{}->{}", child_entry, parent_frame.current),
+                vec![AiMessage::text(AiRole::User, text)],
+            )
         } else {
-            format!("[independent process `{}` ended]", child_entry)
-        };
-
-        // Inject a marker so the parent's next turn wakes up with a user-side
-        // hand-off. Going through enqueue_pending both persists it and fires
-        // the Wakeup signal.
-        let marker = PendingInput::Msg {
-            record_id: format!(
-                "process-end:{}:{}",
-                child_entry,
-                uuid::Uuid::new_v4().simple()
-            ),
-            from: "system".to_string(),
-            from_did: None,
-            from_name: Some("system".to_string()),
-            tunnel_did: None,
-            text: marker_text.clone(),
-            ai_message: AiMessage::text(AiRole::User, marker_text),
-        };
-        if let Err(err) = self.enqueue_pending(marker).await {
-            warn!(
-                "opendan.session[{}]: enqueue end-marker after pop failed: {err:#}",
-                self.session_id
-            );
-        }
-        if let Some(text) = on_behavior_switch_text {
-            let seq = self
-                .trace_seq
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let on_behavior_switch = PendingInput::Msg {
-                record_id: format!(
-                    "on-behavior-switch-{}-{}-{}",
-                    self.session_id, parent_frame.current, seq
-                ),
-                from: "opendan:on_behavior_switch".to_string(),
-                from_did: None,
-                from_name: Some("on_behavior_switch".to_string()),
-                tunnel_did: None,
-                text: text.clone(),
-                ai_message: AiMessage::text(AiRole::User, text),
+            let marker_text = if parent_frame.fork {
+                fork_child_end_marker(&child_entry, &child_report)
+            } else {
+                format!("[independent process `{}` ended]", child_entry)
             };
-            info!(
-                "opendan.session[{}]: enqueue user message hook=on_behavior_switch from=`{}` to=`{}` key={}",
-                self.session_id,
-                child_entry,
-                parent_frame.current,
-                on_behavior_switch.dedup_key()
-            );
-            if let Err(err) = self.enqueue_pending(on_behavior_switch).await {
-                warn!(
-                    "opendan.session[{}]: enqueue on_behavior_switch after fork pop failed: {err:#}",
-                    self.session_id
-                );
-            }
-        }
-        Ok(NextAction::Idle)
+            (
+                format!("process_return:{}->{}", child_entry, parent_frame.current),
+                vec![AiMessage::text(AiRole::User, marker_text)],
+            )
+        };
+        self.set_internal_continuation(InternalContinuation {
+            reason,
+            user_messages,
+        })
+        .await?;
+        Ok(NextAction::Continue)
     }
 
     /// **Fork primitive** (Phase 4 of llm_context_helper.rs design).
@@ -4888,7 +4925,7 @@ impl AgentSession {
 }
 
 enum NextAction {
-    Idle,
+    Continue,
     WaitForMsg,
     /// Session yielded on async tool dispatch — the worker is parked until
     /// the matching task-completion events arrive in `pending_inputs`.
@@ -5055,6 +5092,21 @@ fn append_turn_message_to_snapshot(
 
 fn is_runtime_auto_user_pending(from: &str) -> bool {
     from == "opendan:on_behavior_switch"
+}
+
+fn prune_legacy_internal_pending_inputs(pending: &mut Vec<PendingInput>) -> usize {
+    let before = pending.len();
+    pending.retain(|input| {
+        let is_legacy_internal = matches!(
+            input,
+            PendingInput::Msg { from, .. } if is_runtime_auto_user_pending(from)
+        ) || matches!(
+            input,
+            PendingInput::Msg { record_id, .. } if is_history_input_pending(record_id)
+        );
+        !is_legacy_internal
+    });
+    before.saturating_sub(pending.len())
 }
 
 fn is_history_input_pending(record_id: &str) -> bool {
