@@ -304,6 +304,15 @@ impl StepResultHook for OpenDanStepResultHook {
             serde_json::to_value(&step.action_results).unwrap_or(serde_json::Value::Null);
         let pending_inputs = self.pending_input_values().await;
         let pending_input_text = render_pending_input_values(&pending_inputs);
+        info!(
+            "opendan.session[{}]: build user message hook=on_behavior_step_ob behavior=`{}` actions={} results={} pending_inputs={} template_chars={}",
+            self.session_id,
+            self.behavior.meta.name,
+            step.actions.len(),
+            step.action_results.len(),
+            pending_inputs.len(),
+            template.chars().count()
+        );
         let env = build_agent_session_env(
             &self.session_id,
             &self.agent_config,
@@ -356,6 +365,13 @@ impl StepResultHook for OpenDanStepResultHook {
             return Ok(StepResultHookOutput::default());
         }
 
+        info!(
+            "opendan.session[{}]: rendered user message hook=on_behavior_step_ob behavior=`{}` chars={} preview=`{}`",
+            self.session_id,
+            self.behavior.meta.name,
+            rendered.chars().count(),
+            text_log_preview(rendered)
+        );
         Ok(StepResultHookOutput {
             user_message: Some(AiMessage::text(AiRole::User, rendered.to_string())),
             history_inputs: Vec::new(),
@@ -1005,6 +1021,19 @@ impl AgentSession {
                     &pending_task_index,
                 )
                 .await;
+            let on_wait_cfg = driver.hook(SessionHookPoint::OnWait);
+            let selected_stats = pending_input_stats(&selected_pending);
+            info!(
+                "opendan.session[{}]: driver hook=on_wait pending_total={} selected_total={} selected_msg={} selected_event={} selected_interrupt={} pull_msg={:?} pull_event={:?}",
+                self.session_id,
+                pending.len(),
+                selected_pending.len(),
+                selected_stats.msg,
+                selected_stats.event,
+                selected_stats.interrupt,
+                on_wait_cfg.pull_msg,
+                on_wait_cfg.pull_event
+            );
             if selected_pending.is_empty() {
                 self.set_status(SessionStatus::WaitingInput).await;
                 if self.should_exit_when_driver_blocked().await {
@@ -1255,6 +1284,19 @@ impl AgentSession {
             if let Some(batch) = format_event_batch_for_turn(&turn_events) {
                 round_inputs.push(AiMessage::text(AiRole::User, batch));
             }
+            info!(
+                "opendan.session[{}]: build user input hook=on_wait msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
+                self.session_id,
+                msg_count,
+                event_count,
+                history_inputs.len(),
+                round_inputs.len(),
+                first_msg_preview.as_deref().unwrap_or(""),
+                first_event_meta
+                    .as_ref()
+                    .map(|(id, kind)| format!("{id}:{kind}"))
+                    .unwrap_or_else(|| "none".to_string())
+            );
 
             // If the snapshot is currently mid-PendingTool and the upper
             // layer queued bare Msg/Event entries without an Interrupt
@@ -2061,6 +2103,7 @@ impl AgentSession {
             self.pull_events_for_env(cfg, pending, observed_at_ms).await;
         let (msgs, _) = self.pull_msgs_for_env(cfg, pending, observed_at_ms);
         let msg_count = msgs.len();
+        let event_count = consumed_event_keys.len();
         let snapshot = self.try_load_snapshot_for_prompt();
         let agent_global_state = if let Some(agent) = self.parent_agent.upgrade() {
             agent.snapshot_global_state(Some(&self.session_id)).await
@@ -2089,10 +2132,22 @@ impl AgentSession {
                 )
             })
             .unwrap_or((None, None, Vec::new()));
+        let bg_events = self.meta.lock().await.background_events.clone();
+        info!(
+            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} pull_msg={:?} pull_event={:?}",
+            self.session_id,
+            point.as_key(),
+            pending.len(),
+            msg_count,
+            event_count,
+            bg_events.len(),
+            cfg.pull_msg,
+            cfg.pull_event
+        );
         LlmContextEnv {
             msgs,
             events,
-            bg_events: self.meta.lock().await.background_events.clone(),
+            bg_events,
             last_step,
             last_report,
             behavior_history,
@@ -2100,7 +2155,7 @@ impl AgentSession {
                 agent_global_state,
                 point.as_key(),
                 msg_count,
-                consumed_event_keys.len(),
+                event_count,
             ),
         }
     }
@@ -2864,14 +2919,40 @@ impl AgentSession {
         // wakeup into a fake conversational turn. Bootstrap turns (work
         // session first run, no input, no snapshot) get the objective via
         // System and don't need env either.
-        let turn_message = compose_turn_message(
-            turn_messages,
-            if inject_background_environment && self.session_class_inject_background_environment() {
-                self.compose_environment_message(behavior).await
-            } else {
-                None
-            },
-        );
+        let environment_message = if inject_background_environment
+            && self.session_class_inject_background_environment()
+        {
+            self.compose_environment_message(behavior).await
+        } else {
+            None
+        };
+        let environment_injected = environment_message
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| !text.is_empty());
+        let turn_message = compose_turn_message(turn_messages, environment_message);
+        if let Some(message) = turn_message.as_ref() {
+            info!(
+                "opendan.session[{}]: composed user message trace={} behavior=`{}` source_messages={} environment_injected={} blocks={} text_chars={} preview=`{}`",
+                self.session_id,
+                trace_id,
+                behavior.meta.name,
+                turn_messages.len(),
+                environment_injected,
+                message.content.len(),
+                message_text_chars(message),
+                ai_message_log_preview(message)
+            );
+        } else if !turn_messages.is_empty() || environment_injected {
+            info!(
+                "opendan.session[{}]: skipped empty user message trace={} behavior=`{}` source_messages={} environment_injected={}",
+                self.session_id,
+                trace_id,
+                behavior.meta.name,
+                turn_messages.len(),
+                environment_injected
+            );
+        }
 
         if let Some(snapshot) = self.try_load_snapshot() {
             if snapshot.state.pending_tool_calls.is_empty() {
@@ -3810,6 +3891,16 @@ impl AgentSession {
                 &pending,
             )
             .await;
+        info!(
+            "opendan.session[{}]: build user message hook=on_behavior_switch from=`{}` to=`{}` pending_total={} env_msgs={} env_events={} template_chars={}",
+            self.session_id,
+            prev_name,
+            next.meta.name,
+            pending.len(),
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+            template.chars().count()
+        );
         let report = from_context_report
             .map(str::trim)
             .filter(|value| !value.is_empty());
@@ -3842,7 +3933,20 @@ impl AgentSession {
             ("to_context", to_context),
         ];
         match prompt_env::render_template(template, &env, &extras).await {
-            Ok(text) => Some(text.trim().to_string()),
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    info!(
+                        "opendan.session[{}]: rendered user message hook=on_behavior_switch from=`{}` to=`{}` chars={} preview=`{}`",
+                        self.session_id,
+                        prev_name,
+                        next.meta.name,
+                        text.chars().count(),
+                        text_log_preview(&text)
+                    );
+                }
+                Some(text)
+            }
             Err(err) => {
                 warn!(
                     "opendan.session[{}]: render on_behavior_switch for behavior `{}` failed: {err}",
@@ -3887,6 +3991,13 @@ impl AgentSession {
             text: text.clone(),
             ai_message: AiMessage::text(AiRole::User, text),
         };
+        info!(
+            "opendan.session[{}]: enqueue user message hook=on_behavior_switch from=`{}` to=`{}` key={}",
+            self.session_id,
+            prev.meta.name,
+            next.meta.name,
+            input.dedup_key()
+        );
         if let Err(err) = self.enqueue_pending(input).await {
             warn!(
                 "opendan.session[{}]: enqueue on_behavior_switch input for behavior `{}` failed: {err:#}",
@@ -4173,6 +4284,13 @@ impl AgentSession {
                 text: text.clone(),
                 ai_message: AiMessage::text(AiRole::User, text),
             };
+            info!(
+                "opendan.session[{}]: enqueue user message hook=on_behavior_switch from=`{}` to=`{}` key={}",
+                self.session_id,
+                child_entry,
+                parent_frame.current,
+                on_behavior_switch.dedup_key()
+            );
             if let Err(err) = self.enqueue_pending(on_behavior_switch).await {
                 warn!(
                     "opendan.session[{}]: enqueue on_behavior_switch after fork pop failed: {err:#}",
@@ -4865,6 +4983,25 @@ fn merge_global_state_hook_stats(
     }
 }
 
+#[derive(Default)]
+struct PendingInputStats {
+    msg: usize,
+    event: usize,
+    interrupt: usize,
+}
+
+fn pending_input_stats(inputs: &[PendingInput]) -> PendingInputStats {
+    let mut stats = PendingInputStats::default();
+    for input in inputs {
+        match input {
+            PendingInput::Msg { .. } => stats.msg += 1,
+            PendingInput::Event { .. } => stats.event += 1,
+            PendingInput::Interrupt { .. } => stats.interrupt += 1,
+        }
+    }
+    stats
+}
+
 fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
@@ -5493,6 +5630,23 @@ fn trigger_preview(text: &str) -> String {
         out.push(c);
     }
     out
+}
+
+fn text_log_preview(text: &str) -> String {
+    trigger_preview(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn message_text_chars(message: &AiMessage) -> usize {
+    message.text_content().chars().count()
+}
+
+fn ai_message_log_preview(message: &AiMessage) -> String {
+    let text = message.text_content();
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        return text_log_preview(trimmed);
+    }
+    pending_msg_preview("", message)
 }
 
 /// Derive a coarse `event_kind` label from a kevent id. Today's pump produces

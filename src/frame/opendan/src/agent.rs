@@ -540,7 +540,8 @@ impl AIAgent {
                     .iter()
                     .map(|sub| sub.pattern.clone())
                     .collect::<Vec<_>>();
-                pump.set_session_subscriptions(&meta.session_id, patterns).await;
+                pump.set_session_subscriptions(&meta.session_id, patterns)
+                    .await;
             }
         }
     }
@@ -753,7 +754,10 @@ impl AIAgent {
 
     async fn session_accepts_pending(&self, session_id: &str) -> Result<bool> {
         if let Some(session) = self.sessions.lock().await.get(session_id).cloned() {
-            return Ok(!matches!(session.meta.lock().await.status, SessionStatus::Ended));
+            return Ok(!matches!(
+                session.meta.lock().await.status,
+                SessionStatus::Ended
+            ));
         }
         let meta_path = self
             .config
@@ -1668,9 +1672,8 @@ impl AIAgent {
         }
         let status = target.meta.lock().await.status;
         if matches!(status, SessionStatus::Ended) {
-            return Err(anyhow!(
-                "forward_message: target session `{target_session_id}` has ended"
-            ));
+            let summary = target.summary().await;
+            return Err(anyhow!("{}", ended_forward_message_guidance(&summary)));
         }
         let record_id = format!("forward:{source_session_id}:{}", mint_session_id("fwd"));
         target
@@ -1696,6 +1699,33 @@ impl AIAgent {
             s.stop().await;
         }
     }
+}
+
+fn ended_forward_message_guidance(summary: &SessionSummary) -> String {
+    let mut context = Vec::new();
+    if !summary.title.trim().is_empty() {
+        context.push(format!("title `{}`", summary.title.trim()));
+    }
+    if !summary.objective.trim().is_empty() {
+        context.push(format!("objective `{}`", summary.objective.trim()));
+    }
+    if let Some(workspace_id) = summary
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push(format!("workspace `{workspace_id}`"));
+    }
+    let context = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" Previous context: {}.", context.join(", "))
+    };
+    format!(
+        "forward_message: target session `{}` has ended and cannot accept forwarded messages.{} Do not retry `forward_msg` for this session. Fork/select a replacement with `try_create_worksession` for the current user follow-up, then forward to the new session id returned in `followup_routing.target_worksession_id`.",
+        summary.session_id, context
+    )
 }
 
 /// Parameters for [`AIAgent::create_work_session`]. Mirrors the §8.1
@@ -2041,6 +2071,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_message_ended_session_guides_new_worksession() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "work-ended".to_string(),
+            SessionKind::Work,
+            "work_default".to_string(),
+            "ui-1".to_string(),
+        );
+        meta.status = SessionStatus::Ended;
+        meta.title = "Old task".to_string();
+        meta.objective = "Finish the previous work".to_string();
+        meta.workspace_id = Some("old-workspace".to_string());
+        meta.bootstrap_done = true;
+        let session = agent
+            .clone()
+            .ensure_session_inner(
+                meta.session_id.clone(),
+                meta.kind,
+                meta.owner.clone(),
+                Some(meta.current_behavior.clone()),
+                Some(meta),
+            )
+            .await
+            .expect("mount ended session");
+        session.meta.lock().await.status = SessionStatus::Ended;
+
+        let err = agent
+            .forward_message("work-ended", "ui-1", "follow-up")
+            .await
+            .expect_err("ended session should reject forward");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("target session `work-ended` has ended"));
+        assert!(msg.contains("Do not retry `forward_msg` for this session"));
+        assert!(msg.contains("try_create_worksession"));
+        assert!(msg.contains("followup_routing.target_worksession_id"));
+        assert!(msg.contains("title `Old task`"));
+        assert!(msg.contains("workspace `old-workspace`"));
+    }
+
+    #[tokio::test]
     async fn restore_session_routes_does_not_mount_workers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = test_agent(dir.path().to_path_buf());
@@ -2057,7 +2128,10 @@ mod tests {
 
         assert!(agent.get_session("ui-did_dev_alice").await.is_none());
         assert_eq!(
-            agent.resolve_session_for_command("did:dev:alice").await.unwrap(),
+            agent
+                .resolve_session_for_command("did:dev:alice")
+                .await
+                .unwrap(),
             "ui-did_dev_alice"
         );
     }
