@@ -10,7 +10,7 @@
 
 [system] [user [a-call u-result] [a-call u-result] [a-call u-result] assistant]@round1 [user [a-call u-result] [a-call u-result]  assistant]@round2 [user assistant]@round3 **user**
 
-模式二 Behavior Loop里的一次beahvior run: 通过一个on_switch 触发，得到 behavior_result  (next_behavior有值)
+模式二 Behavior Loop里的一次beahvior run: 通过一个on_behavior_switch 触发，得到 behavior_result  (next_behavior有值)
 
 [behavior-system] ([user:step0-step3-history + beahvior-on-switch]) [agent:intent user:last_step_result]@step4 [[a-call u-result] agent:intent user:last_step_result]@step5 **beahvior-on-switch + pending inputs** 
 
@@ -282,7 +282,7 @@ Step Record History压缩：
 
 [do-behavior-system] ([user:step0-step3-history + beahvior-on-switch]) [agent:intent user:last_step_result]@step4 [[a-call u-result] agent:intent user:last_step_result]@step5 agent:next_behavior=CHECK
 
-执行切换后,填入on_switch构造的user_message
+执行切换后,填入on_behavior_switch构造的user_message
 
 [check-behavior-system] ([user:step0-step3-history + beahvior-on-switch]) [agent:intent user:last_step_result]@step4 [[a-call u-result] agent:intent user:last_step_result]@step5 agent:next_behavior=CHECK **check-beahvior-on-switch** --继续推理-->
 
@@ -294,7 +294,7 @@ Step Record History压缩：
 
 [do-behavior-system] **do-beahvior-on-switch** [agent:intent user:last_step_result]@step1 [[a-call u-result] agent:intent user:last_step_result]@step2 agent:next_behavior=CHECK
 
-执行切换后，Resume target behavior的llm_context,并填入on_switch构造的user_message:
+执行切换后，Resume target behavior的llm_context,并填入on_behavior_switch构造的user_message:
 
 [check-behavior-system] **check-beahvior-on-switch**  （从头开始）
 
@@ -362,9 +362,9 @@ plan
 fork前
 [PLAN-behavior-system] **plan-beahvior-on-switch** [agent:intent user:last_step_result]@step1 [[a-call u-result] agent:intent user:last_step_result]@step2 agent:next_behavior=DO
 
-fork 后的 sub-ctx 入口是**一条** user message，内部分两段（XML section 或类似形式）：一段是从父继承的 StepRecord history，一段是 on_switch payload：
+fork 后的 sub-ctx 入口是**一条** user message，内部分两段（XML section 或类似形式）：一段是从父继承的 StepRecord history，一段是 on_behavior_switch payload：
 
-[DO-behavior-system] [user: \<inherited_steps\>...\</inherited_steps\> \<on_switch\>DO-beahvior-on-switch\</on_switch\>] --多step推理--> agent:next_behavior=END (join)
+[DO-behavior-system] [user: \<inherited_steps\>...\</inherited_steps\> \<on_behavior_switch\>DO-beahvior-on-switch\</on_behavior_switch\>] --多step推理--> agent:next_behavior=END (join)
 
 > sub 看到的是**结构化的 StepRecord history**（thought / observation / next_behavior / self_report 等字段），不是父的 message 序列原样回放。这是 fork 跟"原样继承消息"路线的根本区别。
 
@@ -379,8 +379,8 @@ fork 后的 sub-ctx 入口是**一条** user message，内部分两段（XML sec
 
 最薄的"只 self_report"等价于下面"不继承历史"——self_report 本来就是父 behavior 的交接 statement。
 
-如果选择不继承历史记录 fork（所有需要的共享状态都打包进 DO-behavior-system 或 on_switch payload）:
-[DO-behavior-system] [user: \<on_switch\>DO-beahvior-on-switch\</on_switch\>] --多step推理--> agent:next_behavior=END (join)
+如果选择不继承历史记录 fork（所有需要的共享状态都打包进 DO-behavior-system 或 on_behavior_switch payload）:
+[DO-behavior-system] [user: \<on_behavior_switch\>DO-beahvior-on-switch\</on_behavior_switch\>] --多step推理--> agent:next_behavior=END (join)
 
 对 sub-behavior 来说，这是 context window 负担最轻的方法，缺点就是要求上层共享状态的使用要非常精确。
 
@@ -388,7 +388,7 @@ join 后的主干：
 [PLAN-behavior-system] plan-beahvior-on-switch [agent:intent user:last_step_result]@step1 [[a-call u-result] agent:intent user:last_step_result]@step2 agent:next_behavior=DO
 **user:PLAN-beahvior-on-switch(可以包含do-behavior的last report)** , 继续前进
 
-> sub 跑出来的 step 只在内存里，join 时**整段丢弃**，只有 last_report 通过 on_switch payload 流回父。
+> sub 跑出来的 step 只在内存里，join 时**整段丢弃**，只有 last_report 通过 on_behavior_switch payload 流回父。
 
 #### 跟"独立切换首次进入"的形状对照
 
@@ -396,7 +396,7 @@ join 后的主干：
 
 |  | fork sub-ctx 入口 | 独立切换首次进入 |
 |---|---|---|
-| 形状 | `[DO-system] [user: 继承payload + on_switch]` | `[DO-system] [user: on_switch]` |
+| 形状 | `[DO-system] [user: 继承payload + on_behavior_switch]` | `[DO-system] [user: on_behavior_switch]` |
 | sub 的 step 流向 | 内存，join 时丢弃 | 自己的 `.snap` 落盘 |
 | 再次进入 | 每次都是全新 sub | resume 自己之前的 stream |
 

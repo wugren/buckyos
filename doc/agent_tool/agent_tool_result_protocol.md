@@ -142,7 +142,7 @@ assistant: hot step intent
 user: hot step action results
 assistant: hot step intent
 user: hot step action results
-user: behavior init / on_switch UserMessage
+user: behavior init / on_behavior_switch UserMessage
 ```
 
 其中：
@@ -151,7 +151,7 @@ user: behavior init / on_switch UserMessage
 - hot tail 是最近若干个完整 `(assistant, user)` step pair。
 - 当 context 不够时，hot tail 中较旧的一部分会合并进 `step_history`，并在 `step_history` 内压缩或裁剪。
 - `step_history` 是可选的；Behavior 刚开始且没有历史时，可以单独给一条 behavior init user message。
-- 如果既有 `step_history` 又需要注入 behavior init / on_switch UserMessage，应先渲染 `step_history`，再追加该 UserMessage，保证沉淀历史在时间顺序上更早。
+- 如果既有 `step_history` 又需要注入 behavior init / on_behavior_switch UserMessage，应先渲染 `step_history`，再追加该 UserMessage，保证沉淀历史在时间顺序上更早。
 
 ### Full Step
 

@@ -5,7 +5,7 @@
 //! ```text
 //!   AIAgent::open(root, runtime) -> Self        // load AgentConfig
 //!   AIAgent::run()                              // spawns the dispatcher loop
-//!     ├── restore_active_sessions()             // boot non-Ended sessions on disk
+//!     ├── restore_session_routes()              // restore routing indexes only
 //!     ├── select loop:
 //!     │     - inbound MsgPack  → dispatch_msg_pack → AgentSession::submit_text
 //!     │     - inbound EventPack→ dispatch_event_pack (MVP no-op)
@@ -414,7 +414,7 @@ impl AIAgent {
     /// (single-shot — calling twice panics).
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("opendan.agent[{}]: starting AIAgent::run", self.agent_name);
-        self.clone().restore_active_sessions().await;
+        self.clone().restore_session_routes().await;
         self.clone().ensure_self_check_hard_barrier_timer().await;
 
         let pump_handle = self.clone().spawn_msg_center_pump();
@@ -500,11 +500,10 @@ impl AIAgent {
         Some(tokio::spawn(msg_center_pump::run(cfg)))
     }
 
-    /// Restore non-Ended sessions from disk. MVP scope: for each
-    /// `session/<id>/.meta/session.json` whose status is not `Ended`, recreate
-    /// the AgentSession in-memory (its worker will resume from `state.snap`
-    /// on first input).
-    async fn restore_active_sessions(self: Arc<Self>) {
+    /// Restore lightweight dispatch indexes for non-Ended sessions without
+    /// starting their workers. Workers are mounted on demand when the main loop
+    /// is about to write a new pending input.
+    async fn restore_session_routes(self: Arc<Self>) {
         let sessions_dir = self.config.layout.sessions_dir.clone();
         let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
             return;
@@ -529,42 +528,21 @@ impl AIAgent {
             if matches!(meta.status, SessionStatus::Ended) {
                 continue;
             }
-            if let Err(err) = self.clone().restore_session(meta).await {
-                warn!(
-                    "opendan.agent[{}]: restore session {} failed: {err:#}",
-                    self.agent_name,
-                    path.display()
-                );
+            if matches!(meta.kind, SessionKind::Ui) && !meta.owner.is_empty() {
+                self.tunnel_to_ui_session
+                    .lock()
+                    .await
+                    .insert(meta.owner.clone(), meta.session_id.clone());
+            }
+            if let Some(pump) = self.event_pump.as_ref() {
+                let patterns = meta
+                    .event_subscriptions
+                    .iter()
+                    .map(|sub| sub.pattern.clone())
+                    .collect::<Vec<_>>();
+                pump.set_session_subscriptions(&meta.session_id, patterns).await;
             }
         }
-    }
-
-    async fn restore_session(self: Arc<Self>, meta: SessionMeta) -> Result<()> {
-        info!(
-            "opendan.agent[{}]: restoring session {} (kind={:?})",
-            self.agent_name, meta.session_id, meta.kind
-        );
-        let session_id = meta.session_id.clone();
-        let kind = meta.kind;
-        let owner = meta.owner.clone();
-        let behavior = meta.current_behavior.clone();
-        let _session = self
-            .clone()
-            .ensure_session_inner(
-                session_id.clone(),
-                kind,
-                owner.clone(),
-                Some(behavior),
-                Some(meta),
-            )
-            .await?;
-        if matches!(kind, SessionKind::Ui) && !owner.is_empty() {
-            self.tunnel_to_ui_session
-                .lock()
-                .await
-                .insert(owner, session_id);
-        }
-        Ok(())
     }
 
     /// Decide which session class an inbound item lands in. Walks the
@@ -773,6 +751,26 @@ impl AIAgent {
         }
     }
 
+    async fn session_accepts_pending(&self, session_id: &str) -> Result<bool> {
+        if let Some(session) = self.sessions.lock().await.get(session_id).cloned() {
+            return Ok(!matches!(session.meta.lock().await.status, SessionStatus::Ended));
+        }
+        let meta_path = self
+            .config
+            .layout
+            .session_dir(session_id)
+            .join(".meta")
+            .join("session.json");
+        if !meta_path.exists() {
+            return Ok(true);
+        }
+        let bytes = std::fs::read(&meta_path)
+            .map_err(|err| anyhow!("read {} failed: {err}", meta_path.display()))?;
+        let meta: SessionMeta = serde_json::from_slice(&bytes)
+            .map_err(|err| anyhow!("parse {} failed: {err}", meta_path.display()))?;
+        Ok(!matches!(meta.status, SessionStatus::Ended))
+    }
+
     /// Mint or look up the session id this inbound goes to, given its
     /// resolved session class. Returns `None` when the strategy's required
     /// fields aren't present in the inbound (e.g. PerPeer with no `from`).
@@ -839,9 +837,17 @@ impl AIAgent {
                         None => self.clone().resolve_ui_session(&from).await?,
                     }
                 };
+                if !self.session_accepts_pending(&resolved_id).await? {
+                    warn!(
+                        "opendan.agent[{}]: reject msg record_id={} for ended session {}",
+                        self.agent_name, record_id, resolved_id
+                    );
+                    self.ack_msg_record(record_id).await;
+                    return Ok(());
+                }
                 let session = self
                     .clone()
-                    .get_or_create_session(resolved_id, from.clone(), kind, &class)
+                    .get_or_create_session(resolved_id.clone(), from.clone(), kind, &class)
                     .await?;
                 // enqueue_pending durably parks the input on the session
                 // and only returns once `.meta/session.json` is on disk.
@@ -911,6 +917,13 @@ impl AIAgent {
                 // lands with `session_sub_kevent`.
                 let explicit_target = target_session_id.or_else(|| self.route_event_target(&data));
                 let session = if let Some(sid) = explicit_target {
+                    if !self.session_accepts_pending(&sid).await? {
+                        warn!(
+                            "opendan.agent[{}]: reject event {} for ended session {}",
+                            self.agent_name, event_id, sid
+                        );
+                        return Ok(());
+                    }
                     match self.clone().ensure_session(&sid).await {
                         Ok(session) => session,
                         Err(err) => {
@@ -927,6 +940,13 @@ impl AIAgent {
                         .session_class(&class)
                         .map(|cfg| cfg.kind)
                         .unwrap_or(SessionKind::SelfCheck);
+                    if !self.session_accepts_pending(&class).await? {
+                        warn!(
+                            "opendan.agent[{}]: reject event {} for ended session {}",
+                            self.agent_name, event_id, class
+                        );
+                        return Ok(());
+                    }
                     self.clone()
                         .get_or_create_session(class.clone(), "system".to_string(), kind, &class)
                         .await?
@@ -1223,6 +1243,10 @@ impl AIAgent {
     }
 
     pub async fn retire_idle_session(&self, session_id: &str) {
+        self.sessions.lock().await.remove(session_id);
+    }
+
+    pub async fn retire_ended_session(&self, session_id: &str) {
         let removed = self.sessions.lock().await.remove(session_id);
         if removed.is_some() {
             if let Some(pump) = self.event_pump.as_ref() {
@@ -1976,6 +2000,68 @@ mod tests {
         AIAgent::open(root, Arc::new(runtime)).expect("open test agent")
     }
 
+    fn write_session_meta(agent: &AIAgent, mut meta: SessionMeta) {
+        let dir = agent
+            .config
+            .layout
+            .session_dir(&meta.session_id)
+            .join(".meta");
+        std::fs::create_dir_all(&dir).expect("mkdir meta");
+        if meta.status_changed_at_ms == 0 {
+            meta.status_changed_at_ms = 1;
+        }
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec_pretty(&meta).expect("encode meta"),
+        )
+        .expect("write meta");
+    }
+
+    #[tokio::test]
+    async fn session_accepts_pending_rejects_ended_disk_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "work-ended".to_string(),
+            SessionKind::Work,
+            "plan".to_string(),
+            "ui-1".to_string(),
+        );
+        meta.status = SessionStatus::Ended;
+        write_session_meta(&agent, meta);
+
+        assert!(!agent
+            .session_accepts_pending("work-ended")
+            .await
+            .expect("status check"));
+        assert!(agent
+            .session_accepts_pending("new-session")
+            .await
+            .expect("missing meta is acceptable"));
+    }
+
+    #[tokio::test]
+    async fn restore_session_routes_does_not_mount_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "ui-did_dev_alice".to_string(),
+            SessionKind::Ui,
+            "chat_route".to_string(),
+            "did:dev:alice".to_string(),
+        );
+        meta.status = SessionStatus::Idle;
+        write_session_meta(&agent, meta);
+
+        agent.clone().restore_session_routes().await;
+
+        assert!(agent.get_session("ui-did_dev_alice").await.is_none());
+        assert_eq!(
+            agent.resolve_session_for_command("did:dev:alice").await.unwrap(),
+            "ui-did_dev_alice"
+        );
+    }
+
     #[tokio::test]
     async fn ui_session_creation_does_not_create_or_bind_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2019,11 +2105,12 @@ mod tests {
         );
         meta.workspace_id = Some("legacy-ws".to_string());
 
+        write_session_meta(&agent, meta);
         agent
             .clone()
-            .restore_session(meta)
+            .ensure_session("ui-legacy")
             .await
-            .expect("restore ui session");
+            .expect("ensure ui session");
         let session = agent.get_session("ui-legacy").await.expect("session");
         assert_eq!(session.summary().await.workspace_id, None);
         let record = agent

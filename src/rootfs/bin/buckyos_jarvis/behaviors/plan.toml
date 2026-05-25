@@ -85,7 +85,7 @@ Read global state only when it can change the plan. Do not repeat large state du
 <</RESULT_PROTOCOL>>
 """
 
-# 
+#
 on_behavior_switch = """
 {% if from_context %}
 ## Last Finish Todo Report:

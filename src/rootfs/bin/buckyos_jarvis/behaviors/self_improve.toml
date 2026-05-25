@@ -34,7 +34,7 @@ Behavior history:
 <</RESULT_PROTOCOL>>
 """
 
-on_switch = """
+on_behavior_switch = """
 Continue SelfImprove from frozen global state:
 hook={{ llm_context.agent_global_state.driver.hook_point }} pulled_msgs={{ llm_context.agent_global_state.driver.pulled_msg_count }} pulled_events={{ llm_context.agent_global_state.driver.pulled_event_count }}
 """

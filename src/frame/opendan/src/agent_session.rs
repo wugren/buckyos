@@ -13,6 +13,7 @@ use ndn_lib::{MsgContent, MsgContentFormat, MsgObjKind, MsgObject};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::{timeout, Duration};
 
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
@@ -65,6 +66,7 @@ use crate::task_dispatch::TaskDispatch;
 pub const NEXT_BEHAVIOR_WAIT_USER_MSG: &str = "WAIT_USER_MSG";
 const MAX_PENDING_INPUTS: usize = 256;
 const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
+const IDLE_WORKER_RETIRE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorksessionReportPhase {
@@ -286,7 +288,7 @@ struct OpenDanStepResultHook {
 
 #[async_trait]
 impl StepResultHook for OpenDanStepResultHook {
-    async fn on_step_result(
+    async fn on_behavior_step_ob(
         &self,
         _snapshot: &LLMContextSnapshot,
         step: &StepRecord,
@@ -738,6 +740,14 @@ impl AgentSession {
         }
     }
 
+    async fn finish_ended(&self) {
+        self.set_status(SessionStatus::Ended).await;
+        let _ = self.reply_tx.send(SessionReply::Ended).await;
+        if let Some(agent) = self.parent_agent.upgrade() {
+            agent.retire_ended_session(&self.session_id).await;
+        }
+    }
+
     /// Convenience: enqueue a locally-injected human message. The synthetic
     /// `record_id` distinguishes CLI / test injections from msg-center
     /// records (which use the upstream record id).
@@ -817,7 +827,7 @@ impl AgentSession {
                         }
                     };
                     let bootstrap_message = self
-                        .render_on_switch_input_text("none", &behavior, None, None)
+                        .render_on_behavior_switch_input_text("none", &behavior, None, None)
                         .await
                         .map(|text| AiMessage::text(AiRole::User, text));
                     let bootstrap_messages = bootstrap_message.into_iter().collect::<Vec<_>>();
@@ -849,8 +859,7 @@ impl AgentSession {
                                 self.set_status(SessionStatus::WaitingTool).await
                             }
                             NextAction::End => {
-                                self.set_status(SessionStatus::Ended).await;
-                                let _ = self.reply_tx.send(SessionReply::Ended).await;
+                                self.finish_ended().await;
                                 return;
                             }
                         },
@@ -871,20 +880,44 @@ impl AgentSession {
                     continue;
                 }
                 if self.should_exit_when_idle().await {
-                    if let Err(err) = self.flush_meta().await {
-                        warn!(
-                            "opendan.session[{}]: flush before idle worker exit failed: {err:#}",
-                            self.session_id
-                        );
+                    match timeout(
+                        Duration::from_millis(IDLE_WORKER_RETIRE_MS),
+                        inbox_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(None) => {
+                            info!(
+                                "opendan.session[{}]: inbox closed, exiting worker",
+                                self.session_id
+                            );
+                            return;
+                        }
+                        Ok(Some(SessionInput::Cancel)) => {
+                            self.set_status(SessionStatus::Idle).await;
+                            if self.kind.is_work_family() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Ok(Some(SessionInput::Wakeup)) => continue,
+                        Err(_) => {
+                            if let Err(err) = self.flush_meta().await {
+                                warn!(
+                                    "opendan.session[{}]: flush before idle worker exit failed: {err:#}",
+                                    self.session_id
+                                );
+                            }
+                            if let Some(agent) = self.parent_agent.upgrade() {
+                                agent.retire_idle_session(&self.session_id).await;
+                            }
+                            info!(
+                                "opendan.session[{}]: idle transient worker exiting",
+                                self.session_id
+                            );
+                            return;
+                        }
                     }
-                    if let Some(agent) = self.parent_agent.upgrade() {
-                        agent.retire_idle_session(&self.session_id).await;
-                    }
-                    info!(
-                        "opendan.session[{}]: idle transient worker exiting",
-                        self.session_id
-                    );
-                    return;
                 }
                 match inbox_rx.recv().await {
                     None => {
@@ -962,6 +995,48 @@ impl AgentSession {
                 pending.truncate(pos);
             }
 
+            let pending_task_index = self.pending_task_index().await;
+            let driver = self.session_class_driver();
+            let selected_pending = self
+                .select_pending_for_hook(
+                    SessionHookPoint::OnWait,
+                    &driver,
+                    &pending,
+                    &pending_task_index,
+                )
+                .await;
+            if selected_pending.is_empty() {
+                self.set_status(SessionStatus::WaitingInput).await;
+                if self.should_exit_when_driver_blocked().await {
+                    if let Err(err) = self.flush_meta().await {
+                        warn!(
+                            "opendan.session[{}]: flush before driver-blocked worker exit failed: {err:#}",
+                            self.session_id
+                        );
+                    }
+                    if let Some(agent) = self.parent_agent.upgrade() {
+                        agent.retire_idle_session(&self.session_id).await;
+                    }
+                    info!(
+                        "opendan.session[{}]: transient worker exiting; pending input is not pulled by current driver hook",
+                        self.session_id
+                    );
+                    return;
+                }
+                match inbox_rx.recv().await {
+                    None => return,
+                    Some(SessionInput::Cancel) => {
+                        self.set_status(SessionStatus::Idle).await;
+                        if self.kind.is_work_family() {
+                            return;
+                        }
+                    }
+                    Some(SessionInput::Wakeup) => {}
+                }
+                continue;
+            }
+            pending = selected_pending;
+
             // Three buckets:
             //   - Msg / generic Event → fold into the next round as `round_inputs`
             //   - Event whose id matches a `pending_task_calls` pattern →
@@ -988,7 +1063,6 @@ impl AgentSession {
             let mut event_count: u32 = 0;
             let mut first_msg_preview: Option<String> = None;
             let mut first_event_meta: Option<(String, String)> = None;
-            let pending_task_index = self.pending_task_index().await;
             for input in &pending {
                 match input {
                     PendingInput::Msg {
@@ -1123,8 +1197,7 @@ impl AgentSession {
                                     self.set_status(SessionStatus::WaitingTool).await
                                 }
                                 NextAction::End => {
-                                    self.set_status(SessionStatus::Ended).await;
-                                    let _ = self.reply_tx.send(SessionReply::Ended).await;
+                                    self.finish_ended().await;
                                     return;
                                 }
                             }
@@ -1241,11 +1314,7 @@ impl AgentSession {
                 system_events: hist_system_events,
             };
             let _hook_env = self
-                .apply_hook(
-                    SessionHookPoint::OnWait,
-                    &self.session_class_driver(),
-                    &pending,
-                )
+                .apply_hook(SessionHookPoint::OnWait, &driver, &pending)
                 .await;
             let round_result = self
                 .run_one_round(
@@ -1269,8 +1338,7 @@ impl AgentSession {
                             self.set_status(SessionStatus::WaitingTool).await
                         }
                         NextAction::End => {
-                            self.set_status(SessionStatus::Ended).await;
-                            let _ = self.reply_tx.send(SessionReply::Ended).await;
+                            self.finish_ended().await;
                             return;
                         }
                     }
@@ -1338,9 +1406,12 @@ impl AgentSession {
 
     async fn should_exit_when_idle(&self) -> bool {
         let meta = self.meta.lock().await;
-        !meta.keep_alive
-            && meta.pending_inputs.is_empty()
-            && !matches!(meta.status, SessionStatus::WaitingTool)
+        meta.pending_inputs.is_empty() && !matches!(meta.status, SessionStatus::WaitingTool)
+    }
+
+    async fn should_exit_when_driver_blocked(&self) -> bool {
+        let meta = self.meta.lock().await;
+        !matches!(meta.status, SessionStatus::WaitingTool)
     }
 
     /// Flip `bootstrap_done = true` and flush. Idempotent — calling twice
@@ -2060,6 +2131,18 @@ impl AgentSession {
         (values, keys)
     }
 
+    async fn select_pending_for_hook(
+        &self,
+        point: SessionHookPoint,
+        driver: &SessionDriverCfg,
+        pending: &[PendingInput],
+        pending_task_index: &std::collections::HashMap<String, PendingTaskCall>,
+    ) -> Vec<PendingInput> {
+        let cfg = driver.hook(point);
+        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        select_pending_for_hook_with_subscriptions(cfg, pending, pending_task_index, &subscriptions)
+    }
+
     async fn pull_events_for_env(
         &self,
         cfg: &HookPointCfg,
@@ -2074,20 +2157,7 @@ impl AgentSession {
                 continue;
             };
             let matched = match &cfg.pull_event {
-                PullEventPolicy::None => false,
-                PullEventPolicy::All => true,
-                PullEventPolicy::Filter(name) => {
-                    let filter = name
-                        .strip_suffix(".*")
-                        .or_else(|| name.strip_suffix("/**"))
-                        .unwrap_or(name);
-                    event_id == filter
-                        || event_id.starts_with(&format!("{filter}."))
-                        || event_id.starts_with(&format!("{filter}/"))
-                        || subscriptions.iter().any(|sub| {
-                            sub.mode == EventSubscriptionMode::Full && sub.matches(event_id)
-                        })
-                }
+                policy => event_matches_pull_policy(event_id, policy, &subscriptions),
             };
             if matched {
                 let reason = subscriptions
@@ -2917,7 +2987,7 @@ impl AgentSession {
     ) -> llm_context::deps::LLMContextDeps {
         let Some(template) = behavior
             .prompt
-            .on_step_result
+            .on_behavior_step_ob
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3710,7 +3780,7 @@ impl AgentSession {
                 self.session_id
             );
         }
-        self.enqueue_on_switch_input(
+        self.enqueue_on_behavior_switch_input(
             prev,
             &new_cfg,
             Some(from_context_report.as_str()),
@@ -3720,14 +3790,14 @@ impl AgentSession {
         Ok(())
     }
 
-    async fn render_on_switch_input_text(
+    async fn render_on_behavior_switch_input_text(
         &self,
         prev_name: &str,
         next: &BehaviorCfg,
         from_context_report: Option<&str>,
         from_context: Option<serde_json::Value>,
     ) -> Option<String> {
-        let template = next.prompt.on_switch.as_deref().map(str::trim)?;
+        let template = next.prompt.on_behavior_switch.as_deref().map(str::trim)?;
         if template.is_empty() {
             return None;
         }
@@ -3775,7 +3845,7 @@ impl AgentSession {
             Ok(text) => Some(text.trim().to_string()),
             Err(err) => {
                 warn!(
-                    "opendan.session[{}]: render on_switch for behavior `{}` failed: {err}",
+                    "opendan.session[{}]: render on_behavior_switch for behavior `{}` failed: {err}",
                     self.session_id, next.meta.name
                 );
                 None
@@ -3784,7 +3854,7 @@ impl AgentSession {
         .filter(|text| !text.is_empty())
     }
 
-    async fn enqueue_on_switch_input(
+    async fn enqueue_on_behavior_switch_input(
         &self,
         prev: &BehaviorCfg,
         next: &BehaviorCfg,
@@ -3792,7 +3862,12 @@ impl AgentSession {
         from_context: Option<serde_json::Value>,
     ) {
         let Some(text) = self
-            .render_on_switch_input_text(&prev.meta.name, next, from_context_report, from_context)
+            .render_on_behavior_switch_input_text(
+                &prev.meta.name,
+                next,
+                from_context_report,
+                from_context,
+            )
             .await
         else {
             return;
@@ -3801,17 +3876,20 @@ impl AgentSession {
             .trace_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let input = PendingInput::Msg {
-            record_id: format!("on-switch-{}-{}-{}", self.session_id, next.meta.name, seq),
-            from: "opendan:on_switch".to_string(),
+            record_id: format!(
+                "on-behavior-switch-{}-{}-{}",
+                self.session_id, next.meta.name, seq
+            ),
+            from: "opendan:on_behavior_switch".to_string(),
             from_did: None,
-            from_name: Some("on_switch".to_string()),
+            from_name: Some("on_behavior_switch".to_string()),
             tunnel_did: None,
             text: text.clone(),
             ai_message: AiMessage::text(AiRole::User, text),
         };
         if let Err(err) = self.enqueue_pending(input).await {
             warn!(
-                "opendan.session[{}]: enqueue on_switch input for behavior `{}` failed: {err:#}",
+                "opendan.session[{}]: enqueue on_behavior_switch input for behavior `{}` failed: {err:#}",
                 self.session_id, next.meta.name
             );
         }
@@ -4024,10 +4102,10 @@ impl AgentSession {
             self.discard_snapshot();
         }
 
-        let on_switch_text = if parent_frame.fork {
+        let on_behavior_switch_text = if parent_frame.fork {
             match self.agent_config.load_behavior(&parent_frame.current) {
                 Ok(parent_cfg) => {
-                    self.render_on_switch_input_text(
+                    self.render_on_behavior_switch_input_text(
                         child_entry.as_str(),
                         &parent_cfg,
                         Some(child_report.as_str()),
@@ -4048,7 +4126,7 @@ impl AgentSession {
         };
 
         let marker_text = if parent_frame.fork {
-            if on_switch_text.is_some() {
+            if on_behavior_switch_text.is_some() {
                 format!("[fork process `{}` ended]", child_entry)
             } else {
                 fork_child_end_marker(&child_entry, &child_report)
@@ -4079,25 +4157,25 @@ impl AgentSession {
                 self.session_id
             );
         }
-        if let Some(text) = on_switch_text {
+        if let Some(text) = on_behavior_switch_text {
             let seq = self
                 .trace_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let on_switch = PendingInput::Msg {
+            let on_behavior_switch = PendingInput::Msg {
                 record_id: format!(
-                    "on-switch-{}-{}-{}",
+                    "on-behavior-switch-{}-{}-{}",
                     self.session_id, parent_frame.current, seq
                 ),
-                from: "opendan:on_switch".to_string(),
+                from: "opendan:on_behavior_switch".to_string(),
                 from_did: None,
-                from_name: Some("on_switch".to_string()),
+                from_name: Some("on_behavior_switch".to_string()),
                 tunnel_did: None,
                 text: text.clone(),
                 ai_message: AiMessage::text(AiRole::User, text),
             };
-            if let Err(err) = self.enqueue_pending(on_switch).await {
+            if let Err(err) = self.enqueue_pending(on_behavior_switch).await {
                 warn!(
-                    "opendan.session[{}]: enqueue on_switch after fork pop failed: {err:#}",
+                    "opendan.session[{}]: enqueue on_behavior_switch after fork pop failed: {err:#}",
                     self.session_id
                 );
             }
@@ -4839,7 +4917,7 @@ fn append_turn_message_to_snapshot(
 }
 
 fn is_runtime_auto_user_pending(from: &str) -> bool {
-    from == "opendan:on_switch"
+    from == "opendan:on_behavior_switch"
 }
 
 fn is_history_input_pending(record_id: &str) -> bool {
@@ -5048,6 +5126,64 @@ fn should_replace_pending_event(existing: &PendingInput, incoming: &PendingInput
         return false;
     };
     event_status_rank(incoming_data) >= event_status_rank(existing_data)
+}
+
+fn event_matches_pull_policy(
+    event_id: &str,
+    policy: &PullEventPolicy,
+    subscriptions: &[EventSubscription],
+) -> bool {
+    match policy {
+        PullEventPolicy::None => false,
+        PullEventPolicy::All => true,
+        PullEventPolicy::Filter(name) => {
+            let filter = name
+                .strip_suffix(".*")
+                .or_else(|| name.strip_suffix("/**"))
+                .unwrap_or(name);
+            event_id == filter
+                || event_id.starts_with(&format!("{filter}."))
+                || event_id.starts_with(&format!("{filter}/"))
+                || subscriptions
+                    .iter()
+                    .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(event_id))
+        }
+    }
+}
+
+fn select_pending_for_hook_with_subscriptions(
+    cfg: &HookPointCfg,
+    pending: &[PendingInput],
+    pending_task_index: &std::collections::HashMap<String, PendingTaskCall>,
+    subscriptions: &[EventSubscription],
+) -> Vec<PendingInput> {
+    let mut out = Vec::new();
+    let msg_limit = match cfg.pull_msg {
+        PullMsgPolicy::None => Some(0usize),
+        PullMsgPolicy::One => Some(1usize),
+        PullMsgPolicy::All => None,
+    };
+    let mut msg_count = 0usize;
+    for input in pending {
+        match input {
+            PendingInput::Msg { .. } => {
+                if msg_limit.is_some_and(|limit| msg_count >= limit) {
+                    continue;
+                }
+                msg_count += 1;
+                out.push(input.clone());
+            }
+            PendingInput::Event { event_id, .. } => {
+                if pending_task_index.contains_key(event_id)
+                    || event_matches_pull_policy(event_id, &cfg.pull_event, subscriptions)
+                {
+                    out.push(input.clone());
+                }
+            }
+            PendingInput::Interrupt { .. } => {}
+        }
+    }
+    out
 }
 
 fn event_status_rank(data: &serde_json::Value) -> u8 {

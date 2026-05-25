@@ -20,6 +20,25 @@ fn todo_json(
     })
 }
 
+fn pending_msg(record_id: &str, text: &str) -> PendingInput {
+    PendingInput::Msg {
+        record_id: record_id.to_string(),
+        from: "alice".to_string(),
+        from_did: None,
+        from_name: None,
+        tunnel_did: None,
+        text: text.to_string(),
+        ai_message: AiMessage::text(AiRole::User, text.to_string()),
+    }
+}
+
+fn pending_event(event_id: &str) -> PendingInput {
+    PendingInput::Event {
+        event_id: event_id.to_string(),
+        data: serde_json::json!({"status": "Completed"}),
+    }
+}
+
 #[test]
 fn compose_human_text_skips_empties() {
     let v = vec!["  ".to_string(), "hello".to_string(), "".to_string()];
@@ -354,8 +373,8 @@ fn append_on_switch_message_after_step_history_as_user_tail() {
         Some("Continue TASK_ANCHOR.".to_string())
     );
     assert!(out.state.last_step.is_none());
-    assert!(is_runtime_auto_user_pending("opendan:on_switch"));
-    assert!(!is_history_input_pending("on-switch-s-1-do-0"));
+    assert!(is_runtime_auto_user_pending("opendan:on_behavior_switch"));
+    assert!(!is_history_input_pending("on-behavior-switch-s-1-do-0"));
 }
 
 #[test]
@@ -388,6 +407,52 @@ fn pending_input_dedup_key_distinguishes_variants() {
     assert_eq!(msg.dedup_key(), "msg:abc");
     assert_eq!(event.dedup_key(), "event:abc");
     assert_ne!(msg.dedup_key(), event.dedup_key());
+}
+
+#[test]
+fn driver_pull_selects_only_configured_pending_inputs() {
+    let cfg = HookPointCfg {
+        filter: crate::agent_config::BehaviorFilter::Top,
+        pull_msg: PullMsgPolicy::One,
+        pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+    };
+    let pending = vec![
+        pending_msg("m1", "first"),
+        pending_msg("m2", "second"),
+        pending_event("timer.reminder_check"),
+        pending_event("kvdoc.changed"),
+    ];
+    let selected = select_pending_for_hook_with_subscriptions(
+        &cfg,
+        &pending,
+        &std::collections::HashMap::new(),
+        &[],
+    );
+    let keys = selected.iter().map(PendingInput::dedup_key).collect::<Vec<_>>();
+    assert_eq!(keys, vec!["msg:m1", "event:timer.reminder_check"]);
+}
+
+#[test]
+fn driver_pull_keeps_task_events_internal_even_when_event_pull_is_none() {
+    let cfg = HookPointCfg {
+        filter: crate::agent_config::BehaviorFilter::Top,
+        pull_msg: PullMsgPolicy::None,
+        pull_event: PullEventPolicy::None,
+    };
+    let pending = vec![pending_msg("m1", "ignored"), pending_event("/task_mgr/7")];
+    let mut task_index = std::collections::HashMap::new();
+    task_index.insert(
+        "/task_mgr/7".to_string(),
+        PendingTaskCall {
+            call_id: "call-1".to_string(),
+            tool_name: "exec".to_string(),
+            task_id: 7,
+            event_pattern: "/task_mgr/7".to_string(),
+        },
+    );
+    let selected = select_pending_for_hook_with_subscriptions(&cfg, &pending, &task_index, &[]);
+    let keys = selected.iter().map(PendingInput::dedup_key).collect::<Vec<_>>();
+    assert_eq!(keys, vec!["event:/task_mgr/7"]);
 }
 
 #[test]

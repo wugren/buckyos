@@ -298,7 +298,7 @@ name      = "explorer"
 objective = "explore unknown territory"
 
 # ─── prompt 渲染:当前实现是简单 `{var}` 替换 ───────────────
-# `on_init` / `on_switch` 通过 `llm_context::PromptRenderEngine` 渲染
+# `on_init` / `on_behavior_switch` 通过 `llm_context::PromptRenderEngine` 渲染
 # (upon `{{ var }}` + OpenDAN `__VAR__` / `__ENV__` / `__INCLUDE__`)。完整变量契约见
 # `doc/opendan/Agent Enviroment.md` §15.1。提示词内联在 toml 多行字符串里
 # ——一个 behavior 的提示词是一个整体,不拆文件;长内容需要外置时用
@@ -327,7 +327,7 @@ Use only the tools allowed by this behavior's capabilities.
 # 当 next_behavior 切换到这个 behavior 后,渲染为一条 synthetic User input,
 # 触发切换后的继续运行。当前可用同一套 PromptRenderEngine 变量。
 # 不写 ⇒ 切换后等待下一条真实输入。
-on_switch = """
+on_behavior_switch = """
 Continue in behavior `{{ behavior.name }}`.
 """
 
@@ -420,7 +420,7 @@ v0 **直接沿用现状 `BehaviorCfg.tool_whitelist` / `approval_required` / `to
 | `max_rounds` / `max_consecutive_errors` / `budget` | `[budget]` | — |
 | `switch_mode` | `[session.<class>].switch_mode` | **上提到 session 类** |
 | `model` | `[model]` | — |
-| — | `[prompt].on_switch` | **新增**:切换到该 behavior 后自动注入 synthetic User input,触发继续运行 |
+| — | `[prompt].on_behavior_switch` | **新增**:切换到该 behavior 后自动注入 synthetic User input,触发继续运行 |
 | — | `[prompt].on_input_msg` / `on_input_event` | **新增**:`on_input_event` 当前已作为行为级 fallback 使用;`on_input_msg` 字段已进 schema,但 worker drain 尚未应用 |
 | — | `[on_xxx]` 旁路开关 | **新增**:异常路径从 Rust 默认逻辑里提出来做成可见开关 |
 
@@ -680,6 +680,6 @@ preferred = "claude-haiku-4-5-20251001"
 > **`agent.toml` 承载 Gateway + Session 类骨架(事件类型 → session class 的固定映射,loop / switch /
 > session_id 派生策略全归 session 类);`behaviors/<name>.toml` 单文件承载"已经决定要推理之后,
 > 渲染哪段提示词、能用哪些能力、有没有打开异常旁路"——prompt 模板字段内联在 toml 里
-> (`on_init` / `on_switch` 当前生效,`on_input_event` 作为事件 fallback 生效,`on_input_msg` 尚未接入 worker drain)
+> (`on_init` / `on_behavior_switch` 当前生效,`on_input_event` 作为事件 fallback 生效,`on_input_msg` 尚未接入 worker drain)
 > + `[capabilities]` + `[on_xxx]` 开关。v0 整份配置不带表达式,
 > LLM 不选择 switch_mode,复杂状态机走 Workflow LLMContext DSL,不在本 schema 上叠加。**

@@ -187,7 +187,7 @@ assistant: current behavior hot step intent
 user:      current behavior hot step action results
 assistant: current behavior hot step intent
 user:      current behavior hot step action results
-optional user: real user/event input with background environment, or on_switch rendered UserMessage
+optional user: real user/event input with background environment, or on_behavior_switch rendered UserMessage
 ```
 
 `step_history` 是一条 user message,承载已经不该占 hot tail 的历史语义。它可以同时包含:
@@ -214,7 +214,7 @@ Created T01.
 <</step_history>>
 ````
 
-`on_switch` 模板渲染出的内容是一条 synthetic UserMessage,它不属于 `step_history`。正确顺序是先渲染已经发生的 `step_history`,再追加 `on_switch` 渲染出的 UserMessage:
+`on_behavior_switch` 模板渲染出的内容是一条 synthetic UserMessage,它不属于 `step_history`。正确顺序是先渲染已经发生的 `step_history`,再追加 `on_behavior_switch` 渲染出的 UserMessage:
 
 ```text
 user:
@@ -223,10 +223,10 @@ user:
 <</step_history>>
 
 user:
-UserMessage rendered from on_switch
+UserMessage rendered from on_behavior_switch
 ```
 
-核心语义是:沉淀的 StepRecord 历史比 on_switch 触发出的 UserMessage 更早发生。
+核心语义是:沉淀的 StepRecord 历史比 on_behavior_switch 触发出的 UserMessage 更早发生。
 
 完整 step 仍然渲染为严格相邻的 hot pair:
 
@@ -253,16 +253,16 @@ compression_level
 
 随后推理产生新的 `assistant Step 0 Intent`;系统执行 Step 0 actions 后得到 `user Step 0 Action Results`;Step 0 成为当前 behavior 的 hot tail。再往后,它会逐渐进入当前 behavior 的 StepRecord history;如果发生 Behavior 切换,它会以 `step_record` 或 summary 的形式被继承,而不是继续作为新 Behavior 的完整 assistant/user hot round。
 
-## 七、`on_switch`、fork join 和真实用户输入的区别
+## 七、`on_behavior_switch`、fork join 和真实用户输入的区别
 
-`on_switch` 是 behavior 配置里的 runtime 模板,不是用户真实发来的消息。当前实现按来源区分输入:
+`on_behavior_switch` 是 behavior 配置里的 runtime 模板,不是用户真实发来的消息。当前实现按来源区分输入:
 
 - 真实用户/peer message:作为本轮 user turn 进入 request tail,可附带 background environment。
 - 业务 event:格式化为 user-visible wakeup,驱动本轮推理。
-- `on_switch`:渲染为 synthetic UserMessage,排在 `step_history` 后面。
+- `on_behavior_switch`:渲染为 synthetic UserMessage,排在 `step_history` 后面。
 - fork child `END`:恢复 parent snapshot 后,把 child report / join marker 渲染为 `HistoryInputRecord`,进入 parent 的 `step_history`。
 
-这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;`on_switch` 是 Runtime 在 behavior 边界生成的新 UserMessage,也应该在沉淀历史之后出现;fork join 是 Runtime 对已完成子过程的解释,仍归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
+这样做的原因是:真实用户输入会改变对话事实,应该作为本轮 tail;`on_behavior_switch` 是 Runtime 在 behavior 边界生成的新 UserMessage,也应该在沉淀历史之后出现;fork join 是 Runtime 对已完成子过程的解释,仍归入 StepRecord history,和触发它的 StepRecord 保持同一条时间线。
 
 ## 八、状态机和输入构造的精确定义
 
@@ -278,7 +278,7 @@ Behavior Loop 的 Runtime 状态不是 provider message list 本身。message li
 | `steps` | 已沉淀的 StepRecord 流 | `step_history` 或 compact/summary |
 | `last_step` | 当前 behavior 的 hot step,也就是最近一次 LLM intent 及其 action results | assistant/user hot pair |
 | `history_inputs` | Runtime 解释过的外部状态变更,如 fork join handoff | `step_history` 内的 `history_input` |
-| `pending_inputs` | 尚未喂给本轮推理的输入队列,来源可能是用户、event、on_switch、process-end marker | 本轮 tail 或 history input |
+| `pending_inputs` | 尚未喂给本轮推理的输入队列,来源可能是用户、event、on_behavior_switch、process-end marker | 本轮 tail 或 history input |
 | `process_stack` | fork / independent 模式下的调用栈 | 不直接渲染,影响 snapshot 恢复 |
 
 `step_index` 是整个 behavior-loop state stream 的单调序号,不是每个 round 或每个 behavior 从 0 重开。`fork` child 可以继承 parent 的 `next_step_index`,所以日志里新 round 的第一条新 step 不要求从 0 开始。
@@ -306,7 +306,7 @@ user:
   <</last_step_action_results>>
 ```
 
-这个空 block 表示"step 3 的 actions 已经观察完毕,结果为空",不是用户输入,也不是 fork/on_switch 的载体。真实用户补充不应该塞进这个 block。
+这个空 block 表示"step 3 的 actions 已经观察完毕,结果为空",不是用户输入,也不是 fork/on_behavior_switch 的载体。真实用户补充不应该塞进这个 block。
 
 ### 8.3 输入来源分类
 
@@ -316,7 +316,7 @@ user:
 | --- | --- | --- | --- |
 | `runtime_step_result` | action 执行结果 | 上一个 Step 的 observation | `last_step_action_results` |
 | `runtime_history_input` | fork child END、process-end marker | 已完成 runtime 状态变更 | `step_history` 内 |
-| `runtime_auto_user` | `on_switch` / `on_init` 模板输出 | Runtime 生成的继续执行指令 | 本轮 tail |
+| `runtime_auto_user` | `on_behavior_switch` / `on_init` 模板输出 | Runtime 生成的继续执行指令 | 本轮 tail |
 | `external_user` | 用户消息、forwarded usermsg | 新事实 / 新约束 / 人类补充 | 本轮 tail,或嵌入 runtime tail 的补充小节 |
 | `external_event` | kevent / msg event | 外部事件唤醒 | 本轮 tail |
 
@@ -387,7 +387,7 @@ optional user:
 - 跨 behavior 的旧 step 仍作为 assistant/user hot pair 出现在新 behavior 里。
 - fork child 的完整 step stream 被合并回 parent hot tail。
 - 用户补充被放到空的 `last_step_action_results` block 里。
-- `on_switch` 之前出现裸的用户补充,导致模型先读到一个无结构事实,再读到真正的 continue anchor。
+- `on_behavior_switch` 之前出现裸的用户补充,导致模型先读到一个无结构事实,再读到真正的 continue anchor。
 
 ## 九、三种切换模式的典型 message list
 
@@ -412,7 +412,7 @@ user:
   <</step_history>>
 
 user:
-  UserMessage rendered from do_todo.on_switch
+  UserMessage rendered from do_todo.on_behavior_switch
 
 assistant:
   <observation>T01 is the current child task.</observation>
@@ -488,7 +488,7 @@ user:
   <</step_history>>
 
 user:
-  UserMessage rendered from do.on_switch
+  UserMessage rendered from do.on_behavior_switch
 
 assistant:
   <observation>I have the inherited plan records.</observation>
@@ -537,7 +537,7 @@ user:
   <</last_step_action_results>>
 ```
 
-这里不会出现 `main` 的 `<step_record>`、`main` 的 hot pair 或 `main.on_switch` 生成的消息。`main` 只是被保存到自己的 snapshot;`monitor` 从自己的 snapshot 继续。`monitor` 输出 `<next_behavior>END</next_behavior>` 后,Runtime 再恢复 `main` process;如果 process stack 已空,session 才真正结束。
+这里不会出现 `main` 的 `<step_record>`、`main` 的 hot pair 或 `main.on_behavior_switch` 生成的消息。`main` 只是被保存到自己的 snapshot;`monitor` 从自己的 snapshot 继续。`monitor` 输出 `<next_behavior>END</next_behavior>` 后,Runtime 再恢复 `main` process;如果 process stack 已空,session 才真正结束。
 
 
 ## 收束

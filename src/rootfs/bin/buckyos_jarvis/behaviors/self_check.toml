@@ -40,7 +40,7 @@ Background event snapshots, if any, are read-only context:
 <</RESULT_PROTOCOL>>
 """
 
-on_switch = """
+on_behavior_switch = """
 Continue the timer check from the driver event batch:
 {% for event in input.timer_events %}
 - event {{ event.event_id }}{% if event.data.target_id %} target_id={{ event.data.target_id }}{% endif %}{% if event.data.reason %} reason={{ event.data.reason }}{% endif %}

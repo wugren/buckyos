@@ -29,8 +29,6 @@ Session driver hook
 | `on_behavior_step_ob` | Behavior Loop step 观察阶段 | 在 step 边界观察追加输入或事件 |
 | `on_wakeup` | idle / waiting 状态下被 pending input 唤醒 | UI / Work session 被输入唤醒后的下一轮驱动 |
 
-`on_wakeup` 是目标命名；当前 Rust enum / `agent.toml` 仍使用旧名 `on_wait`。实现迁移前，配置文件里仍要写 `[session.<class>.driver.on_wait]`。
-
 背景环境块也分两层配置：
 
 | 配置点 | 含义 |
@@ -78,8 +76,6 @@ Session title: {{ session.title }}
 数组 / object 不能直接当字符串输出。`{{ input.events }}`、`{{ input.bg_events }}`、`{{ current_context.step_history }}` 这类写法会在 upon 格式化阶段失败；模板应访问标量字段、循环展开，或使用后续提供的 `*_json` 辅助字段。
 
 ## 3. 变量参考
-
-本节描述 Behavior 模板应该使用的目标契约。当前实现中仍有若干兼容旧名，见 §9。
 
 ### 3.1 `session`
 
@@ -315,7 +311,7 @@ on_behavior_step_ob = """
 | `$default_last_step_action_results_text` | string | 当前 last step action results 的默认纯文本渲染，可直接放进 prompt |
 | `$default_last_step_action_results_content` | array / object | 当前 last step action results 的结构化内容，不能直接用 `{{ }}` 格式化输出 |
 
-当前实现里 text 对应 `step_result.default_user_message`。目标契约中，Behavior 模板需要自然语言 observation 时统一使用 `default_last_step_action_results_text`；只有需要按类型处理 action result 时才读取结构化 `default_last_step_action_results_content`。
+Behavior 模板需要自然语言 observation 时统一使用 `default_last_step_action_results_text`；只有需要按类型处理 action result 时才读取结构化 `default_last_step_action_results_content`。
 
 ### 3.6 `runtime`
 
@@ -326,9 +322,9 @@ on_behavior_step_ob = """
 | `$runtime.recent_activity` | `{{ runtime.recent_activity }}` | string | `OneLineStatusSink` 当前值 |
 | `$runtime.has_activity` | `{{ runtime.has_activity }}` | bool | recent activity 是否非空 |
 
-## 4. `on_switch` 变量
+## 4. `on_behavior_switch` 变量
 
-`on_switch` 除了通用变量，还会注入切换来源信息：
+`on_behavior_switch` 除了通用变量，还会注入切换来源信息：
 
 | 占位 | 类型 | 含义 |
 | --- | --- | --- |
@@ -341,7 +337,7 @@ Fork / independent child 返回父 context 时，`switch.from_context.last_repor
 
 ## 5. 关键事件变量
 
-事件统一进入 `input.events`。为了让常见事件更容易写模板，计划提供下列派生变量；没有匹配事件时均为空数组。
+事件统一进入 `input.events`。为了让常见事件更容易写模板，下列派生变量按事件类型分桶；没有匹配事件时均为空数组。
 
 | 变量 | 类型 | 来源 event |
 | --- | --- | --- |
@@ -410,57 +406,9 @@ Behavior 模板应使用 `__INCLUDE__` 引入文件内容，不再依赖 `role_m
 
 `__INCLUDE__` 解析为绝对路径，且必须在某个 `include_root` 之下，否则会留下失败标记，不会读取任意路径。
 
-## 8. 当前实现差异
-
-本节记录从当前实现迁到目标契约时需要处理的差异。
-
-| 目标契约 | 当前实现 | 处理计划 |
-| --- | --- | --- |
-| `input.msgs` | 未暴露；`pull_msg` 只影响 `agent_global_state.driver.pulled_msg_count` | 增加 `MsgRef` 并暴露 `$input.msgs` |
-| `input.events` | 当前为 `llm_context.events` / `events` | 迁到 `input.events`，保留旧 alias 一段时间 |
-| `input.bg_events` | 当前为 `llm_context.bg_events` / `bg_events` | 迁到 `input.bg_events`，保留旧 alias 一段时间 |
-| `current_context.last_step` | 当前为 `llm_context.last_step` / `last_step` | 迁到 `current_context.last_step`，保留 `$last_step` alias |
-| `current_context.step_history` | 当前为 `llm_context.behavior_history` / `behavior_history` | 重命名并整理为稳定 `StepRecord` |
-| `current_context.last_report` | 当前未进 prompt env | 从 snapshot state 暴露 |
-| `switch.from_context` | 当前只暴露 `from_context.report` | 扩展为完整 `LLMContext` 摘要 |
-| `on_wakeup` hook name | 当前实现和配置仍叫 `on_wait` | schema 迁移到 `on_wakeup`，保留 `on_wait` 作为 deprecated alias |
-| `default_last_step_action_results_text` | 已在 `on_behavior_step_ob` extras 暴露，来源为 `step_result.default_user_message` | 作为内置模板的推荐直接输出入口 |
-| `default_last_step_action_results_content` | 已在 `on_behavior_step_ob` extras 暴露，值为结构化 `step.action_results` | 只用于循环 / 索引读取；直接输出改用 `default_last_step_action_results_text` |
-| `agent_global_state` | 当前暴露在 `llm_context.agent_global_state` | 不作为 Behavior 模板公共变量继续推广 |
-| `role_md` / `self_md` extras | 当前 `on_init` 仍支持 | 模板改用 `__INCLUDE(/role.md)__` / `__INCLUDE(/self.md)__` |
-
-## 9. 历史扁平命名
-
-早期设计稿出现过下面这些 `$xxx` 扁平命名。新模板应使用 namespace + 点路径。
-
-| 历史命名 | 现行 / 目标映射 |
-| --- | --- |
-| `$session_title` | `$session.title` |
-| `$current_behavior` | `$session.current_behavior` / `$current_context.behavior_name` |
-| `$step_index` / `$step_num` / `$step_limit` | 未实现；规划属于 `$current_context.*` 或 step budget 字段 |
-| `$last_step` | 已实现兼容 alias；目标为 `$current_context.last_step` |
-| `$last_steps.$num` | 未实现；目标为 `$current_context.step_history` |
-| `$new_msg` / `$new_msg.$n` | 目标为 `$input.msgs` |
-| `$owner` / `$owner.did` / `$owner.show_name` | 未实现；后续如需要放入 `$owner.*` |
-| `$session_list` / `$session_list.$n` | 不在 prompt env 计划内，worksession 工具自己拼装 |
-| `$workspace_list` / `$workspace_list.$n` | 不在 prompt env 计划内，worksession 工具自己拼装 |
-| `$workspace_todolist` 及变体 | 不在当前 prompt env 计划内 |
-| `$workspace/<rel_path>` | 不再支持；使用 `__INCLUDE(<absolute_path>)__` |
-| `$params` | 不进 loader，由 behavior cfg 直接覆盖 |
-| `$llm_result` / `$trace` | 不计划暴露为 prompt 变量 |
-
-## 10. 测试入口
+## 8. 测试入口
 
 - 单元测试在 [`prompt_env::tests`](../../src/frame/opendan/src/prompt_env.rs) 模块。
-- 变量契约主测试是 `prompt_env::tests::contract_renders_main_variables_and_control_flow`。本文任意新增、删除、重命名或改变语义的 prompt env 变量，必须同步更新这个测试；新增常用模板写法（尤其是 `if` / `for` / 数组索引 / 旧 alias 兼容）也必须在该测试或同级契约测试中覆盖。
+- 变量契约主测试是 `prompt_env::tests::contract_renders_main_variables_and_control_flow`。本文任意新增、删除、重命名或改变语义的 prompt env 变量，必须同步更新这个测试；新增常用模板写法（尤其是 `if` / `for` / 数组索引）也必须在该测试或同级契约测试中覆盖。
 - `cargo test -p opendan --lib prompt_env::` 可单独跑。
 - 完整 opendan 单元测试：`cargo test -p opendan --lib`。
-
-## 11. 后续阶段
-
-1. 实现 `input.msgs` / `input.events` / `input.bg_events` 与旧 alias 兼容。
-2. 实现 `current_context.last_report` / `current_context.step_history`，并整理稳定 `StepRecord` schema。
-3. 扩展 `switch.from_context` / `switch.to_context`。
-4. 增加关键事件派生变量，优先覆盖 timer 与 worksession report。
-5. 更新 Jarvis 默认 behavior 模板，去掉直接输出 array / object 的写法。
-6. 移除 `role_md` / `self_md` extras 依赖，统一使用 `__INCLUDE__`。

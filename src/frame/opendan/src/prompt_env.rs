@@ -970,7 +970,7 @@ clock: unix_ms=123";
     }
 
     #[tokio::test]
-    async fn extra_vars_support_on_switch_from_context_report() {
+    async fn extra_vars_support_on_behavior_switch_from_context_report() {
         let env = sample_env();
         let extras = vec![(
             "from_context",

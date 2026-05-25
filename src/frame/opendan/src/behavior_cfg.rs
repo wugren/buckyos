@@ -8,8 +8,8 @@
 //! New schema groups fields into:
 //!   * `[meta]` — name / objective
 //!   * `[prompt]` — parser choice + per-event prompt templates
-//!     (`on_init` / `on_switch` / `on_step_result` / `on_input_msg` /
-//!     `on_input_event`) + output spec
+//!     (`on_init` / `on_behavior_switch` / `on_behavior_step_ob` /
+//!     `on_input_msg` / `on_input_event`) + output spec
 //!   * `[capabilities]` — tool_whitelist / approval_required / tool_plan
 //!     (v0 placeholder; §5.3 — will be redone in beta2.3 alongside skill
 //!     bundle / function-call tool unification)
@@ -81,7 +81,7 @@ impl BehaviorOutput {
 
 /// Prompt templates per "renders the prompt" event.
 ///
-/// `on_init` / `on_switch` / `on_step_result` are rendered through
+/// `on_init` / `on_behavior_switch` / `on_behavior_step_ob` are rendered through
 /// `llm_context::PromptRenderEngine` (upon
 /// `{{ var }}` placeholders, `__VAR__` / `__ENV__` / `__INCLUDE__`
 /// directives) with the Phase-1 variable contract from
@@ -95,9 +95,9 @@ impl BehaviorOutput {
 ///
 /// | template          | callsite                              | empty ⇒              |
 /// |-------------------|---------------------------------------|---------------------|
-/// | `on_init`         | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
-/// | `on_switch`       | after `next_behavior` switch          | no synthetic input |
-/// | `on_step_result`  | after behavior-loop action results    | default `<<last_step_action_results>>` user message |
+/// | `on_init`              | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
+/// | `on_behavior_switch`   | after `next_behavior` switch          | no synthetic input |
+/// | `on_behavior_step_ob`  | after behavior-loop action results    | default `<<last_step_action_results>>` user message |
 /// | `on_input_msg`    | wraps each `PendingInput::Msg` text   | raw `AiMessage` is passed through (today's default) |
 /// | `on_input_event`  | behavior-wide event-format fallback   | falls through to subscription template, then to `format_event_for_turn_with_subscriptions` default |
 ///
@@ -113,7 +113,7 @@ impl BehaviorOutput {
 ///   * `on_input_msg`: `{msg_text}`, `{msg_from_did}`, `{msg_from_name}`
 ///   * `on_input_event`: `{event_id}`, `{event_data}` plus any top-level
 ///     scalar field of the JSON payload as `{<key>}`
-///   * `on_step_result` (upon syntax): full Phase-1 contract plus render-time
+///   * `on_behavior_step_ob` (upon syntax): full Phase-1 contract plus render-time
 ///     extras `{{ step }}`, `{{ step_result.default_user_message }}`,
 ///     `{{ pending_inputs }}`, and `{{ pending_input_text }}`.
 ///
@@ -132,9 +132,9 @@ pub struct PromptCfg {
     pub parser_strict: bool,
     pub on_init: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_switch: Option<String>,
+    pub on_behavior_switch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_step_result: Option<String>,
+    pub on_behavior_step_ob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_input_msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,8 +148,8 @@ impl Default for PromptCfg {
             parser: "xml".to_string(),
             parser_strict: false,
             on_init: String::new(),
-            on_switch: None,
-            on_step_result: None,
+            on_behavior_switch: None,
+            on_behavior_step_ob: None,
             on_input_msg: None,
             on_input_event: None,
             output: BehaviorOutput::Text,
@@ -592,23 +592,49 @@ mod tests {
             [prompt]
             parser = "xml"
             on_init = "Hello {agent_name}, you are {behavior_name}."
-            on_switch = "Continue as {{ behavior.name }}."
-            on_step_result = "Observe {{ step_result.default_user_message }}."
+            on_behavior_switch = "Continue as {{ behavior.name }}."
+            on_behavior_step_ob = "Observe {{ step_result.default_user_message }}."
             on_input_msg = "[from {msg_from_did}] {msg_text}"
         "#;
         let cfg = BehaviorCfg::from_toml_str(toml_src).unwrap();
         assert!(cfg.prompt.on_init.contains("{agent_name}"));
         assert_eq!(
-            cfg.prompt.on_switch.as_deref(),
+            cfg.prompt.on_behavior_switch.as_deref(),
             Some("Continue as {{ behavior.name }}.")
         );
         assert_eq!(
-            cfg.prompt.on_step_result.as_deref(),
+            cfg.prompt.on_behavior_step_ob.as_deref(),
             Some("Observe {{ step_result.default_user_message }}.")
         );
         assert_eq!(
             cfg.prompt.on_input_msg.as_deref(),
             Some("[from {msg_from_did}] {msg_text}")
         );
+    }
+
+    #[test]
+    fn jarvis_work_behaviors_define_runtime_prompt_hooks() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../rootfs/bin/buckyos_jarvis/behaviors");
+        for name in ["plan", "do"] {
+            let path = root.join(format!("{name}.toml"));
+            let cfg = BehaviorCfg::load_from_file(&path).unwrap();
+            assert!(
+                cfg.prompt
+                    .on_behavior_switch
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} must define [prompt].on_behavior_switch",
+                path.display()
+            );
+            assert!(
+                cfg.prompt
+                    .on_behavior_step_ob
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} must define [prompt].on_behavior_step_ob",
+                path.display()
+            );
+        }
     }
 }

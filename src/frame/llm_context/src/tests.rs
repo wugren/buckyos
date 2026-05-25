@@ -96,7 +96,7 @@ struct CustomStepResultHook;
 
 #[async_trait]
 impl StepResultHook for CustomStepResultHook {
-    async fn on_step_result(
+    async fn on_behavior_step_ob(
         &self,
         _snapshot: &LLMContextSnapshot,
         step: &crate::behavior_loop::StepRecord,
@@ -632,7 +632,7 @@ async fn behavior_loop_ignores_next_behavior_when_actions_exist() {
 }
 
 #[tokio::test]
-async fn behavior_loop_on_step_result_overrides_next_user_message() {
+async fn behavior_loop_on_behavior_step_ob_overrides_next_user_message() {
     let llm = Arc::new(RecordingLlm::new(text_response(
         r#"<response>
 <observation>custom observed</observation>
@@ -684,7 +684,7 @@ async fn behavior_loop_on_step_result_overrides_next_user_message() {
         seen[0]
             .iter()
             .any(|m| m.role == AiRole::User && m.text_content() == "custom step result 0"),
-        "custom on_step_result user message should be rendered into the next inference"
+        "custom on_behavior_step_ob user message should be rendered into the next inference"
     );
 }
 

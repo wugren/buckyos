@@ -326,7 +326,7 @@ pub struct StepResultHookOutput {
 
 #[async_trait]
 pub trait StepResultHook: Send + Sync {
-    async fn on_step_result(
+    async fn on_behavior_step_ob(
         &self,
         snapshot: &LLMContextSnapshot,
         step: &StepRecord,

@@ -1137,7 +1137,7 @@ impl LLMContext {
             return;
         };
         let snapshot = self.snapshot();
-        match hook.on_step_result(&snapshot, step).await {
+        match hook.on_behavior_step_ob(&snapshot, step).await {
             Ok(output) => {
                 if let Some(message) = output.user_message {
                     step.next_user_message = Some(normalize_user_message(message));
@@ -1146,7 +1146,7 @@ impl LLMContext {
             }
             Err(err) => {
                 log::warn!(
-                    "behavior_loop: on_step_result hook failed for behavior `{}` step {}: {}",
+                    "behavior_loop: on_behavior_step_ob hook failed for behavior `{}` step {}: {}",
                     step.meta.behavior_name,
                     step.meta.step_index,
                     err
