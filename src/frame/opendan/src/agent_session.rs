@@ -2371,6 +2371,77 @@ impl AgentSession {
             .unwrap_or(SwitchMode::Normal)
     }
 
+    /// Configured `process_stack_limit` for this session class. `0` ⇒
+    /// unbounded (the documented default in `SessionClassCfg`).
+    fn session_class_process_stack_limit(&self) -> u32 {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.process_stack_limit)
+            .unwrap_or(0)
+    }
+
+    /// Side-channel for the §10 #3 "refused fork/independent switch" path.
+    /// Writes both a `warn!` line (engineering visibility) and a worklog
+    /// record (operator-visible audit trail). Best-effort: any worklog
+    /// failure is logged but never propagates — refusing the switch is
+    /// already the right user-visible outcome.
+    async fn refuse_switch_for_stack_limit(
+        &self,
+        prev: &BehaviorCfg,
+        next_cfg: &BehaviorCfg,
+        switch_mode: SwitchMode,
+        current_depth: u32,
+        limit: u32,
+        final_snapshot: &LLMContextSnapshot,
+    ) {
+        let last_report = final_snapshot
+            .state
+            .last_report
+            .clone()
+            .unwrap_or_default();
+        warn!(
+            "opendan.session[{}]: refusing {:?} switch `{}` -> `{}`: process_stack depth={} >= limit={} (config: session_class.process_stack_limit)",
+            self.session_id,
+            switch_mode,
+            prev.meta.name,
+            next_cfg.meta.name,
+            current_depth,
+            limit
+        );
+        let record = serde_json::json!({
+            "type": "agent.session.behavior_switch_refused",
+            "owner_session_id": self.session_id,
+            "status": "Refused",
+            "payload": {
+                "reason": "process_stack_limit_exceeded",
+                "from_behavior": prev.meta.name,
+                "to_behavior": next_cfg.meta.name,
+                "switch_mode": format!("{:?}", switch_mode),
+                "process_stack_depth": current_depth,
+                "process_stack_limit": limit,
+                "last_report": last_report,
+            }
+        });
+        if let Err(err) = self
+            .runtime
+            .worklog
+            .append_record_for_session(
+                &self.session_id,
+                &self.agent_name,
+                &prev.meta.name,
+                0,
+                record,
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: append behavior_switch_refused worklog failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
     fn session_class_report_delivery(&self) -> ReportDeliveryMode {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
@@ -4282,9 +4353,39 @@ impl AgentSession {
         // §4.2 of the config-rewrite doc: switch_mode is a session-class
         // property — the LLM picks `<next_behavior>`, the runtime decides
         // whether to go Normal / Fork / Independent.
+        let switch_mode = self.session_class_switch_mode();
+        // §10 #3: enforce `process_stack_limit`. Normal switches don't grow
+        // the stack, so they're exempt. Fork / Independent would push a
+        // ProcessFrame — refuse if it would exceed the configured ceiling.
+        // Policy (per spec §10 #3 — "refuse fork + warn to worklog,
+        // escape valve for ops"): drop the switch, persist the post-run
+        // snapshot, and end the current process gracefully so the
+        // session lifecycle stays observable.
+        if matches!(switch_mode, SwitchMode::Fork | SwitchMode::Independent) {
+            let limit = self.session_class_process_stack_limit();
+            if limit > 0 {
+                let current_depth = self.meta.lock().await.process_stack.len() as u32;
+                if current_depth >= limit {
+                    self.refuse_switch_for_stack_limit(
+                        prev,
+                        &new_cfg,
+                        switch_mode,
+                        current_depth,
+                        limit,
+                        &final_snapshot,
+                    )
+                    .await;
+                    self.persist_snapshot(&final_snapshot).await;
+                    return Ok(match self.kind {
+                        SessionKind::Ui => NextAction::WaitForMsg,
+                        _ => NextAction::End,
+                    });
+                }
+            }
+        }
         let from_context = prompt_env::context_snapshot_prompt_value(&final_snapshot);
         let from_context_report = final_snapshot.state.last_report.clone().unwrap_or_default();
-        match self.session_class_switch_mode() {
+        match switch_mode {
             SwitchMode::Normal => {
                 self.apply_switch_normal(&new_cfg, final_snapshot).await?;
                 self.meta.lock().await.current_behavior = new_cfg.meta.name.clone();

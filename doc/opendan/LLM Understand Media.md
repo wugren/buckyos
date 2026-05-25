@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v0.2（对齐 buckyos beta2.2 实际基础设施） |
+| 文档版本 | v0.3（引入本地轻量媒体理解管线，复用 workflow DSL） |
 | 所属系统 | OpenDAN / BuckyOS — `agent_tool` 受控 `llm_*` 工具族 |
 | 组件类别 | `llm_*` 受控旁路工具（封装层提供，非开放 fork 原语） |
 | 实现位置 | [src/frame/agent_tool/src/llm_understand_media.rs](src/frame/agent_tool/src/llm_understand_media.rs)（占位文件） |
@@ -30,6 +30,8 @@
 | Pending 状态 | `AgentToolStatus::Pending` + `AgentToolPendingReason` | [lib.rs:336](src/frame/agent_tool/src/lib.rs:336) |
 | 视觉能力标识 | `features::VISION = "vision"`（AICC 能力标识；当前 LLMContext 桥接层尚未提供 vision requirement 透传） | [aicc_client.rs:100](src/kernel/buckyos-api/src/aicc_client.rs:100)、[ai_runtime.rs](src/frame/opendan/src/ai_runtime.rs) |
 | 模型策略 | `ModelPolicy` 当前只承载 preferred / fallbacks / temperature / max_completion_tokens / provider_options；`Requirements.must_features` 由 AICC adapter 根据 tool/json 输出等能力生成 | [llm_context/src/request.rs](src/frame/llm_context/src/request.rs)、[ai_runtime.rs](src/frame/opendan/src/ai_runtime.rs) |
+| Workflow DSL | `buckyos_api::workflow_dsl::WorkflowDefinition` / `StepDefinition` / `ControlNodeDefinition` | [workflow_dsl.rs](src/kernel/buckyos-api/src/workflow_dsl.rs)、[src/kernel/workflow/src/dsl.rs](src/kernel/workflow/src/dsl.rs) |
+| Workflow executor 表达 | `ExecutorRef` 支持 `service::` / `http::` / `appservice::` / `operator::` / `func::` 与 `/agent/` / `/skill/` / `/tool/` 语义路径 | [workflow_types.rs](src/kernel/buckyos-api/src/workflow_types.rs)、[doc/workflow/executor list.md](doc/workflow/executor%20list.md) |
 
 > beta2.2 是 breaking-change 版本：`AgentToolResult` / 各 `AiContent` 变体允许直接扩展，不必为旧调用方留兼容层。
 
@@ -52,6 +54,7 @@
 
 - 是一个**嵌套的 LLMContext**——内部以 `OneShotRequest` 形式发起，`goal` 是它的 user message；
 - 启动时继承父 history 的"提纯快照"（见 §4.2）；
+- 在进入模型分析前，先执行一条**本地轻量媒体理解管线**：机械识别 → 机械预处理 → 传统分析 → 模型分析；管线结构复用 `src/kernel/workflow` 的 DSL，但不复用分布式 Workflow Service 的调度语义（见 §4.5）；
 - 采用 **fork-and-discard** 语义：旁路在返回瞬间整体蒸发，主干只看到一对 `AiContent::ToolUse` / `AiContent::ToolResult`；
 - 不向 agent 暴露底层 fork 机制，agent 只表达"理解某个媒体"这一意图（intent over function call）。
 
@@ -94,7 +97,7 @@
 - **禁止作为长期 history 引用**：`Base64 { mime, data_base64 }`——一旦写回主干 `tool_result`，base64 永久驻留 history，违背本设计的核心收益。`llm_understand_media` 在写回时**必须**剔除 inline base64。详见 §6.1。
 - **MIME 来源**：模型路由必须基于媒体 MIME / media kind，而不是仅基于 `obj_id`。`Url` 可使用 `mime_hint` 或 HTTP `Content-Type`，`Base64` 自带 `mime`；`NamedObject` 当前不在 `ResourceRef` 内携带 MIME，工具应在 materialize / open chunk reader 时从 FileObject meta 获取 MIME，缺失时读取开头字节做 magic sniff。调用方传入的 `mime_hint` 只作为 override / fallback，不是常规必填参数。
 
-> 本文档 v0.2 实现范围仅覆盖图片：工具需把 target media 解析为 `image/*` 后才构造 `AiContent::Image`；`AiContent::Document` / 视频 / 音频 接口预留，不在本期实现。
+> 本文档 v0.3 的基础实现范围仍先覆盖图片：工具需把 target media 解析为 `image/*` 后才构造 `AiContent::Image`；`AiContent::Document` / 视频 / 音频 接口预留，不在本期实现。
 
 ### 2.3 `ToolResult`（写回主干的内容）
 
@@ -207,7 +210,9 @@ struct ObservationItem {
 │        // 当前不能在此直接声明 features::VISION requirement │
 │    }                                                         │
 │    tool_policy = ToolPolicy { allow_tools: false, .. }       │
-│  → LocalLLMContext::drive_to_terminal                        │
+│  → LocalMediaPipelineRunner                                  │
+│      probe -> preprocess -> traditional analysis -> model     │
+│      model stage uses LocalLLMContext::drive_to_terminal      │
 │  → 产出 UnderstandingReport                                   │
 └──────────────────────────────────────────────────────────────┘
    │
@@ -218,9 +223,9 @@ struct ObservationItem {
    仅新增: AiContent::ToolUse + AiContent::ToolResult { content: [Text { output }] }
 ```
 
-- 旁路里那次完整推理（含媒体像素）在返回瞬间随 OneShot 工作目录蒸发。主干 history 永远只留一对 `ToolUse` / `ToolResult`。
+- 旁路里那次完整管线执行（含媒体像素、派生 artifact、传统分析中间结果和模型推理）在返回瞬间随 OneShot 工作目录蒸发。主干 history 永远只留一对 `ToolUse` / `ToolResult`。
 - 旁路对主干**无副作用**——除了最终写回的 `tool_result`。
-- 旁路内部本身受 `LocalLLMContext` 的 per-turn 持久化保护（崩溃半成品可丢弃，见 §5）。
+- 旁路中的模型分析 stage 受 `LocalLLMContext` 的 per-turn 持久化保护；其前面的确定性本地 stage 可在恢复时按 pipeline hash 重算（见 §5）。
 
 ### 4.2 父 history 继承策略（提纯投影，非全量拷贝）
 
@@ -285,31 +290,291 @@ model = "llm.video"
 - `default_model` 仅在 MIME 已识别但没有更具体 route 时使用；MIME 无法识别时不盲目 fallback。
 - 对 `NamedObject`，MIME 探测发生在打开 chunk reader / materialize 阶段：优先 FileObject meta，其次首块 magic sniff，最后才使用调用方 `mime_hint`。
 
+### 4.5 本地轻量媒体理解管线
+
+`llm_understand_media` 的长期定位不是“图片转文字”的单点工具，而是 OpenDAN / BuckyOS 理解非结构化数据的本地旁路。通用执行顺序为：
+
+```text
+机械识别(probe) -> 机械预处理(preprocess) -> 传统分析(traditional analysis) -> 模型分析(model analysis)
+```
+
+这条管线应复用 `src/kernel/workflow` 已有 DSL 来表达 stage、输入输出 schema、依赖关系和可扩展 executor，但执行时不进入分布式 Workflow Service / Thunk Dispatcher。原因是本工具的执行范围是一次 `llm_*` 旁路调用，生命周期短、工作目录临时、输出只写回 `AgentToolResult`；引入分布式调度会把一次媒体理解扩展成长期任务，破坏 fork-and-discard 的成本边界。
+
+设计原则是：**执行纯本地，结果全局可复用**。`llm_understand_media` 不把本次 stage 投递到远端节点执行，也不等待分布式调度完成；但所有确定性 stage 都通过 NDN / named_store 读取和写入内容寻址结果。因此如果别的节点、别的 workflow、或另一次本地调用已经用相同参数算出某个派生产物，本地 runner 可以直接命中 NDN cache 并复用结果。这让工具保持旁路调用的低复杂度，同时享受系统级分布式计算已经产生的结果。
+
+#### 4.5.1 与 Workflow Service 的边界
+
+| 维度 | 分布式 Workflow Service | `llm_understand_media` 本地管线 |
+|---|---|---|
+| DSL | 复用 `WorkflowDefinition` / `StepDefinition` / `edges` / `defs` | 同左 |
+| 编译 | 可复用 `compile_workflow` 的静态分析与 Expr Tree 语义 | 可复用；也可先实现 profile 校验后逐步接入 compiler |
+| 执行器 | Workflow Orchestrator + ExecutorRegistry + Thunk Dispatcher | `agent_tool` 进程内 LocalMediaPipelineRunner |
+| 调度 | 支持长期 run、分布式节点、human wait、map/parallel | v0 只支持短生命周期 DAG；无 human wait；无 Thunk；不发起远端执行 |
+| 状态 | WorkflowRun / task tracker / object store | 临时 work_dir + `AgentToolResult.details.pipeline_trace` + 可复用的 NDN stage cache |
+| 恢复 | workflow run 可恢复、可审查、可人工干预 | 旁路按 `OneShotRequest` 整体恢复或丢弃重跑 |
+
+本地管线可视为 Workflow DSL 的一个受限 profile：共享描述语言，不共享长期运行时。
+
+#### 4.5.2 Local Media Pipeline Profile
+
+本工具支持的 DSL 子集应明确受限，避免把 `llm_understand_media` 变成第二套 workflow engine：
+
+1. `steps` 仅支持 `type: "autonomous"`。`human_confirm` / `human_required` 不在本地管线内执行；
+2. `edges` 支持线性 DAG；后续可支持有界并行，但必须受本工具预算和超时约束。
+3. `nodes` 中的 `branch` 可作为后续优化，用于按 MIME 选择图片 / 视频 / 文档路径；v0 可先通过代码选择默认 pipeline。
+4. `for_each` / `parallel` 不作为 v0 必需能力。视频抽帧、多页 PDF 等批量场景后续可在本地 runner 中以有界并发实现。
+5. `executor` 必须使用当前 `ExecutorRef::parse` 已支持的形式。内置 stage 使用 `operator::media.*`；用户可扩展能力优先通过 `/tool/media.*` 语义路径解析到 `appservice::` / `http::` / `operator::`，不要新增 `media::` namespace。
+6. 每个 stage 的输出必须是 JSON value，并通过 `output_schema` 约束。二进制派生产物只能以 `ResourceRef` / `obj_id` / 临时 work_dir path 引用，不得内联 base64 写入 `details` 或主干 history。
+7. 声明 `idempotent: true` 的 stage 必须接入系统级缓存。cache key 语义与 Workflow Orchestrator 保持一致：`executor identity + resolved input + stage version`，结果写入 NDN / named_store 后用 obj_id 引用。
+
+#### 4.5.3 Stage 分类
+
+| Stage | 典型 executor | 输入 | 输出 | 说明 |
+|---|---|---|---|---|
+| 机械识别 | `operator::media.probe` | `ResourceRef`、`mime_hint` | `mime`、`size_bytes`、图片宽高、EXIF 摘要、视频时长/codec/fps | 完全确定性，不调用 LLM |
+| 机械预处理 | `operator::media.preprocess_image` / `operator::media.preprocess_video` | 原始媒体 + probe metadata + provider 限制 | `model_media`、派生 artifact、缩放/转码参数 | 图片可自动缩小以塞入 vision provider；视频可抽首帧/关键帧 |
+| 传统分析 | `/tool/media.ocr` / `appservice::media_ocr.extract` | 原始或预处理 artifact | OCR 文本、layout、barcode、字幕、ASR 等 | 可选 stage；结果带来源和置信度，不能和模型观察混在一起 |
+| 模型分析 | `operator::media.model_analyze` | `model_media` + metadata + traditional findings + goal + purified history | `UnderstandingReport` | 内部仍用 `OneShotRequest` / `LocalLLMContext` 调 AICC |
+| 汇总渲染 | `operator::media.render_report` | report + pipeline trace | `AgentToolResult.output` 文本 | 控制写回主干的体积 |
+
+#### 4.5.4 本地管线上下文
+
+本地 runner 在各 stage 之间传递一个结构化上下文，stage 输出只追加确定字段：
+
+```rust
+struct MediaUnderstandingContext {
+    source: ResourceRef,
+    goal: String,
+    parent_history: Vec<AiMessage>,
+    metadata: Option<MediaMetadata>,
+    derived_artifacts: Vec<DerivedArtifact>,
+    traditional_findings: Vec<TraditionalFinding>,
+    model_media: Option<ResourceRef>,
+    report: Option<UnderstandingReport>,
+    pipeline_trace: Vec<StageTrace>,
+}
+```
+
+关键约束：
+
+- `metadata` 保存机械识别结果，如原始分辨率、EXIF 摘要、视频时长；这些信息进入 `AgentToolResult.details`，也可作为模型分析的文本上下文。
+- `derived_artifacts` 保存预处理产物引用，例如缩小后的图片、抽帧图片、提取出的音轨。长期有价值的产物应写入 NDN；仅服务本次旁路的临时文件必须随 work_dir 清理。
+- `traditional_findings` 保存 OCR / ASR / barcode 等传统算法结果，并标明 `source_stage`、`artifact_ref`、`confidence`。模型分析阶段可以引用这些 finding，但最终 report 必须保留 provenance。
+- `pipeline_trace` 记录 stage 名、executor、输入摘要、输出摘要、耗时、错误、`cache_key`、`cache_hit`、`result_obj_id`。trace 进入 `details`，不进入 `output`。
+
+#### 4.5.5 NDN + Thunk-style 系统级缓存
+
+媒体处理天然适合内容寻址缓存：输入媒体是 `ResourceRef::NamedObject { obj_id }`，预处理参数是结构化 JSON，stage 版本可显式声明。因此只要 stage 是幂等的，相同输入必然得到相同语义输出。`llm_understand_media` 本地管线应复用 Workflow / Thunk 的缓存思想，得到跨工具、跨会话、跨 workflow 的系统级处理缓存。
+
+这里的“复用分布式计算结果”不是指本工具发起分布式计算。`llm_understand_media` 的 stage 执行仍然是纯本地的；它只是在执行前查 NDN cache，发现已有结果就复用。已有结果可以来自同机的历史调用，也可以来自其它节点执行过的 Workflow / Thunk / AppService，只要对应 cache record 和 artifact 已经通过 NDN 可寻址即可。
+
+缓存 key 规则：
+
+```text
+stage_cache_key = hash({
+  executor: "operator::media.preprocess_image",
+  identity: executor_identity_or_function_object_id,
+  version: stage_version,
+  input: resolved_input_json
+})
+```
+
+其中 `resolved_input_json` 必须使用内容稳定的引用：
+
+- 原始媒体使用 NDN `obj_id`，不要使用临时文件路径。
+- 派生 artifact 使用其 NDN `obj_id`。
+- 预处理参数、OCR 语言、抽帧策略、provider 限制等全部进入 input。
+- executor 实现版本、模型无关的算法版本、外部工具版本摘要进入 `version` 或 `identity`。
+
+命中流程：
+
+1. 本地 runner 执行 `idempotent: true` stage 前，先计算 `stage_cache_key`。
+2. 到 named_store 查询 `media_stage_cache/<stage_cache_key>` 或等价命名对象。
+3. 若命中，读取缓存记录中的 `result_obj_id` / `artifact_refs`，直接回填该 stage output，并在 `pipeline_trace` 标记 `cache_hit: true`。
+4. 若未命中，执行 stage；完成后把 JSON output 与需要长期复用的派生 artifact 写入 NDN，再写 cache record。
+
+示例：别的 workflow 已经用同一个原图 `obj_id=O1`、同样的 `max_long_edge=2048`、同样的 `operator::media.preprocess_image@v1` 生成过缩略图 `obj_id=T1`。本次 `llm_understand_media` 走到 `preprocess` stage 时，计算出的 `stage_cache_key` 相同，因此直接复用 `T1`，不再解码、缩放、重新编码图片。
+
+这套缓存语义同时兼容未来的真正 Thunk 路径：当某个 stage 从本地 `operator::media.*` 升级为 `func::<objid>` 时，`FunctionObject + params = ThunkObject` 的内容寻址 id 可作为同一类执行 key；Scheduler / Node Daemon Runner 执行出的结果仍写入 NDN，本地管线只需要按同一 cache record 读取结果。也就是说，本地 runner 不必一开始走分布式 Thunk 调度，但 stage 的命名、输入、版本和结果存储必须从第一天就按 Thunk 可缓存语义设计。
+
+缓存边界：
+
+- `probe`、`preprocess_image`、`preprocess_video`、OCR、barcode、PDF text extraction 等确定性 stage 默认 `idempotent: true`，应启用缓存。
+- `model_analyze` 默认 `idempotent: false`，不要默认跨调用复用。即便输入相同，不同时间的 provider、系统 prompt、route policy 也可能导致不同结果；后续若要缓存模型结果，必须显式把 model/provider/prompt/policy 版本纳入 key。
+- 涉及隐私策略或用户授权的 stage，其 cache record 必须带 owner / zone / permission scope；不能因为内容 hash 相同就跨权限边界复用。
+- cache record 只保存 JSON output 和 artifact 引用，不保存 base64 payload。
+
+#### 4.5.6 从媒体理解提炼的 FunctionObject
+
+这个场景可以反过来帮助定义真正有价值的 FunctionObject。FunctionObject 不应只是数学意义上的低层算子；`operator` 更适合表达 `sort`、`topk`、`json.pick` 这类无业务语义的纯算子。媒体理解需要的是强语义、可复用、可被人类和 agent 识别的函数组件，例如“生产图片缩略图”“探测媒体元信息”“从图片提取可见文字”。
+
+判断一个媒体 FunctionObject 是否成立，使用以下规则：
+
+```text
+函数名 + 版本 + 参数 + 输入文件 obj_id = 一个确定的结果 obj_id / JSON output
+```
+
+其中“输入文件”必须是 NDN `obj_id`，不能是临时路径；“参数”必须是稳定 JSON；“函数名”必须表达业务语义，而不是实现细节。例如 `produce_image_thumbnail@v1(input=O1, max_long_edge=2048, format=jpeg)` 是一个合格函数；`run_ffmpeg_cmd@v1(args="...")` 不是合格函数，因为它泄漏实现、参数不可治理、缓存语义也不稳定。
+
+首批建议沉淀的 FunctionObject：
+
+| 语义函数名 | 建议语义路径 | 输入文件 | 关键参数 | 输出 | 纯度 / 缓存 |
+|---|---|---|---|---|---|
+| 生产图片缩略图 | `/tool/media.produce_image_thumbnail` | `image_obj_id` | `max_long_edge`、`max_pixels`、`format`、`quality`、`strip_metadata` | `thumbnail_obj_id` + width/height/format/size | 纯函数，默认缓存 |
+| 规范化图片供视觉模型使用 | `/tool/media.prepare_image_for_vision` | `image_obj_id` | `provider_profile`、`max_long_edge`、`max_bytes`、`allow_format` | `model_media_obj_id` + transform report | 纯函数，默认缓存 |
+| 探测媒体元信息 | `/tool/media.probe_metadata` | `media_obj_id` | `include_exif`、`include_streams`、`sniff_bytes` | MIME、size、图片尺寸、EXIF 摘要、视频时长/codec/fps | 纯函数，默认缓存 |
+| 提取图片 EXIF | `/tool/media.extract_image_exif` | `image_obj_id` | `fields`、`privacy_mode` | EXIF JSON 摘要 | 纯函数，默认缓存；隐私字段受策略控制 |
+| 图片 OCR | `/tool/media.extract_visible_text_from_image` | `image_obj_id` | `languages`、`return_layout`、`engine_profile` | text、blocks、layout、confidence | 对固定 engine/profile 视为纯函数，默认缓存 |
+| 识别二维码/条码 | `/tool/media.detect_codes_in_image` | `image_obj_id` | `code_types`、`return_regions` | code list + bbox + confidence | 纯函数，默认缓存 |
+| 视频元信息探测 | `/tool/media.probe_video_metadata` | `video_obj_id` | `include_streams`、`include_chapters` | duration、streams、codec、fps、resolution、audio tracks | 纯函数，默认缓存 |
+| 抽取视频关键帧 | `/tool/media.extract_video_keyframes` | `video_obj_id` | `strategy`、`max_frames`、`interval_ms`、`scene_threshold`、`image_format` | keyframe image obj_ids + timestamps | 固定算法版本下纯函数，默认缓存 |
+| 抽取视频首帧 | `/tool/media.extract_video_first_frame` | `video_obj_id` | `timestamp_ms`、`image_format`、`max_long_edge` | frame image obj_id + timestamp | 纯函数，默认缓存 |
+| 提取音轨 | `/tool/media.extract_audio_track` | `video_obj_id` | `track_index`、`codec`、`sample_rate`、`channels` | audio obj_id + duration/codec | 纯函数，默认缓存 |
+| 音频转写 | `/tool/media.transcribe_audio` | `audio_obj_id` | `language`、`engine_profile`、`return_timestamps` | transcript、segments、confidence | 对固定 engine/profile 视为纯函数；可缓存但需权限 scope |
+| PDF 文本抽取 | `/tool/media.extract_pdf_text` | `pdf_obj_id` | `page_range`、`include_layout` | text/pages/layout | 纯函数，默认缓存 |
+| PDF 页面渲染为图片 | `/tool/media.render_pdf_pages` | `pdf_obj_id` | `page_range`、`dpi`、`format`、`max_long_edge` | page image obj_ids + page metadata | 纯函数，默认缓存 |
+
+这些 FunctionObject 的共同输出约定：
+
+- 大结果和二进制 artifact 一律写 NDN，返回 `obj_id` 和结构化 metadata。
+- JSON output 必须包含 `function_name`、`function_version`、`input_obj_id`、`params_hash`、`result_obj_id`、`metrics`。
+- 若函数内部依赖外部工具，如 ffmpeg / tesseract / poppler，必须把工具版本或 engine profile 纳入 `function_version` / `identity`，否则不能跨节点安全复用 cache。
+- 如果结果受权限或隐私策略影响，如 EXIF 隐私字段、音频转写、OCR 文本，cache record 必须带 owner / zone / permission scope。
+
+在本地管线中，这些函数可以先由 `operator::media.*` 内置实现或 `appservice::media_tools.*` 直执行；一旦某个函数需要跨节点计算或复用独立 runner，就把语义路径解析到 `func::<function_object_id>`。无论执行路径如何，`函数名 + 参数 + 输入文件 = 确定结果` 的缓存语义保持不变。
+
+#### 4.5.7 默认图片管线 DSL 示例
+
+默认图片路径可以用 Workflow DSL 表达如下。这里的 `operator::media.input` 是本地 runner 注入调用参数的虚拟起点；真实实现中它不读取外部系统，只把 `{ media, goal, parent_history }` 规整成下游 schema。
+
+```json
+{
+  "schema_version": "0.2.0",
+  "id": "llm-understand-media-image-default",
+  "name": "Default image understanding pipeline",
+  "trigger": { "type": "manual" },
+  "steps": [
+    {
+      "id": "input",
+      "name": "Normalize invocation input",
+      "type": "autonomous",
+      "executor": "operator::media.input",
+      "output_schema": { "$ref": "#/defs/MediaInvocation" },
+      "idempotent": true,
+      "skippable": false
+    },
+    {
+      "id": "probe",
+      "name": "Probe media metadata",
+      "type": "autonomous",
+      "executor": "operator::media.probe",
+      "input": {
+        "media": "${input.output.media}",
+        "mime_hint": "${input.output.mime_hint}"
+      },
+      "output_schema": { "$ref": "#/defs/MediaProbeOutput" },
+      "idempotent": true,
+      "skippable": false
+    },
+    {
+      "id": "preprocess",
+      "name": "Prepare image for model",
+      "type": "autonomous",
+      "executor": "operator::media.preprocess_image",
+      "input": {
+        "media": "${input.output.media}",
+        "probe": "${probe.output}",
+        "limits": {
+          "max_long_edge": 2048,
+          "max_pixels": 4194304
+        }
+      },
+      "output_schema": { "$ref": "#/defs/ImagePreprocessOutput" },
+      "idempotent": true,
+      "skippable": false
+    },
+    {
+      "id": "ocr",
+      "name": "Extract visible text",
+      "type": "autonomous",
+      "executor": "/tool/media.ocr",
+      "input": {
+        "media": "${preprocess.output.model_media}",
+        "probe": "${probe.output}"
+      },
+      "output_schema": { "$ref": "#/defs/TraditionalFindingSet" },
+      "idempotent": true,
+      "skippable": true
+    },
+    {
+      "id": "model",
+      "name": "Model analysis",
+      "type": "autonomous",
+      "executor": "operator::media.model_analyze",
+      "input": {
+        "goal": "${input.output.goal}",
+        "media": "${preprocess.output.model_media}",
+        "metadata": "${probe.output}",
+        "traditional_findings": "${ocr.output}"
+      },
+      "output_schema": { "$ref": "#/defs/UnderstandingReport" },
+      "idempotent": false,
+      "skippable": false
+    }
+  ],
+  "edges": [
+    { "from": "input", "to": "probe" },
+    { "from": "probe", "to": "preprocess" },
+    { "from": "preprocess", "to": "ocr" },
+    { "from": "ocr", "to": "model" },
+    { "from": "model" }
+  ],
+  "defs": {
+    "MediaInvocation": { "type": "object" },
+    "MediaProbeOutput": { "type": "object" },
+    "ImagePreprocessOutput": { "type": "object" },
+    "TraditionalFindingSet": { "type": "object" },
+    "UnderstandingReport": { "type": "object" }
+  }
+}
+```
+
+v0 实现可以先内置等价的 Rust plan，不必立刻把 JSON DSL 暴露为用户配置；但内部类型和 stage 命名应按上述 DSL 收敛，保证后续把默认 plan 外置时不重构语义。示例中 `probe`、`preprocess`、`ocr` 都是 `idempotent: true`，必须按 §4.5.5 接入 NDN stage cache；`model` 是 `idempotent: false`，默认不缓存。
+
+#### 4.5.8 用户可扩展性
+
+用户扩展应分两层开放：
+
+1. **配置扩展**：允许用户调整 MIME route、图片缩放限制、是否启用 OCR、OCR executor 选择、视频抽帧策略等。这类配置不改变 stage 代码，只改变默认 DSL 或 stage 参数。
+2. **受控 stage 扩展**：允许 `/tool/media.*` 语义路径解析到用户提供的 `appservice::` / `http::` endpoint，后续再支持 `func::`。扩展 stage 必须声明 `input_schema` / `output_schema`、超时、权限、是否幂等；输出只能是 JSON 和 `ResourceRef`，不能把媒体 payload 内联进 history。
+
+不允许在本工具里直接执行任意 shell 脚本作为用户扩展。若需要本地外部命令能力，应先进入 workflow executor registry / AppService / FunctionObject 的受控模型，再由本地 runner 按 `ExecutorRef` 调用。
+
 ---
 
 ## 5. 崩溃恢复语义
 
-### 5.1 旁路作为 `OneShotRequest`
+### 5.1 模型分析 stage 作为 `OneShotRequest`
 
-整个旁路是一个 `OneShotRequest`，其 `semantic_hash()` 自然覆盖：
+本地管线中的 probe / preprocess / traditional analysis 是确定性本地 stage；真正进入 LLM 的 model analysis stage 仍然是一个 `OneShotRequest`。该 request 的 `input` 必须包含目标媒体、父 history 提纯快照、机械 metadata、传统分析结果、以及当前 pipeline id/version/hash，使 `semantic_hash()` 自然覆盖：
 
 ```rust
 // OneShotRequest::semantic_hash() 已 hash:
 //   - objective ( == goal )
 //   - serde_json::to_vec(&input)
-//     ( input 含父 history 提纯快照 + 末尾 AiContent::Image { source: media } )
-// → ResourceRef::NamedObject { obj_id } 的字节序列自然进入 hash，
-//   等价于把 obj_id 纳入语义键。
+//     ( input 含 pipeline hash + 父 history 提纯快照 + metadata +
+//       traditional_findings + 末尾 AiContent::Image { source: model_media } )
+// → ResourceRef::NamedObject { obj_id } 或派生 artifact 引用的字节序列自然进入 hash。
 ```
 
-实现侧无需为本工具新增额外 hash 逻辑——直接复用 `OneShotRequest::semantic_hash()` 即可。
+实现侧不需要另写一套 hash 算法，但必须保证影响模型分析语义的管线版本、预处理参数和传统分析结果都被放入 `OneShotRequest.input`，否则 resume 时无法区分不同管线定义。
 
 ### 5.2 恢复规则
 
-- 旁路自身的 per-turn 持久化由 `LocalLLMContext` 提供（[local_llm_context.rs](src/frame/agent_tool/src/local_llm_context.rs)），其工作目录独立于主干 OneShot 的工作目录。
+- 模型分析 stage 的 per-turn 持久化由 `LocalLLMContext` 提供（[local_llm_context.rs](src/frame/agent_tool/src/local_llm_context.rs)）；probe / preprocess / traditional analysis 应保持幂等或在 `pipeline_trace` 中记录不可恢复错误。
 - **从主干视角**：在拿到 `AgentToolResult` 之前，主干**不**把 `ToolUse` / `ToolResult` 落入自己的 turn——这一对消息作为**原子单元** commit。
 - 旁路 fork 期间崩溃 →
-  - 若旁路自身 `LocalLLMContext` 状态可恢复（`semantic_hash` 一致）→ 自动 resume；
+  - 若模型分析 stage 的 `LocalLLMContext` 状态可恢复（`semantic_hash` 一致）→ 自动 resume；
   - 否则整体丢弃，主干视角等价于"这次 `llm_understand_media` 调用从未开始"，直接重跑。
 - 旁路内部中间状态不渗透到主干 recovery 模型。
 - 由于 `media` 是 `ResourceRef::NamedObject { obj_id }`、媒体存于 `ndn_lib` NDN 对象，重跑时 media 必然仍可寻址、内容必然未变（`ObjId` 即 content hash），重跑结果语义一致。
@@ -348,7 +613,7 @@ model = "llm.video"
 
 - `llm_understand_media` 是封装层提供的、语义明确的受控 `llm_*` 工具，**不是开放给 agent 的通用 fork 原语**。
 - 因此"旁路内部是否再触发嵌套 `llm_*`"是**设计时静态可推**的，而非运行时不可控。
-- 本期 `llm_understand_media` 内部构造 `OneShotRequest` 时，必须设：
+- 本期 `llm_understand_media` 的模型分析 stage 构造 `OneShotRequest` 时，必须设：
   - `tool_policy.allow_tools = false`（或同义的"无任何 tool 注册"配置）——旁路内部**不得**再触发嵌套 `llm_*` 旁路（深度上限 = 1）；
   - `budget` 显式继承父预算的剩余额度，**不允许**重置为 default 无上限——这是防"旁路成本黑洞"的硬约束。
 - 若未来确需嵌套，必须设定明确的深度上限与预算上限，并接入 L4 scheduler 对 `llm_*` 调用的统一预算账户。
@@ -376,12 +641,18 @@ Agent（第 1 轮）:
         args: { media: { kind: "named_object", obj_id: "O1" },
                 goal: "解释这个报错" }
     }
-  → llm_understand_media 内部构造 OneShotRequest（input = 父 history 提纯快照 +
-      末尾 User message 含 AiContent::Image { source: NamedObject(O1) }）；
-      target media 以原生 AiContent::Image 进入旁路；
-      tool_policy.allow_tools = false。
-  → LocalLLMContext::drive_to_terminal → AICC 处理含 image 的 LLM 请求 →
-      直接看图，产出 UnderstandingReport:
+  → llm_understand_media 启动本地轻量管线：
+      probe: 读取 FileObject meta / magic bytes，得到 mime=image/png、
+             原始分辨率、size、可得 EXIF 摘要；
+      preprocess: 按 executor + O1 + 参数计算 cache key；若已有缩略图 artifact 则直接复用，
+             否则在图片超过 provider 限制时生成缩小后的 model_media 并写入 NDN cache；
+      traditional analysis: 可选 OCR，提取截图中的可见文本并记录 provenance；
+      model: 构造 OneShotRequest（input = pipeline hash + 父 history 提纯快照 +
+             metadata + OCR findings + 末尾 User message 含 AiContent::Image { source: model_media }）；
+             target media 以原生 AiContent::Image 进入旁路；
+             tool_policy.allow_tools = false。
+  → model stage 通过 LocalLLMContext::drive_to_terminal → AICC 处理含 image 的 LLM 请求 →
+      结合图片、metadata、OCR finding 产出 UnderstandingReport:
         observations: [
           obs-1: 红色错误框,
           obs-2: 文本 "OutOfMemoryError",
@@ -414,10 +685,14 @@ Agent（第 30 轮）：怀疑"内存泄漏"判断是否成立
 4. **报告结构**：`AgentToolResult.details` 反序列化为 `UnderstandingReport`，含 `observations`（带 id）/ `reasoning` / `conclusion` / `confidence`；`reasoning` 中每个事实可追溯到某 `observation.id`。
 5. **写回最小化**：`AgentToolResult.output` 是 report 的紧凑文本渲染，`ToolResult.content` 只塞一个 `Text` 块（沿用 `agent_tool` 现有约定）；不出现 `to_value(AgentToolResult)` 全量塞进 LLM 的反模式。
 6. **提纯继承**：旁路子 context 的 `input` 中，除 target `media` 外，父 history 的其他 `AiContent::Image` / `AiContent::Document` 全部已被替换为 `Text` 占位。
-7. **native vision / MIME route**：工具在 open chunk reader / materialize 阶段解析 MIME，按配置表得到 AICC 逻辑模型名并写入 `OneShotRequest.model_policy.preferred`；target 媒体以原生 `AiContent::Image` 进入旁路，无辅助转文字中间层。当前 `ModelPolicy` 不声明 `features::VISION` requirement，若 AICC 无法处理该逻辑模型下含 image 的 LLM 请求，应返回明确 Error（本期不强制实现辅助降级）。后续能力 requirement 透传属于 `LLMContext` / AICC adapter 边界改造。
-8. **崩溃恢复**：旁路 LocalLLMContext 自身 per-turn 持久化生效；主干在 `AgentToolResult` 返回前不 commit 该 turn；`OneShotRequest::semantic_hash()` 自然覆盖 (goal, 父 history 快照, obj_id)，无需额外手写 hash。
-9. **深度 & 预算**：旁路 `OneShotRequest.tool_policy.allow_tools = false`；`budget` 继承父预算剩余额度而非 default 无上限。
-10. **体积度量**：构造长 session（多次媒体理解）测试，验证主干 history 体积仅随 `tool_result` 文本线性增长，与媒体数量 / 大小解耦。
+7. **本地管线**：模型分析前先执行本地轻量媒体管线。v0 图片路径至少包含 probe 与 preprocess；probe 输出原始分辨率、size、MIME、可得的 EXIF 摘要；preprocess 在图片过大时生成适合 vision provider 的派生图。
+8. **Workflow DSL 复用**：默认管线的 stage / edges / input-output schema 可用 `WorkflowDefinition` 表达；本地 runner 使用 Local Media Pipeline Profile，不走 Workflow Service / Thunk Dispatcher，不新增不被 `ExecutorRef::parse` 支持的 executor namespace。
+9. **NDN / Thunk-style 缓存**：所有 `idempotent: true` stage 必须基于 `executor identity + resolved input + stage version` 计算 cache key；命中时直接复用 NDN 中的 JSON output / artifact refs，并在 `pipeline_trace` 标记 `cache_hit`。
+10. **传统分析 provenance**：OCR / ASR / barcode 等传统分析结果若启用，必须作为 `traditional_findings` 进入 `details` 与模型输入，并标明来源 stage / artifact / confidence；最终 report 不得把传统分析结果伪装成模型直接观察。
+11. **native vision / MIME route**：工具在 probe / materialize 阶段解析 MIME，按配置表得到 AICC 逻辑模型名并写入模型分析 stage 的 `OneShotRequest.model_policy.preferred`；target 媒体以原生 `AiContent::Image` 进入旁路，无辅助转文字中间层。当前 `ModelPolicy` 不声明 `features::VISION` requirement，若 AICC 无法处理该逻辑模型下含 image 的 LLM 请求，应返回明确 Error（本期不强制实现辅助降级）。后续能力 requirement 透传属于 `LLMContext` / AICC adapter 边界改造。
+12. **崩溃恢复**：模型分析 stage 的 LocalLLMContext per-turn 持久化生效；主干在 `AgentToolResult` 返回前不 commit 该 turn；模型分析 stage 必须把 `pipeline_id` / `pipeline_version` / `compiled_pipeline_hash` 写入自己的 `OneShotRequest.input`，使 `OneShotRequest::semantic_hash()` 覆盖 (goal, 父 history 快照, obj_id, 管线定义/版本)。
+13. **深度 & 预算**：旁路 `OneShotRequest.tool_policy.allow_tools = false`；本地管线和模型分析 stage 共享父预算剩余额度，不能各自重置 default 无上限；外部扩展 stage 必须有 timeout 和权限约束。
+14. **体积度量**：构造长 session（多次媒体理解）测试，验证主干 history 体积仅随 `tool_result` 文本线性增长，与媒体数量 / 大小解耦。
 
 ---
 
@@ -428,6 +703,11 @@ Agent（第 30 轮）：怀疑"内存泄漏"判断是否成立
 | 父 history 目的导向裁剪 | §4.2.4，长 session 下控制旁路重喂 token 量 | 预留可插拔策略点；先靠 `llm_compress` 全量压缩兜底，依据真实成本数据再实现 |
 | 报告粒度调优 | §3.5，`observations` 完整度 vs 重 fork 频率的平衡点 | 依据真实重复 fork 频率数据调内置 prompt |
 | `Document` / 视频 / 音频 支持 | §2.2，本期仅 image | 接口预留（`AiContent::Document` 已存在；`Capability::Audio` / `Video` / `features::VIDEO_UNDERSTAND` / `features::ASR` 已在 `aicc_client.rs` 中定义），后续迭代 |
+| 本地管线 runner | §4.5，复用 Workflow DSL 但不走分布式调度 | 先实现线性 DAG + `operator::media.*` 内置 stage；后续再接 branch / bounded parallel / executor registry |
+| NDN / Thunk-style stage cache | §4.5.5，幂等 stage 的系统级处理缓存 | 先实现 named_store cache record + `pipeline_trace.cache_hit`；后续与真正 ThunkObject result cache 对齐 |
+| 媒体 FunctionObject catalog | §4.5.6，从真实媒体理解场景提炼强语义函数 | 先沉淀 probe / thumbnail / vision image / OCR / keyframe 等函数的 schema；再接 registry 到 `operator::` / `appservice::` / `func::` |
+| 用户扩展 stage | §4.5.8，`/tool/media.*` 语义路径扩展 | 第一阶段只允许配置扩展；第二阶段接 AppService / HTTP；FunctionObject 待 workflow executor 模型成熟后再开放 |
+| OCR / 传统分析依赖 | §4.5.3，OCR 可显著降低 vision 漏字 | 不作为 v0 硬依赖；引入新库或系统依赖前需确认，并保持可选降级 |
 | 嵌套 `llm_*` | §6.3，本期深度 = 1 | 如需开放，先定深度/预算上限并接入 L4 预算账户 |
 | 辅助视觉模型降级 | §4.3 末段，纯文本主模型回退 | 本期返回明确 Error；后续实现时复用 `agent_tool` 已有 `llm_*` 工具调用模式 |
 | 与 `llm_read_media.rs` 的边界 | 同目录存在另一占位文件 [src/frame/agent_tool/src/llm_read_media.rs](src/frame/agent_tool/src/llm_read_media.rs) | 在实现前确认两者职责切分（"理解" vs "原文/字幕/OCR 抽取"），避免功能重叠或命名混淆 |

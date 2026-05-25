@@ -6,11 +6,13 @@
 //! ```text
 //! [identity]            agent_did / display_name
 //! [runtime]             cancel_reason / language / preserve_attachment_tag_in_egress / filesystem_policy
-//! [[channel]]           Gateway inbound sources (msg_center / kevent / ...)
 //! [dispatch]            default_class + ordered match-rule list
 //! [session.<class>]     per-class kind / loop_mode / default_behavior /
 //!                       session_id_strategy / process_stack_limit / driver
 //! ```
+//!
+//! v0 hardcodes the Gateway inbound channels (`msg_center` + `kevent`) —
+//! `[[channel]]` is reserved for a future schema upgrade (see doc §10 #4).
 //!
 //! Loaded once at `AIAgent::open(root)`. `[session]` is a map keyed by
 //! class name and exposed via [`AgentConfig::session_class`] for the
@@ -129,21 +131,6 @@ impl Default for RuntimeCfg {
             filesystem_policy: FilesystemPolicy::default(),
         }
     }
-}
-
-// ─── `[[channel]]` ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct ChannelCfg {
-    /// Channel kind. v0 honors `"msg_center"` and `"kevent"`; unknown
-    /// kinds log a warning on load but don't fail boot, leaving room
-    /// for plugin-driven channels.
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// Kevent subscription patterns when `kind == "kevent"`. Ignored for
-    /// other channel kinds.
-    pub filters: Vec<String>,
 }
 
 // ─── `[dispatch]` ───────────────────────────────────────────────────────────
@@ -493,10 +480,6 @@ impl SessionClassCfg {
 pub struct AgentTomlFile {
     pub identity: IdentityCfg,
     pub runtime: RuntimeCfg,
-    /// `[[channel]]` array. Order is preserved for diagnostics, but the
-    /// gateway treats it as a set.
-    #[serde(rename = "channel")]
-    pub channels: Vec<ChannelCfg>,
     pub dispatch: DispatchCfg,
     /// `[session.<class>]` table. Keys are class names referenced by
     /// `dispatch.rule[*].session_class` and `dispatch.default_class`.
@@ -840,13 +823,6 @@ mod tests {
                 preserve_attachment_tag_in_egress = true
                 filesystem_policy = "unrestricted"
 
-                [[channel]]
-                type = "msg_center"
-
-                [[channel]]
-                type = "kevent"
-                filters = ["task_mgr/**"]
-
                 [dispatch]
                 default_class = "ui"
 
@@ -903,8 +879,6 @@ mod tests {
             cfg.toml.runtime.filesystem_policy,
             FilesystemPolicy::Unrestricted
         );
-        assert_eq!(cfg.toml.channels.len(), 2);
-        assert_eq!(cfg.toml.channels[1].kind, "kevent");
         assert_eq!(cfg.toml.dispatch.default_class, "ui");
         assert_eq!(cfg.toml.dispatch.rules.len(), 2);
         assert_eq!(cfg.toml.dispatch.rules[0].on, "msg.chat");
