@@ -35,7 +35,7 @@ pub mod session_model;
 pub mod llm_context_helper;
 
 // Phase-1 PromptRenderEngine integration (variable contract +
-// AgentSessionValueLoader + environment-block template). See
+// AgentSessionValueLoader). See
 // `doc/opendan/Agent Enviroment.md` §15.1.
 pub mod prompt_env;
 

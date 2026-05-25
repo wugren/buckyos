@@ -209,6 +209,7 @@ pull_event = "none"
 filter     = "top"
 pull_msg   = "all"
 pull_event = "none"
+load_background_hits = "all"
 
 [session.group]
 kind                = "ui"

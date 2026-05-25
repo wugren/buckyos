@@ -16,7 +16,7 @@ Behavior 模板不是在加载 behavior 时预渲染，而是在 Session worker 
 Session driver hook
   -> freeze AgentSessionEnv
   -> PromptRenderEngine.render()
-  -> AiMessage / background_environment
+  -> AiMessage
   -> LLMContext
 ```
 
@@ -90,8 +90,22 @@ Session title: {{ session.title }}
 | `$session.current_behavior` | `{{ session.current_behavior }}` | string | 当前 behavior name |
 | `$session.current_todo` | `{{ session.current_todo.todo_id }}` | object / null | `todos.json` 中第一个非终态 Todo |
 | `$session.current_todo_list` | `{{ session.current_todo_list }}` | string | `todos.json` 的简表；缺失时为 `(empty)` |
+| `$session.background_hint_changed` | `{{ session.background_hint_changed }}` | bool | 本 hook 是否通过 `load_backgrand_hits` 加载到变化的背景 hint |
+| `$session.default_changed_backgrand_hint_text` | `{{ session.default_changed_backgrand_hint_text }}` | string | `session.background_hints` 的默认纯文本渲染，格式为 `- hint text` 列表 |
+| `$session.default_changed_background_hint_text` | `{{ session.default_changed_background_hint_text }}` | string | 上一项的拼写修正别名 |
+| `$session.background_hints` | `{% for hint in session.background_hints %}` | array of `BackgroundHint` | 本 hook 新加载到的变化背景 hint；没有配置加载或无变化时为空数组 |
 | `$session.has_title` | `{{ session.has_title }}` | bool | title 是否非空 |
 | `$session.has_current_todo` | `{{ session.has_current_todo }}` | bool | 当前 session 是否存在非终态 Todo |
+
+`BackgroundHint`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `path` | string | hint 的稳定路径，如 `event/presence.changed`、`notepad/<id>`、`memory/<key>` |
+| `kind` | string | `event` / `notepad` / `memory` |
+| `text` | string | 给 LLM 阅读的简短提示文本 |
+| `fingerprint` | string | 用于判断本次和上次加载相比是否变化 |
+| `data` | object / null | 结构化原始数据；模板通常不需要直接展开 |
 
 ### 3.2 `workspace`
 
@@ -271,6 +285,8 @@ Driver policy 对 `input` 的影响：
 | `pull_event = "none"` | `input.events = []`，`input.event = null` |
 | `pull_event = "all"` | `input.events` 包含本 hook 可消费的所有 event；`input.event` 指第一条 |
 | `pull_event = "<filter_name>"` | `input.events` 只包含匹配 filter 的 event，例如 `timer.*`；`input.event` 指第一条匹配事件 |
+| `load_backgrand_hits = "none"` | `session.background_hints = []`，`session.background_hint_changed = false` |
+| `load_backgrand_hits = "all"` | 调用 `load_changed_backgrand_hits`，加载本 hook 相比上次调用发生变化的背景 hint |
 
 ### 3.5 `current_context`
 
@@ -381,16 +397,36 @@ Fork / independent child 返回父 context 时，`switch.from_context.last_repor
 
 ## 6. 环境块
 
-环境块用于给本轮 user message prepend 一段可扫描的 session / workspace / runtime 摘要。内容模板使用同一套变量契约：
+环境块由一组 session 相关的 background hints 组成。OpenDAN 不再自动插入 `<background_environment>` 块；是否插入、插入到哪个 User Message 模板，由 Behavior 开发者显式决定。
 
-```upon
-session: `{{ session.id }}`{% if session.has_title %} ("{{ session.title }}"){% endif %}{% if workspace.has_id %}
-workspace: `{{ workspace.id }}`{% endif %}{% if runtime.has_activity %}
-recent activity: {{ runtime.recent_activity }}{% endif %}
-clock: unix_ms={{ runtime.clock_unix_ms }}
+Driver 需要在对应 hook 上打开 hint 加载，例如：
+
+```toml
+[session.ui.driver.on_wakeup]
+filter = "top"
+pull_msg = "all"
+pull_event = "none"
+load_backgrand_hits = "all"
 ```
 
-渲染后会包进 `<background_environment>...</background_environment>`。是否注入环境块由 session driver 的 hook point 配置决定；环境块本身不直接消费 pending input。
+然后在相关 User Message 模板中手工插入：
+
+```upon
+{% if session.background_hint_changed %}
+<background_environment>
+{{ session.default_changed_backgrand_hint_text }}
+</background_environment>
+{% endif %}
+```
+
+`session.default_changed_backgrand_hint_text` 是 `session.background_hints` 的默认渲染，格式为：
+
+```text
+- hint1
+- hint2
+```
+
+需要注意的是，`load_changed_backgrand_hits` 会记录上一次加载状态，只返回相比上次调用发生变化的部分。没有配置 `load_backgrand_hits = "all"` 的 hook 不会读取 hints，`session.background_hint_changed` 为 `false`。
 
 ## 7. Include 与安全边界
 

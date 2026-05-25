@@ -267,21 +267,25 @@ impl Default for SessionDriverCfg {
                 filter: BehaviorFilter::All,
                 pull_msg: PullMsgPolicy::None,
                 pull_event: PullEventPolicy::None,
+                load_background_hits: LoadBackgroundHintsPolicy::None,
             },
             on_behavior_switch: HookPointCfg {
                 filter: BehaviorFilter::Top,
                 pull_msg: PullMsgPolicy::All,
                 pull_event: PullEventPolicy::All,
+                load_background_hits: LoadBackgroundHintsPolicy::None,
             },
             on_behavior_step_ob: HookPointCfg {
                 filter: BehaviorFilter::Top,
                 pull_msg: PullMsgPolicy::All,
                 pull_event: PullEventPolicy::None,
+                load_background_hits: LoadBackgroundHintsPolicy::None,
             },
             on_wakeup: HookPointCfg {
                 filter: BehaviorFilter::Top,
                 pull_msg: PullMsgPolicy::All,
                 pull_event: PullEventPolicy::None,
+                load_background_hits: LoadBackgroundHintsPolicy::None,
             },
         }
     }
@@ -304,6 +308,8 @@ pub struct HookPointCfg {
     pub filter: BehaviorFilter,
     pub pull_msg: PullMsgPolicy,
     pub pull_event: PullEventPolicy,
+    #[serde(default, alias = "load_background_hints")]
+    pub load_background_hits: LoadBackgroundHintsPolicy,
 }
 
 impl Default for HookPointCfg {
@@ -312,6 +318,7 @@ impl Default for HookPointCfg {
             filter: BehaviorFilter::None,
             pull_msg: PullMsgPolicy::None,
             pull_event: PullEventPolicy::None,
+            load_background_hits: LoadBackgroundHintsPolicy::None,
         }
     }
 }
@@ -374,6 +381,19 @@ pub enum PullMsgPolicy {
 impl Default for PullMsgPolicy {
     fn default() -> Self {
         PullMsgPolicy::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBackgroundHintsPolicy {
+    None,
+    All,
+}
+
+impl Default for LoadBackgroundHintsPolicy {
+    fn default() -> Self {
+        LoadBackgroundHintsPolicy::None
     }
 }
 
@@ -720,11 +740,13 @@ fn default_self_check_driver() -> SessionDriverCfg {
             filter: BehaviorFilter::All,
             pull_msg: PullMsgPolicy::None,
             pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+            load_background_hits: LoadBackgroundHintsPolicy::None,
         },
         on_behavior_switch: HookPointCfg {
             filter: BehaviorFilter::Top,
             pull_msg: PullMsgPolicy::None,
             pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+            load_background_hits: LoadBackgroundHintsPolicy::None,
         },
         on_behavior_step_ob: HookPointCfg::default(),
         on_wakeup: HookPointCfg::default(),
@@ -739,11 +761,13 @@ fn default_self_improve_driver() -> SessionDriverCfg {
             filter: BehaviorFilter::All,
             pull_msg: PullMsgPolicy::None,
             pull_event: PullEventPolicy::None,
+            load_background_hits: LoadBackgroundHintsPolicy::None,
         },
         on_behavior_switch: HookPointCfg {
             filter: BehaviorFilter::Top,
             pull_msg: PullMsgPolicy::None,
             pull_event: PullEventPolicy::None,
+            load_background_hits: LoadBackgroundHintsPolicy::None,
         },
         on_behavior_step_ob: HookPointCfg::default(),
         on_wakeup: HookPointCfg::default(),
@@ -925,6 +949,7 @@ mod tests {
             filter = "default_only"
             pull_msg = "all"
             pull_event = "none"
+            load_background_hits = "all"
         "#;
         let cfg: SessionDriverCfg = toml::from_str(src).unwrap();
         assert_eq!(cfg.on_init.filter, BehaviorFilter::All);
@@ -940,6 +965,10 @@ mod tests {
         assert_eq!(
             cfg.hook(SessionHookPoint::OnWakeup).pull_msg,
             PullMsgPolicy::All
+        );
+        assert_eq!(
+            cfg.hook(SessionHookPoint::OnWakeup).load_background_hits,
+            LoadBackgroundHintsPolicy::All
         );
 
         let out = toml::to_string(&cfg).unwrap();

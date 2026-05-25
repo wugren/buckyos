@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -15,8 +15,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
+use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput, OwnerScope};
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
+use agent_tool::{AgentMemory, AgentMemoryConfig, LoadOptions};
 use llm_context::{
     behavior_loop::{
         HistoryInputRecord, SendMessageRecord, StepRecord, StepResultHook, StepResultHookOutput,
@@ -33,8 +35,9 @@ use llm_context::{
 
 use crate::agent::AIAgent;
 use crate::agent_config::{
-    AgentConfig, BehaviorFilter, HookPointCfg, LoopMode, PullEventPolicy, PullMsgPolicy,
-    ReportDeliveryMode, SessionDriverCfg, SessionHookPoint, SwitchMode,
+    AgentConfig, BehaviorFilter, HookPointCfg, LoadBackgroundHintsPolicy, LoopMode,
+    PullEventPolicy, PullMsgPolicy, ReportDeliveryMode, SessionDriverCfg, SessionHookPoint,
+    SwitchMode,
 };
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
@@ -44,17 +47,17 @@ use crate::behavior_hooks::{
 use crate::llm_context_helper::{
     apply_overrides_to_snapshot, run_fork_sub_context, ForkSubContextInput, RequestOverrides,
 };
-use crate::prompt_env::{self, AgentSessionEnv, LlmContextEnv, ENVIRONMENT_BLOCK_TEMPLATE};
+use crate::prompt_env::{self, AgentSessionEnv, LlmContextEnv};
 use crate::round_history::{
     CompactionTarget, ContextMode, HistoryEvent, InterruptMode as HistoryInterruptMode,
     RoundStatus, RoundTrigger, SessionHistoryRecorder,
 };
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
-    BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode, ImprovementBudget,
-    ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus, InternalContinuation,
-    InterruptMode, PendingInput, PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput,
-    SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    BackgroundHint, BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode,
+    ImprovementBudget, ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus,
+    InternalContinuation, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
+    ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
 
@@ -2395,11 +2398,7 @@ impl AgentSession {
         limit: u32,
         final_snapshot: &LLMContextSnapshot,
     ) {
-        let last_report = final_snapshot
-            .state
-            .last_report
-            .clone()
-            .unwrap_or_default();
+        let last_report = final_snapshot.state.last_report.clone().unwrap_or_default();
         warn!(
             "opendan.session[{}]: refusing {:?} switch `{}` -> `{}`: process_stack depth={} >= limit={} (config: session_class.process_stack_limit)",
             self.session_id,
@@ -2448,14 +2447,6 @@ impl AgentSession {
             .session_class(&class)
             .map(|c| c.driver.report_delivery)
             .unwrap_or_default()
-    }
-
-    fn session_class_inject_background_environment(&self) -> bool {
-        let class = self.agent_config.class_name_for_kind(self.kind);
-        self.agent_config
-            .session_class(&class)
-            .map(|c| c.driver.inject_background_environment)
-            .unwrap_or(true)
     }
 
     fn session_class_driver(&self) -> SessionDriverCfg {
@@ -2525,23 +2516,35 @@ impl AgentSession {
             })
             .unwrap_or((None, None, Vec::new()));
         let bg_events = self.meta.lock().await.background_events.clone();
+        let background_hints =
+            if filter_allows && cfg.load_background_hits == LoadBackgroundHintsPolicy::All {
+                self.load_changed_background_hits().await
+            } else {
+                Vec::new()
+            };
+        let default_changed_background_hint_text =
+            render_changed_background_hint_text(&background_hints);
         info!(
-            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} filter={:?} filter_allows={} pull_msg={:?} pull_event={:?}",
+            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} background_hints={} filter={:?} filter_allows={} pull_msg={:?} pull_event={:?} load_background_hits={:?}",
             self.session_id,
             point.as_key(),
             pending.len(),
             msg_count,
             event_count,
             bg_events.len(),
+            background_hints.len(),
             cfg.filter,
             filter_allows,
             cfg.pull_msg,
-            cfg.pull_event
+            cfg.pull_event,
+            cfg.load_background_hits
         );
         LlmContextEnv {
             msgs,
             events,
             bg_events,
+            background_hints,
+            default_changed_background_hint_text,
             last_step,
             last_report,
             behavior_history,
@@ -2805,7 +2808,7 @@ impl AgentSession {
         turn_messages: Vec<AiMessage>,
         history_inputs: Vec<HistoryInputRecord>,
         seed: Option<RoundSeed>,
-        inject_background_environment: bool,
+        _inject_background_environment: bool,
     ) -> Result<NextAction> {
         let behavior = self.load_current_behavior().await?;
         let mode = self.history_mode_for(&behavior);
@@ -2844,7 +2847,7 @@ impl AgentSession {
                 history_inputs,
                 &trace_id,
                 &in_flight_input_keys,
-                inject_background_environment,
+                false,
             )
             .await?;
         let mut ctx = match ctx_owner {
@@ -3389,7 +3392,7 @@ impl AgentSession {
         history_inputs: Vec<HistoryInputRecord>,
         trace_id: &str,
         in_flight_input_keys: &[String],
-        inject_background_environment: bool,
+        _inject_background_environment: bool,
     ) -> Result<(
         BuiltContext,
         LLMContextRequest,
@@ -3423,50 +3426,25 @@ impl AgentSession {
         );
         deps = self.attach_step_result_hook(behavior, deps, in_flight_input_keys);
 
-        // Compose the per-turn "environment-aware message" once so both the
-        // resume and fresh-build branches see it. The message is the
-        // opendan-side surface for §5 "环境感知 message" — bundles current
-        // workspace / behavior / activity hints so the LLM doesn't have to
-        // re-discover them every turn.
-        //
-        // Emit env **only when there is real human/event input driving this
-        // turn**. Mid-run resumes (no human text, snapshot present) must
-        // not inject a synthetic User message or they'd promote an idle
-        // wakeup into a fake conversational turn. Bootstrap turns (work
-        // session first run, no input, no snapshot) get the objective via
-        // System and don't need env either.
-        let environment_message = if inject_background_environment
-            && self.session_class_inject_background_environment()
-        {
-            self.compose_environment_message(behavior).await
-        } else {
-            None
-        };
-        let environment_injected = environment_message
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| !text.is_empty());
-        let turn_message = compose_turn_message(turn_messages, environment_message);
+        let turn_message = compose_turn_message(turn_messages);
         if let Some(message) = turn_message.as_ref() {
             info!(
-                "opendan.session[{}]: composed user message trace={} behavior=`{}` source_messages={} environment_injected={} blocks={} text_chars={} preview=`{}`",
+                "opendan.session[{}]: composed user message trace={} behavior=`{}` source_messages={} blocks={} text_chars={} preview=`{}`",
                 self.session_id,
                 trace_id,
                 behavior.meta.name,
                 turn_messages.len(),
-                environment_injected,
                 message.content.len(),
                 message_text_chars(message),
                 ai_message_log_preview(message)
             );
-        } else if !turn_messages.is_empty() || environment_injected {
+        } else if !turn_messages.is_empty() {
             info!(
-                "opendan.session[{}]: skipped empty user message trace={} behavior=`{}` source_messages={} environment_injected={}",
+                "opendan.session[{}]: skipped empty user message trace={} behavior=`{}` source_messages={}",
                 self.session_id,
                 trace_id,
                 behavior.meta.name,
-                turn_messages.len(),
-                environment_injected
+                turn_messages.len()
             );
         }
 
@@ -3669,27 +3647,8 @@ impl AgentSession {
         })
     }
 
-    /// Compose the "environment-aware message" — a short, structured
-    /// summary of the session's current environment that we prefix onto
-    /// each turn's user input. Per §5 of `notepads/NewOpenDANRuntime.md`
-    /// the message should eventually include auto-recalled memory and an
-    /// event/message diff; the MVP version assembles the bits we can read
-    /// synchronously without grabbing the async meta lock:
-    ///
-    /// - Current behavior name (so the LLM knows which prompt context it's
-    ///   operating under after a `Normal`-mode switch).
-    /// - Workspace binding id (when present).
-    /// - One-line activity status (filled by tools through the
-    ///   `OneLineStatusSink`).
-    /// - Wall-clock timestamp so the LLM can reason about "now".
-    ///
-    /// Returns `None` when nothing useful can be rendered — caller then
-    /// falls back to just the raw human-text input (or `ResumeFromMidRun`).
-    /// `meta.try_lock` failures degrade silently (returns `None`); the
-    /// fact that a turn is currently driving an inference is rare to
-    /// happen concurrently with build_or_resume anyway.
     /// Build the Phase-1 [`AgentSessionEnv`] snapshot used by both the
-    /// behavior-template render path and the environment-block template. See
+    /// behavior-template render path and prompt environment variables. See
     /// `doc/opendan/Agent Enviroment.md` §15.1 for the variable contract.
     /// `input_text` is left empty in Phase 1 — `$input.*` is not consumed by
     /// the two currently-templated sections, and the user-input section is
@@ -3705,26 +3664,186 @@ impl AgentSession {
         .await
     }
 
-    async fn compose_environment_message(&self, behavior: &BehaviorCfg) -> Option<String> {
-        let mut env = self.build_prompt_env(behavior).await;
-        let pending = self.meta.lock().await.pending_inputs.clone();
-        env.llm_context = self
-            .apply_hook(
-                SessionHookPoint::OnInit,
-                &self.session_class_driver(),
-                &pending,
+    async fn load_changed_background_hits(&self) -> Vec<BackgroundHint> {
+        let (old_fingerprints, bg_events, owner) = {
+            let meta = self.meta.lock().await;
+            (
+                meta.background_hint_state.hint_fingerprints.clone(),
+                meta.background_events.clone(),
+                meta.owner.clone(),
             )
-            .await;
-        match prompt_env::render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[]).await {
-            Ok(text) => Some(text),
-            Err(err) => {
-                warn!(
-                    "opendan.session[{}]: render environment block failed: {err}; falling back to empty",
-                    self.session_id
-                );
-                None
+        };
+
+        let topic_tags = load_session_topic_tags(&self.session_dir);
+        let mut candidates = Vec::new();
+        candidates.extend(build_background_event_hints(&bg_events));
+        candidates.extend(self.build_notepad_hints(&topic_tags, &owner).await);
+        candidates.extend(self.build_memory_hints(&topic_tags).await);
+
+        let mut next_fingerprints = BTreeMap::new();
+        let mut changed = Vec::new();
+        for hint in candidates {
+            let previous = old_fingerprints.get(&hint.path);
+            next_fingerprints.insert(hint.path.clone(), hint.fingerprint.clone());
+            if previous != Some(&hint.fingerprint) {
+                changed.push(hint);
             }
         }
+
+        {
+            let mut meta = self.meta.lock().await;
+            meta.background_hint_state.hint_fingerprints = next_fingerprints;
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush background hint state failed: {err:#}",
+                self.session_id
+            );
+        }
+
+        changed
+    }
+
+    async fn build_notepad_hints(&self, topic_tags: &[String], owner: &str) -> Vec<BackgroundHint> {
+        let owner = owner.trim();
+        if owner.is_empty() || !self.agent_config.layout.notepads_dir.exists() {
+            return Vec::new();
+        }
+
+        let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
+            self.agent_config.layout.notepads_dir.clone(),
+        )) {
+            Ok(notebook) => notebook,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: open notepads for background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+        let candidate_notebook_ids = load_subscribed_notepad_ids(&self.session_dir);
+        let scope = OwnerScope::new(owner.to_string()).with_agent(self.agent_name.clone());
+        let hints = match notebook.build_notebook_hints(BuildHintsInput {
+            scope,
+            session_id: self.session_id.clone(),
+            topic_tags: if topic_tags.is_empty() {
+                None
+            } else {
+                Some(topic_tags.to_vec())
+            },
+            candidate_notebook_ids,
+            max_hints: Some(3),
+        }) {
+            Ok(hints) => hints,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: build notepad background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+
+        hints
+            .hints
+            .into_iter()
+            .map(|hint| {
+                let data = serde_json::to_value(&hint).unwrap_or(serde_json::Value::Null);
+                let fingerprint = stable_json_fingerprint(&data);
+                BackgroundHint {
+                    path: format!("notepad/{}", hint.notebook_id),
+                    kind: "notepad".to_string(),
+                    text: hint.text,
+                    fingerprint,
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    async fn build_memory_hints(&self, topic_tags: &[String]) -> Vec<BackgroundHint> {
+        if topic_tags.is_empty() || !self.agent_config.layout.memory_dir.exists() {
+            return Vec::new();
+        }
+        let memory = match AgentMemory::open(AgentMemoryConfig::new(
+            self.agent_config.layout.memory_dir.clone(),
+        )) {
+            Ok(memory) => memory,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: open memory for background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+        let items = match memory.load(
+            topic_tags,
+            LoadOptions {
+                max_records: 5,
+                max_bytes: 8 * 1024,
+                body_truncate_bytes: 1024,
+                ..LoadOptions::default()
+            },
+        ) {
+            Ok(items) => items,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: load memory background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+
+        items
+            .into_iter()
+            .map(|item| {
+                let key = item.key;
+                let matched_items = item.matched;
+                let ts = item.ts;
+                let size = item.size;
+                let truncated = item.truncated;
+                let content = item.content;
+                let data = serde_json::json!({
+                    "key": key.clone(),
+                    "matched": matched_items,
+                    "ts": ts,
+                    "size": size,
+                    "truncated": truncated,
+                });
+                let fingerprint =
+                    stable_report_hash(&format!("{}:{}", stable_json_fingerprint(&data), content));
+                let matched = data
+                    .get("matched")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let key = data
+                    .get("key")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                BackgroundHint {
+                    path: format!("memory/{key}"),
+                    kind: "memory".to_string(),
+                    text: if matched.is_empty() {
+                        format!("Memory may be relevant: {key}")
+                    } else {
+                        format!("Memory may be relevant: {key} (matched: {matched})")
+                    },
+                    fingerprint,
+                    data,
+                }
+            })
+            .collect()
     }
 
     async fn render_system_messages(&self, behavior: &BehaviorCfg) -> Result<Vec<AiMessage>> {
@@ -4440,13 +4559,14 @@ impl AgentSession {
         }
         let mut env = self.build_prompt_env(next).await;
         let pending = self.meta.lock().await.pending_inputs.clone();
-        env.llm_context = self
+        let hook_env = self
             .apply_hook(
                 SessionHookPoint::OnBehaviorSwitch,
                 &self.session_class_driver(),
                 &pending,
             )
             .await;
+        apply_hook_env_to_prompt_env(&mut env, hook_env);
         info!(
             "opendan.session[{}]: build user message hook=on_behavior_switch from=`{}` to=`{}` pending_total={} env_msgs={} env_events={} template_chars={}",
             self.session_id,
@@ -4526,7 +4646,7 @@ impl AgentSession {
             return Ok(None);
         }
         let mut env = self.build_prompt_env(&behavior).await;
-        env.llm_context = llm_context;
+        apply_hook_env_to_prompt_env(&mut env, llm_context);
         info!(
             "opendan.session[{}]: build user message hook=on_wakeup behavior=`{}` env_msgs={} env_events={} template_chars={}",
             self.session_id,
@@ -5516,6 +5636,8 @@ async fn build_agent_session_env(
         session_owner: owner,
         session_current_todo: load_current_todo(session_dir),
         session_current_todo_list: render_current_todo_list(session_dir),
+        session_background_hints: Vec::new(),
+        session_default_changed_background_hint_text: String::new(),
         behavior_name: behavior.meta.name.clone(),
         behavior_objective: behavior.meta.objective.clone(),
         behavior_mode: "behavior",
@@ -5537,6 +5659,159 @@ async fn build_agent_session_env(
             ..Default::default()
         },
     }
+}
+
+fn apply_hook_env_to_prompt_env(env: &mut AgentSessionEnv, hook_env: LlmContextEnv) {
+    env.session_background_hints = hook_env.background_hints.clone();
+    env.session_default_changed_background_hint_text =
+        hook_env.default_changed_background_hint_text.clone();
+    env.llm_context = hook_env;
+}
+
+fn build_background_event_hints(events: &[BgEventSnapshot]) -> Vec<BackgroundHint> {
+    let mut events = events.to_vec();
+    events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    events
+        .into_iter()
+        .map(|event| {
+            let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+            let fingerprint = stable_json_fingerprint(&data);
+            let reason = event
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            BackgroundHint {
+                path: format!("event/{}", event.event_id),
+                kind: "event".to_string(),
+                text: format!(
+                    "Background event changed: {}{} observed_at_ms={}",
+                    event.event_id, reason, event.observed_at_ms
+                ),
+                fingerprint,
+                data,
+            }
+        })
+        .collect()
+}
+
+fn render_changed_background_hint_text(hints: &[BackgroundHint]) -> String {
+    hints
+        .iter()
+        .map(|hint| {
+            let text = hint.text.trim();
+            if text.is_empty() {
+                hint.path.trim()
+            } else {
+                text
+            }
+        })
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("- {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn load_session_topic_tags(session_dir: &Path) -> Vec<String> {
+    let tag_set_path = session_dir.join(".meta").join("tag_set.json");
+    if let Ok(value) = read_json_file(&tag_set_path) {
+        let tags = value
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !tags.is_empty() {
+            return tags;
+        }
+    }
+
+    let topic_path = session_dir.join(".meta").join("topic.md");
+    let Ok(text) = std::fs::read_to_string(topic_path) else {
+        return Vec::new();
+    };
+    parse_topic_doc_tags(&text)
+}
+
+fn parse_topic_doc_tags(text: &str) -> Vec<String> {
+    if !text.starts_with("---\n") {
+        return Vec::new();
+    }
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    let Some((frontmatter, _body)) = rest.split_once("\n---") else {
+        return Vec::new();
+    };
+    for line in frontmatter.lines() {
+        let Some(raw) = line.trim().strip_prefix("tags:") else {
+            continue;
+        };
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(raw.trim()) else {
+            return Vec::new();
+        };
+        return tags
+            .into_iter()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn load_subscribed_notepad_ids(session_dir: &Path) -> Option<Vec<String>> {
+    let path = session_dir.join(".meta").join("subscriptions.json");
+    let value = read_json_file(&path).ok()?;
+    let subscriptions = value.get("subscriptions")?.as_array()?;
+    let mut ids = Vec::new();
+    for subscription in subscriptions {
+        let kind = subscription
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if kind != "notepad" && kind != "notebook" {
+            continue;
+        }
+        let Some(id) = subscription
+            .get("id")
+            .or_else(|| subscription.get("notebook_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        ids.push(id.to_string());
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+fn read_json_file(path: &Path) -> std::io::Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path)?;
+    serde_json::from_str(&text)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+fn stable_json_fingerprint(value: &serde_json::Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    stable_report_hash(&text)
 }
 
 fn merge_global_state_hook_stats(
@@ -6823,17 +7098,11 @@ fn agent_mention_token(agent_name: &str) -> String {
     }
 }
 
-fn compose_turn_message(messages: &[AiMessage], env: Option<String>) -> Option<AiMessage> {
+fn compose_turn_message(messages: &[AiMessage]) -> Option<AiMessage> {
     if messages.is_empty() {
         return None;
     }
     let mut blocks = Vec::new();
-    if let Some(env) = env.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        append_turn_content(
-            &mut blocks,
-            AiContent::text(background_environment_block(&env)),
-        );
-    }
     for message in messages {
         for block in &message.content {
             append_turn_content(&mut blocks, block.clone());
@@ -6948,13 +7217,6 @@ fn inject_user_supplement_into_text(text: &str, supplement: &str) -> String {
     } else {
         format!("{trimmed}\n\n{supplement}")
     }
-}
-
-fn background_environment_block(env: &str) -> String {
-    format!(
-        "<background_environment>\n{}\n</background_environment>",
-        env.trim()
-    )
 }
 
 fn append_turn_content(blocks: &mut Vec<AiContent>, block: AiContent) {

@@ -22,7 +22,7 @@ use llm_context::{
 };
 use serde_json::{json, Value as Json};
 
-use crate::session_model::{BgEventSnapshot, EventRef, PendingInput, SessionKind};
+use crate::session_model::{BackgroundHint, BgEventSnapshot, EventRef, PendingInput, SessionKind};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default)]
@@ -30,6 +30,8 @@ pub struct LlmContextEnv {
     pub msgs: Vec<Json>,
     pub events: Vec<EventRef>,
     pub bg_events: Vec<BgEventSnapshot>,
+    pub background_hints: Vec<BackgroundHint>,
+    pub default_changed_background_hint_text: String,
     pub last_step: Option<Json>,
     pub last_report: Option<String>,
     pub behavior_history: Vec<Json>,
@@ -42,6 +44,8 @@ impl Default for LlmContextEnv {
             msgs: Vec::new(),
             events: Vec::new(),
             bg_events: Vec::new(),
+            background_hints: Vec::new(),
+            default_changed_background_hint_text: String::new(),
             last_step: None,
             last_report: None,
             behavior_history: Vec::new(),
@@ -56,8 +60,7 @@ impl Default for LlmContextEnv {
 ///
 /// String fields that drive presence checks (`session_title`,
 /// `recent_activity`) are stored already-trimmed so the matching
-/// `has_*` booleans line up with the historical `compose_environment_message`
-/// rules byte-for-byte.
+/// `has_*` booleans are stable across behavior-template renders.
 #[derive(Debug, Clone)]
 pub struct AgentSessionEnv {
     pub session_id: String,
@@ -67,6 +70,8 @@ pub struct AgentSessionEnv {
     pub session_owner: String,
     pub session_current_todo: Json,
     pub session_current_todo_list: String,
+    pub session_background_hints: Vec<BackgroundHint>,
+    pub session_default_changed_background_hint_text: String,
 
     pub behavior_name: String,
     pub behavior_objective: String,
@@ -100,6 +105,10 @@ impl AgentSessionEnv {
 
     fn has_current_todo(&self) -> bool {
         !self.session_current_todo.is_null()
+    }
+
+    fn background_hint_changed(&self) -> bool {
+        !self.session_background_hints.is_empty()
     }
 
     fn has_workspace_id(&self) -> bool {
@@ -217,6 +226,14 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "session.current_behavior" => Some(Json::String(env.behavior_name.clone())),
         "session.current_todo" => Some(env.session_current_todo.clone()),
         "session.current_todo_list" => Some(Json::String(env.session_current_todo_list.clone())),
+        "session.background_hint_changed" => Some(Json::Bool(env.background_hint_changed())),
+        "session.default_changed_background_hint_text" => Some(Json::String(
+            env.session_default_changed_background_hint_text.clone(),
+        )),
+        "session.default_changed_background_hint_text" => Some(Json::String(
+            env.session_default_changed_background_hint_text.clone(),
+        )),
+        "session.background_hints" => Some(background_hints_array(env)),
         "session.has_title" => Some(Json::Bool(env.has_title())),
         "session.has_current_todo" => Some(Json::Bool(env.has_current_todo())),
 
@@ -320,6 +337,10 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "current_behavior": env.behavior_name,
         "current_todo": env.session_current_todo.clone(),
         "current_todo_list": env.session_current_todo_list,
+        "background_hint_changed": env.background_hint_changed(),
+        "default_changed_background_hint_text": env.session_default_changed_background_hint_text.clone(),
+        "default_changed_background_hint_text": env.session_default_changed_background_hint_text.clone(),
+        "background_hints": background_hints_array(env),
         "has_title": env.has_title(),
         "has_current_todo": env.has_current_todo(),
     })
@@ -434,6 +455,10 @@ fn events_array(env: &AgentSessionEnv) -> Json {
 
 fn bg_events_array(env: &AgentSessionEnv) -> Json {
     serde_json::to_value(&env.llm_context.bg_events).unwrap_or(Json::Array(Vec::new()))
+}
+
+fn background_hints_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.session_background_hints).unwrap_or(Json::Array(Vec::new()))
 }
 
 fn first_or_null(values: &[Json]) -> Json {
@@ -691,28 +716,6 @@ pub async fn render_template(
     Ok(result.rendered)
 }
 
-/// Phase-1 environment-block template. Mirrors the historical
-/// `compose_environment_message` output line-for-line:
-///
-/// ```text
-/// behavior: `<name>`
-/// session: `<id>`[ ("<title>")]
-/// [workspace: `<id>`]
-/// [recent activity: <activity>]
-/// clock: unix_ms=<ms>
-/// ```
-///
-/// The `{% if %}` guards key off the explicit `has_*` booleans seeded into
-/// the aggregate objects, so empty-string distinction is exact.
-pub const ENVIRONMENT_BLOCK_TEMPLATE: &str = "\
-behavior: `{{ behavior.name }}`
-session: `{{ session.id }}`{% if session.has_title %} (\"{{ session.title }}\"){% endif %}\
-{% if workspace.has_id %}
-workspace: `{{ workspace.id }}`{% endif %}\
-{% if runtime.has_activity %}
-recent activity: {{ runtime.recent_activity }}{% endif %}
-clock: unix_ms={{ runtime.clock_unix_ms }}";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +735,8 @@ mod tests {
                 "skills": ["docs"],
             }),
             session_current_todo_list: "T01 pending current - do thing".into(),
+            session_background_hints: Vec::new(),
+            session_default_changed_background_hint_text: String::new(),
             behavior_name: "chat_route".into(),
             behavior_objective: "route".into(),
             behavior_mode: "behavior",
@@ -770,6 +775,8 @@ mod tests {
                     reason: None,
                     observed_at_ms: 122,
                 }],
+                background_hints: Vec::new(),
+                default_changed_background_hint_text: String::new(),
                 last_step: Some(json!({"step_index": 7, "behavior_name": "chat_route"})),
                 last_report: Some("latest report".into()),
                 behavior_history: vec![json!({"step_index": 6, "behavior_name": "chat_route"})],
@@ -787,6 +794,8 @@ mod tests {
             session_owner: String::new(),
             session_current_todo: Json::Null,
             session_current_todo_list: String::new(),
+            session_background_hints: Vec::new(),
+            session_default_changed_background_hint_text: String::new(),
             behavior_name: "chat_route".into(),
             behavior_objective: String::new(),
             behavior_mode: "behavior",
@@ -914,50 +923,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_block_matches_full_layout() {
-        let env = sample_env();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-1` (\"hello\")
-workspace: `ws1`
-recent activity: running tool
-clock: unix_ms=123";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
-    async fn environment_block_minimal_layout() {
-        let env = minimal_env();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-2`
-clock: unix_ms=999";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
-    async fn environment_block_partial_title_only() {
-        let mut env = sample_env();
-        env.workspace_id = None;
-        env.workspace_root = None;
-        env.recent_activity = String::new();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-1` (\"hello\")
-clock: unix_ms=123";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
     async fn extra_vars_seed_overlay() {
         let env = sample_env();
         let extras = vec![
@@ -1081,6 +1046,8 @@ clock: unix_ms=123";
                 reason: Some("presence subscription".into()),
                 observed_at_ms: 105,
             }],
+            background_hints: Vec::new(),
+            default_changed_background_hint_text: String::new(),
             last_step: Some(json!({
                 "step_index": 8,
                 "behavior_name": "chat_route",
@@ -1114,6 +1081,15 @@ clock: unix_ms=123";
                 },
             }),
         };
+        env.session_background_hints = vec![BackgroundHint {
+            path: "memory/user/preference/style".into(),
+            kind: "memory".into(),
+            text: "Memory may be relevant: /user/preference/style".into(),
+            fingerprint: "fp-memory".into(),
+            data: json!({"key": "/user/preference/style"}),
+        }];
+        env.session_default_changed_background_hint_text =
+            "- Memory may be relevant: /user/preference/style".into();
 
         let extras = vec![
             (
@@ -1154,6 +1130,10 @@ workspace={{ workspace.id }}|{{ workspace.root }}|{{ workspace.has_id }}
 paths={{ paths.agent_root }}|{{ paths.session_root }}|{{ paths.workspace_root }}
 runtime={{ runtime.clock_unix_ms }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
 {% if session.has_title %}if_session_title={{ session.title }}{% endif %}
+{% if session.background_hint_changed %}if_background_hint={{ session.default_changed_background_hint_text }}
+{% endif %}
+{% for hint in session.background_hints %}hint={{ hint.path }}|{{ hint.kind }}|{{ hint.text }}
+{% endfor %}
 {% if input.has_user_text %}if_input_text={{ input.text }}{% endif %}
 {% if input.has_msgs %}if_msgs=yes{% endif %}
 {% if input.has_events %}if_events=yes{% endif %}
@@ -1201,6 +1181,8 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
             "paths=/tmp/agent|/tmp/agent/sessions/s-1|/tmp/ws1",
             "runtime=123|running tool|true",
             "if_session_title=hello",
+            "if_background_hint=- Memory may be relevant: /user/preference/style",
+            "hint=memory/user/preference/style|memory|Memory may be relevant: /user/preference/style",
             "if_input_text=look\n[image: screenshot.png]",
             "if_msgs=yes",
             "if_events=yes",

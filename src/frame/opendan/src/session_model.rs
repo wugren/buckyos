@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use buckyos_api::{match_event_patterns, AiMessage};
 use chrono::{DateTime, FixedOffset};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -165,6 +167,8 @@ pub struct SessionMeta {
     pub event_subscriptions: Vec<EventSubscription>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_events: Vec<BgEventSnapshot>,
+    #[serde(default, skip_serializing_if = "BackgroundHintState::is_empty")]
+    pub background_hint_state: BackgroundHintState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -209,6 +213,7 @@ impl SessionMeta {
             peer_tunnel_did: None,
             event_subscriptions: Vec::new(),
             background_events: Vec::new(),
+            background_hint_state: BackgroundHintState::default(),
             workspace_id: None,
             pending_task_calls: Vec::new(),
             improvement_budget: None,
@@ -299,6 +304,32 @@ pub struct BgEventSnapshot {
     pub reason: Option<String>,
     #[serde(default)]
     pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackgroundHintState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hint_fingerprints: BTreeMap<String, String>,
+}
+
+impl BackgroundHintState {
+    pub fn is_empty(&self) -> bool {
+        self.hint_fingerprints.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundHint {
+    pub path: String,
+    pub kind: String,
+    pub text: String,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "serde_json_value_is_null")]
+    pub data: serde_json::Value,
+}
+
+fn serde_json_value_is_null(value: &serde_json::Value) -> bool {
+    value.is_null()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

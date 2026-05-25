@@ -269,13 +269,10 @@ fn compose_turn_message_preserves_structured_blocks() {
             },
         ],
     );
-    let out = compose_turn_message(&[msg], Some("environment".to_string())).unwrap();
+    let out = compose_turn_message(&[msg]).unwrap();
     assert_eq!(out.role, AiRole::User);
     assert_eq!(out.content.len(), 2);
-    assert_eq!(
-        out.text_content(),
-        "<background_environment>\nenvironment\n</background_environment>\n\nsee this"
-    );
+    assert_eq!(out.text_content(), "see this");
     assert!(matches!(out.content[1], AiContent::Image { .. }));
 }
 
@@ -727,6 +724,7 @@ fn driver_pull_selects_only_configured_pending_inputs() {
         filter: crate::agent_config::BehaviorFilter::Top,
         pull_msg: PullMsgPolicy::One,
         pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+        load_background_hits: Default::default(),
     };
     let pending = vec![
         pending_msg("m1", "first"),
@@ -753,6 +751,7 @@ fn driver_pull_keeps_task_events_internal_even_when_event_pull_is_none() {
         filter: crate::agent_config::BehaviorFilter::Top,
         pull_msg: PullMsgPolicy::None,
         pull_event: PullEventPolicy::None,
+        load_background_hits: Default::default(),
     };
     let pending = vec![pending_msg("m1", "ignored"), pending_event("/task_mgr/7")];
     let mut task_index = std::collections::HashMap::new();
@@ -932,7 +931,9 @@ __INCLUDE(/role.md)__
         session_owner: "owner".into(),
         session_current_todo: serde_json::Value::Null,
         session_current_todo_list: "(empty)".into(),
-        behavior_name: "do".into(),
+        session_background_hints: Vec::new(),
+        session_default_changed_background_hint_text: String::new(),
+        behavior_name: "do".intobackground
         behavior_objective: "execute".into(),
         behavior_mode: "behavior",
         behavior_template_dir: behavior_path.parent().map(|path| path.to_path_buf()),
@@ -1208,6 +1209,7 @@ fn session_meta_round_trips_pending_inputs() {
             message_template: None,
         }],
         background_events: Vec::new(),
+        background_hint_state: Default::default(),
         workspace_id: Some("ws-1".to_string()),
         pending_task_calls: vec![PendingTaskCall {
             call_id: "call-1".to_string(),
@@ -1473,6 +1475,45 @@ fn merge_env_and_human_handles_missing_pieces() {
         Some("e")
     );
     assert!(merge_env_and_human(None, None).is_none());
+}
+
+#[test]
+fn default_changed_background_hint_text_renders_list() {
+    let hints = vec![
+        BackgroundHint {
+            path: "event/presence.changed".to_string(),
+            kind: "event".to_string(),
+            text: "Background event changed: presence.changed observed_at_ms=122".to_string(),
+            fingerprint: "fp1".to_string(),
+            data: serde_json::Value::Null,
+        },
+        BackgroundHint {
+            path: "memory/user/preference/style".to_string(),
+            kind: "memory".to_string(),
+            text: "Memory may be relevant: /user/preference/style".to_string(),
+            fingerprint: "fp2".to_string(),
+            data: serde_json::Value::Null,
+        },
+    ];
+    assert_eq!(
+        render_changed_background_hint_text(&hints),
+        "- Background ebackgroundged: presence.changed observed_at_ms=122\n- Memory may be relevant: /user/preference/style"
+    );
+}
+
+#[test]
+fn default_changed_background_hint_text_falls_back_to_path() {
+    let hints = vec![BackgroundHint {
+        path: "notepad/project".to_string(),
+        kind: "notepad".to_string(),
+        text: String::new(),
+        fingerprint: "fp1".to_string(),
+        data: serde_json::Value::Null,
+    }];
+    assert_eq!(
+        render_changed_background_hint_text(&hints),
+        "- notepad/projbackground
+    );
 }
 
 #[test]
