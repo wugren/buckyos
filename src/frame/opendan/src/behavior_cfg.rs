@@ -9,7 +9,7 @@
 //!   * `[meta]` — name / objective
 //!   * `[prompt]` — parser choice + per-event prompt templates
 //!     (`on_init` / `on_behavior_switch` / `on_behavior_step_ob` /
-//!     `on_input_msg` / `on_input_event`) + output spec
+//!     `on_input_event`) + output spec
 //!   * `[capabilities]` — tool_whitelist / approval_required / tool_plan
 //!     (v0 placeholder; §5.3 — will be redone in beta2.3 alongside skill
 //!     bundle / function-call tool unification)
@@ -85,10 +85,10 @@ impl BehaviorOutput {
 /// `llm_context::PromptRenderEngine` (upon
 /// `{{ var }}` placeholders, `__VAR__` / `__ENV__` / `__INCLUDE__`
 /// directives) with the Phase-1 variable contract from
-/// `doc/opendan/Agent Enviroment.md` §15.1. `on_input_msg` /
-/// `on_input_event` still use the dynamic-payload-aware `{var}` substitution
-/// in `render_event_template` — this is a separate per-event format engine
-/// and is not affected by the system-prompt rendering pipeline.
+/// `doc/opendan/Agent Enviroment.md` §15.1. `on_input_event` still uses the
+/// dynamic-payload-aware `{var}` substitution in `render_event_template` —
+/// this is a separate per-event format engine and is not affected by the
+/// system-prompt rendering pipeline.
 ///
 /// **Per-event hook names map onto the actual prompt-construction sites
 /// the runtime has today**:
@@ -98,7 +98,6 @@ impl BehaviorOutput {
 /// | `on_init`              | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
 /// | `on_behavior_switch`   | after `next_behavior` switch          | no synthetic input |
 /// | `on_behavior_step_ob`  | after behavior-loop action results    | default `<<last_step_action_results>>` user message |
-/// | `on_input_msg`    | wraps each `PendingInput::Msg` text   | raw `AiMessage` is passed through (today's default) |
 /// | `on_input_event`  | behavior-wide event-format fallback   | falls through to subscription template, then to `format_event_for_turn_with_subscriptions` default |
 ///
 /// Available variables:
@@ -110,7 +109,6 @@ impl BehaviorOutput {
 ///     §15.1 for the complete set. Render-time extras: `{{ role_md }}`,
 ///     `{{ self_md }}` (pre-read from `agent_root/role.md` and
 ///     `agent_root/self.md`).
-///   * `on_input_msg`: `{msg_text}`, `{msg_from_did}`, `{msg_from_name}`
 ///   * `on_input_event`: `{event_id}`, `{event_data}` plus any top-level
 ///     scalar field of the JSON payload as `{<key>}`
 ///   * `on_behavior_step_ob` (upon syntax): full Phase-1 contract plus render-time
@@ -136,8 +134,6 @@ pub struct PromptCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_behavior_step_ob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_input_msg: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_input_event: Option<String>,
     pub output: BehaviorOutput,
 }
@@ -150,7 +146,6 @@ impl Default for PromptCfg {
             on_init: String::new(),
             on_behavior_switch: None,
             on_behavior_step_ob: None,
-            on_input_msg: None,
             on_input_event: None,
             output: BehaviorOutput::Text,
         }
@@ -594,7 +589,6 @@ mod tests {
             on_init = "Hello {agent_name}, you are {behavior_name}."
             on_behavior_switch = "Continue as {{ behavior.name }}."
             on_behavior_step_ob = "Observe {{ step_result.default_user_message }}."
-            on_input_msg = "[from {msg_from_did}] {msg_text}"
         "#;
         let cfg = BehaviorCfg::from_toml_str(toml_src).unwrap();
         assert!(cfg.prompt.on_init.contains("{agent_name}"));
@@ -605,10 +599,6 @@ mod tests {
         assert_eq!(
             cfg.prompt.on_behavior_step_ob.as_deref(),
             Some("Observe {{ step_result.default_user_message }}.")
-        );
-        assert_eq!(
-            cfg.prompt.on_input_msg.as_deref(),
-            Some("[from {msg_from_did}] {msg_text}")
         );
     }
 

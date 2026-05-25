@@ -27,7 +27,7 @@ default_class = "ui"
 on = "msg.chat"
 session_class = "ui"
 
-# ─── Session 类: 一个 peer 一个 UI session,永远 keep_alive ─────────────
+# ─── Session 类: 一个 peer 一个 UI session ─────────────
 [session.ui]
 kind                = "ui"
 loop_mode           = "agent"
@@ -35,7 +35,6 @@ default_behavior    = "ui_default"
 session_id_strategy = "per_peer"     # session_id = `ui-<peer_did>`
 
 [session.ui.driver]
-keep_alive = true
 switch_mode = "normal"
 inject_background_environment = true
 report_delivery = "final_only"

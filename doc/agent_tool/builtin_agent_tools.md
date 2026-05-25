@@ -136,7 +136,7 @@ builtin tool 的标准输出协议是 `AgentToolResult`，详细字段见：
 
 - `read` 的 `content` 是读取结果，可以放在 `detail`
 - `write_file` 的 `content` 是输入参数，不应放在 `detail`
-- `edit_file` 的 `new_content` / `pos_chunk` 是输入参数，不应放在 `detail`
+- `edit_file` 的 `old_string` / `new_string` 是输入参数，不应放在 `detail`
 - `todo` / `worklog_manage` 的 `action` 是输入参数，不应只为了回显而放在 `detail`
 - `path`、`mode`、`range` 等输入参数默认不应复制到 `detail`，需要追踪调用时读取 arguments 或 `cmd_args`
 
@@ -158,7 +158,7 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 |---|---|---|---|
 | `read` | action / llm_tool_call | 按 uri/path 读取内容；无 `://` 时默认文件路径 | `src/read_tool.rs` |
 | `write_file` | action | 覆盖/追加写文件 | `src/file_tools.rs` |
-| `edit_file` | action | 基于锚点编辑文件 | `src/file_tools.rs` |
+| `edit_file` | action | 基于唯一 old_string 替换文件 | `src/file_tools.rs` |
 | `get_session` | bash | 读取 session 状态 | `src/lib.rs` |
 | `load_memory` | bash / llm_tool_call | 加载记忆摘要 | `src/lib.rs` |
 | `todo` | bash | 工作项 PDCA 管理 | `src/agent_todo_tool.rs` |
@@ -261,18 +261,19 @@ detail 关键字段：
 
 用途：
 
-- 基于锚点字符串对文件做替换、前插、后插
+- 基于唯一 `old_string` 对文件做替换
 
 输入：
 
 ```json
 {
   "path": "string",
-  "pos_chunk": "string",
-  "new_content": "string",
-  "mode": "replace|after|before"
+  "old_string": "string",
+  "new_string": "string"
 }
 ```
+
+`new_string` 必须不同于 `old_string`。`old_string` 必须在文件中只出现一次；没有命中或命中多处都会失败。
 
 
 detail 关键字段：
@@ -287,10 +288,10 @@ detail 关键字段：
 
 - 顶层固定字段至少包含 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`
 - `cmd_name` 应为 `edit_file`
-- `cmd_args` 表达 path / pos_chunk / mode / new_content 等输入参数
-- `summary` 表达是否命中锚点、是否产生修改
+- `cmd_args` 表达 path / old_string / new_string 等输入参数
+- `summary` 表达是否产生修改
 - 主结果放 `detail`
-- `detail` 不应包含输入参数 `pos_chunk` 或 `new_content`
+- `detail` 不应包含输入参数 `old_string` 或 `new_string`
 
 ### 5.4 `get_session`
 

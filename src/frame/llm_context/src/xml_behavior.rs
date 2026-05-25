@@ -87,9 +87,10 @@ python3 test.py
     <exec_bash><![CDATA[
 ifconfig
     ]]></exec_bash>
-    <edit_file path="src/foo.rs" mode="replace_range" from_line="10" to_line="20"><![CDATA[
-new content
-    ]]></edit_file>
+    <edit_file path="src/foo.rs">
+      <old_string><![CDATA[println!("hello");]]></old_string>
+      <new_string><![CDATA[println!("hi");]]></new_string>
+    </edit_file>
     <read uri="src/foo.rs" offset="0" limit="4096"/>
     <sendmsg><![CDATA[
 Message to the user; optional; SHOULD only be provided when there is important progress or user input is required.
@@ -111,6 +112,7 @@ Message to the user; optional; SHOULD only be provided when there is important p
 
 - Actions are executed in order, and later actions can depend on the results of earlier actions.
 - You SHOULD always prefer `write_file` / `edit_file` / `read` over `exec_bash`. MUST NOT use `echo`, `cat`, or heredoc to write files
+- `<edit_file>` MUST provide `old_string` and `new_string`. `new_string` MUST be different from `old_string`. `old_string` MUST match exactly once in the target file, otherwise the edit fails.
 - `<exec_bash>` MUST contain online bash commands in its body, and each `<exec_bash>` SHOULD complete exactly one task.
 
 "#;
@@ -132,6 +134,7 @@ pub const V2_ACTION_TAGS: &[&str] = &[
 ];
 
 const SELF_REPORT_TAGS: &[&str] = &["report"];
+const EDIT_FILE_ARG_TAGS: &[&str] = &["old_string", "new_string"];
 
 /// True if `name` is a v2 first-class Action tag (i.e. handled by the XML
 /// behavior parser rather than by `ToolManager`'s provider-native tool
@@ -152,7 +155,7 @@ pub fn is_v2_action_tag(name: &str) -> bool {
 fn body_arg_name(tag: &str) -> Option<&'static str> {
     match tag {
         "exec_bash" => Some("command"),
-        "write_file" | "edit_file" => Some("content"),
+        "write_file" => Some("content"),
         _ => None,
     }
 }
@@ -293,7 +296,11 @@ fn extract_v2_actions(
             .map(|(k, v)| (k, Value::String(v)))
             .collect();
 
-        if let Some(arg_name) = body_arg_name(raw.tag) {
+        if raw.tag == "edit_file" {
+            for child in scan_known_tags(&raw.body, EDIT_FILE_ARG_TAGS) {
+                args.insert(child.tag.to_string(), Value::String(child.body));
+            }
+        } else if let Some(arg_name) = body_arg_name(raw.tag) {
             if !raw.body.is_empty() {
                 args.insert(arg_name.to_string(), Value::String(raw.body));
             }
@@ -821,6 +828,31 @@ mod tests {
             out.do_actions[0].args.get("content"),
             Some(&json!("</write_file>literal</write_file>"))
         );
+    }
+
+    #[test]
+    fn edit_file_child_tags_map_to_old_and_new_string_args() {
+        let parser = XmlBehaviorParser::new();
+        let raw = r#"<actions>
+<edit_file path="src/foo.rs">
+  <old_string><![CDATA[println!("hello");]]></old_string>
+  <new_string><![CDATA[println!("hi");]]></new_string>
+</edit_file>
+</actions>"#;
+        let out = parser.parse(&resp(raw)).unwrap();
+        assert_eq!(out.do_actions.len(), 1);
+        let call = &out.do_actions[0];
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(call.args.get("path"), Some(&json!("src/foo.rs")));
+        assert_eq!(
+            call.args.get("old_string"),
+            Some(&json!("println!(\"hello\");"))
+        );
+        assert_eq!(
+            call.args.get("new_string"),
+            Some(&json!("println!(\"hi\");"))
+        );
+        assert!(call.args.get("content").is_none());
     }
 
     #[test]

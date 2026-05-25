@@ -18,7 +18,7 @@
 | [`exec_bash`](#1-exec_bash) | bash / action / llm_tool_call | 执行 bash 命令 | `src/llm_bash.rs` |
 | [`read`](#2-read) | bash / action / llm_tool_call | 按 URI 读取（v2 Action） | `src/read_tool.rs` |
 | [`write_file`](#3-write_file) | action | 写文件 | `src/file_tools.rs` |
-| [`edit_file`](#4-edit_file) | action | 基于锚点编辑文件 | `src/file_tools.rs` |
+| [`edit_file`](#4-edit_file) | action | 基于唯一字符串替换文件 | `src/file_tools.rs` |
 | [`read_file`](#5-read_file-legacy) | bash / llm_tool_call | legacy 文本读取，支持纯文本 stdout | `src/file_tools.rs` |
 | [`Glob`](#6-glob) | bash / llm_tool_call | 文件名 glob 匹配 | `src/glob_tool.rs` |
 | [`Grep`](#7-grep) | bash / llm_tool_call | ripgrep 内容搜索 | `src/grep_tool.rs` |
@@ -299,7 +299,7 @@ cat new.txt | write_file src/foo.rs --mode write --content-stdin
 
 ## 4. `edit_file`
 
-锚点编辑：`pos_chunk` 命中第一处后做 `replace` / `after` / `before`。
+唯一字符串替换：`old_string` 必须在文件中只出现一次，然后替换成不同的 `new_string`。
 
 ### Prompt
 
@@ -310,14 +310,13 @@ cat new.txt | write_file src/foo.rs --mode write --content-stdin
     "type": "object",
     "properties": {
       "path":        { "type": "string" },
-      "pos_chunk":   { "type": "string" },
-      "new_content": { "type": "string" },
-      "mode":        { "type": "string", "enum": ["replace", "after", "before"] }
+      "old_string":  { "type": "string" },
+      "new_string":  { "type": "string" }
     },
-    "required": ["path", "pos_chunk", "new_content"]
+    "required": ["path", "old_string", "new_string"]
   }
   ```
-- `usage`: `edit_file <path> --pos-chunk <text> [--mode replace|after|before] (--new-content <text> | --new-content-stdin)`
+- `usage`: `edit_file <path> --old-string <text> (--new-string <text> | --new-string-stdin)`
 
 ### Bash 支持
 
@@ -328,18 +327,18 @@ cat new.txt | write_file src/foo.rs --mode write --content-stdin
 XML action 形态：
 
 ```xml
-<edit_file path="src/foo.rs" mode="replace">
-  <pos_chunk>println!("hello");</pos_chunk>
-  <new_content>println!("hi");</new_content>
+<edit_file path="src/foo.rs">
+  <old_string><![CDATA[println!("hello");]]></old_string>
+  <new_string><![CDATA[println!("hi");]]></new_string>
 </edit_file>
 ```
 
 CLI 形态：
 
 ```bash
-edit_file src/foo.rs --mode replace \
-  --pos-chunk 'println!("hello");' \
-  --new-content 'println!("hi");'
+edit_file src/foo.rs \
+  --old-string 'println!("hello");' \
+  --new-string 'println!("hi");'
 ```
 
 ### 输出示例
@@ -349,8 +348,8 @@ edit_file src/foo.rs --mode replace \
   "agent_tool_protocol": "1",
   "status": "success",
   "cmd_name": "edit_file",
-  "cmd_args": "src/foo.rs --mode=replace --pos-chunk='println!(\"hello\");'",
-  "title": "edit_file src/foo.rs mode=replace => success (line 7)",
+  "cmd_args": "edit_file src/foo.rs old_string=\"println!(\\\"hello\\\");\"",
+  "title": "edit_file src/foo.rs => success (line 7)",
   "summary": "edited src/foo.rs with replace at line 7\n```diff\n-    println!(\"hello\");\n+    println!(\"hi\");\n```",
   "detail": {
     "matched": true,

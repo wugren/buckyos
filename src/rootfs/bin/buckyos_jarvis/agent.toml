@@ -45,7 +45,6 @@ session_id_strategy = "per_peer"
 process_stack_limit = 4
 
 [session.ui.driver]
-keep_alive = true
 switch_mode = "normal"
 inject_background_environment = true
 report_delivery = "final_only"
@@ -78,7 +77,6 @@ session_id_strategy = "per_group"
 process_stack_limit = 4
 
 [session.group.driver]
-keep_alive = true
 switch_mode = "normal"
 inject_background_environment = true
 report_delivery = "final_only"
@@ -111,7 +109,6 @@ session_id_strategy = "per_event_session"
 process_stack_limit = 8
 
 [session.work.driver]
-keep_alive = false
 switch_mode = "fork"
 inject_background_environment = false
 report_delivery = "final_only"
@@ -145,7 +142,6 @@ session_id_strategy = "singleton"
 process_stack_limit = 2
 
 [session.self_check.driver]
-keep_alive = false
 switch_mode = "normal"
 inject_background_environment = false
 report_delivery = "final_only"
@@ -179,7 +175,6 @@ session_id_strategy = "singleton"
 process_stack_limit = 2
 
 [session.self_improve.driver]
-keep_alive = false
 switch_mode = "normal"
 inject_background_environment = false
 report_delivery = "final_only"

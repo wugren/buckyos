@@ -22,7 +22,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use log::warn;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::behavior_cfg::{BehaviorCfg, BehaviorCfgError};
@@ -262,7 +261,6 @@ impl SessionHookPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SessionDriverCfg {
-    pub keep_alive: bool,
     pub switch_mode: SwitchMode,
     pub inject_background_environment: bool,
     pub report_delivery: ReportDeliveryMode,
@@ -276,7 +274,6 @@ pub struct SessionDriverCfg {
 impl Default for SessionDriverCfg {
     fn default() -> Self {
         Self {
-            keep_alive: false,
             switch_mode: SwitchMode::Normal,
             inject_background_environment: true,
             report_delivery: ReportDeliveryMode::FinalOnly,
@@ -539,12 +536,6 @@ impl AgentConfig {
                     path: toml_path.display().to_string(),
                     err,
                 })?;
-            let raw_value =
-                toml::from_str::<toml::Value>(&bytes).map_err(|err| AgentConfigError::Parse {
-                    path: toml_path.display().to_string(),
-                    err,
-                })?;
-            warn_deprecated_session_keys(&toml_path, &raw_value);
             let parsed: AgentTomlFile =
                 toml::from_str(&bytes).map_err(|err| AgentConfigError::Parse {
                     path: toml_path.display().to_string(),
@@ -742,7 +733,6 @@ pub fn open_agent_root(root: impl AsRef<Path>) -> Result<AgentConfig, AgentConfi
 
 fn default_self_check_driver() -> SessionDriverCfg {
     SessionDriverCfg {
-        keep_alive: false,
         inject_background_environment: false,
         on_init: HookPointCfg {
             filter: BehaviorFilter::All,
@@ -762,7 +752,6 @@ fn default_self_check_driver() -> SessionDriverCfg {
 
 fn default_self_improve_driver() -> SessionDriverCfg {
     SessionDriverCfg {
-        keep_alive: false,
         inject_background_environment: false,
         on_init: HookPointCfg {
             filter: BehaviorFilter::All,
@@ -805,33 +794,6 @@ fn validate_driver_filters(path: &Path, cfg: &AgentTomlFile) -> Result<(), Agent
         }
     }
     Ok(())
-}
-
-fn warn_deprecated_session_keys(path: &Path, raw: &toml::Value) {
-    let Some(session_table) = raw.get("session").and_then(|v| v.as_table()) else {
-        return;
-    };
-    for (class, value) in session_table {
-        let Some(table) = value.as_table() else {
-            continue;
-        };
-        for key in [
-            "subscribe_events",
-            "inject_background_environment",
-            "switch_mode",
-            "report_delivery",
-        ] {
-            if table.contains_key(key) {
-                warn!(
-                    "deprecated agent.toml key {} [session.{}].{}: move it under [session.{}.driver]",
-                    path.display(),
-                    class,
-                    key,
-                    class
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -904,7 +866,6 @@ mod tests {
                 session_id_strategy = "per_peer"
 
                 [session.ui.driver]
-                keep_alive = true
                 switch_mode = "normal"
                 inject_background_environment = true
                 report_delivery = "final_only"
@@ -917,7 +878,6 @@ mod tests {
                 process_stack_limit = 8
 
                 [session.work.driver]
-                keep_alive = false
                 inject_background_environment = false
                 report_delivery = "top_level"
                 switch_mode = "normal"
@@ -954,13 +914,11 @@ mod tests {
         assert_eq!(ui.kind, SessionKind::Ui);
         assert_eq!(ui.loop_mode, LoopMode::Agent);
         assert_eq!(ui.default_behavior, "alice_ui");
-        assert!(ui.driver.keep_alive);
         let work = cfg.session_class("work").unwrap();
         assert_eq!(work.kind, SessionKind::Work);
         assert_eq!(work.loop_mode, LoopMode::Behavior);
         assert_eq!(work.session_id_strategy, SessionIdStrategy::PerEventSession);
         assert_eq!(work.process_stack_limit, 8);
-        assert!(!work.driver.keep_alive);
         assert!(!work.driver.inject_background_environment);
         assert_eq!(work.driver.report_delivery, ReportDeliveryMode::TopLevel);
         assert_eq!(
@@ -1179,7 +1137,6 @@ mod tests {
         assert_eq!(cfg.toml.dispatch.default_class, "ui");
         let ui = cfg.session_class("ui").expect("demo defines [session.ui]");
         assert_eq!(ui.default_behavior, "ui_default");
-        assert!(ui.driver.keep_alive);
 
         let beh = cfg.load_behavior("ui_default").expect("load demo behavior");
         assert_eq!(beh.name(), "ui_default");

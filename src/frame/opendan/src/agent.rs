@@ -1284,37 +1284,6 @@ impl AIAgent {
         let session_dir = self.config.layout.session_dir(&session_id);
         let _ = std::fs::create_dir_all(&session_dir);
         let mut existing_meta = existing_meta;
-        let legacy_ui_workspace_id = if matches!(kind, SessionKind::Ui) {
-            existing_meta
-                .as_ref()
-                .and_then(|m| m.workspace_id.clone())
-                .filter(|s| !s.trim().is_empty())
-        } else {
-            None
-        };
-        if matches!(kind, SessionKind::Ui) {
-            if let Some(meta) = existing_meta.as_mut() {
-                meta.workspace_id = None;
-            }
-        }
-        if let Some(legacy_workspace_id) = legacy_ui_workspace_id.as_ref() {
-            match self.workspaces.load_record(legacy_workspace_id).await {
-                Ok(record) if record.current_session.as_deref() == Some(session_id.as_str()) => {
-                    if let Err(err) = self
-                        .workspaces
-                        .set_current_session(legacy_workspace_id, None)
-                        .await
-                    {
-                        warn!(
-                            "opendan.agent[{}]: clear legacy UI workspace `{}` binding failed: {err}",
-                            self.agent_name, legacy_workspace_id
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {}
-            }
-        }
         let workspace_rec = if kind.is_work_family() {
             let preselected_ws = existing_meta
                 .as_ref()
@@ -1344,21 +1313,12 @@ impl AIAgent {
             let class = self.config.class_name_for_kind(kind);
             self.config.default_behavior_for_class(&class)
         });
-        let class_name = self.config.class_name_for_kind(kind);
-        let class_keep_alive = self
-            .config
-            .session_class(&class_name)
-            .map(|cfg| cfg.driver.keep_alive)
-            .unwrap_or(matches!(kind, SessionKind::Ui));
         if let Some(meta) = existing_meta.as_mut() {
             if meta.status_changed_at_ms == 0 {
                 meta.status_changed_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-            }
-            if matches!(kind, SessionKind::Ui) || class_keep_alive {
-                meta.keep_alive = class_keep_alive;
             }
         }
         let agent_id = self.agent_id();
@@ -1406,7 +1366,6 @@ impl AIAgent {
         let session = Arc::new(session);
         {
             let mut meta = session.meta.lock().await;
-            meta.keep_alive = class_keep_alive;
             if meta.status_changed_at_ms == 0 {
                 meta.status_changed_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2158,44 +2117,6 @@ mod tests {
 
         agent
             .delete_session_physical(&session_id)
-            .await
-            .expect("delete session");
-    }
-
-    #[tokio::test]
-    async fn restored_ui_session_ignores_legacy_workspace_binding() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let agent = test_agent(dir.path().to_path_buf());
-        agent
-            .workspaces()
-            .create_or_open("legacy-ws", "legacy", Some("ui-legacy"))
-            .await
-            .expect("create legacy workspace");
-        let mut meta = SessionMeta::new(
-            "ui-legacy".to_string(),
-            SessionKind::Ui,
-            "ui_default".to_string(),
-            "did:dev:alice".to_string(),
-        );
-        meta.workspace_id = Some("legacy-ws".to_string());
-
-        write_session_meta(&agent, meta);
-        agent
-            .clone()
-            .ensure_session("ui-legacy")
-            .await
-            .expect("ensure ui session");
-        let session = agent.get_session("ui-legacy").await.expect("session");
-        assert_eq!(session.summary().await.workspace_id, None);
-        let record = agent
-            .workspaces()
-            .load_record("legacy-ws")
-            .await
-            .expect("load legacy workspace");
-        assert_eq!(record.current_session, None);
-
-        agent
-            .delete_session_physical("ui-legacy")
             .await
             .expect("delete session");
     }

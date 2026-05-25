@@ -92,9 +92,9 @@ Continue TASK_ANCHOR.
 """
 
 on_behavior_step_ob = """
-<<last_step_action_results>>
+
 {{ default_last_step_action_results_text }}
-<</last_step_results>>
+
 """
 
 

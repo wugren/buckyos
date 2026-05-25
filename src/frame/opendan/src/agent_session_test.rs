@@ -808,7 +808,6 @@ fn session_meta_round_trips_pending_inputs() {
         status: SessionStatus::WaitingInput,
         status_changed_at_ms: 0,
         owner: "alice".to_string(),
-        keep_alive: false,
         one_line_status: String::new(),
         pending_inputs: vec![
             PendingInput::Msg {

@@ -101,9 +101,9 @@ Continue from PROCESS_RULES.
 
 # Plan模式可以在每个step都读取可能的用户输入和事件
 on_behavior_step_ob = """
-<<last_step_action_results>>
+
 {{ default_last_step_action_results_text }}
-<</last_step_results>>
+
 
 {% if input.has_msgs %}
 <<new_user_msgs>>

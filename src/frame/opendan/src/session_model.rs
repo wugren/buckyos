@@ -9,8 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 // input that belongs to the same topic creates a new Work-family session and
 // may copy/read old context explicitly at a higher layer. Routing metadata is
 // kept in `.meta/session.json` for audit/debug after END, but it is not an
-// active dispatch target. `keep_alive=true` keeps non-END workers warm while
-// idle; it never changes END into a resumable state.
+// active dispatch target.
 
 /// Internal wake-up signal for the session worker. The worker consumes the
 /// actual payload from `SessionMeta::pending_inputs` (which is persisted) —
@@ -155,8 +154,6 @@ pub struct SessionMeta {
     #[serde(default)]
     pub owner: String,
     #[serde(default)]
-    pub keep_alive: bool,
-    #[serde(default)]
     pub one_line_status: String,
     #[serde(default)]
     pub pending_inputs: Vec<PendingInput>,
@@ -204,7 +201,6 @@ impl SessionMeta {
             status: SessionStatus::Idle,
             status_changed_at_ms: 0,
             owner,
-            keep_alive: false,
             one_line_status: String::new(),
             pending_inputs: Vec::new(),
             peer_did: None,

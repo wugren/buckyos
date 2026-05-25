@@ -151,13 +151,11 @@ impl EditFileTool {
 #[derive(Deserialize, JsonSchema)]
 pub struct EditFileArgs {
     pub path: String,
-    pub pos_chunk: String,
-    pub new_content: String,
-    #[serde(default)]
-    pub mode: Option<String>,
+    pub old_string: String,
+    pub new_string: String,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct EditFileOutput {
     pub matched: bool,
     pub changed: bool,
@@ -187,7 +185,10 @@ impl TypedTool for EditFileTool {
     }
 
     fn usage(&self) -> Option<String> {
-        Some("edit_file <path> --pos-chunk <text> [--mode replace|after|before] (--new-content <text> | --new-content-stdin)".to_string())
+        Some(
+            "edit_file <path> --old-string <text> (--new-string <text> | --new-string-stdin)"
+                .to_string(),
+        )
     }
 
     fn parse_cli_args(
@@ -199,11 +200,9 @@ impl TypedTool for EditFileTool {
     }
 
     fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        let mode = normalize_edit_mode(args.mode.as_deref()).unwrap_or("replace");
         Some(build_edit_request_cmd_line(
             &args.path,
-            mode,
-            args.pos_chunk.as_str(),
+            args.old_string.as_str(),
         ))
     }
 
@@ -222,7 +221,7 @@ impl TypedTool for EditFileTool {
                 &output.diff,
             )
         } else if !output.matched {
-            format!("edit {} skipped, anchor not found", output.file_path)
+            format!("edit {} skipped, old_string not found", output.file_path)
         } else {
             format!("edit {} made no change", output.file_path)
         }
@@ -230,7 +229,7 @@ impl TypedTool for EditFileTool {
 
     fn build_title(&self, output: &Self::Output) -> Option<String> {
         let status = if !output.matched {
-            "anchor not found".to_string()
+            "old_string not found".to_string()
         } else if output.changed {
             match output.line_no {
                 Some(line) => format!("success (line {line})"),
@@ -239,10 +238,7 @@ impl TypedTool for EditFileTool {
         } else {
             "no change".to_string()
         };
-        Some(format!(
-            "{TOOL_EDIT_FILE} {} mode={} => {status}",
-            output.file_path, output.operation
-        ))
+        Some(format!("{TOOL_EDIT_FILE} {} => {status}", output.file_path))
     }
 
     async fn execute(
@@ -256,57 +252,48 @@ impl TypedTool for EditFileTool {
                 "missing required arg `path`".to_string(),
             ));
         }
-        let pos_chunk = args.pos_chunk;
-        if pos_chunk.is_empty() {
+        let old_string = args.old_string;
+        if old_string.is_empty() {
             return Err(AgentToolError::InvalidArgs(
-                "missing required arg `pos_chunk`".to_string(),
+                "missing required arg `old_string`".to_string(),
             ));
         }
-        let mode = normalize_edit_mode(args.mode.as_deref())?;
+        let new_string = args.new_string;
+        if old_string == new_string {
+            return Err(AgentToolError::InvalidArgs(
+                "`new_string` must be different from `old_string`".to_string(),
+            ));
+        }
         let abs_path = resolve_path_from_root(&self.cfg.root_dir, &file_path)?;
         self.cfg.ensure_write_path_allowed(&abs_path, &file_path)?;
 
-        let exists = fs::metadata(&abs_path).await.is_ok();
-        let original_content = if exists {
-            read_text_file_lossy(&abs_path).await?
-        } else {
-            String::new()
+        let original_content = read_text_file_lossy(&abs_path).await?;
+        let matches: Vec<usize> = original_content
+            .match_indices(old_string.as_str())
+            .map(|(pos, _)| pos)
+            .collect();
+        let anchor_pos = match matches.as_slice() {
+            [] => {
+                return Err(AgentToolError::InvalidArgs(
+                    "`old_string` was not found in the file".to_string(),
+                ))
+            }
+            [pos] => *pos,
+            _ => {
+                return Err(AgentToolError::InvalidArgs(format!(
+                    "`old_string` must match exactly once, found {} matches",
+                    matches.len()
+                )))
+            }
         };
 
-        let new_content = args.new_content;
-        let (operation, updated_content, matched) =
-            if let Some(anchor_pos) = original_content.find(&pos_chunk) {
-                let updated = match mode {
-                    "replace" => {
-                        let mut out = original_content.clone();
-                        let end = anchor_pos + pos_chunk.len();
-                        out.replace_range(anchor_pos..end, &new_content);
-                        out
-                    }
-                    "after" => {
-                        let mut out = original_content.clone();
-                        let insert_at = anchor_pos + pos_chunk.len();
-                        out.insert_str(insert_at, &new_content);
-                        out
-                    }
-                    "before" => {
-                        let mut out = original_content.clone();
-                        out.insert_str(anchor_pos, &new_content);
-                        out
-                    }
-                    _ => unreachable!("validated by normalize_edit_mode"),
-                };
-                (mode.to_string(), updated, true)
-            } else {
-                (mode.to_string(), original_content.clone(), false)
-            };
+        let operation = "replace".to_string();
+        let mut updated_content = original_content.clone();
+        let end = anchor_pos + old_string.len();
+        updated_content.replace_range(anchor_pos..end, &new_string);
 
         let changed = original_content != updated_content;
-        let created = changed && !exists;
         if changed {
-            if created {
-                self.cfg.ensure_create_allowed(&file_path)?;
-            }
             self.cfg
                 .ensure_write_size_allowed(&file_path, updated_content.len())?;
             if let Some(parent) = abs_path.parent() {
@@ -328,7 +315,7 @@ impl TypedTool for EditFileTool {
         if changed {
             let audit_args = json!({
                 "path": file_path,
-                "pos_chunk": pos_chunk,
+                "old_string": old_string,
                 "mode": operation,
             });
             if let Err(err) = self
@@ -339,7 +326,7 @@ impl TypedTool for EditFileTool {
                     &FileWriteAuditRecord {
                         file_path: file_path.clone(),
                         operation: operation.clone(),
-                        created,
+                        created: false,
                         changed,
                         bytes_before: original_content.len(),
                         bytes_after: updated_content.len(),
@@ -356,15 +343,15 @@ impl TypedTool for EditFileTool {
             }
         }
 
-        let line_no = original_content.find(&pos_chunk).map(|pos| {
-            original_content[..pos]
+        let line_no = Some(
+            original_content[..anchor_pos]
                 .bytes()
                 .filter(|b| *b == b'\n')
                 .count()
-                + 1
-        });
+                + 1,
+        );
         Ok(EditFileOutput {
-            matched,
+            matched: true,
             changed,
             operation,
             line_no,
@@ -891,18 +878,6 @@ pub fn rewrite_read_file_path_with_shell_cwd(args: &mut Json, shell_cwd: &Path) 
     );
 }
 
-fn normalize_edit_mode(raw: Option<&str>) -> Result<&'static str, AgentToolError> {
-    let raw = raw.unwrap_or("replace");
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "replace" => Ok("replace"),
-        "after" => Ok("after"),
-        "before" => Ok("before"),
-        other => Err(AgentToolError::InvalidArgs(format!(
-            "invalid edit mode `{other}`, expected replace/after/before"
-        ))),
-    }
-}
-
 fn normalize_write_mode(raw: Option<&str>) -> Result<&'static str, AgentToolError> {
     let raw = raw.unwrap_or("write");
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -1292,10 +1267,10 @@ fn build_write_request_cmd_line(path: &str, mode: &str) -> String {
     format!("{TOOL_WRITE_FILE} {path} mode={mode_text}")
 }
 
-fn build_edit_request_cmd_line(path: &str, mode: &str, pos_chunk: &str) -> String {
+fn build_edit_request_cmd_line(path: &str, old_string: &str) -> String {
     format!(
-        "{TOOL_EDIT_FILE} {path} mode={mode} anchor=\"{}\"",
-        compact_cmd_param_preview(pos_chunk)
+        "{TOOL_EDIT_FILE} {path} old_string=\"{}\"",
+        compact_cmd_param_preview(old_string)
     )
 }
 
@@ -1426,8 +1401,8 @@ fn is_path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 /// Shared shape for the `write_file` and `edit_file` CLI parsers — the
-/// two tools share path + mode + a stdin-capable content field, and
-/// `edit_file` adds a required `--pos-chunk` argument.
+/// two tools share path + a stdin-capable content field, and `edit_file`
+/// adds a required `--old-string` argument.
 #[derive(Clone, Copy)]
 pub(crate) struct WriteOrEditCliSpec {
     pub tool_name: &'static str,
@@ -1447,10 +1422,10 @@ impl WriteOrEditCliSpec {
     };
     pub const EDIT_FILE: Self = Self {
         tool_name: TOOL_EDIT_FILE,
-        extra_required: Some(("--pos-chunk", "pos_chunk")),
-        content_flag: "--new-content",
-        content_stdin_flag: "--new-content-stdin",
-        content_field: "new_content",
+        extra_required: Some(("--old-string", "old_string")),
+        content_flag: "--new-string",
+        content_stdin_flag: "--new-string-stdin",
+        content_field: "new_string",
     };
 
     fn usage_err(&self, msg: impl Into<String>) -> AgentToolError {
@@ -1569,6 +1544,19 @@ pub(crate) fn parse_write_or_edit_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NullToolHost;
+    use tempfile::tempdir;
+
+    fn test_session() -> SessionRuntimeContext {
+        SessionRuntimeContext {
+            trace_id: "trace".to_string(),
+            agent_name: "agent".to_string(),
+            behavior: "test".to_string(),
+            step_idx: 0,
+            wakeup_id: "wake".to_string(),
+            session_id: "session".to_string(),
+        }
+    }
 
     fn pr(value: Json, total: usize) -> Result<Option<(usize, usize)>, AgentToolError> {
         parse_line_range(Some(&value), total)
@@ -1642,6 +1630,97 @@ mod tests {
         assert_eq!(summary, "created demo.txt, wrote 12 bytes across 2 lines");
         assert!(!summary.contains("```content"));
         assert!(!summary.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_unique_old_string() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("demo.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").await.unwrap();
+        let tool = EditFileTool::new(
+            FileToolConfig::new(dir.path()),
+            Arc::new(NoopFileWriteAudit::default()),
+        );
+        let session = test_session();
+        let host = NullToolHost;
+        let ctx = ToolCtx::new(&session, &host);
+
+        let output = tool
+            .execute(
+                &ctx,
+                EditFileArgs {
+                    path: "demo.txt".to_string(),
+                    old_string: "beta".to_string(),
+                    new_string: "delta".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(output.changed);
+        assert_eq!(output.line_no, Some(2));
+        assert_eq!(
+            fs::read_to_string(&path).await.unwrap(),
+            "alpha\ndelta\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_multiple_old_string_matches() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("demo.txt"), "same\nsame\n")
+            .await
+            .unwrap();
+        let tool = EditFileTool::new(
+            FileToolConfig::new(dir.path()),
+            Arc::new(NoopFileWriteAudit::default()),
+        );
+        let session = test_session();
+        let host = NullToolHost;
+        let ctx = ToolCtx::new(&session, &host);
+
+        let err = tool
+            .execute(
+                &ctx,
+                EditFileArgs {
+                    path: "demo.txt".to_string(),
+                    old_string: "same".to_string(),
+                    new_string: "other".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("match exactly once"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_equal_new_string() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("demo.txt"), "same\n")
+            .await
+            .unwrap();
+        let tool = EditFileTool::new(
+            FileToolConfig::new(dir.path()),
+            Arc::new(NoopFileWriteAudit::default()),
+        );
+        let session = test_session();
+        let host = NullToolHost;
+        let ctx = ToolCtx::new(&session, &host);
+
+        let err = tool
+            .execute(
+                &ctx,
+                EditFileArgs {
+                    path: "demo.txt".to_string(),
+                    old_string: "same".to_string(),
+                    new_string: "same".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must be different"));
     }
 
     #[test]

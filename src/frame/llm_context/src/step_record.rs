@@ -722,11 +722,10 @@ fn action_command_text(action: &buckyos_api::AiToolCall) -> String {
         }
         "edit_file" => {
             let path = string_arg(action, "path").unwrap_or_else(|| "target".to_string());
-            let mode = string_arg(action, "mode").unwrap_or_else(|| "replace".to_string());
-            let mut command = format!("edit_file {path} mode={mode}");
-            if let Some(anchor) = string_arg(action, "pos_chunk") {
-                command.push_str(" anchor=\"");
-                command.push_str(compact_inline_value(&anchor, 80).as_str());
+            let mut command = format!("edit_file {path}");
+            if let Some(old_string) = string_arg(action, "old_string") {
+                command.push_str(" old_string=\"");
+                command.push_str(compact_inline_value(&old_string, 80).as_str());
                 command.push('"');
             }
             command
@@ -736,7 +735,10 @@ fn action_command_text(action: &buckyos_api::AiToolCall) -> String {
             let mut keys: Vec<&String> = action.args.keys().collect();
             keys.sort();
             for key in keys {
-                if matches!(key.as_str(), "content" | "new_content" | "from_user_did") {
+                if matches!(
+                    key.as_str(),
+                    "content" | "old_string" | "new_string" | "from_user_did"
+                ) {
                     continue;
                 }
                 if let Some(value) = action.args.get(key) {
