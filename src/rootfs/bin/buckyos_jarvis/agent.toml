@@ -111,7 +111,7 @@ process_stack_limit = 8
 [session.work.driver]
 switch_mode = "fork"
 inject_background_environment = false
-report_delivery = "final_only"
+report_delivery = "top_level"
 
 [session.work.driver.on_init]
 filter = "all"

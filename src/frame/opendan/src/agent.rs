@@ -2173,6 +2173,8 @@ mod tests {
             .expect("create ui session");
         let ui = agent.get_session(&ui_session_id).await.expect("ui session");
         ui.abort_worker().await;
+        agent.sessions.lock().await.remove(&ui_session_id);
+        assert!(agent.get_session(&ui_session_id).await.is_none());
         let mut meta = SessionMeta::new(
             "work-report".to_string(),
             SessionKind::Work,
@@ -2238,6 +2240,7 @@ mod tests {
         let pending = ui.meta.lock().await.pending_inputs.clone();
         assert!(pending.is_empty());
         assert!(work.meta.lock().await.last_report_delivery.is_none());
+        assert!(agent.get_session(&ui_session_id).await.is_none());
         let report_md = std::fs::read_to_string(work.session_dir.join("report.md"))
             .expect("report.md should be written even when outbound is unavailable");
         assert!(report_md.contains("final answer"));

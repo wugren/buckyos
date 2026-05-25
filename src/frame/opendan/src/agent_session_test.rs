@@ -142,6 +142,107 @@ async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
     assert!(session_dir.join(".meta/session.json").exists());
 }
 
+#[tokio::test]
+async fn on_behavior_step_ob_top_filter_keeps_pending_msgs_out_of_fork_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "do"
+
+        [prompt]
+        on_behavior_step_ob = """
+step observed
+{% if input.has_msgs %}
+{{input.text}}
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/do.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "do".to_string(),
+        "owner".to_string(),
+    );
+    meta.process_stack.push(ProcessFrame {
+        entry: "plan".to_string(),
+        current: "plan".to_string(),
+        fork: true,
+    });
+    meta.pending_inputs
+        .push(pending_msg("m1", "forwarded follow-up"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.filter = BehaviorFilter::Top;
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "do".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+    let text = output
+        .user_message
+        .expect("rendered user message")
+        .text_content();
+
+    assert!(text.contains("step observed"));
+    assert!(!text.contains("forwarded follow-up"));
+    assert_eq!(meta.lock().await.pending_inputs.len(), 1);
+}
+
 #[test]
 fn compose_human_text_skips_empties() {
     let v = vec!["  ".to_string(), "hello".to_string(), "".to_string()];
@@ -932,6 +1033,16 @@ fn worksession_report_delivery_modes_match_context_depth() {
 }
 
 #[test]
+fn idle_worker_retire_timeout_depends_on_session_kind() {
+    assert_eq!(idle_worker_retire_ms(SessionKind::Ui), 15 * 60 * 1000);
+    assert_eq!(idle_worker_retire_ms(SessionKind::Work), 3 * 60 * 1000);
+    assert_eq!(
+        idle_worker_retire_ms(SessionKind::SelfImprove),
+        3 * 60 * 1000
+    );
+}
+
+#[test]
 fn worksession_report_msg_carries_source_metadata() {
     let agent = name_lib::DID::from_str("did:dev:agent").unwrap();
     let peer = name_lib::DID::from_str("did:dev:alice").unwrap();
@@ -952,13 +1063,13 @@ fn worksession_report_msg_carries_source_metadata() {
         "created_at_ms": 42u64,
     });
 
-    let msg = build_worksession_report_msg(&agent, &peer, "ui-1", &data);
+    let msg = build_worksession_report_base_msg(&agent, &peer, "ui-1", &data);
 
-    assert_eq!(msg.content.content, "done");
     assert_eq!(
-        msg.content.title.as_deref(),
-        Some("WorkSession report: build demo")
+        worksession_report_content_title(&data),
+        "WorkSession report: build demo"
     );
+    assert!(msg.content.content.is_empty());
     assert_eq!(msg.thread.topic.as_deref(), Some("ui-1"));
     assert_eq!(msg.thread.correlation_id.as_deref(), Some("work-1"));
     assert_eq!(
@@ -979,6 +1090,17 @@ fn worksession_report_msg_carries_source_metadata() {
             .and_then(|v| v.as_str()),
         Some("work-1")
     );
+}
+
+#[test]
+fn worksession_report_normalizes_attachment_markers() {
+    let report =
+        "files\n<attachment>/tmp/a.html<attachment>\n<attachement>/tmp/b.css</attachement>";
+    let normalized = normalize_report_attachment_tags(report);
+
+    assert!(normalized.contains("<attachment>/tmp/a.html</attachment>"));
+    assert!(normalized.contains("<attachment>/tmp/b.css</attachment>"));
+    assert!(!normalized.contains("attachement"));
 }
 
 #[test]

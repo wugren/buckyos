@@ -9,7 +9,7 @@ use buckyos_api::{
     UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
-use ndn_lib::{MsgContent, MsgContentFormat, MsgObjKind, MsgObject};
+use ndn_lib::{MsgContent, MsgObjKind, MsgObject};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -33,8 +33,8 @@ use llm_context::{
 
 use crate::agent::AIAgent;
 use crate::agent_config::{
-    AgentConfig, HookPointCfg, LoopMode, PullEventPolicy, PullMsgPolicy, ReportDeliveryMode,
-    SessionDriverCfg, SessionHookPoint, SwitchMode,
+    AgentConfig, BehaviorFilter, HookPointCfg, LoopMode, PullEventPolicy, PullMsgPolicy,
+    ReportDeliveryMode, SessionDriverCfg, SessionHookPoint, SwitchMode,
 };
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
@@ -66,7 +66,8 @@ use crate::task_dispatch::TaskDispatch;
 pub const NEXT_BEHAVIOR_WAIT_USER_MSG: &str = "WAIT_USER_MSG";
 const MAX_PENDING_INPUTS: usize = 256;
 const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
-const IDLE_WORKER_RETIRE_MS: u64 = 250;
+const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_IDLE_WORKER_RETIRE_MS: u64 = 3 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorksessionReportPhase {
@@ -426,6 +427,17 @@ impl OpenDanStepResultHook {
     async fn selected_pending_inputs(&self) -> Vec<PendingInput> {
         let cfg = self.driver.hook(SessionHookPoint::OnBehaviorStepOb);
         let meta = self.meta.lock().await;
+        let default_behavior = self
+            .agent_config
+            .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+        if !hook_filter_allows(
+            &cfg.filter,
+            &meta.current_behavior,
+            &default_behavior,
+            &meta.process_stack,
+        ) {
+            return Vec::new();
+        }
         let pending = meta
             .pending_inputs
             .iter()
@@ -1140,12 +1152,8 @@ impl AgentSession {
                     continue;
                 }
                 if self.should_exit_when_idle().await {
-                    match timeout(
-                        Duration::from_millis(IDLE_WORKER_RETIRE_MS),
-                        inbox_rx.recv(),
-                    )
-                    .await
-                    {
+                    let idle_retire_ms = idle_worker_retire_ms(self.kind);
+                    match timeout(Duration::from_millis(idle_retire_ms), inbox_rx.recv()).await {
                         Ok(None) => {
                             info!(
                                 "opendan.session[{}]: inbox closed, exiting worker",
@@ -2378,9 +2386,26 @@ impl AgentSession {
     ) -> LlmContextEnv {
         let cfg = driver.hook(point);
         let observed_at_ms = now_ms();
-        let (events, consumed_event_keys) =
-            self.pull_events_for_env(cfg, pending, observed_at_ms).await;
-        let (msgs, _) = self.pull_msgs_for_env(cfg, pending, observed_at_ms);
+        let filter_allows = {
+            let meta = self.meta.lock().await;
+            let default_behavior = self
+                .agent_config
+                .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+            hook_filter_allows(
+                &cfg.filter,
+                &meta.current_behavior,
+                &default_behavior,
+                &meta.process_stack,
+            )
+        };
+        let (events, consumed_event_keys, msgs) = if filter_allows {
+            let (events, consumed_event_keys) =
+                self.pull_events_for_env(cfg, pending, observed_at_ms).await;
+            let (msgs, _) = self.pull_msgs_for_env(cfg, pending, observed_at_ms);
+            (events, consumed_event_keys, msgs)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let msg_count = msgs.len();
         let event_count = consumed_event_keys.len();
         let snapshot = self.try_load_snapshot_for_prompt();
@@ -2413,13 +2438,15 @@ impl AgentSession {
             .unwrap_or((None, None, Vec::new()));
         let bg_events = self.meta.lock().await.background_events.clone();
         info!(
-            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} pull_msg={:?} pull_event={:?}",
+            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} filter={:?} filter_allows={} pull_msg={:?} pull_event={:?}",
             self.session_id,
             point.as_key(),
             pending.len(),
             msg_count,
             event_count,
             bg_events.len(),
+            cfg.filter,
+            filter_allows,
             cfg.pull_msg,
             cfg.pull_event
         );
@@ -2473,7 +2500,19 @@ impl AgentSession {
         pending_task_index: &std::collections::HashMap<String, PendingTaskCall>,
     ) -> Vec<PendingInput> {
         let cfg = driver.hook(point);
-        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        let meta = self.meta.lock().await;
+        let default_behavior = self
+            .agent_config
+            .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+        if !hook_filter_allows(
+            &cfg.filter,
+            &meta.current_behavior,
+            &default_behavior,
+            &meta.process_stack,
+        ) {
+            return Vec::new();
+        }
+        let subscriptions = meta.event_subscriptions.clone();
         select_pending_for_hook_with_subscriptions(cfg, pending, pending_task_index, &subscriptions)
     }
 
@@ -2589,30 +2628,29 @@ impl AgentSession {
             "created_at_ms": created_at_ms,
         });
         self.write_worksession_report_file(&data).await;
-        let Some(agent) = self.parent_agent.upgrade() else {
-            warn!(
-                "opendan.session[{}]: worksession report target {} unavailable because parent agent is gone",
-                self.session_id, target_session_id
-            );
-            return Ok(());
+        let target = match self.parent_agent.upgrade() {
+            Some(agent) => agent.get_session(&target_session_id).await,
+            None => None,
         };
-        let Some(target) = agent.get_session(&target_session_id).await else {
-            warn!(
-                "opendan.session[{}]: worksession report target UI session {} not found",
-                self.session_id, target_session_id
-            );
-            return Ok(());
+        let posted = if let Some(target) = target {
+            if !matches!(target.kind, SessionKind::Ui) {
+                warn!(
+                    "opendan.session[{}]: worksession report target {} is not a UI session",
+                    self.session_id, target_session_id
+                );
+                return Ok(());
+            }
+            target
+                .post_worksession_report_outbound(&data, Some(report_id.clone()))
+                .await?
+        } else {
+            self.post_worksession_report_outbound_to_persisted_ui(
+                &target_session_id,
+                &data,
+                Some(report_id.clone()),
+            )
+            .await?
         };
-        if !matches!(target.kind, SessionKind::Ui) {
-            warn!(
-                "opendan.session[{}]: worksession report target {} is not a UI session",
-                self.session_id, target_session_id
-            );
-            return Ok(());
-        }
-        let posted = target
-            .post_worksession_report_outbound(&data, Some(report_id.clone()))
-            .await?;
         if posted {
             {
                 let mut meta = self.meta.lock().await;
@@ -5067,21 +5105,90 @@ impl AgentSession {
         if !matches!(self.kind, SessionKind::Ui) {
             return Ok(false);
         }
+        let target_meta = self.meta.lock().await.clone();
+        self.post_worksession_report_outbound_to_ui_meta(
+            &self.session_id,
+            &target_meta,
+            data,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn post_worksession_report_outbound_to_persisted_ui(
+        &self,
+        target_session_id: &str,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        let meta_path = self
+            .agent_config
+            .layout
+            .session_dir(target_session_id)
+            .join(".meta")
+            .join("session.json");
+        let bytes = match tokio::fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report target UI session {} not found: read {} failed: {err}",
+                    self.session_id,
+                    target_session_id,
+                    meta_path.display()
+                );
+                return Ok(false);
+            }
+        };
+        let target_meta: SessionMeta = match serde_json::from_slice(&bytes) {
+            Ok(meta) => meta,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report target UI session {} invalid: parse {} failed: {err}",
+                    self.session_id,
+                    target_session_id,
+                    meta_path.display()
+                );
+                return Ok(false);
+            }
+        };
+        self.post_worksession_report_outbound_to_ui_meta(
+            target_session_id,
+            &target_meta,
+            data,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn post_worksession_report_outbound_to_ui_meta(
+        &self,
+        target_session_id: &str,
+        target_meta: &SessionMeta,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        if !matches!(target_meta.kind, SessionKind::Ui) {
+            warn!(
+                "opendan.session[{}]: worksession report target {} is not a UI session",
+                self.session_id, target_session_id
+            );
+            return Ok(false);
+        }
         let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
             return Ok(false);
         };
-        let peer_did_raw = self.meta.lock().await.peer_did.clone();
+        let peer_did_raw = target_meta.peer_did.clone();
         let Some(peer_did_raw) = peer_did_raw.as_deref().filter(|s| !s.trim().is_empty()) else {
             warn!(
                 "opendan.session[{}]: cannot post worksession report — UI session has no peer DID",
-                self.session_id
+                target_session_id
             );
             return Ok(false);
         };
         let Ok(peer_did) = name_lib::DID::from_str(peer_did_raw) else {
             warn!(
                 "opendan.session[{}]: cannot post worksession report — invalid peer DID `{}`",
-                self.session_id, peer_did_raw
+                target_session_id, peer_did_raw
             );
             return Ok(false);
         };
@@ -5092,26 +5199,25 @@ impl AgentSession {
         let Ok(agent_did) = name_lib::DID::from_str(agent_did_raw) else {
             warn!(
                 "opendan.session[{}]: cannot post worksession report — invalid agent DID `{}`",
-                self.session_id, agent_did_raw
+                target_session_id, agent_did_raw
             );
             return Ok(false);
         };
         if agent_did == peer_did {
             return Ok(false);
         }
-        let tunnel = self
-            .meta
-            .lock()
-            .await
+        let tunnel = target_meta
             .peer_tunnel_did
             .as_deref()
             .and_then(|raw| name_lib::DID::from_str(raw).ok());
-        let msg = build_worksession_report_msg(&agent_did, &peer_did, &self.session_id, data);
+        let msg = self
+            .build_worksession_report_msg(&agent_did, &peer_did, target_session_id, data)
+            .await;
         let send_ctx = buckyos_api::SendContext {
             contact_mgr_owner: Some(agent_did),
             preferred_tunnel: tunnel,
-            context_id: Some(self.session_id.clone()),
-            extra: Some(with_tg_route_chat_id(data.clone(), &self.session_id)),
+            context_id: Some(target_session_id.to_string()),
+            extra: Some(with_tg_route_chat_id(data.clone(), target_session_id)),
             ..Default::default()
         };
         match msg_center
@@ -5122,7 +5228,7 @@ impl AgentSession {
             Ok(result) => {
                 warn!(
                     "opendan.session[{}]: worksession report outbound rejected — reason={:?}",
-                    self.session_id, result.reason
+                    target_session_id, result.reason
                 );
                 Ok(false)
             }
@@ -5368,20 +5474,82 @@ fn stable_report_hash(report: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn build_worksession_report_msg(
+fn idle_worker_retire_ms(kind: SessionKind) -> u64 {
+    if matches!(kind, SessionKind::Ui) {
+        UI_IDLE_WORKER_RETIRE_MS
+    } else {
+        DEFAULT_IDLE_WORKER_RETIRE_MS
+    }
+}
+
+impl AgentSession {
+    async fn build_worksession_report_msg(
+        &self,
+        agent_did: &name_lib::DID,
+        peer_did: &name_lib::DID,
+        target_session_id: &str,
+        data: &serde_json::Value,
+    ) -> MsgObject {
+        let content_title = worksession_report_content_title(data);
+        let mut msg =
+            build_worksession_report_base_msg(agent_did, peer_did, target_session_id, data);
+        let report = normalize_report_attachment_tags(&json_str(data, "report"));
+        let workspace_id = json_str(data, "workspace_id");
+        let workspace_dir = if workspace_id.is_empty() {
+            None
+        } else {
+            Some(self.agent_config.layout.workspaces_dir.join(workspace_id))
+        };
+        let validator = crate::attachment_policy::WorkspaceAttachmentValidator::with_policy(
+            workspace_dir.clone(),
+            self.agent_name.clone(),
+            self.agent_config.toml.runtime.filesystem_policy,
+        );
+        let resolver = crate::attachment_resolver::NamedStoreLocalLinkResolver::new(
+            workspace_dir,
+            self.agent_name.clone(),
+        );
+        let egress_options = llm_context::MsgEgressOptions {
+            preserve_attachment_tag_in_egress: self
+                .agent_config
+                .toml
+                .runtime
+                .preserve_attachment_tag_in_egress,
+        };
+        match llm_context::ai_message_to_msg_object_with_base_validated_async(
+            &AiMessage::text(AiRole::Assistant, report),
+            msg.clone(),
+            &validator,
+            egress_options,
+            &resolver,
+        )
+        .await
+        {
+            Ok(mut converted) => {
+                converted.content.title = Some(content_title);
+                converted
+            }
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report conversion failed: {err}",
+                    self.session_id
+                );
+                msg.content.content = normalize_report_attachment_tags(&json_str(data, "report"));
+                msg.content.title = Some(content_title);
+                msg
+            }
+        }
+    }
+}
+
+fn build_worksession_report_base_msg(
     agent_did: &name_lib::DID,
     peer_did: &name_lib::DID,
     target_session_id: &str,
     data: &serde_json::Value,
 ) -> MsgObject {
-    let report = json_str(data, "report");
     let title = json_str(data, "title");
     let source_session_id = json_str(data, "source_session_id");
-    let content_title = if title.is_empty() {
-        format!("WorkSession report: {source_session_id}")
-    } else {
-        format!("WorkSession report: {title}")
-    };
     let mut msg = MsgObject {
         from: agent_did.clone(),
         to: vec![peer_did.clone()],
@@ -5390,12 +5558,7 @@ fn build_worksession_report_msg(
             .get("created_at_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or_else(now_ms),
-        content: MsgContent {
-            title: Some(content_title),
-            format: Some(MsgContentFormat::TextMarkdown),
-            content: report,
-            ..MsgContent::default()
-        },
+        content: MsgContent::default(),
         ..MsgObject::default()
     };
     msg.thread.topic = Some(target_session_id.to_string());
@@ -5449,6 +5612,42 @@ fn build_worksession_report_msg(
         }
     }
     msg
+}
+
+fn worksession_report_content_title(data: &serde_json::Value) -> String {
+    let title = json_str(data, "title");
+    let source_session_id = json_str(data, "source_session_id");
+    if title.is_empty() {
+        format!("WorkSession report: {source_session_id}")
+    } else {
+        format!("WorkSession report: {title}")
+    }
+}
+
+fn normalize_report_attachment_tags(report: &str) -> String {
+    report
+        .replace("</attachement>", "</attachment>")
+        .replace("<attachement", "<attachment")
+        .lines()
+        .map(normalize_report_attachment_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_report_attachment_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let Some(body) = trimmed.strip_prefix("<attachment>") else {
+        return line.to_string();
+    };
+    let Some(body) = body.strip_suffix("<attachment>") else {
+        return line.to_string();
+    };
+    if body.contains("</attachment>") {
+        return line.to_string();
+    }
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    format!("{indent}<attachment>{}</attachment>", body.trim())
 }
 
 fn tg_route_extra_for_session(session_id: &str) -> Option<serde_json::Value> {
@@ -5644,6 +5843,23 @@ fn select_pending_for_hook_with_subscriptions(
         }
     }
     out
+}
+
+fn hook_filter_allows(
+    filter: &BehaviorFilter,
+    current_behavior: &str,
+    default_behavior: &str,
+    process_stack: &[ProcessFrame],
+) -> bool {
+    match filter {
+        BehaviorFilter::None => false,
+        BehaviorFilter::All => true,
+        BehaviorFilter::Top => process_stack.is_empty(),
+        BehaviorFilter::DefaultOnly => {
+            process_stack.is_empty() && current_behavior == default_behavior
+        }
+        BehaviorFilter::Behavior(name) => current_behavior == name,
+    }
 }
 
 fn event_status_rank(data: &serde_json::Value) -> u8 {
