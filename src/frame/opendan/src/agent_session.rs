@@ -91,6 +91,23 @@ pub enum SessionReply {
     Ended,
 }
 
+#[derive(Debug, Clone)]
+pub enum ManualCompressOutcome {
+    NoSnapshot,
+    NoChange {
+        messages: usize,
+        tokens: u32,
+        target_tokens: u32,
+    },
+    Applied {
+        before_messages: usize,
+        after_messages: usize,
+        before_tokens: u32,
+        after_tokens: u32,
+        target_tokens: u32,
+    },
+}
+
 pub struct InMemoryStatus {
     current: std::sync::Mutex<String>,
     turn_nonce: std::sync::Mutex<Option<String>>,
@@ -3023,6 +3040,117 @@ impl AgentSession {
             "context_window_ratio",
         )
         .await
+    }
+
+    pub async fn compress_context_window_once(&self) -> Result<ManualCompressOutcome> {
+        let status = self.meta.lock().await.status;
+        if matches!(status, SessionStatus::Running | SessionStatus::WaitingTool) {
+            return Err(anyhow!(
+                "session status is {:?}; compress after the current run/tool wait finishes",
+                status
+            ));
+        }
+
+        let Some(mut snapshot) = self.try_load_snapshot() else {
+            return Ok(ManualCompressOutcome::NoSnapshot);
+        };
+        if !snapshot.state.pending_tool_calls.is_empty() {
+            return Err(anyhow!(
+                "snapshot has {} pending tool call(s); compress after tool results are resolved",
+                snapshot.state.pending_tool_calls.len()
+            ));
+        }
+
+        let behavior = self.load_current_behavior().await?;
+        let policy =
+            behavior_hooks::resolve_llm_message_compress(behavior.on_llm_message_compress.as_ref())
+                .map_err(|err| anyhow!("invalid on_llm_message_compress hook: {err}"))?
+                .unwrap_or_default();
+        let context_window_tokens = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+            .or(snapshot.request.budget.max_total_tokens)
+            .ok_or_else(|| {
+                anyhow!(
+                    "context window tokens unavailable for model `{}`",
+                    snapshot.request.model_policy.preferred
+                )
+            })?;
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            return Err(anyhow!("model preferred is empty"));
+        }
+
+        let trace_id = self.next_trace_id();
+        let from_user_did = self.current_from_user_did().await;
+        let deps = build_session_deps(
+            &self.runtime,
+            SessionDepsInput {
+                tools: self.tools.clone(),
+                ctx: SessionRuntimeContext {
+                    trace_id,
+                    agent_name: self.agent_name.clone(),
+                    behavior: behavior.meta.name.clone(),
+                    step_idx: snapshot.state.steps.len() as u32,
+                    wakeup_id: String::new(),
+                    session_id: self.session_id.clone(),
+                },
+                snapshot_path: self.state_snap_path.clone(),
+                approval_required: behavior.capabilities.approval_required.clone(),
+                one_line_status: Some(self.status.clone() as Arc<dyn OneLineStatusSink>),
+                i18n: self.agent_config.i18n.clone(),
+                parser_renderer: behavior.build_parser_and_renderer(self.session_class_loop_mode()),
+                from_user_did,
+            },
+        );
+
+        let before_messages = snapshot.state.accumulated.len();
+        let before_tokens = estimate_history_tokens(&deps, &snapshot.state.accumulated);
+        let rewritten = llm_compress::compress(
+            &snapshot.state.accumulated,
+            &deps,
+            target_token_budget,
+            model_alias,
+        )
+        .await
+        .map_err(|err| anyhow!("llm_message_compress failed: {err}"))?;
+        let after_messages = rewritten.len();
+        let after_tokens = estimate_history_tokens(&deps, &rewritten);
+
+        if after_messages == before_messages && after_tokens >= before_tokens {
+            return Ok(ManualCompressOutcome::NoChange {
+                messages: before_messages,
+                tokens: before_tokens,
+                target_tokens: target_token_budget,
+            });
+        }
+
+        info!(
+            "opendan.session[{}]: manual llm_message_compress messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens}, target={target_token_budget}",
+            self.session_id
+        );
+        self.history
+            .append_event(HistoryEvent::Compaction {
+                target: CompactionTarget::Accumulated,
+                dropped: before_messages.saturating_sub(after_messages) as u32,
+                kept_head: leading_system_messages(&rewritten) as u32,
+                kept_tail: after_messages.saturating_sub(leading_system_messages(&rewritten))
+                    as u32,
+                summary_preview: format!(
+                    "llm_message_compress(manual): messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens}"
+                ),
+            })
+            .await;
+        snapshot.state.accumulated = rewritten;
+        self.persist_snapshot(&snapshot).await;
+        Ok(ManualCompressOutcome::Applied {
+            before_messages,
+            after_messages,
+            before_tokens,
+            after_tokens,
+            target_tokens: target_token_budget,
+        })
     }
 
     async fn compress_accumulated_for_context_limit(

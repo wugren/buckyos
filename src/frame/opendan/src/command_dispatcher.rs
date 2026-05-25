@@ -10,6 +10,7 @@
 //! the registry without duplicating documentation.
 
 use crate::agent::AIAgent;
+use crate::agent_session::ManualCompressOutcome;
 use crate::session_model::{InterruptMode, SessionSummary};
 use anyhow::Result;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 /// Names of all built-in commands. Anything not in this list is **not**
 /// treated as a command — the message falls through to LLM inference.
 pub const BUILTIN_COMMANDS: &[&str] = &[
-    "new", "clean", "stop", "cancel", "info", "list", "switch", "help",
+    "new", "clean", "stop", "cancel", "info", "list", "switch", "compress", "help",
 ];
 
 /// Returns `true` iff `name` matches a built-in command (case-insensitive
@@ -67,6 +68,7 @@ pub async fn run_command(
         "info" => info_session(agent, invocation).await,
         "list" => list_sessions(agent).await,
         "switch" => switch_session(agent, invocation).await,
+        "compress" => compress_session(agent, invocation).await,
         "help" => Ok(CommandOutcome {
             reply: render_help(),
         }),
@@ -238,6 +240,38 @@ async fn switch_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result
     })
 }
 
+async fn compress_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result<CommandOutcome> {
+    let sid = agent.resolve_session_for_command(&inv.from).await?;
+    let Some(session) = agent.get_session(&sid).await else {
+        return Ok(CommandOutcome {
+            reply: format!("no active session for `{}`", inv.from),
+        });
+    };
+    let reply = match session.compress_context_window_once().await {
+        Ok(ManualCompressOutcome::NoSnapshot) => {
+            format!("session `{sid}` has no saved context to compress")
+        }
+        Ok(ManualCompressOutcome::NoChange {
+            messages,
+            tokens,
+            target_tokens,
+        }) => format!(
+            "session `{sid}` context already within target: {messages} messages, {tokens} tokens (target {target_tokens}); no compression applied"
+        ),
+        Ok(ManualCompressOutcome::Applied {
+            before_messages,
+            after_messages,
+            before_tokens,
+            after_tokens,
+            target_tokens,
+        }) => format!(
+            "session `{sid}` compressed context: messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens} (target {target_tokens})"
+        ),
+        Err(err) => format!("session `{sid}` compress failed: {err}"),
+    };
+    Ok(CommandOutcome { reply })
+}
+
 fn render_help() -> String {
     let mut out = String::from("available commands:\n");
     out.push_str("  /new              create a new session\n");
@@ -247,6 +281,7 @@ fn render_help() -> String {
     out.push_str("  /info             show current session status\n");
     out.push_str("  /list             list active sessions on this agent\n");
     out.push_str("  /switch <id>      bind this tunnel to a different session\n");
+    out.push_str("  /compress         manually compress current session context\n");
     out.push_str("  /help             show this message\n");
     out
 }
@@ -263,6 +298,7 @@ mod tests {
         assert!(is_known_command("stop"));
         assert!(is_known_command("cancel"));
         assert!(is_known_command("info"));
+        assert!(is_known_command("compress"));
         assert!(is_known_command("Help"));
         assert!(!is_known_command("etc"));
         assert!(!is_known_command("clear"));

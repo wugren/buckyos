@@ -1003,7 +1003,7 @@ mod tests {
         assert_eq!(work.default_behavior, "plan");
         assert_eq!(work.driver.switch_mode, SwitchMode::Fork);
         assert_eq!(work.process_stack_limit, 8);
-        assert_eq!(work.driver.report_delivery, ReportDeliveryMode::FinalOnly);
+        assert_eq!(work.driver.report_delivery, ReportDeliveryMode::TopLevel);
         let self_check = cfg.session_class("self_check").unwrap();
         assert!(!self_check.enabled);
         assert_eq!(self_check.kind, SessionKind::SelfCheck);

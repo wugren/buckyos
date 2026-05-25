@@ -172,13 +172,14 @@ agent_runtime
 
 - **逻辑挂点**是 Provider 内稳定的 tier 名或角色目录挂载,永远代表该 tier / 角色下的最新可用版本,如 `llm.opus`、`llm.gemini-flash`、`llm.chat`。
 - **物理型号**是带版本号的具体快照,如 `claude-opus-4.7@anthropic`、`gpt-5.5@openai`,只用于复现、锁定、审计和 Provider 侧实际路由。
-- **任务抽象目录**默认通过内置树链接到 Provider 逻辑挂点,也允许 Provider inventory 直接挂载精确模型。OpenAI 当前按角色直接挂载:GPT nano -> `llm.swift`;GPT mini -> `llm.gpt-mini` + `llm.summarize`;GPT 标准非 pro -> `llm.chat`;GPT pro -> `llm.plan` + `llm.reason`;其它 OpenAI LLM -> `llm.gpt`。
+- **任务抽象目录**默认通过内置树链接到 Provider 逻辑挂点,也允许 Provider inventory 直接挂载精确模型。OpenAI 当前按角色直接挂载:GPT nano -> `llm.swift`;GPT mini -> `llm.gpt-mini` + `llm.summarize`;GPT 标准非 pro -> `llm.chat` + `llm.code` + `llm.gpt-standard`;GPT pro -> `llm.plan` + `llm.reason`;其它 OpenAI LLM -> `llm.gpt`。
 - **家族目录**保留为 UI 展示、用户偏好和物理型号索引用途。物理型号可以同时归入家族目录,但不作为任务抽象目录的直接 target。
 
 ### 3.1 `llm` Provider 逻辑挂点目录
 
 ```
 llm
+├── gpt-standard         # OpenAI 标准多模态 GPT
 ├── opus                 # Anthropic 旗舰推理与 agentic 编排
 ├── sonnet               # Anthropic 性价比主力
 ├── haiku                # Anthropic 轻量快速
@@ -207,7 +208,7 @@ llm
 | Provider | 逻辑挂点 | 当前指向 | 定位 |
 |---|---|---|---|
 | OpenAI | `llm.plan` + `llm.reason` | GPT-5.5 Pro | 研究级深度推理 |
-| OpenAI | `llm.chat` | GPT-5.5 | 旗舰,复杂推理与编码 |
+| OpenAI | `llm.chat` / `llm.code` / `llm.gpt-standard` | GPT-5.5 | 标准多模态 GPT,旗舰对话与编码 |
 | OpenAI | `llm.gpt-mini` + `llm.summarize` | GPT-5.4-mini | 低延迟、低成本主力 |
 | OpenAI | `llm.swift` | GPT-5.4-nano | 极轻量、批量场景 |
 | OpenAI | `llm.gpt` | o-series 等其它 OpenAI LLM | 非标准 GPT tier 的 OpenAI LLM |
@@ -240,7 +241,7 @@ llm
 | 逻辑挂点 | 物理型号 | 家族 | api_type | attributes.tier |
 |---|---|---|---|---|
 | `llm.plan` / `llm.reason` | `gpt-5.5-pro@openai` | openai | llm.chat | flagship |
-| `llm.chat` | `gpt-5.5@openai` | openai | llm.chat | flagship |
+| `llm.chat` / `llm.code` / `llm.gpt-standard` | `gpt-5.5@openai` | openai | llm.chat | flagship |
 | `llm.gpt-mini` / `llm.summarize` | `gpt-5.4-mini@openai` | openai | llm.chat | mid |
 | `llm.swift` | `gpt-5.4-nano@openai` | openai | llm.chat | nano |
 | `llm.gpt` | `o1-2024-12-17@openai` | openai | llm.chat | flagship |
@@ -268,7 +269,7 @@ llm
 
 **Reasoning 角色专属**:`llm.reason` 默认只挂载支持强 reasoning / thinking 的逻辑挂点,如 `llm.gemini-deepthink`、`llm.opus`、OpenAI GPT Pro 直接挂载、`llm.grok-heavy`、`llm.deepseek-reasoner`、`llm.kimi-thinking`。具体物理型号由对应 Provider 挂点解析。
 
-**Vision 角色**:`llm.vision` 挂载支持图像输入的逻辑挂点,如 `llm.gemini-pro`、`llm.opus`。纯文本逻辑挂点通过 Provider metadata 过滤。
+**Vision 角色**:`llm.vision` 挂载支持图像输入的逻辑挂点,如 `llm.gpt-standard`、`llm.gemini-pro`、`llm.opus`。纯文本逻辑挂点通过 Provider metadata 过滤。
 
 ### 3.2 `embedding` 家族目录
 
@@ -479,6 +480,7 @@ session_config:
 
     llm.vision:
       items:
+        gpt:    { target: llm.gpt-standard, weight: 3.0 }
         opus:   { target: llm.opus,       weight: 2.5 }
         gemini: { target: llm.gemini-pro, weight: 2.5 }
         qwen:   { target: llm.qwen-max,   weight: 1.0 }

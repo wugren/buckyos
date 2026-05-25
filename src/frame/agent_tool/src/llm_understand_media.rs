@@ -1,16 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
 use buckyos_api::{get_buckyos_api_runtime, AiContent, AiMessage, AiRole, ResourceRef};
 use llm_context::deps::{LLMContextDeps, ToolManager};
 use llm_context::{
     ContextOutput, LLMContextOutcome, LlmClient, ModelPolicy, OutputSpec, ToolMode, ToolPolicy,
 };
-use ndn_lib::{ChunkId, FileObject};
+use ndn_lib::FileObject;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 
 use crate::run_local_llm::{acquire_aicc_client, ensure_buckyos_runtime, AiccLlmClient};
 use crate::{
@@ -26,6 +28,7 @@ const DEFAULT_MODEL_ALIAS: &str = "llm.vision";
 const DEFAULT_SUMMARY_MODEL_ALIAS: &str = "llm.summary";
 const DEFAULT_TARGET_TOKENS: u32 = 24_000;
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 2_048;
+const RAW_OUTPUT_LOG_PREVIEW_CHARS: usize = 2_000;
 
 const SYSTEM_PROMPT: &str = r#"You are OpenDAN's controlled media-understanding side context.
 
@@ -255,10 +258,11 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         );
     }
 
-    let mime = match resolve_media_mime(&media).await {
-        Ok(mime) => mime,
+    let resolved_media = match resolve_media(&media).await {
+        Ok(media) => media,
         Err(err) => return (build_error_result(&opts, err), CLI_EXIT_ERROR),
     };
+    let mime = resolved_media.mime;
     if !is_image_mime(&mime) {
         return (
             build_error_result(
@@ -309,7 +313,15 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         }
     };
 
-    let request = build_request(&opts, media.source.clone(), model_alias, compressed);
+    let parent_history_count = purified.len();
+    let compressed_history_count = compressed.len();
+    let source_kind = resource_source_kind(&resolved_media.source);
+    let request = build_request(
+        &opts,
+        resolved_media.source,
+        model_alias.clone(),
+        compressed,
+    );
     let work_dir = opts
         .work_dir
         .clone()
@@ -328,6 +340,17 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         "llm_understand_media: work_dir={} run_id={}",
         work_dir.display(),
         run_id
+    );
+    log::info!(
+        "llm_understand_media: started; work_dir={} run_id={} mime={} source_kind={} model={} parent_history_count={} compressed_history_count={} goal={}",
+        work_dir.display(),
+        run_id,
+        mime,
+        source_kind,
+        model_alias,
+        parent_history_count,
+        compressed_history_count,
+        opts.goal
     );
 
     let compressor =
@@ -440,11 +463,42 @@ fn build_outcome_result(
                 )
             }
             Err(err) => {
+                let raw_output = output_to_text(&output);
+                let raw_output_chars = raw_output.chars().count();
+                let raw_output_preview =
+                    truncate_for_summary(&raw_output, RAW_OUTPUT_LOG_PREVIEW_CHARS);
+                let output_kind = context_output_kind(&output);
+                let final_outcome_path = run_final_outcome_path(work_dir, run_id);
+                let raw_output_path = match write_parse_error_raw_output(
+                    work_dir,
+                    run_id,
+                    &raw_output,
+                ) {
+                    Ok(path) => Some(path),
+                    Err(write_err) => {
+                        log::warn!(
+                            "llm_understand_media: write parse error raw output failed: {}; work_dir={} run_id={}",
+                            write_err,
+                            work_dir.display(),
+                            run_id
+                        );
+                        None
+                    }
+                };
                 log::error!(
-                    "llm_understand_media: parse understanding report failed: {}; work_dir={} run_id={} goal={}",
+                    "llm_understand_media: parse understanding report failed: {}; work_dir={} run_id={} mime={} output_kind={} raw_output_chars={} raw_output_preview={:?} final_outcome_path={} raw_output_path={} goal={}",
                     err,
                     work_dir.display(),
                     run_id,
+                    mime,
+                    output_kind,
+                    raw_output_chars,
+                    raw_output_preview,
+                    final_outcome_path.display(),
+                    raw_output_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<unwritten>".to_string()),
                     goal
                 );
                 (
@@ -464,7 +518,14 @@ fn build_outcome_result(
                             "mime": mime,
                             "work_dir": work_dir.display().to_string(),
                             "run_id": run_id,
-                            "raw_output": output_to_text(&output),
+                            "output_kind": output_kind,
+                            "raw_output": raw_output,
+                            "raw_output_chars": raw_output_chars,
+                            "raw_output_preview": raw_output_preview,
+                            "raw_output_path": raw_output_path
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "final_outcome_path": final_outcome_path.display().to_string(),
                             "usage": usage,
                             "latency_ms": trace.latency_ms,
                         }),
@@ -611,6 +672,12 @@ struct MediaArg {
     mime_hint: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedMedia {
+    source: ResourceRef,
+    mime: String,
+}
+
 fn parse_media_arg(value: &Value) -> Result<MediaArg, String> {
     let source = serde_json::from_value::<ResourceRef>(value.clone())
         .map_err(|err| format!("invalid media ResourceRef: {err}"))?;
@@ -623,7 +690,7 @@ fn parse_media_arg(value: &Value) -> Result<MediaArg, String> {
     Ok(MediaArg { source, mime_hint })
 }
 
-async fn resolve_media_mime(media: &MediaArg) -> Result<String, String> {
+async fn resolve_media(media: &MediaArg) -> Result<ResolvedMedia, String> {
     match &media.source {
         ResourceRef::Base64 { mime, data_base64 } => {
             let mime =
@@ -631,16 +698,28 @@ async fn resolve_media_mime(media: &MediaArg) -> Result<String, String> {
             if data_base64.trim().is_empty() {
                 return Err("base64 media has empty data_base64".to_string());
             }
-            Ok(mime)
+            Ok(ResolvedMedia {
+                source: media.source.clone(),
+                mime,
+            })
         }
         ResourceRef::Url { url, mime_hint } => {
             if let Some(mime) = mime_hint.as_deref().and_then(normalize_mime) {
-                return Ok(mime);
+                return Ok(ResolvedMedia {
+                    source: media.source.clone(),
+                    mime,
+                });
             }
             if let Some(mime) = media.mime_hint.as_deref().and_then(normalize_mime) {
-                return Ok(mime);
+                return Ok(ResolvedMedia {
+                    source: media.source.clone(),
+                    mime,
+                });
             }
-            resolve_url_mime(url).await
+            Ok(ResolvedMedia {
+                source: media.source.clone(),
+                mime: resolve_url_mime(url).await?,
+            })
         }
         ResourceRef::NamedObject { obj_id } => {
             let runtime = get_buckyos_api_runtime()
@@ -649,36 +728,62 @@ async fn resolve_media_mime(media: &MediaArg) -> Result<String, String> {
                 .get_named_store()
                 .await
                 .map_err(|err| format!("get named_store failed: {err}"))?;
-            let object_json = named_store
-                .get_object(obj_id)
+
+            let object_mime = match named_store.get_object(obj_id).await {
+                Ok(object_json) => file_object_mime_from_json(&object_json),
+                Err(err) => {
+                    log::warn!(
+                        "llm_understand_media: load named_object metadata failed: {}; obj_id={}",
+                        err,
+                        obj_id
+                    );
+                    None
+                }
+            };
+            let (mut reader, _total_size) = named_store
+                .open_reader(obj_id, None)
                 .await
-                .map_err(|err| format!("load named_object {obj_id} failed: {err}"))?;
-            let file_obj: FileObject = serde_json::from_str(object_json.as_str())
-                .map_err(|err| format!("parse named_object {obj_id} as file failed: {err}"))?;
-            if let Some(mime) = file_obj
-                .meta
-                .get("mime_type")
-                .or_else(|| file_obj.meta.get("mime"))
-                .and_then(Value::as_str)
-                .and_then(normalize_mime)
-            {
-                return Ok(mime);
-            }
-            let chunk_id = ChunkId::new(file_obj.content.as_str())
-                .map_err(|err| format!("parse named_object {obj_id} chunk id failed: {err}"))?;
-            let bytes = named_store
-                .get_chunk_data(&chunk_id)
+                .map_err(|err| format!("open named_object {obj_id} reader failed: {err}"))?;
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
                 .await
-                .map_err(|err| format!("read named_object {obj_id} chunk failed: {err}"))?;
-            if let Some(mime) = sniff_image_mime(&bytes) {
-                return Ok(mime.to_string());
+                .map_err(|err| format!("read named_object {obj_id} bytes failed: {err}"))?;
+            if bytes.is_empty() {
+                return Err(format!("named_object {obj_id} has empty content"));
             }
-            media
-                .mime_hint
-                .as_deref()
-                .and_then(normalize_mime)
-                .ok_or_else(|| format!("cannot determine MIME for named_object {obj_id}"))
+
+            let mime = object_mime
+                .or_else(|| sniff_image_mime(&bytes).map(str::to_string))
+                .or_else(|| media.mime_hint.as_deref().and_then(normalize_mime))
+                .ok_or_else(|| format!("cannot determine MIME for named_object {obj_id}"))?;
+            let data_base64 = general_purpose::STANDARD.encode(bytes);
+            Ok(ResolvedMedia {
+                source: ResourceRef::Base64 {
+                    mime: mime.clone(),
+                    data_base64,
+                },
+                mime,
+            })
         }
+    }
+}
+
+fn file_object_mime_from_json(object_json: &str) -> Option<String> {
+    let file_obj: FileObject = serde_json::from_str(object_json).ok()?;
+    file_obj
+        .meta
+        .get("mime_type")
+        .or_else(|| file_obj.meta.get("mime"))
+        .and_then(Value::as_str)
+        .and_then(normalize_mime)
+}
+
+fn resource_source_kind(source: &ResourceRef) -> &'static str {
+    match source {
+        ResourceRef::Base64 { .. } => "base64",
+        ResourceRef::Url { .. } => "url",
+        ResourceRef::NamedObject { .. } => "named_object",
     }
 }
 
@@ -909,6 +1014,33 @@ fn output_to_text(output: &ContextOutput) -> String {
     }
 }
 
+fn context_output_kind(output: &ContextOutput) -> &'static str {
+    match output {
+        ContextOutput::Text { .. } => "text",
+        ContextOutput::Json { .. } => "json",
+    }
+}
+
+fn run_final_outcome_path(work_dir: &Path, run_id: &str) -> PathBuf {
+    work_dir
+        .join("runs")
+        .join(run_id)
+        .join("outcomes")
+        .join("final.json")
+}
+
+fn write_parse_error_raw_output(
+    work_dir: &Path,
+    run_id: &str,
+    raw_output: &str,
+) -> std::io::Result<PathBuf> {
+    let outcomes_dir = work_dir.join("runs").join(run_id).join("outcomes");
+    std::fs::create_dir_all(&outcomes_dir)?;
+    let path = outcomes_dir.join("parse_error_raw_output.txt");
+    std::fs::write(&path, raw_output)?;
+    Ok(path)
+}
+
 fn report_schema() -> Value {
     json!({
         "type": "object",
@@ -1124,7 +1256,7 @@ fn next_value(args: &[String], idx: &mut usize, flag: &str) -> Result<String, Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buckyos_api::AiToolResultContent;
+    use buckyos_api::{AiResponse, AiToolResultContent, AiUsage};
 
     #[test]
     fn purify_history_omits_media_payloads() {
@@ -1214,5 +1346,53 @@ mod tests {
         assert!(tool_policy
             .disable_capabilities
             .contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn parse_error_result_persists_raw_output_diagnostics() {
+        let work_dir = std::env::temp_dir().join(format!(
+            "llm_understand_media-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_id = "20260524-234831-test";
+        let raw = "{\n  \"observations\": [";
+        let outcome = LLMContextOutcome::Done {
+            reason: None,
+            output: ContextOutput::Text {
+                content: raw.to_string(),
+            },
+            usage: AiUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                total_tokens: Some(3),
+            },
+            response: AiResponse::text(raw),
+            trace: llm_context::ContextRunTrace {
+                trace_id: run_id.to_string(),
+                latency_ms: 12,
+                tool_trace: Vec::new(),
+                llm_task_ids: Vec::new(),
+            },
+            behavior_result: None,
+        };
+
+        let (result, exit_code) =
+            build_outcome_result(outcome, "image/png", &work_dir, run_id, "describe image");
+
+        assert_eq!(exit_code, CLI_EXIT_ERROR);
+        assert_eq!(result.status, AgentToolStatus::Error);
+        assert_eq!(result.details["output_kind"], "text");
+        assert_eq!(result.details["raw_output"], raw);
+        let raw_output_path = result.details["raw_output_path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(raw_output_path).unwrap(), raw);
+        assert!(result.details["final_outcome_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("outcomes/final.json"));
+
+        let _ = std::fs::remove_dir_all(work_dir);
     }
 }
