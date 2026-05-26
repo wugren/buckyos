@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use buckyos_api::{AiContent, AiMessage, AiResponse, AiRole, AiToolResultContent, AiUsage};
 use serde_json::Value;
 
-use crate::behavior_loop::{CompressBudget, LLMBehaviorResult, StepMeta, StepRecord};
+use crate::behavior_loop::{LLMBehaviorResult, StepMeta, StepRecord};
 use crate::deps::{resolve_tool_specs, LLMContextDeps, LlmInferenceRequest, WorkEvent};
 use crate::error::LLMComputeError;
 use crate::interrupt::{
@@ -672,7 +672,7 @@ impl LLMContext {
     //
     // The traditional `run_inner` above is reused as a *subroutine* — one
     // step iteration of `run_behavior` starts a fresh traditional LLMContext
-    // (with parser/renderer/compressor stripped), runs it to Done, hands the
+    // (with parser/renderer stripped), runs it to Done, hands the
     // raw response to the configured parser, and sediments the result as a
     // `StepRecord`. `run_inner` itself is untouched.
     // ===================================================================
@@ -946,14 +946,12 @@ impl LLMContext {
                 if let Some(outcome) = self.bump_consecutive_errors(err).await {
                     return outcome;
                 }
-                self.maybe_compress().await;
                 continue;
             }
 
             self.finish_step(&mut new_step);
             self.apply_step_result_hook(&mut new_step).await;
             self.sediment(new_step);
-            self.maybe_compress().await;
         }
     }
 
@@ -1151,44 +1149,6 @@ impl LLMContext {
                     step.meta.step_index,
                     err
                 );
-            }
-        }
-    }
-
-    /// Run the optional history compressor. Compression failures are
-    /// non-fatal — we log via worklog and continue with the uncompressed
-    /// history.
-    async fn maybe_compress(&mut self) {
-        let Some(compressor) = self.deps.history_compressor.clone() else {
-            return;
-        };
-        let steps_before = self.state.steps.len();
-        if steps_before == 0 {
-            return;
-        }
-        let budget = CompressBudget {
-            target_steps: None,
-            target_tokens: self.request.budget.max_total_tokens,
-        };
-        // Clone so a compressor failure leaves the live history intact.
-        let snapshot = self.state.steps.clone();
-        match compressor.compress(snapshot, budget).await {
-            Ok(compressed) => {
-                let steps_after = compressed.steps.len();
-                self.state.steps = compressed.steps;
-                self.state.history_summaries.extend(compressed.summaries);
-                self.deps
-                    .worklog
-                    .emit(WorkEvent::ContextRewritten {
-                        trace_id: self.request.trace.clone(),
-                        from_messages: steps_before,
-                        to_messages: steps_after,
-                    })
-                    .await;
-            }
-            Err(_) => {
-                // Compressor refused — keep the uncompressed history. Caller
-                // observes the same `steps` it had before the attempt.
             }
         }
     }

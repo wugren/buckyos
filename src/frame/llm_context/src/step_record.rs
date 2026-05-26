@@ -2,29 +2,26 @@
 //! [`crate::xml_behavior::XmlBehaviorParser`].
 //!
 //! The renderer is responsible for turning sedimented + hot [`StepRecord`]s
-//! back into [`AiMessage`]s that the next inner LLM call sees. It renders one
-//! `<<step_history>>` user message for compact / inherited / summary records,
-//! followed by the hot tail as strict `(assistant, user)` step pairs:
+//! back into [`AiMessage`]s that the next inner LLM call sees. Current-behavior
+//! steps render as stable `(assistant, user)` pairs in append order; inherited
+//! and summary records render into one `<<step_history>>` user message:
 //!
 //! - **Assistant message**: the verbatim hot step text the LLM emitted last
 //!   turn (the parsed XML lives inside `step.assistant_text`).
 //! - **User message**: a `<<last_step_action_results>>` wrapper carrying the
 //!   full dispatcher-side action result.
 //!
-//! ## History compression
+//! ## History stability
 //!
-//! `render_history` applies a simple recency-based two-level scheme so the
-//! oldest steps don't blow the prompt budget:
+//! `render_history` does not decide to compact old current-behavior steps
+//! based on recency. This keeps the rendered prefix stable for provider KV
+//! cache reuse: normal step progression appends new messages instead of
+//! rewriting old ones. If a session needs compression, the scheduler should
+//! rewrite the persisted history explicitly before it reaches this renderer.
 //!
-//! - Inherited and compact records live inside `<<step_history>>` and prefer
-//!   structured `ToolResultView.summary` / `ToolResultView.title`.
-//! - Hot / recent steps stay as `(assistant, user)` pairs and prefer
-//!   structured `ToolResultView.output` / `ToolResultView.detail`.
-//!
-//! Schedulers needing more sophisticated tiering (e.g. the four-level
-//! Min/Mini/Medium/Full scheme from the legacy opendan renderer) should
-//! implement [`StepRenderer`] themselves; this default optimizes for
-//! "good enough out of the box" rather than peak compression.
+//! Inherited and summary records still live inside `<<step_history>>`; they
+//! are already explicit persisted records from the caller's point of view, not
+//! renderer-selected recency compression.
 
 use buckyos_api::{AiMessage, AiRole};
 use serde_json::Value;
@@ -37,24 +34,19 @@ use crate::xml_behavior::xml_escape;
 /// truncation knobs; share a single `Arc<XmlStepRenderer>` across sessions.
 #[derive(Debug, Clone)]
 pub struct XmlStepRenderer {
-    /// Most recent N steps render at full fidelity. Older steps compress.
-    /// `0` means "always compress" (only the hot `last_step` stays full,
-    /// since it bypasses `render_history`).
-    pub recent_full_steps: usize,
     /// Hard cap on rendered assistant_text length per compressed step.
-    /// Hot / recent steps are never truncated by the renderer; truncation
-    /// only applies to compressed history entries.
+    /// Current-behavior steps are never truncated by the renderer; truncation
+    /// only applies to inherited history records.
     pub summary_chars: usize,
-    /// Hard cap on success-body length per *uncompressed* (hot / recent)
-    /// step. `0` disables truncation. The hot `last_step` always goes
-    /// through `render`, so this knob also caps it.
+    /// Hard cap on success-body length per current-behavior step. `0`
+    /// disables truncation. The hot `last_step` always goes through `render`,
+    /// so this knob also caps it.
     pub max_result_chars: usize,
 }
 
 impl Default for XmlStepRenderer {
     fn default() -> Self {
         Self {
-            recent_full_steps: 2,
             summary_chars: 280,
             max_result_chars: 4 * 1024,
         }
@@ -64,11 +56,6 @@ impl Default for XmlStepRenderer {
 impl XmlStepRenderer {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_recent_full_steps(mut self, n: usize) -> Self {
-        self.recent_full_steps = n;
-        self
     }
 
     pub fn with_summary_chars(mut self, n: usize) -> Self {
@@ -90,18 +77,6 @@ impl XmlStepRenderer {
             AiMessage::text(
                 AiRole::User,
                 render_action_results_full(step, self.max_result_chars),
-            )
-        });
-        (assistant, user)
-    }
-
-    fn render_compact(&self, step: &StepRecord) -> (AiMessage, AiMessage) {
-        let assistant_text = compact_assistant_text(step, self.summary_chars);
-        let assistant = AiMessage::text(AiRole::Assistant, assistant_text);
-        let user = step.next_user_message.clone().unwrap_or_else(|| {
-            AiMessage::text(
-                AiRole::User,
-                render_action_results_compact(step, self.summary_chars / 2),
             )
         });
         (assistant, user)
@@ -157,20 +132,6 @@ impl StepRenderer for XmlStepRenderer {
         if steps.is_empty() && summaries.is_empty() && inputs.is_empty() {
             return Vec::new();
         }
-        let current_indices: Vec<usize> = steps
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, step)| {
-                if current_behavior.is_empty() || step.meta.behavior_name == current_behavior {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let current_full_cutoff = current_indices.len().saturating_sub(self.recent_full_steps);
-        let mut current_seen = 0usize;
-
         let mut history_records: Vec<String> = Vec::new();
         for summary in &summaries {
             history_records.push(self.render_summary(summary).text_content());
@@ -181,12 +142,7 @@ impl StepRenderer for XmlStepRenderer {
                 history_records.push(self.render_inherited(step).text_content());
                 continue;
             }
-            let (a, u) = if current_seen >= current_full_cutoff {
-                self.render_full(step)
-            } else {
-                self.render_compact(step)
-            };
-            current_seen = current_seen.saturating_add(1);
+            let (a, u) = self.render_full(step);
             current_pairs.push(a);
             current_pairs.push(u);
         }
@@ -243,28 +199,6 @@ fn render_action_results_full(step: &StepRecord, max_body_chars: usize) -> Strin
         ));
     }
 
-    render_step_action_results_wrapper(step, parts)
-}
-
-fn render_action_results_compact(step: &StepRecord, max_body_chars: usize) -> String {
-    let mut parts: Vec<RenderedActionResult> = Vec::new();
-    let n = step.actions.len().min(step.action_results.len());
-    for i in 0..n {
-        parts.push(render_one_action_result_compact(
-            &step.actions[i],
-            &step.action_results[i],
-            max_body_chars,
-        ));
-    }
-    for obs in step.action_results.iter().skip(n) {
-        parts.push(render_unpaired_action_result(obs, max_body_chars));
-    }
-    for msg in &step.messages_sent {
-        parts.push(RenderedActionResult::output(
-            format!("Message sent to {}", msg.target),
-            "Message sent.".to_string(),
-        ));
-    }
     render_step_action_results_wrapper(step, parts)
 }
 
@@ -863,21 +797,6 @@ fn clip(input: &str, max_chars: usize) -> (String, bool) {
     }
 }
 
-/// Compact form of `assistant_text`: prefer `thought` (since that's the
-/// LLM's own summary of its turn); fall back to a truncated copy of the
-/// raw assistant text.
-fn compact_assistant_text(step: &StepRecord, max_chars: usize) -> String {
-    if let Some(thought) = step.thought.as_deref() {
-        let trimmed = thought.trim();
-        if !trimmed.is_empty() {
-            let (clipped, _) = clip(trimmed, max_chars);
-            return format!("<thinking>{}</thinking>", xml_escape(&clipped));
-        }
-    }
-    let (clipped, _) = clip(step.assistant_text.trim(), max_chars);
-    clipped
-}
-
 // =========================================================================
 // Tests
 // =========================================================================
@@ -1351,9 +1270,8 @@ mod tests {
     }
 
     #[test]
-    fn render_history_compresses_older_steps() {
+    fn render_history_keeps_current_behavior_steps_full_when_older() {
         let renderer = XmlStepRenderer {
-            recent_full_steps: 1,
             summary_chars: 20,
             max_result_chars: 0,
         };
@@ -1381,18 +1299,59 @@ mod tests {
         let msgs = renderer.render_history(steps, "", Vec::new(), Vec::new());
         assert_eq!(msgs.len(), 4);
 
-        // Step 0 (older, compressed) should use the <thinking>thought-0</thinking>
-        // form rather than the original raw assistant_text.
+        // Step 0 is older, but current-behavior history must remain full so
+        // adding Step 1 appends messages instead of rewriting the prefix.
         let a0 = plain_text(&msgs[0]);
         assert!(
-            a0.contains("<thinking>thought-0</thinking>"),
-            "expected compact form, got: {a0}"
+            a0.contains("<exec_bash>t</exec_bash>"),
+            "expected full assistant text for older step, got: {a0}"
         );
-        assert!(!a0.contains("<exec_bash>t</exec_bash>"));
+        let u0 = plain_text(&msgs[1]);
+        assert!(u0.contains("old body, should compress"));
 
-        // Step 1 (newest, full) keeps the verbatim original assistant_text.
         let a1 = plain_text(&msgs[2]);
         assert!(a1.contains("<exec_bash>t</exec_bash>"));
+    }
+
+    #[test]
+    fn render_history_appends_new_current_step_without_rewriting_prefix() {
+        let renderer = XmlStepRenderer::new();
+        let make_step = |idx: u32| {
+            let mut step = StepRecord::default();
+            step.meta.behavior_name = "execute".into();
+            step.meta.step_index = idx;
+            step.assistant_text = format!(
+                "<thinking>thought-{idx}</thinking><actions><exec_bash>cmd-{idx}</exec_bash></actions>"
+            );
+            step.thought = Some(format!("thought-{idx}"));
+            step.actions = vec![tool_call("exec_bash", &format!("c-{idx}"))];
+            step.action_results = vec![Observation::Success {
+                call_id: format!("c-{idx}"),
+                content: json!(format!("result-{idx}")),
+                bytes: 8,
+                truncated: false,
+                tool_result: None,
+            }];
+            step
+        };
+
+        let prefix = renderer.render_history(
+            vec![make_step(0), make_step(1)],
+            "execute",
+            Vec::new(),
+            Vec::new(),
+        );
+        let extended = renderer.render_history(
+            vec![make_step(0), make_step(1), make_step(2)],
+            "execute",
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(extended.len(), prefix.len() + 2);
+        assert_eq!(&extended[..prefix.len()], prefix.as_slice());
+        assert!(plain_text(&extended[4]).contains("<exec_bash>cmd-2</exec_bash>"));
+        assert!(plain_text(&extended[5]).contains("result-2"));
     }
 
     #[test]
@@ -1431,7 +1390,6 @@ mod tests {
     #[test]
     fn inherited_behavior_steps_render_as_single_history_records() {
         let renderer = XmlStepRenderer {
-            recent_full_steps: 1,
             summary_chars: 20,
             max_result_chars: 0,
         };

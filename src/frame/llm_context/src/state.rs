@@ -47,8 +47,9 @@ pub struct LLMContextState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub llm_task_ids: Vec<String>,
 
-    /// Behavior mode: sedimented step history (compression-eligible).
-    /// Always empty in traditional mode.
+    /// Behavior mode: sedimented step history. During one LLMContext run this
+    /// history is append-only; any compression or rewrite happens above the
+    /// waist before a new stable snapshot is resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepRecord>,
 

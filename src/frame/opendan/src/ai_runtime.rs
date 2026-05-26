@@ -11,9 +11,9 @@
 //! - [`OpenDanWorklogSink`]  → `WorklogSink`   (over `crate::worklog::WorklogService`)
 //! - [`SessionSnapshotHook`] → `TurnHook`      (writes `LLMContextSnapshot` to disk)
 //!
-//! Step 3 (`behavior_cfg`) will plug `LLMResultParser` / `StepRenderer` /
-//! `HistoryCompressor` on top of [`build_session_deps`] when the Behavior
-//! Loop is enabled for a given behavior.
+//! Step 3 (`behavior_cfg`) will plug `LLMResultParser` / `StepRenderer` on
+//! top of [`build_session_deps`] when the Behavior Loop is enabled for a
+//! given behavior.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -952,8 +952,8 @@ pub struct SessionDepsInput {
 }
 
 /// Assemble per-session `LLMContextDeps`. Step 3 will compose the optional
-/// behavior-loop fields (`result_parser` / `step_renderer` /
-/// `history_compressor`) on top of the value returned here.
+/// behavior-loop fields (`result_parser` / `step_renderer`) on top of the
+/// value returned here.
 pub fn build_session_deps(runtime: &AgentRuntime, input: SessionDepsInput) -> LLMContextDeps {
     let SessionDepsInput {
         tools,

@@ -6976,9 +6976,9 @@ const COMPRESS_KEEP_TAIL: usize = 12;
 /// case (tail starts with `User`) clean and the edge case from emitting
 /// two `Assistant` messages in a row.
 ///
-/// Note: this is an opendan-level compressor (message dimension), distinct
-/// from the optional `HistoryCompressor` inside the Behavior Loop (step
-/// dimension). They can coexist.
+/// Note: this is an opendan-level compressor (message dimension). The
+/// behavior loop itself only appends and renders persisted step history; it
+/// does not run a separate step compressor.
 pub fn compress_messages_for_context_limit(accumulated: Vec<AiMessage>) -> Vec<AiMessage> {
     let leading_system = accumulated
         .iter()

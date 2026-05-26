@@ -24,7 +24,6 @@ pub mod step_record;
 pub mod xml_behavior;
 
 pub use behavior_loop::{
-    CompressBudget, CompressError, HistoryCompressionOutput, HistoryCompressor,
     HistorySummaryRecord, LLMBehaviorResult, LLMResultParser, StepCompressionLevel, StepMeta,
     StepRecord, StepRenderer, StepResultHook, StepResultHookOutput,
 };
