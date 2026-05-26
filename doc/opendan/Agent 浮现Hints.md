@@ -111,6 +111,37 @@ OpenDAN 中，这个浮现机制的核心是：
 
 > Agent 不需要一开始就知道所有事实，但它需要知道“可能有这么一件相关的事”。
 
+### 3.1 Notepad 与 Memory 的本质区分
+
+主流 memory 方案常把两种不同的东西混成一个系统，导致两边都不到位。OpenDAN 把它们分开看待：
+
+| 维度 | Notepad | Memory |
+|---|---|---|
+| 写入语义 | “请记下来”（显式） | “刚才发生了”（沉淀） |
+| 内容形态 | 事实 / 规则 / 提醒 | 经历 / 感觉 / 线索 |
+| 召回需求 | 精确匹配 / 必然召回 | 联想浮现 / 可能相关 |
+| 写入者 | 用户主导（含 Agent 显式调用） | 系统主导 |
+| Prompt 位置 | system prompt | 紧贴 user msg |
+| 失败模式 | 漏掉 = 灾难 | 没浮现 = 可接受 |
+
+`update_session_topic` **属于 Notepad 子系统的工具** —— 由 Agent 显式调用、写入精确的事实条目（本 Session 当前在谈什么）。但它写入的内容会被 **Memory 浮现层** 消费：未来 Session 在合适时机浮现“昨天讨论过 X (session: …)”时，topic 行就是浮现产物的来源。
+
+简言之：
+
+> **写入是 Notepad 语义，消费是 Memory 语义。**
+
+这条工具是把“事实级 topic”和“启发式浮现”对接的桥。
+
+### 3.2 浮现 = pointer + hint + 延迟具象化
+
+整个浮现机制可以归纳为三个层次，复用同一个文件系统抽象（`session_dir` 是天然的锚）：
+
+1. **“这里有东西”**：浮现产物只是 *awareness* —— 一个 Session 存在、它大致谈了什么；
+2. **“它在哪”**：Session ID 作为锚点，文件系统路径作为统一 schema（不引入专门的 memory API）；
+3. **“用的时候再展开”**：浮现阶段每条线索只占 20–50 token；模型判断要不要深入时再触发对文件级资产的“深度调用”。
+
+`update_session_topic` 写入的 **topic 行**就是这一层的 “hint”，`session_id` 就是 pointer，`session_dir` 下的 history / artifacts 就是延迟具象化的目标。
+
 ---
 
 ## 4. 核心概念
@@ -258,6 +289,79 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 
 > `update_session_topic` 不一定每次都执行完整召回。它可以只是快速更新 Topic，然后返回。
 
+### 5.1 调用时机：反例
+
+期望模型在以下时机调用：用户首条消息已让主题清晰、话题发生显著漂移、Session 即将进入长尾。下列情况**不应触发**：
+
+- 用户随手聊一句、和当前任务无关的边角问答；
+- 模型自己内部的中间步骤；
+- 当前 topic 的细微展开（不是漂移）。
+
+主题更新本身是 Agent 的元行为，调用频率应远低于普通工具调用。工具描述（给 LLM 看的 system prompt 片段）必须明确：只在主题首次明确或显著漂移时调用、写给“未来的自己”而不是给用户看、不是会话总结、不要堆细节。
+
+### 5.2 同步契约：永不 pending
+
+`update_session_topic` 的工具结果遵守 `success | error` 协议，**永不返回 pending**。具体约束见 §10.3，这里先给出对 Agent 状态机的含义：
+
+- Agent 拿到 `success` 时可以确信：要么没召回（`recall` 字段为 None），要么召回已完成（`recall` 字段含完整条目）；
+- 即便召回失败（超时 / 旁路 LLM 报错），工具仍 `success`，因为 Tag 更新这一“保底语义”已经完成；
+- **不存在“工具已返回但召回还在后台跑”的中间状态** —— Agent 侧不需要处理异步召回的事件回调。
+
+### 5.3 调用语义补充
+
+- **覆盖写**（非 append）。一个 Session 同一时刻只有一个 topic；
+- **幂等**：相同 topic 内容重复调用对 `topic.md` 是 no-op；但 tags 的变化仍会触发 Tag 集合更新与可能的召回；
+- **历史可追溯但不必暴露给 LLM**：底层把每次更新落到 `topic_log.jsonl`（运维 / 审计用），但工具对外只承诺“当前 topic = 最后一次写入”；
+- **隔离边界**：不允许跨 Session 写他人的 topic（边界 = session_id）；
+- **单行 ≤ 120 字符校验**：topic title 单行、人类可读、对未来的“我”友好。
+
+### 5.4 文件布局
+
+复用 `session_dir` 作为锚，避免引入第二套 memory 数据库：
+
+```
+{session_dir}/
+  .meta/
+    topic.md           # 当前 topic（覆盖写）
+    topic_log.jsonl    # 历次更新审计（append-only，可选）
+    tag_set.json       # 当前 Tag 集合状态（含权重、时间戳、tier）
+    subscriptions.json # 当前活跃的状态订阅（由 LLM 召回路径产生）
+  round_history/       # 见 session-history 设计
+  ...
+```
+
+`topic.md` 内容形态：
+
+```markdown
+---
+session_id: 2026-05-12-xxx
+updated_at: 2026-05-12T15:30:00Z
+tags: [llm-context, design]
+---
+
+讨论 LLM Context 设计与“浮现”式 Memory 的工程实现
+```
+
+`tag_set.json` 内容形态：
+
+```json
+{
+  "capacity": 8,
+  "tags": [
+    {
+      "name": "llm-context",
+      "weight": 3.2,
+      "last_touched": "2026-05-12T15:30:00Z",
+      "tier": "active"
+    }
+  ],
+  "last_recall_turn": 12,
+  "last_recall_at": "2026-05-12T15:25:00Z"
+}
+```
+
+全局索引由浮现层另行维护，本工具不负责索引，只承诺：写完 `topic.md` 后浮现层最终能看到。
+
 ---
 
 ## 6. Session Topic Tag 的数量限制与机械淘汰
@@ -298,6 +402,21 @@ tag_score = mention_weight × time_decay
 ```
 
 如果某个 Tag 在最近多轮对话中持续出现，它的权重会升高；如果一个 Tag 曾经重要但长时间没有再出现，它会自然降权。
+
+参考实现（v0.2 默认）：
+
+```text
+score = weight * exp(-(now - last_touched) / TAU)
+TAU = 30 分钟（可配置）
+```
+
+新 Tag 进入流程：
+
+1. 若已存在同名 Tag → 权重 `+= 1.0`，`last_touched` 更新为当前时间；
+2. 若不存在 → 以 `weight=1.0, tier=Transient` 加入；
+3. 容量超限时：计算每个 transient Tag 的 score，淘汰得分最低者。
+
+`tier` 字段（Pinned / Active / Transient）保留接口但 v0.2 全部置为 Transient；tier 升降级未来由 LLM 召回路径调用。
 
 ### 6.2 机械淘汰
 
@@ -521,6 +640,23 @@ trigger_score =
 
 当 `trigger_score` 超过阀门值时，触发 LLM 旁路。
 
+参考默认（v0.2）：
+
+```text
+distance_threshold = 5      # 距离上一次召回的对话轮次
+change_threshold   = 0.5    # (added + removed) / tag_set.len()
+
+# 阀门判定三态
+if change_ratio >= change_threshold:
+    return LLM           # 剧烈变化 → 走深度路径
+elif turns_since_last_recall >= distance_threshold:
+    return Mechanical    # 距离够 → 走轻量路径
+else:
+    return NotTriggered  # 阀门未突破，直接 success 返回
+```
+
+> 阀门策略必须可配置（通过 `RecallPolicy` 结构注入），不得硬编码常量。
+
 ### 9.3 旁路不是必然召回全文
 
 即使触发了 LLM 旁路，也不意味着一定要读取大量数据。
@@ -601,6 +737,19 @@ User Message 到达
 ```
 
 这类似系统在用户输入前插入当前时间，但范围可以扩展到更多动态状态。
+
+### 10.3 工程契约：互斥二选一 + 同步等待
+
+> **机械召回与 LLM 召回是互斥的二选一关系**。一旦判定触发召回，`update_session_topic` 工具调用会**同步等待召回完成**才返回 `success`，召回结果作为工具返回值的一部分交付。
+
+含义：
+
+- 调用方（Agent）拿到 `success` 时可以确信：要么没召回（`recall` 字段为 None），要么召回已完成；
+- **不存在“工具已返回但召回还在后台跑”的中间状态**；
+- 简化 Agent 侧状态机：无需处理异步召回的事件回调；
+- LLM 旁路超时（默认 10s）归入 `Failed` 状态，工具仍 `success`。
+
+若未来需要异步语义，应另开新的召回入口（如 `OnUserMessageEnter` 钩子），而不是改变本工具的契约。
 
 ---
 
@@ -902,6 +1051,15 @@ flowchart TD
 - 最近触发时间；
 - 是否允许暴露读取方法。
 
+订阅生命周期：
+
+- **创建**：仅由 LLM 召回路径产出；
+- **TTL**：默认与产生它的 Tag 绑定 —— 订阅记录中显式带 `bound_tags: Vec<String>`，**Tag 被淘汰，对应订阅自动失效**；
+- **去重**：同一类订阅（如“地理位置”）多次注册时合并为一条，更新最新 Tag 关联；
+- **退订**：Session 结束时全部清理；或 Tag tier 被降级至淘汰时清理。
+
+订阅与 Tag 在数据结构上必须**显式关联**，以支持级联清理；这是实现层的硬约束，不可省。
+
 ### 15.6 ContextWeaver
 
 负责在 LLM 输入前编织背景信息。
@@ -928,6 +1086,48 @@ flowchart TD
 - 可选读取；
 - 权限控制；
 - 对象到 Hint 的解释能力。
+
+### 15.8 三子系统硬解耦：RecallService 抽象
+
+整套机制由三个**独立可演化**的子系统构成：
+
+| 子系统 | 职责 | 何时执行 |
+|---|---|---|
+| **A. Topic / Tag 更新** | 维护 Session Tag 集合（增删 + 淘汰） | `update_session_topic` 调用时 |
+| **B. 基于 Topic 的召回** | 以当前 Tag 为背景信息，从 Memory / Notebook / Global Object 中检索条目 | 任意触发点（当前仅 `update_session_topic`，但接口开放） |
+| **C. 召回信息的呈现** | 决定召回结果以何种形式、在何时进入 LLM 上下文 | 立即返回 / 背景注入 / 状态订阅触发 |
+
+> **关键约束**：三者必须通过定义良好的数据交换协议解耦。实现时，B 子系统必须抽象为独立的 `RecallService`，**不得**把召回逻辑直接耦合到 `update_session_topic` 工具实现内部。`update_session_topic` 是 `RecallService` 的**调用方，不是实现者**，两者必须在不同的模块 / crate 中。
+
+参考 trait 定义（Rust 风格示意）：
+
+```rust
+trait RecallService {
+    async fn recall(
+        &self,
+        tags: &TagSet,
+        mode: RecallMode,
+        policy: &RecallPolicy,
+    ) -> RecallResult;
+}
+
+enum RecallMode {
+    Mechanical,
+    LLM,
+    Auto,  // 由 policy 的阀门判定决定
+}
+
+enum RecallResult {
+    NotTriggered,
+    Recalled {
+        items: Vec<RecallItem>,
+        subscriptions: Vec<Subscription>,  // 仅 LLM 路径可能产出
+    },
+    Failed { reason: String },
+}
+```
+
+未来可在其他位置接入新的召回入口（例：`OnUserMessageEnter`、长时间无活动、外部事件到达），复用同一个 `RecallService`。
 
 ---
 
@@ -988,6 +1188,23 @@ Hints 应该少而精。
 3. 在事件发生或任务需要时才暴露读取方法；
 4. 对高成本对象设置查询预算；
 5. 对敏感对象设置权限确认。
+
+### 16.7 策略矩阵参考默认值
+
+集中列出 v0.2 的可调维度及默认值，方便实现者一次性看清：
+
+| 维度 | 选项 | 当前默认 |
+|---|---|---|
+| Tag 容量 | 整数 | 8 |
+| Tag 分层 | pinned / active / transient | 全 transient（v0.2 简化） |
+| 衰减常数 TAU | 时长 | 30 分钟 |
+| 距离阀门 | turn 间隔 | 5 |
+| 剧烈度阀门 | (add+remove)/total 比例 | 0.5 |
+| 召回路径选择 | mechanical / llm / auto | auto |
+| 召回入口 | `update_session_topic` | 仅此一个（接口开放） |
+| 呈现通道 | tool result / bg inject / sub trigger | 三通道并存 |
+| LLM 召回超时 | 时长 | 10s |
+| topic title 长度 | 字符上限 | 120 |
 
 ---
 

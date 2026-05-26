@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -35,8 +35,14 @@ pub struct UpdateSessionTopicInput {
     pub session_id: String,
     pub session_dir: PathBuf,
     pub topic: String,
-    pub tags: Vec<String>,
+    pub tags: Vec<TagInput>,
     pub current_turn: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TagInput {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -119,6 +125,8 @@ pub struct TagEntry {
     pub weight: f32,
     pub last_touched: String,
     pub tier: TagTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -220,6 +228,11 @@ impl SessionTopicUpdater {
     ) -> Result<UpdateSessionTopicResult, SessionTopicError> {
         let topic = normalize_topic(&input.topic)?;
         let tags = normalize_tags(&input.tags)?;
+        let tag_names: Vec<String> = tags.iter().map(|tag| tag.name.clone()).collect();
+        let tag_reasons: BTreeMap<String, String> = tags
+            .iter()
+            .map(|tag| (tag.name.clone(), tag.reason.clone()))
+            .collect();
         let now = now_string();
         let meta_dir = input.session_dir.join(META_DIR);
         fs::create_dir_all(&meta_dir)?;
@@ -228,16 +241,26 @@ impl SessionTopicUpdater {
         let old_topic = read_topic_doc(&topic_path).ok();
         let topic_changed = old_topic
             .as_ref()
-            .map(|old| old.topic != topic || old.tags != tags)
+            .map(|old| {
+                old.topic != topic || old.tags != tag_names || old.tag_reasons != tag_reasons
+            })
             .unwrap_or(true);
         if topic_changed {
-            write_topic_doc(&topic_path, &input.session_id, &topic, &tags, &now)?;
+            write_topic_doc(
+                &topic_path,
+                &input.session_id,
+                &topic,
+                &tag_names,
+                &tag_reasons,
+                &now,
+            )?;
         }
         append_topic_log(
             &meta_dir.join(TOPIC_LOG_FILE),
             &input.session_id,
             &topic,
-            &tags,
+            &tag_names,
+            &tag_reasons,
             topic_changed,
             &now,
         )?;
@@ -516,7 +539,7 @@ pub fn decide_recall(
 
 fn update_tag_set(
     tag_set: &mut TagSet,
-    incoming: &[String],
+    incoming: &[TagInput],
     now: &str,
     policy: &RecallPolicy,
 ) -> TagSetDiff {
@@ -529,21 +552,23 @@ fn update_tag_set(
         .collect();
 
     for tag in incoming {
-        if let Some(idx) = by_name.get(tag).copied() {
+        if let Some(idx) = by_name.get(&tag.name).copied() {
             let entry = &mut tag_set.tags[idx];
             entry.weight += 1.0;
             entry.last_touched = now.to_string();
             entry.tier = TagTier::Transient;
+            entry.reason = Some(tag.reason.clone());
         } else {
             let idx = tag_set.tags.len();
             tag_set.tags.push(TagEntry {
-                name: tag.clone(),
+                name: tag.name.clone(),
                 weight: 1.0,
                 last_touched: now.to_string(),
                 tier: TagTier::Transient,
+                reason: Some(tag.reason.clone()),
             });
-            by_name.insert(tag.clone(), idx);
-            added.push(tag.clone());
+            by_name.insert(tag.name.clone(), idx);
+            added.push(tag.name.clone());
         }
     }
 
@@ -606,12 +631,14 @@ fn write_topic_doc(
     session_id: &str,
     topic: &str,
     tags: &[String],
+    tag_reasons: &BTreeMap<String, String>,
     now: &str,
 ) -> Result<(), SessionTopicError> {
     let tags_json = serde_json::to_string(tags)?;
+    let reasons_json = serde_json::to_string(tag_reasons)?;
     let body = format!(
-        "---\nsession_id: {}\nupdated_at: {}\ntags: {}\n---\n\n{}\n",
-        session_id, now, tags_json, topic
+        "---\nsession_id: {}\nupdated_at: {}\ntags: {}\ntag_reasons: {}\n---\n\n{}\n",
+        session_id, now, tags_json, reasons_json, topic
     );
     write_atomic(path, body.as_bytes())?;
     Ok(())
@@ -627,6 +654,7 @@ fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
         return Ok(TopicDoc {
             session_id: String::new(),
             tags: Vec::new(),
+            tag_reasons: BTreeMap::new(),
             topic: text.trim().to_string(),
         });
     }
@@ -639,17 +667,21 @@ fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
     let body = text[4 + end + 5..].trim().to_string();
     let mut session_id = String::new();
     let mut tags = Vec::new();
+    let mut tag_reasons = BTreeMap::new();
     for line in fm.lines() {
         let line = line.trim();
         if let Some(raw) = line.strip_prefix("session_id:") {
             session_id = raw.trim().to_string();
         } else if let Some(raw) = line.strip_prefix("tags:") {
             tags = serde_json::from_str(raw.trim()).unwrap_or_default();
+        } else if let Some(raw) = line.strip_prefix("tag_reasons:") {
+            tag_reasons = serde_json::from_str(raw.trim()).unwrap_or_default();
         }
     }
     Ok(TopicDoc {
         session_id,
         tags,
+        tag_reasons,
         topic: body,
     })
 }
@@ -659,6 +691,7 @@ fn append_topic_log(
     session_id: &str,
     topic: &str,
     tags: &[String],
+    tag_reasons: &BTreeMap<String, String>,
     topic_changed: bool,
     now: &str,
 ) -> Result<(), SessionTopicError> {
@@ -667,6 +700,7 @@ fn append_topic_log(
         "updated_at": now,
         "topic": topic,
         "tags": tags,
+        "tag_reasons": tag_reasons,
         "topic_changed": topic_changed,
     });
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -678,6 +712,7 @@ fn append_topic_log(
 struct TopicDoc {
     session_id: String,
     tags: Vec<String>,
+    tag_reasons: BTreeMap<String, String>,
     topic: String,
 }
 
@@ -771,26 +806,42 @@ fn normalize_topic(topic: &str) -> Result<String, SessionTopicError> {
     Ok(topic.to_string())
 }
 
-fn normalize_tags(tags: &[String]) -> Result<Vec<String>, SessionTopicError> {
+fn normalize_tags(tags: &[TagInput]) -> Result<Vec<TagInput>, SessionTopicError> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for raw in tags {
-        let tag = raw.trim().to_lowercase();
-        if tag.is_empty() {
+        let name = raw.name.trim().to_lowercase();
+        if name.is_empty() {
             continue;
         }
-        if tag.contains('\n') || tag.contains('\r') {
+        if name.contains('\n') || name.contains('\r') {
             return Err(SessionTopicError::InvalidInput(
-                "`tags` entries must be single-line strings".to_string(),
+                "`tags[].name` entries must be single-line strings".to_string(),
             ));
         }
-        if tag.chars().count() > 48 {
+        if name.chars().count() > 48 {
             return Err(SessionTopicError::InvalidInput(
-                "`tags` entries must be 48 characters or fewer".to_string(),
+                "`tags[].name` entries must be 48 characters or fewer".to_string(),
             ));
         }
-        if seen.insert(tag.clone()) {
-            out.push(tag);
+        let reason = raw.reason.trim().to_string();
+        if reason.is_empty() {
+            return Err(SessionTopicError::InvalidInput(
+                "`tags[].reason` must not be empty".to_string(),
+            ));
+        }
+        if reason.contains('\n') || reason.contains('\r') {
+            return Err(SessionTopicError::InvalidInput(
+                "`tags[].reason` entries must be single-line strings".to_string(),
+            ));
+        }
+        if reason.chars().count() > 160 {
+            return Err(SessionTopicError::InvalidInput(
+                "`tags[].reason` entries must be 160 characters or fewer".to_string(),
+            ));
+        }
+        if seen.insert(name.clone()) {
+            out.push(TagInput { name, reason });
         }
     }
     Ok(out)
@@ -897,7 +948,10 @@ mod tests {
         };
         let diff = update_tag_set(
             &mut set,
-            &["new".to_string(), "fresh".to_string()],
+            &[
+                tag_input("new", "new topic focus"),
+                tag_input("fresh", "still relevant"),
+            ],
             now,
             &policy,
         );
@@ -905,6 +959,13 @@ mod tests {
         assert_eq!(diff.removed, vec!["old"]);
         let fresh = set.tags.iter().find(|t| t.name == "fresh").unwrap();
         assert_eq!(fresh.weight, 2.0);
+        assert_eq!(fresh.reason.as_deref(), Some("still relevant"));
+    }
+
+    #[test]
+    fn tag_normalization_requires_reason() {
+        let err = normalize_tags(&[tag_input("Design", "   ")]).unwrap_err();
+        assert!(matches!(err, SessionTopicError::InvalidInput(_)));
     }
 
     #[tokio::test]
@@ -935,7 +996,7 @@ mod tests {
                 session_id: "s1".to_string(),
                 session_dir: dir.path().join("s1"),
                 topic: "Discuss session topic implementation".to_string(),
-                tags: vec!["Design".to_string()],
+                tags: vec![tag_input("Design", "current implementation topic")],
                 current_turn: 0,
             })
             .await
@@ -953,6 +1014,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tag_set.tags[0].name, "design");
+        assert_eq!(
+            tag_set.tags[0].reason.as_deref(),
+            Some("current implementation topic")
+        );
+        let topic_log = fs::read_to_string(dir.path().join("s1/.meta/topic_log.jsonl")).unwrap();
+        assert!(topic_log.contains("current implementation topic"));
         assert!(dir.path().join("s1/.meta/subscriptions.json").exists());
     }
 
@@ -970,7 +1037,7 @@ mod tests {
                 session_id: "s1".to_string(),
                 session_dir: dir.path().join("s1"),
                 topic: "Discuss recall failure handling".to_string(),
-                tags: vec!["ops".to_string()],
+                tags: vec![tag_input("ops", "checking failure handling")],
                 current_turn: 0,
             })
             .await
@@ -999,7 +1066,7 @@ mod tests {
             session_id: "s1".to_string(),
             session_dir: dir.path().join("s1"),
             topic: "Discuss idempotent topic writes".to_string(),
-            tags: vec!["idempotent".to_string()],
+            tags: vec![tag_input("idempotent", "same topic repeated")],
             current_turn: 0,
         };
         updater.update(input.clone()).await.unwrap();
@@ -1026,6 +1093,14 @@ mod tests {
             weight,
             last_touched: last_touched.to_string(),
             tier: TagTier::Transient,
+            reason: None,
+        }
+    }
+
+    fn tag_input(name: &str, reason: &str) -> TagInput {
+        TagInput {
+            name: name.to_string(),
+            reason: reason.to_string(),
         }
     }
 }

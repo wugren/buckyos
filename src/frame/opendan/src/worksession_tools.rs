@@ -43,7 +43,7 @@ use crate::llm_context_helper::RequestOverrides;
 use crate::local_workspace::{WorkspaceRecord, WorkspaceStatus};
 use crate::session_model::{SessionKind, SessionStatus, SessionSummary};
 use crate::session_topic::{
-    RecallPolicy, SessionTopicError, SessionTopicUpdater, UpdateSessionTopicInput,
+    RecallPolicy, SessionTopicError, SessionTopicUpdater, TagInput, UpdateSessionTopicInput,
     UpdateSessionTopicResult,
 };
 
@@ -450,9 +450,10 @@ pub struct UpdateSessionTopicArgs {
     /// One-line topic hint for the current session. Write for the future self,
     /// not for the user; this is not a session summary.
     pub topic: String,
-    /// Optional short tags used as coarse recall keys.
+    /// Optional short tags used as coarse recall keys. Each reason should be a
+    /// compact explanation of why the tag matters now.
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub tags: Vec<TagInput>,
 }
 
 pub struct UpdateSessionTopicTool {
@@ -481,7 +482,7 @@ impl TypedTool for UpdateSessionTopicTool {
     }
 
     fn description(&self) -> &str {
-        "Update this session's one-line topic hint. Call only when the topic first becomes clear, significantly drifts, or reaches a final form. Write for your future self; do not use this for detailed summaries."
+        "Update this session's one-line topic hint and short topic tags. Call only when the topic first becomes clear, significantly drifts, or reaches a final form. Each tag must include a compact reason explaining why it matters now. Write for your future self; do not use this for detailed summaries."
     }
 
     fn calling(&self) -> CallingConventions {
@@ -491,7 +492,14 @@ impl TypedTool for UpdateSessionTopicTool {
     fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
         let mut parts = vec![format!("update_session_topic topic={}", args.topic.trim())];
         if !args.tags.is_empty() {
-            parts.push(format!("tags={}", args.tags.join(",")));
+            parts.push(format!(
+                "tags={}",
+                args.tags
+                    .iter()
+                    .map(|tag| tag.name.trim())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
         }
         Some(parts.join(" "))
     }
