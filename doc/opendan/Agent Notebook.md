@@ -89,6 +89,8 @@ system
 
 Notebook 本身只提供组织、版本、统计和注入元信息。事实正文存储在 Note Item 中。
 
+每个 Agent scope 必须有一个默认 notebook。当前 CLI 默认 notebook id 为 `user/actions`。上层 CLI / session 集成在未显式指定 notebook id 时，应先把请求解析到该 Agent 的默认 notebook，再调用底层 notebook 读写接口；底层结果中始终返回解析后的 concrete `notebook_id`。
+
 ### 2.2 Note Item
 
 Note Item 是 Notebook 里的最小事实单元。它应实现为统一 Item 系统中的一种 item type，例如：
@@ -720,21 +722,22 @@ append_note(input: {
 Requirements：
 
 1. append-first：不得覆盖旧 item content；
-2. 写入必须在事务中完成：创建 Item、创建 NotebookItem metadata、更新 notebook revision/version、创建 event；
-3. `title` 和 `content` 不能为空；
-4. `actor_kind = "online_agent"` 时，`write_reason` 只能是 `user_explicit`、`strong_rule`、`project_state`；
-5. `actor_kind = "curator"` 时，允许 `curator_extracted`、`curator_cleanup`；
-6. `tags` 必须先经 §3.6 规范化再持久化；非法 tag 直接返回 `invalid_input`；
-7. 返回 possible conflicts，但默认不阻止写入；
-8. possible conflicts 候选来源：
+2. 如果目标 notebook 不存在，必须在同一事务中自动创建 notebook，再写入 note；
+3. 写入必须在事务中完成：创建 Item、创建 NotebookItem metadata、更新 notebook revision/version、创建 event；
+4. `title` 和 `content` 不能为空；
+5. `actor_kind = "online_agent"` 时，`write_reason` 只能是 `user_explicit`、`strong_rule`、`project_state`；
+6. `actor_kind = "curator"` 时，允许 `curator_extracted`、`curator_cleanup`；
+7. `tags` 必须先经 §3.6 规范化再持久化；非法 tag 直接返回 `invalid_input`；
+8. 返回 possible conflicts，但默认不阻止写入；
+9. possible conflicts 候选来源：
    - 同 notebook、规范化 title 完全相同；
    - 同 notebook、title 近似（实现自定）；
    - 通过 `ItemSearchPort.searchItemsByTags` 用新 item 的 tags 召回的 top-N active item（`reason = "tag_overlap"`）；
    - 当前 active item 的 valid time 与新 item 重叠；
-9. 不要为冲突检测实现独立全文索引；
-10. 写入后必须发布 NotebookEvent，event.tags 为新 item 的规范化 tags；
-11. 写入后应使相关 session 的旧 read cache 失效，或通过 version mismatch 自然失效；
-12. 写入成功且存在 `session_id` 时，必须自动订阅当前 session 的 `notebook_id + title`，后续其它 session 对该 notebook 或相同/相近 title 的更新可触发 `agent-note` hint。
+10. 不要为冲突检测实现独立全文索引；
+11. 写入后必须发布 NotebookEvent，event.tags 为新 item 的规范化 tags；
+12. 写入后应使相关 session 的旧 read cache 失效，或通过 version mismatch 自然失效；
+13. 写入成功且存在 `session_id` 时，必须自动订阅当前 session 的 `notebook_id + title`，后续其它 session 对该 notebook 或相同/相近 title 的更新可触发 `agent-note` hint。
 
 ### 5.5 mark_note_status
 
@@ -1069,6 +1072,14 @@ include_status = ["active", "stale", "superseded"]
 
 如果代码库倾向用 CLI 暴露 agent 工具，可以实现 `agent-notebook`。命令形态与 Agent Memory v2.8 保持一致风格：subcommand + positional + flags，CLI 不接受 JSON 入参。
 
+Notebook selector 约定：
+
+1. `read` / `append` 使用可选 `--id <notebook_id>` 选择 notebook，不再把 `notebook_id` 作为 positional 参数；
+2. `read` / `append` 不传 `--id` 时，CLI 必须解析为当前 `owner_agent` 的默认 notebook；
+3. `create-notebook` 是显式 notebook 管理命令，必须传 `--id <notebook_id>`，不使用默认 notebook 兜底；
+4. CLI 在调用底层接口前必须得到 concrete `notebook_id`；底层 read cache、subscription、event、返回 JSON 都使用解析后的 id；
+5. `status` / `promote` 这类以 `item_id` 定位既有条目的命令，不要求 `--id`，其 notebook 归属由 item 元数据确定。
+
 ### 9.1 list
 
 ```bash
@@ -1083,9 +1094,10 @@ agent-notebook list \
 ### 9.2 read
 
 ```bash
-agent-notebook read <notebook_id> \
+agent-notebook read \
   --owner-user <user_id> \
   --session <session_id> \
+  [--id <notebook_id>] \
   [--tags <tag1,tag2,tag3>] \
   [--title <title>] \
   [--latest 10] \
@@ -1097,22 +1109,25 @@ agent-notebook read <notebook_id> \
 
 输出 `NotebookReadResult` JSON。
 
+`--id` 是可选 notebook 选择器；不传时读取当前 `owner_agent` 的默认 notebook。`read` 不再要求 positional `notebook_id`。
+
 `--tags` 是 tag list，逗号拆分；trim 后按 §3.6 规范化。**不传 `--tags` 即无过滤，返回该 notebook 全部 active items（按时间倒序）**；`--tags '*'` 语义等价于不传。
 
 互斥优先级：`--items` > `--title` > `--tags` > `--latest` > 全部缺省（= all_active）。当多个同时给出时，CLI 按优先级取一个并在 stderr warning 提示忽略的参数。
 
-当传入 `--session` 且读取结果为 `ok` 时，CLI 应把当前 session 自动订阅到该 `notebook_id`，并订阅本次读取输入或返回 entries 中涉及的 title。
+当传入 `--session` 且读取结果为 `ok` 时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id`，并订阅本次读取输入或返回 entries 中涉及的 title。
 
 ### 9.3 append
 
 短 content：
 
 ```bash
-agent-notebook append <notebook_id> <title> <content> \
+agent-notebook append <title> <content> \
   --owner-user <user_id> \
   --session <session_id> \
   --actor-kind online_agent \
   --write-reason user_explicit \
+  [--id <notebook_id>] \
   [--confidence high] \
   [--tags read-cache,unchanged-response] \
   [--valid-until 2026-12-25]
@@ -1121,20 +1136,39 @@ agent-notebook append <notebook_id> <title> <content> \
 长 content 走 stdin：
 
 ```bash
-cat note.md | agent-notebook append <notebook_id> <title> \
+cat note.md | agent-notebook append <title> \
   --owner-user <user_id> \
   --session <session_id> \
   --actor-kind curator \
   --write-reason curator_extracted \
+  [--id <notebook_id>] \
   --tags read-cache,unchanged-response \
   --stdin
 ```
 
+`--id` 是可选 notebook 选择器；不传时写入当前 `owner_agent` 的默认 notebook。`append` 不再要求 positional `notebook_id`。
+
+如果解析后的目标 notebook 不存在，append 成功路径必须先自动创建该 notebook，再写入 note；这保证 Agent 可以直接向默认 notebook 写入。
+
 `--tags` 同样是逗号拆分的 ordered list；写入时强制规范化校验。
 
-当传入 `--session` 且 append 成功时，CLI 应把当前 session 自动订阅到该 `notebook_id + title`。后续其它 session 修改同一 notebook 或相同/相近 title 时，`build_notebook_hints` 会把这类订阅命中合并到返回的 hint block。
+当传入 `--session` 且 append 成功时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id + title`。后续其它 session 修改同一 notebook 或相同/相近 title 时，`build_notebook_hints` 会把这类订阅命中合并到返回的 hint block。
 
-### 9.4 status
+### 9.4 create-notebook
+
+```bash
+agent-notebook create-notebook \
+  --owner-user <user_id> \
+  [--owner-agent <agent_id>] \
+  --id <notebook_id> \
+  [--kind normal|project|agent] \
+  [--title <title>] \
+  [--description <description>]
+```
+
+`--id` 是必填 notebook id；`create-notebook` 不再要求 positional `notebook_id`，也不使用默认 notebook 兜底。
+
+### 9.5 status
 
 ```bash
 agent-notebook status <item_id> stale \
@@ -1143,7 +1177,7 @@ agent-notebook status <item_id> stale \
   --actor-kind curator
 ```
 
-### 9.5 registry-context
+### 9.6 registry-context
 
 ```bash
 agent-notebook registry-context \
@@ -1151,7 +1185,7 @@ agent-notebook registry-context \
   [--owner-agent <agent_id>]
 ```
 
-### 9.6 hints
+### 9.7 hints
 
 ```bash
 agent-notebook hints \

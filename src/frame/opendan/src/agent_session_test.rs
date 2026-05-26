@@ -89,6 +89,7 @@ async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
             .expect("step hook template"),
         behavior,
         agent_config,
+        agent_name: "jarvis".to_string(),
         driver,
         meta: meta.clone(),
         session_id: "work-1".to_string(),
@@ -192,6 +193,7 @@ step observed
             .expect("step hook template"),
         behavior,
         agent_config,
+        agent_name: "jarvis".to_string(),
         driver,
         meta: meta.clone(),
         session_id: "work-1".to_string(),
@@ -946,6 +948,8 @@ __INCLUDE(/role.md)__
         input_has_events: false,
         recent_activity: String::new(),
         clock_unix_ms: 1,
+        notebook_list_text: String::new(),
+        notebook_last_items_text: String::new(),
         llm_context: LlmContextEnv::default(),
     };
     let detail = render_template_failure_detail(

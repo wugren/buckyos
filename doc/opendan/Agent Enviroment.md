@@ -339,6 +339,25 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | `$runtime.recent_activity` | `{{ runtime.recent_activity }}` | string | `OneLineStatusSink` 当前值 |
 | `$runtime.has_activity` | `{{ runtime.has_activity }}` | bool | recent activity 是否非空 |
 
+### 3.7 `notebook`
+
+`notebook` 表示当前 Agent 可见的 Agent Notebook 摘要。这里注入的是给 prompt 使用的纯文本索引，不是 notebook 正文；需要确认事实时，Behavior 仍应调用 `agent-notebook read` 读取对应 notebook / item。
+
+| 表达式 | upon 占位 | 类型 | 来源 |
+| --- | --- | --- | --- |
+| `$notebook` | `{{ notebook }}` | object | 下列字段的聚合 |
+| `$notebook.list_text` | `{{ notebook.list_text }}` | string | Agent Notebook registry 的默认纯文本渲染；列出当前一共有多少个 Notebook、每个 Notebook 有多少条记录，以及最后修改时间 |
+| `$notebook.last_items_text` | `{{ notebook.last_items_text }}` | string | Agent Notebook 最近新增 item 的默认纯文本渲染；最多列出最近新增的 8 条 item |
+
+推荐在 system prompt 中直接插入这两个字段：
+
+```upon
+{{ notebook.list_text }}
+{{ notebook.last_items_text }}
+```
+
+`notebook.list_text` 用于帮助 Agent 选择应该读取哪本 notebook；`notebook.last_items_text` 用于提示最近新增的记录标题和归属，但不应替代 `agent-notebook read` 的事实读取。
+
 ## 4. `on_behavior_switch` 变量
 
 `on_behavior_switch` 除了通用变量，还会注入切换来源信息：

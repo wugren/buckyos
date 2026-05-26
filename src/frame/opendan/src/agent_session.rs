@@ -302,6 +302,7 @@ struct OpenDanStepResultHook {
     template: String,
     behavior: BehaviorCfg,
     agent_config: Arc<AgentConfig>,
+    agent_name: String,
     driver: SessionDriverCfg,
     meta: Arc<Mutex<SessionMeta>>,
     session_id: String,
@@ -357,6 +358,7 @@ impl StepResultHook for OpenDanStepResultHook {
         let mut env = build_agent_session_env(
             &self.session_id,
             &self.agent_config,
+            &self.agent_name,
             &self.meta,
             &self.session_dir,
             &self.behavior,
@@ -637,6 +639,7 @@ impl AgentSession {
                 remaining: 32_000,
             });
         }
+        meta.ensure_default_event_subscriptions(now_ms());
         let history = Arc::new(SessionHistoryRecorder::new(
             b.session_id.clone(),
             session_dir.clone(),
@@ -3357,18 +3360,13 @@ impl AgentSession {
         context_window_tokens_from_model_directory(&directory, model_alias)
     }
 
-    /// Build the [`RequestOverrides`] that refreshes a resumed snapshot's
-    /// request side with the **current** behavior config. Mirrors
-    /// `apply_switch_normal` but with `reset_rounds = reset_errors = false`
-    /// — this is a soft refresh on every resume, not a behavior switch.
-    ///
-    /// Without this, edits to the behavior config (system prompt, model,
-    /// tool policy, budget, …) made between turns silently fail to land:
-    /// resume re-uses the snapshot's stored `request` and only a `switch` /
-    /// `discard` path would otherwise pick up the new config.
-    async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> Result<RequestOverrides> {
-        Ok(RequestOverrides {
-            system_messages: Some(self.render_system_messages(behavior).await?),
+    /// Build the [`RequestOverrides`] that refreshes non-message request
+    /// policy for a resumed snapshot. The message stream is inherited
+    /// strictly from the snapshot: `on_init` / system prompt rendering only
+    /// happens when a session context is created fresh.
+    fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> RequestOverrides {
+        RequestOverrides {
+            system_messages: None,
             user_messages: None,
             tool_policy: Some(behavior.to_tool_policy()),
             objective: Some(behavior.meta.objective.clone()),
@@ -3383,7 +3381,7 @@ impl AgentSession {
             reset_errors: false,
             reset_behavior_hot_tail: false,
             forbid_next_behavior: false,
-        })
+        }
     }
 
     async fn build_or_resume(
@@ -3451,16 +3449,12 @@ impl AgentSession {
 
         if let Some(snapshot) = self.try_load_snapshot() {
             if snapshot.state.pending_tool_calls.is_empty() {
-                // Refresh the snapshot's request side with the current
-                // behavior config before resuming. The cost (one
-                // leading-system swap + a handful of policy field copies)
-                // is negligible next to history tokens + inference, and it
-                // guarantees mid-session config edits actually land — without
-                // this, only a `switch` or a `discard` round would pick up
-                // the new system prompt / model / tool policy.
+                // Resume from the snapshot's persisted message stream.
+                // Refresh only non-message request policy here; `on_init`
+                // system prompt rendering belongs to fresh context creation.
                 let snapshot = apply_overrides_to_snapshot(
                     snapshot,
-                    self.current_behavior_overrides(behavior).await?,
+                    self.current_behavior_overrides(behavior),
                 );
 
                 if turn_message.is_some() || !history_inputs.is_empty() {
@@ -3574,6 +3568,7 @@ impl AgentSession {
             template: template.to_string(),
             behavior: behavior.clone(),
             agent_config: self.agent_config.clone(),
+            agent_name: self.agent_name.clone(),
             driver: self.session_class_driver(),
             meta: self.meta.clone(),
             session_id: self.session_id.clone(),
@@ -3658,6 +3653,7 @@ impl AgentSession {
         build_agent_session_env(
             &self.session_id,
             &self.agent_config,
+            &self.agent_name,
             &self.meta,
             &self.session_dir,
             behavior,
@@ -5616,6 +5612,7 @@ enum BuiltContext {
 async fn build_agent_session_env(
     session_id: &str,
     agent_config: &AgentConfig,
+    agent_name: &str,
     meta: &Arc<Mutex<SessionMeta>>,
     session_dir: &Path,
     behavior: &BehaviorCfg,
@@ -5641,6 +5638,8 @@ async fn build_agent_session_env(
     let workspace_root = workspace_id
         .as_deref()
         .map(|ws| agent_config.layout.workspaces_dir.join(ws));
+    let (notebook_list_text, notebook_last_items_text) =
+        build_notebook_prompt_texts(agent_config, owner.trim(), agent_name);
     AgentSessionEnv {
         session_id: session_id.to_string(),
         session_kind: AgentSessionEnv::kind_str(kind),
@@ -5667,11 +5666,52 @@ async fn build_agent_session_env(
         input_has_events: false,
         recent_activity: one_line.trim().to_string(),
         clock_unix_ms: now_ms(),
+        notebook_list_text,
+        notebook_last_items_text,
         llm_context: LlmContextEnv {
             bg_events,
             ..Default::default()
         },
     }
+}
+
+fn build_notebook_prompt_texts(
+    agent_config: &AgentConfig,
+    owner: &str,
+    agent_name: &str,
+) -> (String, String) {
+    if owner.is_empty() || !agent_config.layout.notepads_dir.exists() {
+        return (
+            "Available notebooks: 0 total.\n".to_string(),
+            "Recent notebook items: none.\n".to_string(),
+        );
+    }
+
+    let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
+        agent_config.layout.notepads_dir.clone(),
+    )) {
+        Ok(notebook) => notebook,
+        Err(err) => {
+            warn!("opendan.session: open notepads for prompt env failed: {err}");
+            return (String::new(), String::new());
+        }
+    };
+    let scope = OwnerScope::new(owner.to_string()).with_agent(agent_name.to_string());
+    let list_text = match notebook.build_notebook_list_text(scope.clone()) {
+        Ok(text) => text,
+        Err(err) => {
+            warn!("opendan.session: build notebook list prompt text failed: {err}");
+            String::new()
+        }
+    };
+    let last_items_text = match notebook.build_recent_items_text(scope, 8) {
+        Ok(text) => text,
+        Err(err) => {
+            warn!("opendan.session: build notebook recent items prompt text failed: {err}");
+            String::new()
+        }
+    };
+    (list_text, last_items_text)
 }
 
 fn apply_hook_env_to_prompt_env(env: &mut AgentSessionEnv, hook_env: LlmContextEnv) {

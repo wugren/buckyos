@@ -1900,6 +1900,103 @@ impl AgentNotebook {
         })
     }
 
+    pub fn build_notebook_list_text(&self, scope: OwnerScope) -> Result<String> {
+        validate_owner(&scope)?;
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, description, active_entry_count, updated_at
+             FROM notebooks
+             WHERE owner_user_id = ?
+               AND owner_agent_id = ?
+               AND status = 'active'
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope.owner_user_id, scope.agent()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut notebooks = Vec::new();
+        for row in rows {
+            notebooks.push(row?);
+        }
+
+        if notebooks.is_empty() {
+            return Ok("Available notebooks: 0 total.\n".to_string());
+        }
+
+        let mut text = format!("Available notebooks: {} total.\n", notebooks.len());
+        for (id, title, description, active_entry_count, updated_at) in notebooks {
+            let label = if description.is_empty() {
+                title.as_str()
+            } else {
+                description.as_str()
+            };
+            text.push_str(&format!(
+                "- {}: {}, {} records, last modified {}\n",
+                id, label, active_entry_count, updated_at
+            ));
+        }
+        Ok(text)
+    }
+
+    pub fn build_recent_items_text(&self, scope: OwnerScope, max_items: usize) -> Result<String> {
+        validate_owner(&scope)?;
+        let max_items = max_items.max(1);
+        let conn = self.lock_conn()?;
+        let now = now_iso8601();
+        let mut stmt = conn.prepare(
+            "SELECT i.item_id, i.notebook_id, i.title, i.created_at, i.updated_at
+             FROM notebook_items i
+             JOIN notebooks n
+               ON n.owner_user_id = i.owner_user_id
+              AND n.owner_agent_id = i.owner_agent_id
+              AND n.id = i.notebook_id
+             WHERE i.owner_user_id = ?
+               AND i.owner_agent_id = ?
+               AND i.status = 'active'
+               AND n.status = 'active'
+               AND (i.valid_until IS NULL OR i.valid_until >= ?)
+             ORDER BY i.created_at DESC, i.updated_at DESC, i.item_id ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.owner_user_id, scope.agent(), now, max_items as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+
+        if items.is_empty() {
+            return Ok("Recent notebook items: none.\n".to_string());
+        }
+
+        let mut text = format!("Recent notebook items: latest {}.\n", items.len());
+        for (item_id, notebook_id, title, created_at, updated_at) in items {
+            text.push_str(&format!(
+                "- [{}] {} ({}, created {}, updated {})\n",
+                notebook_id, title, item_id, created_at, updated_at
+            ));
+        }
+        Ok(text)
+    }
+
     // ----------------------------- build_system_notebook_context (§5.8)
 
     pub fn build_system_notebook_context(
@@ -3986,6 +4083,34 @@ mod tests {
             .unwrap();
         assert!(!ctx.text.contains("DO NOT LEAK"));
         assert!(ctx.text.contains("user/preferences"));
+    }
+
+    #[test]
+    fn prompt_notebook_texts_include_registry_and_recent_item_metadata_only() {
+        let (_t, n) = open_tmp();
+        append(&n, "user/preferences", "tone", "DO NOT LEAK", &["tone"]);
+        append(
+            &n,
+            "projects/demo",
+            "scope",
+            "DO NOT LEAK EITHER",
+            &["scope"],
+        );
+
+        let list_text = n.build_notebook_list_text(scope()).unwrap();
+        assert!(list_text.contains("Available notebooks: 2 total."));
+        assert!(list_text.contains("user/preferences"));
+        assert!(list_text.contains("projects/demo"));
+        assert!(list_text.contains("1 records"));
+        assert!(list_text.contains("last modified"));
+        assert!(!list_text.contains("DO NOT LEAK"));
+
+        let recent_text = n.build_recent_items_text(scope(), 1).unwrap();
+        assert!(recent_text.contains("Recent notebook items: latest 1."));
+        assert!(recent_text.contains("["));
+        assert!(recent_text.contains("created "));
+        assert!(recent_text.contains("updated "));
+        assert!(!recent_text.contains("DO NOT LEAK"));
     }
 
     #[test]

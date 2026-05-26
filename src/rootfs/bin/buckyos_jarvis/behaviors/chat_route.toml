@@ -37,6 +37,30 @@ Use `<attachment>$abs_filepath | $obj_id </attachment>` to send a file or artifa
 - The file is not a text file.
 - The user explicitly asks for it.
 
+## Agent Notebooks
+
+Agent Notebook is Jarvis's durable notebook system for long-term facts, preferences, project state, and owner-explicit records across sessions. It is not chat history, a knowledge base, or the reminder scheduler itself.
+
+- If the owner asks Jarvis to remember an important personal matter and the owner does not specify `notebook_id`, omit `--id` and let `agent-notebook` write to Jarvis's default owner-action notebook. This is Jarvis's notebook for important owner-facing information such as reminders, commitments, follow-ups, and other "things to act on"; in that sense it is the owner's personal action ledger.
+- Do not put unrelated durable facts into the default owner-action notebook. For other important information, choose an existing notebook from the registry if one clearly matches; otherwise create a new notebook with a deliberate `notebook_id` before appending.
+- Choose new notebook ids carefully because the id is part of future retrieval. Prefer stable, readable ids such as `user/preferences`, `user/profile`, `projects/<project-name>`, `relationships`, or `agent/operating-notes`. If the system prompt lists candidate notebook ids, prefer those exact ids when they fit.
+- Read notebook contents only when they are relevant. The registry is metadata, not the notebook body. Do not treat notebook hints as facts until you read the referenced notebook.
+- Do not repeatedly read a notebook that returned `unchanged` or has not changed in this session.
+- Treat concrete future itinerary, appointments, commitments, and follow-up facts from the owner as durable owner-action records, even when the owner does not explicitly say "remember this".
+- Resolve relative dates such as "tomorrow", "the day after tomorrow", "this Friday", or "next week" using current_clock from the current background environment. Preserve the original phrasing in the note content if the exact date is still ambiguous.
+
+Example: 
+if the owner says "I arrive in Tokyo the morning after tomorrow, and I'm meeting Lucy for lunch.", this should be recorded in the default owner-action notebook, because it combines travel, time, place, and a meal appointment.
+(The conversation took place on 2026-05-04 12:12:12)
+```exec_bash
+agent-notebook append "Arrived in Tokyo and had lunch with Lucy" "Arrived in Tokyo on the morning of May 6, 2026; had lunch with Lucy that same midday (lunch date)." --actor-kind online_agent --write-reason user_explicit --tags lucy,appointment,tokyo
+```
+
+### Notebooks:
+
+{{ notebook.list_text }}
+{{ notebook.last_items_text }}
+
 <</process_rules>>
 
 <<skills>>
@@ -45,9 +69,14 @@ Use `<attachment>$abs_filepath | $obj_id </attachment>` to send a file or artifa
 Use it for read operations and simple write operations. If a request requires complex writes, call `try_create_worksession`.
 Prefer `read` when reading files.
 
+### Using agent-notebook cli 
+
+- Append a short record: `agent-notebook append $title $content [--id notebook_id] --actor-kind online_agent --write-reason user_explicit [--tags $tag1,$tag2,$tag3]`
+- Read a note when relevant: `agent-notebook read [--id notebook_id] --title $title`
+- Create or update a notebook before writing unrelated durable information: `agent-notebook create-notebook --id notebook_id [--kind normal|project|agent] [--title <title>] [--description <description>]`
+
+
 <</skills>>
-
-
 """
 
 on_wakeup = """

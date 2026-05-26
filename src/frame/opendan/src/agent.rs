@@ -44,7 +44,8 @@ use crate::paths;
 use crate::session_event_pump::SessionEventPump;
 use crate::session_model::{
     PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary, TimerEventKind,
-    TimerReason, TimerTargetType, TimerTriggerType,
+    TimerReason, TimerTargetType, TimerTriggerType, UI_CLOCK_TIMER_EVENT_ID,
+    UI_CLOCK_TIMER_INTERVAL_MS,
 };
 use crate::tool_plan::{self, ResolvedToolPlan, SessionBinRenderer, ToolPlanToml};
 
@@ -416,6 +417,7 @@ impl AIAgent {
         info!("opendan.agent[{}]: starting AIAgent::run", self.agent_name);
         self.clone().restore_session_routes().await;
         self.clone().ensure_self_check_hard_barrier_timer().await;
+        self.clone().ensure_ui_clock_timer().await;
 
         let pump_handle = self.clone().spawn_msg_center_pump();
         let event_pump_handle = self.event_pump.as_ref().map(|p| {
@@ -525,8 +527,29 @@ impl AIAgent {
                 );
                 continue;
             };
+            let mut meta = meta;
             if matches!(meta.status, SessionStatus::Ended) {
                 continue;
+            }
+            if meta.ensure_default_event_subscriptions(current_unix_ms()) {
+                match serde_json::to_vec_pretty(&meta) {
+                    Ok(bytes) => {
+                        if let Err(err) = std::fs::write(&meta_path, bytes) {
+                            warn!(
+                                "opendan.agent[{}]: backfill default subscriptions for {} failed: {err}",
+                                self.agent_name,
+                                meta_path.display()
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "opendan.agent[{}]: encode default subscriptions for {} failed: {err}",
+                            self.agent_name,
+                            meta_path.display()
+                        );
+                    }
+                }
             }
             if matches!(meta.kind, SessionKind::Ui) && !meta.owner.is_empty() {
                 self.tunnel_to_ui_session
@@ -716,6 +739,31 @@ impl AIAgent {
                     self.agent_name
                 );
             }
+        }
+    }
+
+    async fn ensure_ui_clock_timer(self: Arc<Self>) {
+        let Some(client) = self.runtime.kevent_client.as_ref() else {
+            return;
+        };
+        if let Err(err) = client
+            .create_timer(
+                UI_CLOCK_TIMER_EVENT_ID,
+                TimerOptions {
+                    interval_ms: UI_CLOCK_TIMER_INTERVAL_MS,
+                    repeat: true,
+                    initial_delay_ms: Some(UI_CLOCK_TIMER_INTERVAL_MS),
+                    data: Some(serde_json::json!({
+                        "purpose": "current_clock",
+                    })),
+                },
+            )
+            .await
+        {
+            warn!(
+                "opendan.agent[{}]: create ui clock timer failed: {err:?}",
+                self.agent_name
+            );
         }
     }
 
@@ -1823,6 +1871,13 @@ async fn remove_dir_all_if_exists(path: PathBuf) -> Result<()> {
     }
 }
 
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn truncate(s: &str, limit: usize) -> String {
     if s.chars().count() <= limit {
         return s.to_string();
@@ -2096,6 +2151,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compress_command_mounts_restored_ui_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "ui-did_dev_alice".to_string(),
+            SessionKind::Ui,
+            "chat_route".to_string(),
+            "did:dev:alice".to_string(),
+        );
+        meta.status = SessionStatus::Idle;
+        write_session_meta(&agent, meta);
+
+        agent.clone().restore_session_routes().await;
+        assert!(agent.get_session("ui-did_dev_alice").await.is_none());
+
+        let outcome = crate::command_dispatcher::run_command(
+            &agent,
+            &crate::command_dispatcher::CommandInvocation {
+                record_id: "local-command".to_string(),
+                from: "did:dev:alice".to_string(),
+                from_did: None,
+                tunnel_did: None,
+                command: "compress".to_string(),
+                args: String::new(),
+            },
+        )
+        .await
+        .expect("run compress command");
+
+        assert!(outcome
+            .reply
+            .contains("session `ui-did_dev_alice` has no saved context to compress"));
+        assert!(!outcome.reply.contains("no active session"));
+        let session = agent
+            .get_session("ui-did_dev_alice")
+            .await
+            .expect("session mounted by command");
+        session.abort_worker().await;
+    }
+
+    #[tokio::test]
     async fn ui_session_creation_does_not_create_or_bind_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = test_agent(dir.path().to_path_buf());
@@ -2107,6 +2203,17 @@ mod tests {
             .expect("create ui session");
         let session = agent.get_session(&session_id).await.expect("session");
         assert_eq!(session.summary().await.workspace_id, None);
+        let meta = session.meta.lock().await;
+        let clock_sub = meta
+            .event_subscriptions
+            .iter()
+            .find(|sub| sub.pattern == UI_CLOCK_TIMER_EVENT_ID)
+            .expect("default ui clock subscription");
+        assert_eq!(
+            clock_sub.mode,
+            crate::session_model::EventSubscriptionMode::BackgroundOnly
+        );
+        drop(meta);
         assert!(agent
             .workspaces()
             .list()
@@ -2119,6 +2226,41 @@ mod tests {
             .delete_session_physical(&session_id)
             .await
             .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn restore_session_routes_backfills_ui_clock_subscription() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+        let mut meta = SessionMeta::new(
+            "ui-did_dev_alice".to_string(),
+            SessionKind::Ui,
+            "chat_route".to_string(),
+            "did:dev:alice".to_string(),
+        );
+        meta.event_subscriptions.clear();
+        write_session_meta(&agent, meta);
+
+        agent.clone().restore_session_routes().await;
+
+        let meta_path = agent
+            .config
+            .layout
+            .session_dir("ui-did_dev_alice")
+            .join(".meta")
+            .join("session.json");
+        let restored: SessionMeta =
+            serde_json::from_slice(&std::fs::read(meta_path).expect("read restored session meta"))
+                .expect("decode restored session meta");
+        let clock_sub = restored
+            .event_subscriptions
+            .iter()
+            .find(|sub| sub.pattern == UI_CLOCK_TIMER_EVENT_ID)
+            .expect("default ui clock subscription");
+        assert_eq!(
+            clock_sub.mode,
+            crate::session_model::EventSubscriptionMode::BackgroundOnly
+        );
     }
 
     #[tokio::test]

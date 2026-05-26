@@ -4,6 +4,9 @@ use buckyos_api::{match_event_patterns, AiMessage};
 use chrono::{DateTime, FixedOffset};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+pub const UI_CLOCK_TIMER_EVENT_ID: &str = "timer";
+pub const UI_CLOCK_TIMER_INTERVAL_MS: u64 = 2 * 60 * 1000;
+
 // AgentSession lifecycle invariants.
 //
 // END is terminal for the current worker run: `on_wakeup` is not triggered after
@@ -200,7 +203,7 @@ impl SessionMeta {
         current_behavior: String,
         owner: String,
     ) -> Self {
-        Self {
+        let mut meta = Self {
             session_id,
             kind,
             current_behavior: current_behavior.clone(),
@@ -225,7 +228,29 @@ impl SessionMeta {
             process_stack: Vec::new(),
             last_report_delivery: None,
             internal_continuation: None,
+        };
+        meta.ensure_default_event_subscriptions(0);
+        meta
+    }
+
+    pub fn ensure_default_event_subscriptions(&mut self, subscribed_at_ms: u64) -> bool {
+        if !matches!(self.kind, SessionKind::Ui) {
+            return false;
         }
+        if self
+            .event_subscriptions
+            .iter()
+            .any(|sub| sub.pattern == UI_CLOCK_TIMER_EVENT_ID)
+        {
+            return false;
+        }
+        self.event_subscriptions.push(EventSubscription {
+            pattern: UI_CLOCK_TIMER_EVENT_ID.to_string(),
+            subscribed_at_ms,
+            mode: EventSubscriptionMode::BackgroundOnly,
+            message_template: None,
+        });
+        true
     }
 }
 

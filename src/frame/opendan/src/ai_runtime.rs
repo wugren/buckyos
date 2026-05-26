@@ -373,7 +373,14 @@ fn result_to_observation(call_id: String, result: AgentToolResult) -> Observatio
     let summary = result.summary.clone();
     let title = result.title.clone();
     if is_error {
-        let message = if !summary.is_empty() {
+        let output = result.output.clone().unwrap_or_default();
+        let message = if !output.trim().is_empty() {
+            if summary.trim().is_empty() {
+                output
+            } else {
+                format!("{}\n```output\n{}\n```", summary.trim(), output.trim())
+            }
+        } else if !summary.is_empty() {
             summary
         } else if !title.is_empty() {
             title
@@ -522,6 +529,7 @@ impl PolicyEngine for AgentPolicy {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use ::agent_tool::AgentToolStatus;
     use llm_context::request::{ContextOwnerRef, ToolMode, ToolPolicy};
     use std::collections::HashMap;
 
@@ -549,6 +557,26 @@ mod policy_tests {
             name: name.to_string(),
             args: HashMap::new(),
             call_id: "call-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn error_observation_keeps_tool_output() {
+        let result = AgentToolResult::from_details(json!({}))
+            .with_tool("exec_bash")
+            .with_command_metadata("exec_bash", "date -d @1")
+            .with_status(AgentToolStatus::Error)
+            .with_result("exit=1 in 10ms")
+            .with_output("date: illegal option -- d\nusage: date ...")
+            .with_return_code(1);
+
+        let obs = result_to_observation("call-1".to_string(), result);
+        match obs {
+            Observation::Error { message, .. } => {
+                assert!(message.contains("exit=1 in 10ms"));
+                assert!(message.contains("date: illegal option -- d"));
+            }
+            _ => panic!("expected error observation"),
         }
     }
 

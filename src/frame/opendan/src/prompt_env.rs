@@ -91,6 +91,8 @@ pub struct AgentSessionEnv {
 
     pub recent_activity: String,
     pub clock_unix_ms: u64,
+    pub notebook_list_text: String,
+    pub notebook_last_items_text: String,
     pub llm_context: LlmContextEnv,
 }
 
@@ -144,6 +146,7 @@ pub fn build_render_vars(env: &AgentSessionEnv) -> RenderVars {
         .with_var("input", input_object(env))
         .with_var("current_context", current_context_object(env))
         .with_var("runtime", runtime_object(env))
+        .with_var("notebook", notebook_object(env))
         .with_var("llm_context", llm_context_object(env))
         .with_var("msgs", msgs_array(env))
         .with_var("events", events_array(env))
@@ -293,6 +296,10 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "runtime.recent_activity" => Some(Json::String(env.recent_activity.clone())),
         "runtime.has_activity" => Some(Json::Bool(env.has_recent_activity())),
 
+        "notebook" => Some(notebook_object(env)),
+        "notebook.list_text" => Some(Json::String(env.notebook_list_text.clone())),
+        "notebook.last_items_text" => Some(Json::String(env.notebook_last_items_text.clone())),
+
         "current_context" => Some(current_context_object(env)),
         "current_context.behavior_name" => Some(Json::String(env.behavior_name.clone())),
         "current_context.last_step" | "last_step" => {
@@ -425,6 +432,13 @@ fn runtime_object(env: &AgentSessionEnv) -> Json {
     })
 }
 
+fn notebook_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "list_text": env.notebook_list_text,
+        "last_items_text": env.notebook_last_items_text,
+    })
+}
+
 fn clock_text_from_unix_ms(clock_unix_ms: u64) -> String {
     let Ok(ms) = i64::try_from(clock_unix_ms) else {
         return String::new();
@@ -433,7 +447,7 @@ fn clock_text_from_unix_ms(clock_unix_ms: u64) -> String {
     Local
         .timestamp_millis_opt(ms)
         .single()
-        .map(|dt| dt.format("%d-%m %H:%M").to_string())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S %Z").to_string())
         .unwrap_or_default()
 }
 
@@ -765,6 +779,8 @@ mod tests {
             input_has_events: false,
             recent_activity: "running tool".into(),
             clock_unix_ms: 123,
+            notebook_list_text: "Available notebooks: 1 total.\n- user/preferences: preferences, 2 records, last modified 2026-05-24T10:00:00Z\n".into(),
+            notebook_last_items_text: "Recent notebook items: latest 1.\n- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)\n".into(),
             llm_context: LlmContextEnv {
                 msgs: vec![json!({
                     "record_id": "msg-1",
@@ -824,8 +840,23 @@ mod tests {
             input_has_events: false,
             recent_activity: String::new(),
             clock_unix_ms: 999,
+            notebook_list_text: String::new(),
+            notebook_last_items_text: String::new(),
             llm_context: LlmContextEnv::default(),
         }
+    }
+
+    #[test]
+    fn clock_text_includes_year_seconds_and_timezone() {
+        let timestamp_ms = 1_779_729_908_000;
+        let expected = Local
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string();
+
+        assert_eq!(clock_text_from_unix_ms(timestamp_ms as u64), expected);
     }
 
     #[tokio::test]
@@ -873,6 +904,14 @@ mod tests {
         assert_eq!(
             loader.load("$runtime.clock_text").await.unwrap(),
             Some(Json::String(clock_text_from_unix_ms(env.clock_unix_ms)))
+        );
+        assert_eq!(
+            loader.load("$notebook.list_text").await.unwrap(),
+            Some(Json::String(env.notebook_list_text.clone()))
+        );
+        assert_eq!(
+            loader.load("$notebook.last_items_text").await.unwrap(),
+            Some(Json::String(env.notebook_last_items_text.clone()))
         );
         assert_eq!(
             loader.load("$result_protocol").await.unwrap(),
@@ -1148,6 +1187,7 @@ behavior={{ behavior.name }}|{{ behavior.objective }}|{{ behavior.mode }}
 workspace={{ workspace.id }}|{{ workspace.root }}|{{ workspace.has_id }}
 paths={{ paths.agent_root }}|{{ paths.session_root }}|{{ paths.workspace_root }}
 runtime={{ runtime.clock_unix_ms }}|{{ runtime.clock_text }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
+notebook={{ notebook.list_text }}|{{ notebook.last_items_text }}
 {% if session.has_title %}if_session_title={{ session.title }}{% endif %}
 {% if session.background_hint_changed %}if_background_hint={{ session.default_changed_background_hint_text }}
 {% endif %}
@@ -1203,6 +1243,8 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
             "workspace=ws1|/tmp/ws1|true",
             "paths=/tmp/agent|/tmp/agent/sessions/s-1|/tmp/ws1",
             expected_runtime.as_str(),
+            "notebook=Available notebooks: 1 total.",
+            "- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)",
             "if_session_title=hello",
             "if_background_hint=- Memory may be relevant: /user/preference/style",
             "hint=memory/user/preference/style|memory|Memory may be relevant: /user/preference/style",

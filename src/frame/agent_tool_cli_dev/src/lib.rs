@@ -1123,6 +1123,7 @@ const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NO
 [--session <id> | env OPENDAN_SESSION_ID] \
 <list|read|append|status|promote|create-notebook|registry-context|\
 system-context|hints> [...]";
+const DEFAULT_AGENT_NOTEBOOK_ID: &str = "user/actions";
 
 #[derive(Clone, Debug)]
 struct AgentNotebookInvocation {
@@ -1316,6 +1317,7 @@ fn parse_agent_notebook_list(rest: &[String]) -> Result<AgentNotebookVerb, Agent
 
 fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
+    let mut notebook_id: Option<String> = None;
     let mut tags: Option<Vec<String>> = None;
     let mut title: Option<String> = None;
     let mut latest_n: Option<usize> = None;
@@ -1330,6 +1332,16 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
+            "--id" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                notebook_id = Some(value.clone());
+            }
+            v if v.starts_with("--id=") => {
+                notebook_id = Some(v["--id=".len()..].to_string());
+            }
             "--tags" => {
                 idx += 1;
                 let value = rest
@@ -1421,14 +1433,14 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
         }
         idx += 1;
     }
-    if positionals.len() != 1 {
+    if !positionals.is_empty() {
         return Err(agent_notebook_invalid(format!(
-            "`read` expects exactly 1 positional argument (notebook_id), got {}",
+            "`read` does not accept positional notebook_id; use `--id <notebook_id>` (got {} positional arguments)",
             positionals.len()
         )));
     }
     Ok(AgentNotebookVerb::Read {
-        notebook_id: positionals.into_iter().next().unwrap(),
+        notebook_id: notebook_id.unwrap_or_else(|| DEFAULT_AGENT_NOTEBOOK_ID.to_string()),
         tags,
         title,
         latest_n,
@@ -1444,6 +1456,7 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
 
 fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
+    let mut notebook_id: Option<String> = None;
     let mut use_stdin = false;
     let mut source_excerpt: Option<String> = None;
     let mut actor_kind: Option<ActorKind> = None;
@@ -1458,6 +1471,16 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
+            "--id" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                notebook_id = Some(value.clone());
+            }
+            v if v.starts_with("--id=") => {
+                notebook_id = Some(v["--id=".len()..].to_string());
+            }
             "--stdin" => use_stdin = true,
             "--source-excerpt" => {
                 idx += 1;
@@ -1554,38 +1577,34 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
     let write_reason =
         write_reason.ok_or_else(|| agent_notebook_invalid("`append` requires `--write-reason`"))?;
 
-    let (notebook_id, title, content) = match (use_stdin, positionals.len()) {
-        (false, 3) => {
-            let mut it = positionals.into_iter();
-            (
-                it.next().unwrap(),
-                it.next().unwrap(),
-                Some(it.next().unwrap()),
-            )
-        }
-        (true, 2) => {
-            let mut it = positionals.into_iter();
-            (it.next().unwrap(), it.next().unwrap(), None)
-        }
+    let (title, content) = match (use_stdin, positionals.len()) {
         (false, 2) => {
+            let mut it = positionals.into_iter();
+            (it.next().unwrap(), Some(it.next().unwrap()))
+        }
+        (true, 1) => {
+            let mut it = positionals.into_iter();
+            (it.next().unwrap(), None)
+        }
+        (false, 1) => {
             return Err(agent_notebook_invalid(
                 "`append` expects positional `<content>` or `--stdin`",
             ));
         }
-        (true, 3) => {
+        (true, 2) => {
             return Err(agent_notebook_invalid(
                 "`append --stdin` does not accept a positional `<content>`",
             ));
         }
         (_, n) => {
             return Err(agent_notebook_invalid(format!(
-                "`append` expects 2-3 positional arguments (notebook_id, title[, content]), got {n}"
+                "`append` expects 1-2 positional arguments (title[, content]); use `--id <notebook_id>` to select a notebook, got {n}"
             )));
         }
     };
 
     Ok(AgentNotebookVerb::Append {
-        notebook_id,
+        notebook_id: notebook_id.unwrap_or_else(|| DEFAULT_AGENT_NOTEBOOK_ID.to_string()),
         title,
         content,
         source_excerpt,
@@ -1763,6 +1782,7 @@ fn parse_agent_notebook_promote(rest: &[String]) -> Result<AgentNotebookVerb, Ag
 
 fn parse_agent_notebook_create(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
+    let mut notebook_id: Option<String> = None;
     let mut kind: Option<NotebookKind> = None;
     let mut title: Option<String> = None;
     let mut description: Option<String> = None;
@@ -1770,6 +1790,16 @@ fn parse_agent_notebook_create(rest: &[String]) -> Result<AgentNotebookVerb, Age
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
+            "--id" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                notebook_id = Some(value.clone());
+            }
+            v if v.starts_with("--id=") => {
+                notebook_id = Some(v["--id=".len()..].to_string());
+            }
             "--kind" => {
                 idx += 1;
                 let value = rest
@@ -1809,14 +1839,16 @@ fn parse_agent_notebook_create(rest: &[String]) -> Result<AgentNotebookVerb, Age
         }
         idx += 1;
     }
-    if positionals.len() != 1 {
+    if !positionals.is_empty() {
         return Err(agent_notebook_invalid(format!(
-            "`create-notebook` expects 1 positional argument (notebook_id), got {}",
+            "`create-notebook` does not accept positional notebook_id; use `--id <notebook_id>` (got {} positional arguments)",
             positionals.len()
         )));
     }
+    let notebook_id =
+        notebook_id.ok_or_else(|| agent_notebook_invalid("`create-notebook` requires `--id`"))?;
     Ok(AgentNotebookVerb::CreateNotebook {
-        notebook_id: positionals.into_iter().next().unwrap(),
+        notebook_id,
         kind,
         title,
         description,
@@ -4303,9 +4335,10 @@ mod tests {
                 OsString::from("--session"),
                 OsString::from("s1"),
                 OsString::from("append"),
-                OsString::from("user/preferences"),
                 OsString::from("concise replies"),
                 OsString::from("user prefers terse output"),
+                OsString::from("--id"),
+                OsString::from("user/preferences"),
                 OsString::from("--actor-kind"),
                 OsString::from("online_agent"),
                 OsString::from("--write-reason"),
@@ -4363,6 +4396,7 @@ mod tests {
                 OsString::from("--session"),
                 OsString::from("s1"),
                 OsString::from("read"),
+                OsString::from("--id"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("reply-style"),
@@ -4390,6 +4424,7 @@ mod tests {
                 OsString::from("--session"),
                 OsString::from("s1"),
                 OsString::from("read"),
+                OsString::from("--id"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("reply-style"),
@@ -4425,9 +4460,10 @@ mod tests {
                 OsString::from("--session"),
                 OsString::from("s1"),
                 OsString::from("append"),
-                OsString::from("projects/demo"),
                 OsString::from("design notes"),
                 OsString::from("--stdin"),
+                OsString::from("--id"),
+                OsString::from("projects/demo"),
                 OsString::from("--actor-kind"),
                 OsString::from("curator"),
                 OsString::from("--write-reason"),
@@ -4443,6 +4479,124 @@ mod tests {
         assert_eq!(output.exit_code, EXIT_SUCCESS);
         let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse append json");
         assert_eq!(payload["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn agent_notebook_read_and_append_default_to_owner_action_notebook() {
+        let _lock = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+
+        let append_output = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("--session"),
+                OsString::from("s1"),
+                OsString::from("append"),
+                OsString::from("Tokyo lunch"),
+                OsString::from("Lunch with Lucy in Tokyo."),
+                OsString::from("--actor-kind"),
+                OsString::from("online_agent"),
+                OsString::from("--write-reason"),
+                OsString::from("user_explicit"),
+                OsString::from("--tags"),
+                OsString::from("travel,appointment"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run default append");
+        assert_eq!(append_output.exit_code, EXIT_SUCCESS);
+        let append_payload: Json =
+            serde_json::from_str(append_output.stdout.trim()).expect("parse append json");
+        assert_eq!(append_payload["status"], "ok");
+        assert_eq!(append_payload["notebook_id"], DEFAULT_AGENT_NOTEBOOK_ID);
+
+        let read_output = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("--session"),
+                OsString::from("s2"),
+                OsString::from("read"),
+                OsString::from("--title"),
+                OsString::from("Tokyo lunch"),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("run default read");
+        assert_eq!(read_output.exit_code, EXIT_SUCCESS);
+        let read_payload: Json =
+            serde_json::from_str(read_output.stdout.trim()).expect("parse read json");
+        assert_eq!(read_payload["status"], "ok");
+        assert_eq!(read_payload["notebook_id"], DEFAULT_AGENT_NOTEBOOK_ID);
+        let entries = read_payload["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["title"], "Tokyo lunch");
+    }
+
+    #[tokio::test]
+    async fn agent_notebook_create_notebook_requires_id_flag() {
+        let _lock = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+
+        let missing_id = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("create-notebook"),
+                OsString::from("--title"),
+                OsString::from("Project Demo"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect_err("create-notebook without id should fail during parse");
+        assert!(missing_id
+            .to_string()
+            .contains("`create-notebook` requires `--id`"));
+
+        let created = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("create-notebook"),
+                OsString::from("--id"),
+                OsString::from("projects/demo"),
+                OsString::from("--kind"),
+                OsString::from("project"),
+                OsString::from("--title"),
+                OsString::from("Project Demo"),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("run create-notebook with id");
+        assert_eq!(created.exit_code, EXIT_SUCCESS);
+        let created_payload: Json =
+            serde_json::from_str(created.stdout.trim()).expect("parse created json");
+        assert_eq!(created_payload["status"], "ok");
+        assert_eq!(created_payload["notebook"]["id"], "projects/demo");
+        assert_eq!(created_payload["created"], true);
     }
 
     #[tokio::test]
@@ -4488,9 +4642,10 @@ mod tests {
                 OsString::from("--owner-user"),
                 OsString::from("alice"),
                 OsString::from("append"),
-                OsString::from("user/preferences"),
                 OsString::from("old fact"),
                 OsString::from("a stale fact"),
+                OsString::from("--id"),
+                OsString::from("user/preferences"),
                 OsString::from("--actor-kind"),
                 OsString::from("online_agent"),
                 OsString::from("--write-reason"),
@@ -4543,6 +4698,7 @@ mod tests {
                 OsString::from("--session"),
                 OsString::from("s1"),
                 OsString::from("read"),
+                OsString::from("--id"),
                 OsString::from("user/preferences"),
             ],
             test_env(root, cwd),
@@ -4574,9 +4730,10 @@ mod tests {
                 OsString::from("--owner-user"),
                 OsString::from("alice"),
                 OsString::from("append"),
-                OsString::from("user/preferences"),
                 OsString::from("bad"),
                 OsString::from("x"),
+                OsString::from("--id"),
+                OsString::from("user/preferences"),
                 OsString::from("--actor-kind"),
                 OsString::from("online_agent"),
                 OsString::from("--write-reason"),
@@ -4626,9 +4783,10 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("append"),
-                OsString::from("user/preferences"),
                 OsString::from("from env"),
                 OsString::from("body via env-resolved scope"),
+                OsString::from("--id"),
+                OsString::from("user/preferences"),
                 OsString::from("--actor-kind"),
                 OsString::from("online_agent"),
                 OsString::from("--write-reason"),
@@ -4649,6 +4807,7 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("read"),
+                OsString::from("--id"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("env-test"),
@@ -4687,9 +4846,10 @@ mod tests {
                     OsString::from("--owner-user"),
                     OsString::from("alice"),
                     OsString::from("append"),
-                    OsString::from(nb_id),
                     OsString::from(title),
                     OsString::from("seed content"),
+                    OsString::from("--id"),
+                    OsString::from(nb_id),
                     OsString::from("--actor-kind"),
                     OsString::from("online_agent"),
                     OsString::from("--write-reason"),
