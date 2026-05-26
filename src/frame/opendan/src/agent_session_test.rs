@@ -1487,7 +1487,7 @@ fn default_changed_background_hint_text_renders_list() {
         BackgroundHint {
             path: "event/presence.changed".to_string(),
             kind: "event".to_string(),
-            text: "Background event changed: presence.changed observed_at_ms=122".to_string(),
+            text: r#"presence updated : {"online":true} (presence.changed)"#.to_string(),
             fingerprint: "fp1".to_string(),
             data: serde_json::Value::Null,
         },
@@ -1501,7 +1501,29 @@ fn default_changed_background_hint_text_renders_list() {
     ];
     assert_eq!(
         render_changed_background_hint_text(&hints),
-        "- Background event changed: presence.changed observed_at_ms=122\n- Memory may be relevant: /user/preference/style"
+        r#"- presence updated : {"online":true} (presence.changed)"#.to_string()
+            + "\n- Memory may be relevant: /user/preference/style"
+    );
+}
+
+#[test]
+fn background_event_hint_renders_reason_data_and_event_id() {
+    let hints = build_background_event_hints(&[BgEventSnapshot {
+        event_id: "timer".to_string(),
+        data: serde_json::json!({
+            "purpose": "current_clock",
+            "_timer": {
+                "timer_id": "t_1",
+                "tick_count": 1
+            }
+        }),
+        reason: None,
+        observed_at_ms: 1779769325008,
+    }]);
+    assert_eq!(hints.len(), 1);
+    assert_eq!(
+        hints[0].text,
+        r#"current_clock updated : {"_timer":{"tick_count":1,"timer_id":"t_1"},"purpose":"current_clock"} (timer)"#
     );
 }
 

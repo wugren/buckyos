@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::sleep;
 
 use crate::agent::Inbound;
+use crate::session_model::UI_CLOCK_TIMER_EVENT_ID;
 
 /// Same as `msg_center_pump::EVENT_PULL_TIMEOUT_MS` — short enough that
 /// shutdown / subscription refresh latency stays low; long enough to avoid
@@ -249,6 +250,12 @@ impl SessionEventPump {
                 return;
             }
             delivered += 1;
+            if event.eventid == UI_CLOCK_TIMER_EVENT_ID {
+                info!(
+                    "opendan.event_pump[{}]: routed ui clock timer event_id={} session_id={} patterns={:?}",
+                    self.agent_name, event.eventid, sid, patterns
+                );
+            }
         }
         debug!(
             "opendan.event_pump[{}]: routed event {} to {delivered} session(s)",

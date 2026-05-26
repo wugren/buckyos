@@ -639,7 +639,13 @@ impl AgentSession {
                 remaining: 32_000,
             });
         }
-        meta.ensure_default_event_subscriptions(now_ms());
+        if meta.ensure_default_event_subscriptions(now_ms()) {
+            info!(
+                "opendan.session[{}]: install default ui clock subscription event_id={} mode=background_only",
+                b.session_id,
+                crate::session_model::UI_CLOCK_TIMER_EVENT_ID
+            );
+        }
         let history = Arc::new(SessionHistoryRecorder::new(
             b.session_id.clone(),
             session_dir.clone(),
@@ -873,13 +879,22 @@ impl AgentSession {
     }
 
     pub async fn notify_event(&self, event_id: String, data: serde_json::Value) -> Result<bool> {
-        let interested = {
+        let (full_interested, background_interested) = {
             let meta = self.meta.lock().await;
-            meta.event_subscriptions
-                .iter()
-                .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(&event_id))
+            (
+                meta.event_subscriptions
+                    .iter()
+                    .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(&event_id)),
+                meta.event_subscriptions.iter().any(|sub| {
+                    sub.mode == EventSubscriptionMode::BackgroundOnly && sub.matches(&event_id)
+                }),
+            )
         };
-        if interested {
+        if full_interested {
+            info!(
+                "opendan.session[{}]: event {} matched full subscription; enqueue pending input",
+                self.session_id, event_id
+            );
             self.enqueue_pending(PendingInput::Event { event_id, data })
                 .await?;
             return Ok(true);
@@ -892,9 +907,17 @@ impl AgentSession {
                 .iter_mut()
                 .find(|item| item.event_id == event_id)
             {
+                info!(
+                    "opendan.session[{}]: event {} stored as background snapshot; subscription_match={} action=refresh",
+                    self.session_id, event_id, background_interested
+                );
                 existing.data = data;
                 existing.observed_at_ms = now_ms();
             } else {
+                info!(
+                    "opendan.session[{}]: event {} stored as background snapshot; subscription_match={} action=create",
+                    self.session_id, event_id, background_interested
+                );
                 meta.background_events.push(BgEventSnapshot {
                     event_id,
                     data,
@@ -5734,25 +5757,43 @@ fn build_background_event_hints(events: &[BgEventSnapshot]) -> Vec<BackgroundHin
         .map(|event| {
             let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
             let fingerprint = stable_json_fingerprint(&data);
-            let reason = event
-                .reason
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| format!(" ({value})"))
-                .unwrap_or_default();
+            let reason = background_event_reason(&event);
+            let event_data =
+                serde_json::to_string(&event.data).unwrap_or_else(|_| String::from("null"));
             BackgroundHint {
                 path: format!("event/{}", event.event_id),
                 kind: "event".to_string(),
-                text: format!(
-                    "Background event changed: {}{} observed_at_ms={}",
-                    event.event_id, reason, event.observed_at_ms
-                ),
+                text: format!("{} updated : {} ({})", reason, event_data, event.event_id),
                 fingerprint,
                 data,
             }
         })
         .collect()
+}
+
+fn background_event_reason(event: &BgEventSnapshot) -> String {
+    if let Some(reason) = event
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return reason.to_string();
+    }
+
+    for key in ["reason", "purpose", "type"] {
+        if let Some(reason) = event
+            .data
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return reason.to_string();
+        }
+    }
+
+    "event".to_string()
 }
 
 fn render_changed_background_hint_text(hints: &[BackgroundHint]) -> String {

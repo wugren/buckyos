@@ -532,6 +532,10 @@ impl AIAgent {
                 continue;
             }
             if meta.ensure_default_event_subscriptions(current_unix_ms()) {
+                info!(
+                    "opendan.agent[{}]: backfill default ui clock subscription session_id={} event_id={} mode=background_only",
+                    self.agent_name, meta.session_id, UI_CLOCK_TIMER_EVENT_ID
+                );
                 match serde_json::to_vec_pretty(&meta) {
                     Ok(bytes) => {
                         if let Err(err) = std::fs::write(&meta_path, bytes) {
@@ -746,7 +750,7 @@ impl AIAgent {
         let Some(client) = self.runtime.kevent_client.as_ref() else {
             return;
         };
-        if let Err(err) = client
+        match client
             .create_timer(
                 UI_CLOCK_TIMER_EVENT_ID,
                 TimerOptions {
@@ -760,10 +764,21 @@ impl AIAgent {
             )
             .await
         {
-            warn!(
-                "opendan.agent[{}]: create ui clock timer failed: {err:?}",
-                self.agent_name
-            );
+            Ok(timer_id) => {
+                info!(
+                    "opendan.agent[{}]: ui clock timer started timer_id={} event_id={} interval_ms={}",
+                    self.agent_name,
+                    timer_id,
+                    UI_CLOCK_TIMER_EVENT_ID,
+                    UI_CLOCK_TIMER_INTERVAL_MS
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "opendan.agent[{}]: create ui clock timer failed: {err:?}",
+                    self.agent_name
+                );
+            }
         }
     }
 
@@ -963,6 +978,10 @@ impl AIAgent {
                 target_session_id,
                 data,
             } => {
+                info!(
+                    "opendan.agent[{}]: main_loop received event event_id={} target_session_id={:?}",
+                    self.agent_name, event_id, target_session_id
+                );
                 // Event routing is intentionally narrow in MVP: only
                 // pre-routed events (carrier sets `target_session_id`) are
                 // delivered. Broadcast / pattern-matched event delivery
@@ -1009,7 +1028,18 @@ impl AIAgent {
                     );
                     return Ok(());
                 };
-                session.notify_event(event_id, data).await?;
+                let full_delivery = session.notify_event(event_id.clone(), data).await?;
+                info!(
+                    "opendan.agent[{}]: event dispatched event_id={} session_id={} delivery={}",
+                    self.agent_name,
+                    event_id,
+                    session.session_id,
+                    if full_delivery {
+                        "pending_input"
+                    } else {
+                        "background_only"
+                    }
+                );
                 Ok(())
             }
         }
