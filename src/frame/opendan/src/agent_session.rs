@@ -71,6 +71,7 @@ const MAX_PENDING_INPUTS: usize = 256;
 const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
 const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_IDLE_WORKER_RETIRE_MS: u64 = 3 * 60 * 1000;
+const BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS: u64 = 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorksessionReportPhase {
@@ -3665,8 +3666,16 @@ impl AgentSession {
     }
 
     async fn load_changed_background_hits(&self) -> Vec<BackgroundHint> {
+        let now = now_ms();
         let (old_fingerprints, bg_events, owner) = {
             let meta = self.meta.lock().await;
+            if background_hint_interval_active(
+                meta.background_hint_state
+                    .last_non_empty_background_hints_at_ms,
+                now,
+            ) {
+                return Vec::new();
+            }
             (
                 meta.background_hint_state.hint_fingerprints.clone(),
                 meta.background_events.clone(),
@@ -3693,6 +3702,10 @@ impl AgentSession {
         {
             let mut meta = self.meta.lock().await;
             meta.background_hint_state.hint_fingerprints = next_fingerprints;
+            if !changed.is_empty() {
+                meta.background_hint_state
+                    .last_non_empty_background_hints_at_ms = now;
+            }
         }
         if let Err(err) = self.flush_meta().await {
             warn!(
@@ -5666,6 +5679,11 @@ fn apply_hook_env_to_prompt_env(env: &mut AgentSessionEnv, hook_env: LlmContextE
     env.session_default_changed_background_hint_text =
         hook_env.default_changed_background_hint_text.clone();
     env.llm_context = hook_env;
+}
+
+fn background_hint_interval_active(last_non_empty_at_ms: u64, now_ms: u64) -> bool {
+    last_non_empty_at_ms > 0
+        && now_ms.saturating_sub(last_non_empty_at_ms) < BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS
 }
 
 fn build_background_event_hints(events: &[BgEventSnapshot]) -> Vec<BackgroundHint> {

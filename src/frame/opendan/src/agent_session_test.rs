@@ -933,7 +933,7 @@ __INCLUDE(/role.md)__
         session_current_todo_list: "(empty)".into(),
         session_background_hints: Vec::new(),
         session_default_changed_background_hint_text: String::new(),
-        behavior_name: "do".intobackground
+        behavior_name: "do".into(),
         behavior_objective: "execute".into(),
         behavior_mode: "behavior",
         behavior_template_dir: behavior_path.parent().map(|path| path.to_path_buf()),
@@ -1497,7 +1497,7 @@ fn default_changed_background_hint_text_renders_list() {
     ];
     assert_eq!(
         render_changed_background_hint_text(&hints),
-        "- Background ebackgroundged: presence.changed observed_at_ms=122\n- Memory may be relevant: /user/preference/style"
+        "- Background event changed: presence.changed observed_at_ms=122\n- Memory may be relevant: /user/preference/style"
     );
 }
 
@@ -1512,8 +1512,15 @@ fn default_changed_background_hint_text_falls_back_to_path() {
     }];
     assert_eq!(
         render_changed_background_hint_text(&hints),
-        "- notepad/projbackground
+        "- notepad/project"
     );
+}
+
+#[test]
+fn background_hint_interval_blocks_one_minute_after_non_empty() {
+    assert!(!background_hint_interval_active(0, 10));
+    assert!(background_hint_interval_active(1_000, 60_999));
+    assert!(!background_hint_interval_active(1_000, 61_000));
 }
 
 #[test]

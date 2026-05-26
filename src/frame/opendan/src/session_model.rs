@@ -310,11 +310,13 @@ pub struct BgEventSnapshot {
 pub struct BackgroundHintState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hint_fingerprints: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_non_empty_background_hints_at_ms: u64,
 }
 
 impl BackgroundHintState {
     pub fn is_empty(&self) -> bool {
-        self.hint_fingerprints.is_empty()
+        self.hint_fingerprints.is_empty() && self.last_non_empty_background_hints_at_ms == 0
     }
 }
 
@@ -330,6 +332,10 @@ pub struct BackgroundHint {
 
 fn serde_json_value_is_null(value: &serde_json::Value) -> bool {
     value.is_null()
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

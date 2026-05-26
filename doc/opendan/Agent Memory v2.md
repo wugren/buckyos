@@ -1,20 +1,21 @@
 # Agent Memory Module — 核心组件规格 v2.8（优化版）
 
 > 本文档定义 Agent Memory 核心组件的稳定契约：CLI、数据模型、存储布局、一致性、检索与恢复策略。  
-> 目标是让实现者能快速、准确地实现同一个 `memory_root` 协议；理念、长场景和 ADR 仅保留必要摘要。
+> 目标是让实现者能快速、准确地实现 Agent-scoped singleton `memory_root` 协议；理念、长场景和 ADR 仅保留必要摘要。
 
 ---
 
 ## 0. Core Contract
 
 - `agent-memory` 是唯一核心入口；上层 Agent / Skill 通过 shell 命令调用，不向 CLI 传 JSON。
-- `memory_root` 是一个本地目录；所有持久化状态都在该目录内。
+- Memory 的身份由所属 Agent 决定：每个 Agent 有且只有一个 Memory；不存在 `memory_id`、命名 Memory 或同一 Agent 下的多个 Memory 实例。
+- `memory_root` 是该 Agent 唯一 Memory 的本地物理目录；所有持久化状态都在该目录内。
 - 业务内容以纯 UTF-8 文本文件保存；每个 logical key 对应一个业务内容文件。
 - `.meta/log.jsonl` 是 append-only 审计日志，也是在线状态真相源的一部分。
 - `memory.sqlite` 是派生缓存，可删除、重建；不能作为唯一真相源。
 - 在线状态由“按日志顺序 replay 后的最新 envelope”与“业务内容文件”联合决定。
 - LWW 以日志顺序为准；`ts` 只用于展示、排序和审计，不用于判定最后写入。
-- 同一 `memory_root` 同时只允许一个写者；只读端允许并发，但必须容忍瞬时不一致。
+- 同一 Agent 的唯一 `memory_root` 同时只允许一个写者；只读端允许并发，但必须容忍瞬时不一致。
 - `set` 写入最新内容；`remove` 写入 tombstone；`load` 接收有序英语 tags 并返回相关有效记忆。
 - CLI 不维护 session 状态，不构造 tags，不翻译，不做语言检测。
 - v2.8 仅支持 `primary_language = "en"`；写入英语 content 是上层 Agent 的责任。
@@ -41,6 +42,7 @@ Agent Memory 为 Agent 提供跨会话持久化记忆能力，包括：
 - 不判断一条信息是否“值得记”；这由上层 Agent 决定。
 - 不翻译，不检测 content 语言。
 - 不保证 `load` 是事务快照；浮现式读取允许 best-effort。
+- 不支持同一 Agent 下的多个命名 Memory，也不支持多个 Agent 直接共享同一个 `memory_root`。
 
 ---
 
@@ -48,7 +50,7 @@ Agent Memory 为 Agent 提供跨会话持久化记忆能力，包括：
 
 | 概念 | 定义 |
 |---|---|
-| `memory_root` | 本地根目录，包含业务文件、`.meta/` 与 `memory.sqlite`。 |
+| `memory_root` | 当前 Agent 唯一 Memory 的本地根目录，包含业务文件、`.meta/` 与 `memory.sqlite`。 |
 | key | 逻辑路径，形如 `/user/preference/style`。 |
 | content | 纯 UTF-8 文本，可选系统前言 + 主体。 |
 | reason | 写入原因和来源说明，通过 `--reason` 传入；不参与全文索引。 |
@@ -67,7 +69,7 @@ Agent Memory 为 Agent 提供跨会话持久化记忆能力，包括：
 agent-memory [--root <memory_root>] [--quiet] <verb> [...]
 ```
 
-- `--root`：覆盖默认 memory root。不传时从 `AGENT_MEMORY_ROOT` 或实现约定的本地默认目录推导。
+- `--root`：覆盖当前 Agent 唯一 Memory 的物理目录，仅用于开发、测试、迁移或恢复；不表示选择另一个 Memory。不传时从 `AGENT_MEMORY_ROOT` 或实现约定的 Agent 本地默认目录推导。
 - `--quiet`：抑制非错误日志，不改变退出码。
 - 默认输入不接受 JSON；默认输出为纯文本。
 
@@ -716,7 +718,7 @@ Memory 的核心读取模式是 surfacing：上层 session 在每轮推理前维
 ### A.1 初始化
 
 ```bash
-export AGENT_MEMORY_ROOT=/path/to/memory_root
+export AGENT_MEMORY_ROOT=/path/to/agent_memory_root
 agent-memory init
 ```
 

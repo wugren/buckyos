@@ -90,9 +90,9 @@ Session title: {{ session.title }}
 | `$session.current_behavior` | `{{ session.current_behavior }}` | string | 当前 behavior name |
 | `$session.current_todo` | `{{ session.current_todo.todo_id }}` | object / null | `todos.json` 中第一个非终态 Todo |
 | `$session.current_todo_list` | `{{ session.current_todo_list }}` | string | `todos.json` 的简表；缺失时为 `(empty)` |
-| `$session.background_hint_changed` | `{{ session.background_hint_changed }}` | bool | 本 hook 是否通过 `load_backgrand_hits` 加载到变化的背景 hint |
-| `$session.default_changed_backgrand_hint_text` | `{{ session.default_changed_backgrand_hint_text }}` | string | `session.background_hints` 的默认纯文本渲染，格式为 `- hint text` 列表 |
-| `$session.default_changed_background_hint_text` | `{{ session.default_changed_background_hint_text }}` | string | 上一项的拼写修正别名 |
+| `$session.background_hint_changed` | `{{ session.background_hint_changed }}` | bool | 本 hook 是否通过 `load_background_hits` 加载到变化的背景 hint |
+| `$session.default_changed_background_hint_text` | `{{ session.default_changed_background_hint_text }}` | string | `session.background_hints` 的默认纯文本渲染，格式为 `- hint text` 列表 |
+| `$session.default_changed_backgrand_hint_text` | `{{ session.default_changed_backgrand_hint_text }}` | string | 上一项的历史拼写别名 |
 | `$session.background_hints` | `{% for hint in session.background_hints %}` | array of `BackgroundHint` | 本 hook 新加载到的变化背景 hint；没有配置加载或无变化时为空数组 |
 | `$session.has_title` | `{{ session.has_title }}` | bool | title 是否非空 |
 | `$session.has_current_todo` | `{{ session.has_current_todo }}` | bool | 当前 session 是否存在非终态 Todo |
@@ -285,8 +285,8 @@ Driver policy 对 `input` 的影响：
 | `pull_event = "none"` | `input.events = []`，`input.event = null` |
 | `pull_event = "all"` | `input.events` 包含本 hook 可消费的所有 event；`input.event` 指第一条 |
 | `pull_event = "<filter_name>"` | `input.events` 只包含匹配 filter 的 event，例如 `timer.*`；`input.event` 指第一条匹配事件 |
-| `load_backgrand_hits = "none"` | `session.background_hints = []`，`session.background_hint_changed = false` |
-| `load_backgrand_hits = "all"` | 调用 `load_changed_backgrand_hits`，加载本 hook 相比上次调用发生变化的背景 hint |
+| `load_background_hits = "none"` | `session.background_hints = []`，`session.background_hint_changed = false` |
+| `load_background_hits = "all"` | 调用 `load_changed_background_hits`，加载本 hook 相比上次调用发生变化的背景 hint；若同 session 过去 60 秒内返回过非空结果，本次直接返回空 |
 
 ### 3.5 `current_context`
 
@@ -335,6 +335,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | --- | --- | --- | --- |
 | `$runtime` | `{{ runtime }}` | object | 下列字段的聚合 |
 | `$runtime.clock_unix_ms` | `{{ runtime.clock_unix_ms }}` | number | Driver 冻结环境时的 Unix ms |
+| `$runtime.clock_text` | `{{ runtime.clock_text }}` | string | Driver 冻结环境时的本地时间，格式 `DD-MM HH:MM`，24 小时制 |
 | `$runtime.recent_activity` | `{{ runtime.recent_activity }}` | string | `OneLineStatusSink` 当前值 |
 | `$runtime.has_activity` | `{{ runtime.has_activity }}` | bool | recent activity 是否非空 |
 
@@ -406,7 +407,7 @@ Driver 需要在对应 hook 上打开 hint 加载，例如：
 filter = "top"
 pull_msg = "all"
 pull_event = "none"
-load_backgrand_hits = "all"
+load_background_hits = "all"
 ```
 
 然后在相关 User Message 模板中手工插入：
@@ -414,19 +415,19 @@ load_backgrand_hits = "all"
 ```upon
 {% if session.background_hint_changed %}
 <background_environment>
-{{ session.default_changed_backgrand_hint_text }}
+{{ session.default_changed_background_hint_text }}
 </background_environment>
 {% endif %}
 ```
 
-`session.default_changed_backgrand_hint_text` 是 `session.background_hints` 的默认渲染，格式为：
+`session.default_changed_background_hint_text` 是 `session.background_hints` 的默认渲染，格式为：
 
 ```text
 - hint1
 - hint2
 ```
 
-需要注意的是，`load_changed_backgrand_hits` 会记录上一次加载状态，只返回相比上次调用发生变化的部分。没有配置 `load_backgrand_hits = "all"` 的 hook 不会读取 hints，`session.background_hint_changed` 为 `false`。
+需要注意的是，`load_changed_background_hits` 会记录上一次加载状态，只返回相比上次调用发生变化的部分。为了让事件和其它背景变化有时间汇聚，函数还有一个 session 级 60 秒硬间隔：同一 session 只要返回过一次非空结果，未来 60 秒内每次调用都会直接返回空，不读取也不刷新 hint 指纹。没有配置 `load_background_hits = "all"` 的 hook 不会读取 hints，`session.background_hint_changed` 为 `false`。
 
 ## 7. Include 与安全边界
 

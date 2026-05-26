@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use buckyos_api::{AiContent, AiMessage, ResourceRef};
+use chrono::{Local, TimeZone};
 use llm_context::{
     behavior_loop::StepRecord, EngineConfig, PromptRenderEngine, RenderError, RenderVars,
     ValueLoader, XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT,
@@ -230,7 +231,7 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "session.default_changed_background_hint_text" => Some(Json::String(
             env.session_default_changed_background_hint_text.clone(),
         )),
-        "session.default_changed_background_hint_text" => Some(Json::String(
+        "session.default_changed_backgrand_hint_text" => Some(Json::String(
             env.session_default_changed_background_hint_text.clone(),
         )),
         "session.background_hints" => Some(background_hints_array(env)),
@@ -288,6 +289,7 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
 
         "runtime" => Some(runtime_object(env)),
         "runtime.clock_unix_ms" => Some(Json::from(env.clock_unix_ms)),
+        "runtime.clock_text" => Some(Json::String(clock_text_from_unix_ms(env.clock_unix_ms))),
         "runtime.recent_activity" => Some(Json::String(env.recent_activity.clone())),
         "runtime.has_activity" => Some(Json::Bool(env.has_recent_activity())),
 
@@ -339,7 +341,7 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "current_todo_list": env.session_current_todo_list,
         "background_hint_changed": env.background_hint_changed(),
         "default_changed_background_hint_text": env.session_default_changed_background_hint_text.clone(),
-        "default_changed_background_hint_text": env.session_default_changed_background_hint_text.clone(),
+        "default_changed_backgrand_hint_text": env.session_default_changed_background_hint_text.clone(),
         "background_hints": background_hints_array(env),
         "has_title": env.has_title(),
         "has_current_todo": env.has_current_todo(),
@@ -417,9 +419,22 @@ fn input_object(env: &AgentSessionEnv) -> Json {
 fn runtime_object(env: &AgentSessionEnv) -> Json {
     json!({
         "clock_unix_ms": env.clock_unix_ms,
+        "clock_text": clock_text_from_unix_ms(env.clock_unix_ms),
         "recent_activity": env.recent_activity,
         "has_activity": env.has_recent_activity(),
     })
+}
+
+fn clock_text_from_unix_ms(clock_unix_ms: u64) -> String {
+    let Ok(ms) = i64::try_from(clock_unix_ms) else {
+        return String::new();
+    };
+
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%d-%m %H:%M").to_string())
+        .unwrap_or_default()
 }
 
 fn llm_context_object(env: &AgentSessionEnv) -> Json {
@@ -856,6 +871,10 @@ mod tests {
             Some(Json::Bool(true))
         );
         assert_eq!(
+            loader.load("$runtime.clock_text").await.unwrap(),
+            Some(Json::String(clock_text_from_unix_ms(env.clock_unix_ms)))
+        );
+        assert_eq!(
             loader.load("$result_protocol").await.unwrap(),
             Some(Json::String(
                 XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string()
@@ -1128,7 +1147,7 @@ session={{ session.id }}|{{ session.kind }}|{{ session.title }}|{{ session.objec
 behavior={{ behavior.name }}|{{ behavior.objective }}|{{ behavior.mode }}
 workspace={{ workspace.id }}|{{ workspace.root }}|{{ workspace.has_id }}
 paths={{ paths.agent_root }}|{{ paths.session_root }}|{{ paths.workspace_root }}
-runtime={{ runtime.clock_unix_ms }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
+runtime={{ runtime.clock_unix_ms }}|{{ runtime.clock_text }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
 {% if session.has_title %}if_session_title={{ session.title }}{% endif %}
 {% if session.background_hint_changed %}if_background_hint={{ session.default_changed_background_hint_text }}
 {% endif %}
@@ -1173,13 +1192,17 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
 {% if xml_behavior_result_protocol %}xml_protocol=yes{% endif %}
 "#;
         let out = render_template(template, &env, &extras).await.unwrap();
+        let expected_runtime = format!(
+            "runtime=123|{}|running tool|true",
+            clock_text_from_unix_ms(env.clock_unix_ms)
+        );
 
         for expected in [
             "session=s-1|ui|hello|do thing|alice|chat_route|T01|T01 pending current - do thing",
             "behavior=chat_route|route|behavior",
             "workspace=ws1|/tmp/ws1|true",
             "paths=/tmp/agent|/tmp/agent/sessions/s-1|/tmp/ws1",
-            "runtime=123|running tool|true",
+            expected_runtime.as_str(),
             "if_session_title=hello",
             "if_background_hint=- Memory may be relevant: /user/preference/style",
             "hint=memory/user/preference/style|memory|Memory may be relevant: /user/preference/style",
