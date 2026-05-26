@@ -43,7 +43,7 @@ impl Default for LlmMessageCompressPolicy {
     fn default() -> Self {
         Self {
             trigger_ratio: 0.80,
-            target_ratio: 0.60,
+            target_ratio: 0.50,
             hard_limit_ratio: 0.95,
             min_turns_between_compress: 2,
             preserve_cache_stability: true,

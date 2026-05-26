@@ -485,7 +485,7 @@ mode = "compress_then_continue"         # 唯一支持的模式;填上即启用
 [on_llm_message_compress]
 mode = "context_window_ratio"           # 一轮完成后按 context window 使用率触发
 trigger_ratio = 0.80
-target_ratio = 0.60
+target_ratio = 0.50
 hard_limit_ratio = 0.95
 min_turns_between_compress = 2
 preserve_cache_stability = true

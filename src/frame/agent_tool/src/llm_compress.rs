@@ -35,6 +35,7 @@
 //!     deps: &LLMContextDeps,
 //!     target_token_budget: u32,
 //!     model_alias: &str,
+//!     extra_focus_prompt: Option<&str>,
 //! ) -> Result<Vec<AiMessage>, LLMComputeError>;
 //! ```
 //!
@@ -65,7 +66,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use buckyos_api::{AiContent, AiMessage, AiRole, AiToolResultContent};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +74,7 @@ use llm_context::deps::{LLMContextDeps, LlmInferenceRequest};
 use llm_context::error::LLMComputeError;
 
 use crate::local_llm_context::{Compressor, LocalLLMContextError};
+use crate::{AgentHistoryShowLevel, AgentToolResult, AgentToolStatus, AGENT_TOOL_PROTOCOL_VERSION};
 
 /// 兼容旧调用方的尾部消息数常量；当前实现按 pair 使用
 /// [`DEFAULT_HOT_TAIL_PAIRS`]。
@@ -87,8 +89,11 @@ const SUMMARY_BUDGET_MIN: u32 = 256;
 const SUMMARY_BUDGET_MAX: u32 = 2048;
 const MAX_LLM_COMPRESS_INPUT_TOKENS: u32 = 16_000;
 const MECHANICAL_TOOL_RESULT_TEXT_THRESHOLD: usize = 2_048;
+const MECHANICAL_TOOL_RESULT_MEDIUM_AFTER_PAIRS: usize = DEFAULT_HOT_TAIL_PAIRS;
+const MECHANICAL_TOOL_RESULT_MIN_AFTER_PAIRS: usize = DEFAULT_HOT_TAIL_PAIRS + 2;
 const COMPRESS_META_MARKER: &str = "[LLM_MESSAGE_COMPRESS_META_V1]";
 const COMPRESS_SUMMARY_MARKER: &str = "[LLM_MESSAGE_COMPRESS_SUMMARY_V1]";
+const MECHANICAL_COMPRESS_META_MARKER: &str = "[LLM_MECHANICAL_COMPRESS_META_V1]";
 const LEGACY_SUMMARY_MARKER: &str = "[Conversation summary]";
 const PROMPT_VERSION: &str = "llm_message_compress_v1";
 
@@ -123,6 +128,22 @@ struct LlmCompressOutput {
     memory_candidates: Vec<Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct MechanicalCompressedMeta {
+    is_mechanically_compressed: bool,
+    message_pairs_in_history_block: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_token_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compressed_token_count: Option<u32>,
+    rule_name: String,
+    compressed_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_text: Option<String>,
+}
+
 /// 压缩对话历史到目标 token 预算内。
 ///
 /// 策略：保留 leading system/developer 前缀、Head Keep、已有压缩边界和 Hot
@@ -141,6 +162,7 @@ pub async fn compress(
     deps: &LLMContextDeps,
     target_token_budget: u32,
     model_alias: &str,
+    extra_focus_prompt: Option<&str>,
 ) -> Result<Vec<AiMessage>, LLMComputeError> {
     if history.is_empty() {
         return Ok(Vec::new());
@@ -181,10 +203,7 @@ pub async fn compress(
     summary_budget = summary_budget.clamp(SUMMARY_BUDGET_MIN, SUMMARY_BUDGET_MAX);
 
     let middle_text = render_dialogue(middle, range.start);
-    let summarize_messages = vec![
-        AiMessage::text(
-            AiRole::System,
-            "You are the OpenDAN Agent Runtime history message compressor.\n\n\
+    let mut system_prompt = "You are the OpenDAN Agent Runtime history message compressor.\n\n\
              Compress the supplied historical messages into context that a later LLM can use \
              without reading the original block. Preserve the user's original goals, explicit \
              constraints, preferences, decisions, unresolved work, important file paths, module \
@@ -193,8 +212,18 @@ pub async fn compress(
              and content that no longer affects future reasoning. Do not invent facts. Mark \
              uncertainty explicitly.\n\n\
              Respond as JSON with at least this field: summary. Optional fields: decisions, \
-             pending_actions, open_questions, important_entities, memory_candidates. Do not call tools.",
-        ),
+             pending_actions, open_questions, important_entities, memory_candidates. Do not call tools."
+        .to_string();
+    if let Some(extra) = extra_focus_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        system_prompt.push_str("\n\nAdditional compression focus from caller:\n");
+        system_prompt.push_str(extra);
+    }
+
+    let summarize_messages = vec![
+        AiMessage::text(AiRole::System, system_prompt),
         AiMessage::text(AiRole::User, middle_text),
     ];
 
@@ -440,21 +469,48 @@ fn try_mechanical_compress(
 ) -> Option<Vec<AiMessage>> {
     let mut changed = false;
     let mut out = history.to_vec();
-    for msg in &mut out[range.start..range.end] {
-        if let Some(compressed) = mechanically_compress_tool_result(msg, deps) {
-            *msg = compressed;
+    for idx in range.start..range.end {
+        let Some(level) = desired_tool_result_level(history, idx) else {
+            continue;
+        };
+        if let Some(compressed) = mechanically_compress_tool_result(&out[idx], deps, level) {
+            out[idx] = compressed;
             changed = true;
         }
     }
 
     if changed && count_history_tokens(deps, &out) <= target_token_budget {
         Some(out)
+    } else if let Some(folded) = try_fold_agent_loop_history_block(&out, deps, range) {
+        if count_history_tokens(deps, &folded) <= target_token_budget {
+            Some(folded)
+        } else {
+            None
+        }
     } else {
         None
     }
 }
 
-fn mechanically_compress_tool_result(msg: &AiMessage, deps: &LLMContextDeps) -> Option<AiMessage> {
+fn desired_tool_result_level(history: &[AiMessage], idx: usize) -> Option<AgentHistoryShowLevel> {
+    let pairs_after = history[idx + 1..]
+        .iter()
+        .filter(|msg| msg.role == AiRole::User)
+        .count();
+    if pairs_after >= MECHANICAL_TOOL_RESULT_MIN_AFTER_PAIRS {
+        Some(AgentHistoryShowLevel::Min)
+    } else if pairs_after >= MECHANICAL_TOOL_RESULT_MEDIUM_AFTER_PAIRS {
+        Some(AgentHistoryShowLevel::Medium)
+    } else {
+        None
+    }
+}
+
+fn mechanically_compress_tool_result(
+    msg: &AiMessage,
+    deps: &LLMContextDeps,
+    desired_level: AgentHistoryShowLevel,
+) -> Option<AiMessage> {
     if msg.role != AiRole::Tool || msg.content.len() != 1 {
         return None;
     }
@@ -467,34 +523,417 @@ fn mechanically_compress_tool_result(msg: &AiMessage, deps: &LLMContextDeps) -> 
     else {
         return None;
     };
-    if *is_error || content.len() != 1 {
+    if *is_error {
         return None;
     }
 
-    let AiToolResultContent::Text { text } = &content[0] else {
-        return None;
-    };
+    let mut new_content = content.clone();
+    for (content_idx, item) in content.iter().enumerate() {
+        let AiToolResultContent::Text { text } = item else {
+            continue;
+        };
+        let Some(compressed_text) =
+            mechanically_compress_tool_result_text(text, call_id, deps, msg, desired_level)
+        else {
+            continue;
+        };
+        new_content[content_idx] = AiToolResultContent::Text {
+            text: compressed_text,
+        };
+        return Some(AiMessage::new(
+            AiRole::Tool,
+            vec![AiContent::ToolResult {
+                call_id: call_id.clone(),
+                content: new_content,
+                is_error: false,
+            }],
+        ));
+    }
+
+    None
+}
+
+fn mechanically_compress_tool_result_text(
+    text: &str,
+    call_id: &str,
+    deps: &LLMContextDeps,
+    msg: &AiMessage,
+    desired_level: AgentHistoryShowLevel,
+) -> Option<String> {
+    let original_tokens = count_history_tokens(deps, std::slice::from_ref(msg));
+    if let Some(meta) = read_mechanical_meta_from_text(text) {
+        if meta.message_pairs_in_history_block > 0 || meta.level.as_deref() == Some("min") {
+            return None;
+        }
+        if !matches!(desired_level, AgentHistoryShowLevel::Min) {
+            return None;
+        }
+        let min_text = meta.min_text.as_deref()?.trim();
+        if min_text.is_empty() {
+            return None;
+        }
+        let new_meta = MechanicalCompressedMeta {
+            is_mechanically_compressed: true,
+            message_pairs_in_history_block: 0,
+            original_token_count: meta.original_token_count.or(Some(original_tokens)),
+            compressed_token_count: Some(deps.tokenizer.count_tokens(min_text)),
+            rule_name: "protocol_level_min".to_string(),
+            compressed_at: crate::now_ms(),
+            level: Some("min".to_string()),
+            min_text: None,
+        };
+        return Some(format_mechanical_text(&new_meta, min_text));
+    }
+
+    if let Some(result) = try_decode_agent_tool_envelope(text) {
+        if matches!(
+            result.status,
+            AgentToolStatus::Error | AgentToolStatus::Pending
+        ) {
+            return None;
+        }
+        let _view = result.to_tool_result_view();
+        let level_name = match desired_level {
+            AgentHistoryShowLevel::Min => "min",
+            AgentHistoryShowLevel::Mini | AgentHistoryShowLevel::Medium => "medium",
+            AgentHistoryShowLevel::Full => return None,
+        };
+        let rendered = result.render_for_level(desired_level);
+        let min_text = (!matches!(desired_level, AgentHistoryShowLevel::Min))
+            .then(|| result.render_for_level(AgentHistoryShowLevel::Min))
+            .filter(|value| value.trim() != rendered.trim());
+        let meta = MechanicalCompressedMeta {
+            is_mechanically_compressed: true,
+            message_pairs_in_history_block: 0,
+            original_token_count: Some(original_tokens),
+            compressed_token_count: Some(deps.tokenizer.count_tokens(&rendered)),
+            rule_name: format!("protocol_level_{level_name}"),
+            compressed_at: crate::now_ms(),
+            level: Some(level_name.to_string()),
+            min_text,
+        };
+        return Some(format_mechanical_text(&meta, &rendered));
+    }
+
     if text.len() < MECHANICAL_TOOL_RESULT_TEXT_THRESHOLD {
         return None;
     }
 
-    let original_tokens = count_history_tokens(deps, std::slice::from_ref(msg));
     let hash = sha256_hex(text);
-    let compressed_text = format!(
+    let body = format!(
         "ToolResultCompressed:\ncall_id: {}\nstatus: success\noriginal_token_count: {}\ncontent_sha256: sha256:{}\ncompressed_at_ms: {}\nnote: successful large tool output omitted; rerun or reread the source if exact content is needed.",
         call_id,
         original_tokens,
         hash,
         crate::now_ms(),
     );
-    Some(AiMessage::new(
-        AiRole::Tool,
-        vec![AiContent::tool_result_text(
-            call_id.clone(),
-            compressed_text,
-            false,
-        )],
+    let meta = MechanicalCompressedMeta {
+        is_mechanically_compressed: true,
+        message_pairs_in_history_block: 0,
+        original_token_count: Some(original_tokens),
+        compressed_token_count: Some(deps.tokenizer.count_tokens(&body)),
+        rule_name: "plain_text_truncate_v1".to_string(),
+        compressed_at: crate::now_ms(),
+        level: None,
+        min_text: None,
+    };
+    Some(format_mechanical_text(&meta, &body))
+}
+
+fn try_decode_agent_tool_envelope(content_text: &str) -> Option<AgentToolResult> {
+    let trimmed = strip_mechanical_meta_text(content_text).trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let result: AgentToolResult = serde_json::from_str(trimmed).ok()?;
+    if result.agent_tool_protocol != AGENT_TOOL_PROTOCOL_VERSION {
+        return None;
+    }
+    Some(result)
+}
+
+fn format_mechanical_text(meta: &MechanicalCompressedMeta, body: &str) -> String {
+    format!(
+        "{}\n{}\n{}",
+        MECHANICAL_COMPRESS_META_MARKER,
+        serde_json::to_string(meta).unwrap_or_else(|_| "{}".to_string()),
+        body.trim()
+    )
+}
+
+fn read_mechanical_meta(msg: &AiMessage) -> Option<MechanicalCompressedMeta> {
+    read_mechanical_meta_from_text(&msg.text_content())
+}
+
+fn read_mechanical_meta_from_text(text: &str) -> Option<MechanicalCompressedMeta> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != MECHANICAL_COMPRESS_META_MARKER {
+        return None;
+    }
+    let meta_line = lines.next()?.trim();
+    let meta: MechanicalCompressedMeta = serde_json::from_str(meta_line).ok()?;
+    meta.is_mechanically_compressed.then_some(meta)
+}
+
+fn strip_mechanical_meta_text(text: &str) -> &str {
+    let Some(first_newline) = text.find('\n') else {
+        return text;
+    };
+    if text[..first_newline].trim() != MECHANICAL_COMPRESS_META_MARKER {
+        return text;
+    }
+    let rest = &text[first_newline + 1..];
+    let Some(second_newline) = rest.find('\n') else {
+        return "";
+    };
+    &rest[second_newline + 1..]
+}
+
+fn try_fold_agent_loop_history_block(
+    history: &[AiMessage],
+    deps: &LLMContextDeps,
+    range: &CompressRange,
+) -> Option<Vec<AiMessage>> {
+    if is_behavior_origin(history) {
+        return None;
+    }
+    let spans = build_message_spans(history, range.start);
+    let spans: Vec<&MessageSpan> = spans
+        .iter()
+        .filter(|span| {
+            !span.compressed_boundary
+                && !span.active
+                && span.start >= range.start
+                && span.end <= range.end
+        })
+        .collect();
+    if spans.is_empty()
+        || !spans
+            .iter()
+            .all(|span| span_ready_for_history_fold(history, span))
+    {
+        return None;
+    }
+
+    let mut pair_count = 0usize;
+    let mut body = String::new();
+    body.push_str("History:");
+    for span in spans {
+        if let Some((count, existing)) = existing_history_block_body(history, span) {
+            pair_count = pair_count.saturating_add(count);
+            append_existing_history_body(&mut body, &existing);
+            continue;
+        }
+        pair_count = pair_count.saturating_add(1);
+        body.push('\n');
+        body.push_str(&render_history_span(history, span));
+    }
+    if pair_count == 0 {
+        return None;
+    }
+
+    let original_tokens = count_history_tokens(deps, &history[range.start..range.end]);
+    let compressed_tokens = deps.tokenizer.count_tokens(&body);
+    let meta = MechanicalCompressedMeta {
+        is_mechanically_compressed: true,
+        message_pairs_in_history_block: pair_count,
+        original_token_count: Some(original_tokens),
+        compressed_token_count: Some(compressed_tokens),
+        rule_name: "agent_loop_history_block_v1".to_string(),
+        compressed_at: crate::now_ms(),
+        level: None,
+        min_text: None,
+    };
+    let user = AiMessage::text(
+        AiRole::User,
+        format!(
+            "Historical message pairs {}..{} were mechanically folded into the following assistant History block.",
+            range.start, range.end
+        ),
+    );
+    let assistant = AiMessage::text(AiRole::Assistant, format_mechanical_text(&meta, &body));
+    let mut out = Vec::with_capacity(
+        range
+            .start
+            .saturating_add(2)
+            .saturating_add(history.len().saturating_sub(range.end)),
+    );
+    out.extend_from_slice(&history[..range.start]);
+    out.push(user);
+    out.push(assistant);
+    out.extend_from_slice(&history[range.end..]);
+    Some(out)
+}
+
+fn is_behavior_origin(history: &[AiMessage]) -> bool {
+    history.iter().any(|msg| {
+        let text = msg.render_for_debug();
+        text.contains("<<step_history>>")
+            || text.contains("<<last_step_action_results>>")
+            || (matches!(msg.role, AiRole::System | AiRole::Developer)
+                && text.to_ascii_lowercase().contains("behavior"))
+    })
+}
+
+fn span_ready_for_history_fold(history: &[AiMessage], span: &MessageSpan) -> bool {
+    existing_history_block_body(history, span).is_some()
+        || history[span.start..span.end]
+            .iter()
+            .any(message_has_min_mechanical_tool_result)
+}
+
+fn message_has_min_mechanical_tool_result(msg: &AiMessage) -> bool {
+    if msg.role != AiRole::Tool {
+        return false;
+    }
+    msg.content.iter().any(|block| {
+        let AiContent::ToolResult { content, .. } = block else {
+            return false;
+        };
+        content.iter().any(|item| {
+            let AiToolResultContent::Text { text } = item else {
+                return false;
+            };
+            read_mechanical_meta_from_text(text)
+                .and_then(|meta| meta.level)
+                .as_deref()
+                == Some("min")
+        })
+    })
+}
+
+fn existing_history_block_body(
+    history: &[AiMessage],
+    span: &MessageSpan,
+) -> Option<(usize, String)> {
+    if span.end != span.start + 2 || history.get(span.start)?.role != AiRole::User {
+        return None;
+    }
+    let assistant = history.get(span.start + 1)?;
+    if assistant.role != AiRole::Assistant {
+        return None;
+    }
+    let meta = read_mechanical_meta(assistant)?;
+    if meta.message_pairs_in_history_block == 0 {
+        return None;
+    }
+    let text = assistant.text_content();
+    Some((
+        meta.message_pairs_in_history_block,
+        strip_mechanical_meta_text(&text).to_string(),
     ))
+}
+
+fn append_existing_history_body(out: &mut String, existing: &str) {
+    let existing = existing.trim();
+    if existing.is_empty() {
+        return;
+    }
+    let body = existing.strip_prefix("History:").unwrap_or(existing).trim();
+    if body.is_empty() {
+        return;
+    }
+    out.push('\n');
+    out.push_str(body);
+}
+
+fn render_history_span(history: &[AiMessage], span: &MessageSpan) -> String {
+    let msgs = &history[span.start..span.end];
+    let user = msgs
+        .iter()
+        .find(|msg| msg.role == AiRole::User)
+        .map(compact_message_line)
+        .unwrap_or_else(|| "message pair".to_string());
+    let agent = msgs
+        .iter()
+        .rev()
+        .find(|msg| msg.role == AiRole::Assistant && !msg.text_content().trim().is_empty())
+        .map(compact_message_line)
+        .unwrap_or_else(|| "completed".to_string());
+    let mut out = String::new();
+    out.push_str("  user: ");
+    out.push_str(&user);
+    for line in history_call_lines(msgs) {
+        out.push('\n');
+        out.push_str("    ");
+        out.push_str(&line);
+    }
+    out.push('\n');
+    out.push_str("  agent: ");
+    out.push_str(&agent);
+    out
+}
+
+fn history_call_lines(msgs: &[AiMessage]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for msg in msgs {
+        match msg.role {
+            AiRole::Assistant => {
+                for block in &msg.content {
+                    if let AiContent::ToolUse { name, .. } = block {
+                        lines.push(format!("call({name}): requested"));
+                    }
+                }
+            }
+            AiRole::Tool => {
+                for block in &msg.content {
+                    let AiContent::ToolResult {
+                        call_id, content, ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    for item in content {
+                        let AiToolResultContent::Text { text } = item else {
+                            continue;
+                        };
+                        if let Some(result) = try_decode_agent_tool_envelope(text) {
+                            let name = result
+                                .cmd_name
+                                .as_deref()
+                                .or(result.tool.as_deref())
+                                .unwrap_or(call_id);
+                            let title = result
+                                .title
+                                .trim()
+                                .is_empty()
+                                .then(|| result.summary.trim())
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or_else(|| result.title.trim());
+                            lines.push(format!("call({name}): {}", compact_text_line(title, 160)));
+                        } else {
+                            lines.push(format!(
+                                "call({call_id}): {}",
+                                compact_text_line(strip_mechanical_meta_text(text), 160)
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+fn compact_message_line(msg: &AiMessage) -> String {
+    compact_text_line(&msg.render_for_debug(), 220)
+}
+
+fn compact_text_line(text: &str, max_chars: usize) -> String {
+    let mut compact = strip_mechanical_meta_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.chars().count() > max_chars {
+        compact = compact.chars().take(max_chars).collect::<String>();
+        compact.push_str("...");
+    }
+    if compact.is_empty() {
+        "(empty)".to_string()
+    } else {
+        compact
+    }
 }
 
 fn parse_llm_compress_output(text: &str) -> LlmCompressOutput {
@@ -683,6 +1122,7 @@ impl Compressor for LlmSummarizeCompressor {
             &self.deps,
             self.target_token_budget,
             &self.model_alias,
+            None,
         )
         .await
         .map_err(|e| LocalLLMContextError::CompressorFailed(e.to_string()))
@@ -769,6 +1209,37 @@ mod tests {
                 format!("{}\n{}", COMPRESS_SUMMARY_MARKER, summary),
             ),
         ]
+    }
+
+    fn tool_msg(call_id: &str, text: impl Into<String>, is_error: bool) -> AiMessage {
+        AiMessage::new(
+            AiRole::Tool,
+            vec![buckyos_api::AiContent::tool_result_text(
+                call_id,
+                text.into(),
+                is_error,
+            )],
+        )
+    }
+
+    fn tool_text(msg: &AiMessage) -> String {
+        let AiContent::ToolResult { content, .. } = &msg.content[0] else {
+            panic!("expected tool result");
+        };
+        let AiToolResultContent::Text { text } = &content[0] else {
+            panic!("expected text tool result");
+        };
+        text.clone()
+    }
+
+    fn envelope_json(status: AgentToolStatus, title: &str, summary: &str, output: &str) -> String {
+        let result = AgentToolResult::from_details(json!({"kind": "test"}))
+            .with_status(status)
+            .with_command_metadata("test_tool", "--flag")
+            .with_title(title)
+            .with_result(summary)
+            .with_output(output);
+        serde_json::to_string(&result).unwrap()
     }
 
     fn default_codex_session_path() -> Option<PathBuf> {
@@ -981,7 +1452,7 @@ mod tests {
             }"#,
         );
         let original_tokens = count_history_tokens(&deps, &history);
-        let out = compress(&history, &deps, target_budget, "stub-model")
+        let out = compress(&history, &deps, target_budget, "stub-model", None)
             .await
             .unwrap();
         let new_tokens = count_history_tokens(&deps, &out);
@@ -1045,7 +1516,7 @@ mod tests {
         assert!(!history.is_empty(), "no messages parsed from {path:?}");
 
         let original_tokens = count_history_tokens(&deps, &history);
-        let out = compress(&history, &deps, target_budget, &model_alias)
+        let out = compress(&history, &deps, target_budget, &model_alias, None)
             .await
             .unwrap();
         let new_tokens = count_history_tokens(&deps, &out);
@@ -1085,7 +1556,9 @@ mod tests {
     #[tokio::test]
     async fn empty_history_returns_empty() {
         let deps = make_deps("");
-        let out = compress(&[], &deps, 1024, "test-model").await.unwrap();
+        let out = compress(&[], &deps, 1024, "test-model", None)
+            .await
+            .unwrap();
         assert!(out.is_empty());
     }
 
@@ -1097,7 +1570,7 @@ mod tests {
             msg("user", "hi"),
             msg("assistant", "hello"),
         ];
-        let out = compress(&history, &deps, 10_000, "test-model")
+        let out = compress(&history, &deps, 10_000, "test-model", None)
             .await
             .unwrap();
         assert_eq!(out, history);
@@ -1112,7 +1585,9 @@ mod tests {
             history.push(msg("user", &format!("q{}: {}", i, big_blob)));
             history.push(msg("assistant", &format!("a{}: {}", i, big_blob)));
         }
-        let out = compress(&history, &deps, 1024, "test-model").await.unwrap();
+        let out = compress(&history, &deps, 1024, "test-model", None)
+            .await
+            .unwrap();
         assert_eq!(out[0].role, AiRole::System);
         assert_eq!(out[0].text_content(), "you are helpful");
         assert_eq!(out[1].role, AiRole::User);
@@ -1139,7 +1614,9 @@ mod tests {
             history.push(msg("assistant", &format!("a{}: {}", i, big_blob)));
         }
 
-        let out = compress(&history, &deps, 1024, "test-model").await.unwrap();
+        let out = compress(&history, &deps, 1024, "test-model", None)
+            .await
+            .unwrap();
         let text = out
             .iter()
             .map(AiMessage::text_content)
@@ -1180,7 +1657,7 @@ mod tests {
             history.push(msg("assistant", &format!("tail a{i}")));
         }
 
-        let out = compress(&history, &deps, 10_000, "test-model")
+        let out = compress(&history, &deps, 10_000, "test-model", None)
             .await
             .unwrap();
         let text = out
@@ -1194,6 +1671,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn envelope_tool_result_uses_protocol_level_rendering() {
+        let deps = make_deps("SHOULD_NOT_CALL_LLM");
+        let envelope = envelope_json(
+            AgentToolStatus::Success,
+            "min title",
+            "medium summary",
+            &"full output\n".repeat(40_000),
+        );
+        let mut history = vec![msg("system", "sys")];
+        history.push(msg("user", "head user"));
+        history.push(msg("assistant", "head assistant"));
+        history.push(msg("user", "old command"));
+        history.push(AiMessage::new(
+            AiRole::Assistant,
+            vec![buckyos_api::AiContent::tool_use(
+                "call-1",
+                "test_tool",
+                HashMap::new(),
+            )],
+        ));
+        history.push(tool_msg("call-1", envelope, false));
+        history.push(msg("assistant", "old command done"));
+        for i in 0..2 {
+            history.push(msg("user", &format!("tail q{i}")));
+            history.push(msg("assistant", &format!("tail a{i}")));
+        }
+
+        let out = compress(&history, &deps, 10_000, "test-model", None)
+            .await
+            .unwrap();
+        let text = out
+            .iter()
+            .map(AiMessage::render_for_debug)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(MECHANICAL_COMPRESS_META_MARKER));
+        assert!(text.contains("protocol_level_medium"));
+        assert!(text.contains("medium summary"));
+        assert!(!text.contains("ToolResultCompressed"));
+        assert!(!text.contains(COMPRESS_SUMMARY_MARKER));
+    }
+
+    #[tokio::test]
+    async fn error_and_pending_envelopes_are_not_mechanically_compressed() {
+        let deps = make_deps("");
+        let error_msg = tool_msg(
+            "call-err",
+            envelope_json(
+                AgentToolStatus::Error,
+                "failed",
+                "failure summary",
+                "stack trace",
+            ),
+            false,
+        );
+        assert!(mechanically_compress_tool_result(
+            &error_msg,
+            &deps,
+            AgentHistoryShowLevel::Medium
+        )
+        .is_none());
+
+        let pending_msg = tool_msg(
+            "call-pending",
+            envelope_json(
+                AgentToolStatus::Pending,
+                "pending",
+                "still running",
+                "partial",
+            ),
+            false,
+        );
+        assert!(mechanically_compress_tool_result(
+            &pending_msg,
+            &deps,
+            AgentHistoryShowLevel::Medium
+        )
+        .is_none());
+
+        let transport_error_msg = tool_msg(
+            "call-transport-error",
+            envelope_json(AgentToolStatus::Success, "ok", "ok summary", "output"),
+            true,
+        );
+        assert!(mechanically_compress_tool_result(
+            &transport_error_msg,
+            &deps,
+            AgentHistoryShowLevel::Medium
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn mechanical_meta_allows_medium_to_min_upgrade() {
+        let deps = make_deps("");
+        let original = tool_msg(
+            "call-1",
+            envelope_json(
+                AgentToolStatus::Success,
+                "min title",
+                "medium summary",
+                &"full output\n".repeat(10_000),
+            ),
+            false,
+        );
+        let medium =
+            mechanically_compress_tool_result(&original, &deps, AgentHistoryShowLevel::Medium)
+                .expect("medium compression");
+        let medium_text = tool_text(&medium);
+        assert!(strip_mechanical_meta_text(&medium_text).contains("medium summary"));
+
+        let min = mechanically_compress_tool_result(&medium, &deps, AgentHistoryShowLevel::Min)
+            .expect("min upgrade");
+        let min_text = tool_text(&min);
+        assert_eq!(strip_mechanical_meta_text(&min_text).trim(), "min title");
+        assert!(
+            read_mechanical_meta_from_text(&min_text)
+                .unwrap()
+                .level
+                .as_deref()
+                == Some("min")
+        );
+    }
+
+    #[test]
+    fn agent_loop_history_block_folds_min_pairs() {
+        let deps = make_deps("");
+        let mut history = vec![msg("system", "sys")];
+        history.push(msg("user", "old user one"));
+        history.push(AiMessage::new(
+            AiRole::Assistant,
+            vec![buckyos_api::AiContent::tool_use(
+                "call-1",
+                "test_tool",
+                HashMap::new(),
+            )],
+        ));
+        let min_meta = MechanicalCompressedMeta {
+            is_mechanically_compressed: true,
+            message_pairs_in_history_block: 0,
+            original_token_count: Some(1000),
+            compressed_token_count: Some(2),
+            rule_name: "protocol_level_min".to_string(),
+            compressed_at: crate::now_ms(),
+            level: Some("min".to_string()),
+            min_text: None,
+        };
+        history.push(tool_msg(
+            "call-1",
+            format_mechanical_text(&min_meta, "tool title one"),
+            false,
+        ));
+        history.push(msg("assistant", "agent one"));
+        history.push(msg("user", "old user two"));
+        history.push(AiMessage::new(
+            AiRole::Assistant,
+            vec![buckyos_api::AiContent::tool_use(
+                "call-2",
+                "test_tool",
+                HashMap::new(),
+            )],
+        ));
+        history.push(tool_msg(
+            "call-2",
+            format_mechanical_text(&min_meta, "tool title two"),
+            false,
+        ));
+        history.push(msg("assistant", "agent two"));
+        let range = CompressRange {
+            start: 1,
+            end: history.len(),
+            input_tokens: 0,
+        };
+
+        let out = try_fold_agent_loop_history_block(&history, &deps, &range).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].role, AiRole::User);
+        assert_eq!(out[2].role, AiRole::Assistant);
+        let text = out[2].text_content();
+        let meta = read_mechanical_meta(&out[2]).unwrap();
+        assert_eq!(meta.message_pairs_in_history_block, 2);
+        assert!(text.contains("History:"));
+        assert!(text.contains("user: old user one"));
+        assert!(text.contains("call(test_tool): requested"));
+        assert!(text.contains("tool title two"));
+    }
+
+    #[test]
+    fn agent_loop_history_block_extends_existing_block() {
+        let deps = make_deps("");
+        let existing_meta = MechanicalCompressedMeta {
+            is_mechanically_compressed: true,
+            message_pairs_in_history_block: 1,
+            original_token_count: Some(1000),
+            compressed_token_count: Some(20),
+            rule_name: "agent_loop_history_block_v1".to_string(),
+            compressed_at: crate::now_ms(),
+            level: None,
+            min_text: None,
+        };
+        let min_meta = MechanicalCompressedMeta {
+            is_mechanically_compressed: true,
+            message_pairs_in_history_block: 0,
+            original_token_count: Some(1000),
+            compressed_token_count: Some(2),
+            rule_name: "protocol_level_min".to_string(),
+            compressed_at: crate::now_ms(),
+            level: Some("min".to_string()),
+            min_text: None,
+        };
+        let mut history = vec![
+            msg("system", "sys"),
+            msg("user", "previous fold"),
+            AiMessage::text(
+                AiRole::Assistant,
+                format_mechanical_text(
+                    &existing_meta,
+                    "History:\n  user: old folded user\n  agent: old folded agent",
+                ),
+            ),
+            msg("user", "new old user"),
+        ];
+        history.push(AiMessage::new(
+            AiRole::Assistant,
+            vec![buckyos_api::AiContent::tool_use(
+                "call-2",
+                "test_tool",
+                HashMap::new(),
+            )],
+        ));
+        history.push(tool_msg(
+            "call-2",
+            format_mechanical_text(&min_meta, "new tool title"),
+            false,
+        ));
+        history.push(msg("assistant", "new agent"));
+        let range = CompressRange {
+            start: 1,
+            end: history.len(),
+            input_tokens: 0,
+        };
+
+        let out = try_fold_agent_loop_history_block(&history, &deps, &range).unwrap();
+        assert_eq!(
+            read_mechanical_meta(&out[2])
+                .unwrap()
+                .message_pairs_in_history_block,
+            2
+        );
+        let text = out[2].text_content();
+        assert_eq!(text.matches(MECHANICAL_COMPRESS_META_MARKER).count(), 1);
+        assert!(text.contains("old folded user"));
+        assert!(text.contains("new old user"));
+    }
+
+    #[tokio::test]
     async fn empty_summary_text_errors() {
         let deps = make_deps("   ");
         let big_blob = "x".repeat(4_000);
@@ -1202,7 +1935,7 @@ mod tests {
             history.push(msg("user", &format!("q{}: {}", i, big_blob)));
             history.push(msg("assistant", &format!("a{}: {}", i, big_blob)));
         }
-        let err = compress(&history, &deps, 1024, "test-model")
+        let err = compress(&history, &deps, 1024, "test-model", None)
             .await
             .unwrap_err();
         matches!(err, LLMComputeError::OutputParse(_));
@@ -1218,7 +1951,9 @@ mod tests {
             history.push(msg("assistant", &big_blob));
             history.push(msg("tool", &big_blob));
         }
-        let out = compress(&history, &deps, 512, "test-model").await.unwrap();
+        let out = compress(&history, &deps, 512, "test-model", None)
+            .await
+            .unwrap();
         // After system prefix + summary, the first kept message must not be `tool`.
         let first_non_system = out.iter().find(|m| m.role != AiRole::System).unwrap();
         assert_ne!(first_non_system.role, AiRole::Tool);

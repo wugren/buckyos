@@ -122,7 +122,7 @@ mode = "compress_then_continue"
 [on_llm_message_compress]
 mode = "context_window_ratio"
 trigger_ratio = 0.80
-target_ratio = 0.60
+target_ratio = 0.50
 hard_limit_ratio = 0.95
 min_turns_between_compress = 2
 preserve_cache_stability = true

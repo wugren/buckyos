@@ -301,6 +301,7 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         &deps,
         opts.target_tokens,
         opts.summary_model.as_str(),
+        Some("Preserve parent-history facts relevant to the media-understanding goal and discard unrelated execution detail."),
     )
     .await
     {

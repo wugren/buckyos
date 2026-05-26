@@ -3208,11 +3208,13 @@ impl AgentSession {
 
         let before_messages = snapshot.state.accumulated.len();
         let before_tokens = estimate_history_tokens(&deps, &snapshot.state.accumulated);
+        let extra_focus = llm_message_compress_extra_focus(&self.agent_name, &behavior);
         let rewritten = llm_compress::compress(
             &snapshot.state.accumulated,
             &deps,
             target_token_budget,
             model_alias,
+            Some(extra_focus.as_str()),
         )
         .await
         .map_err(|err| anyhow!("llm_message_compress failed: {err}"))?;
@@ -3287,7 +3289,16 @@ impl AgentSession {
             );
             return None;
         }
-        match llm_compress::compress(accumulated, deps, target_token_budget, model_alias).await {
+        let extra_focus = llm_message_compress_extra_focus(&self.agent_name, behavior);
+        match llm_compress::compress(
+            accumulated,
+            deps,
+            target_token_budget,
+            model_alias,
+            Some(extra_focus.as_str()),
+        )
+        .await
+        {
             Ok(rewritten) => Some(rewritten),
             Err(err) => {
                 warn!(
@@ -3316,11 +3327,16 @@ impl AgentSession {
         }
         let before_len = snapshot.state.accumulated.len();
         let before_tokens = estimate_history_tokens(deps, &snapshot.state.accumulated);
+        let behavior = self.load_current_behavior().await.ok();
+        let extra_focus = behavior
+            .as_ref()
+            .map(|behavior| llm_message_compress_extra_focus(&self.agent_name, behavior));
         let rewritten = match llm_compress::compress(
             &snapshot.state.accumulated,
             deps,
             target_token_budget,
             model_alias,
+            extra_focus.as_deref(),
         )
         .await
         {
@@ -6816,6 +6832,14 @@ fn estimate_history_tokens(deps: &llm_context::deps::LLMContextDeps, msgs: &[AiM
             .saturating_add(deps.tokenizer.count_tokens(msg.role.as_str()))
             .saturating_add(deps.tokenizer.count_tokens(&msg.render_for_debug()))
     })
+}
+
+fn llm_message_compress_extra_focus(agent_name: &str, behavior: &BehaviorCfg) -> String {
+    format!(
+        "Agent identity: {agent_name}\nBehavior: {}\nObjective: {}",
+        behavior.meta.name.trim(),
+        behavior.meta.objective.trim()
+    )
 }
 
 fn leading_system_messages(msgs: &[AiMessage]) -> usize {

@@ -558,7 +558,7 @@ mod tests {
             [on_llm_message_compress]
             mode = "context_window_ratio"
             trigger_ratio = 0.8
-            target_ratio = 0.6
+            target_ratio = 0.5
 
             [on_provider_failed]
             mode = "fallback_behavior"

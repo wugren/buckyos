@@ -56,7 +56,7 @@ mini_agent_demo/
 | 引入 Work session(自主任务) | `[session.work]` 加一段,配 `loop_mode = "behavior"` + `kind = "work"` + 选一个 `session_id_strategy` |
 | 加一个新 behavior(planner / executor / summarizer …) | 在 `behaviors/` 加一个 `.toml`,用 `[meta]` `[prompt]` `[capabilities]` 写好;LLM 用 `<next_behavior>NAME</next_behavior>` 自己切过去 |
 | 上下文满了想压缩后继续而非中止 | 目标 behavior 加 `[on_context_limit_reached]\nmode = "compress_then_continue"` |
-| 想在接近 context window 时提前自动压缩 | 目标 behavior 加 `[on_llm_message_compress]\nmode = "context_window_ratio"\ntrigger_ratio = 0.80\ntarget_ratio = 0.60` |
+| 想在接近 context window 时提前自动压缩 | 目标 behavior 加 `[on_llm_message_compress]\nmode = "context_window_ratio"\ntrigger_ratio = 0.80\ntarget_ratio = 0.50` |
 | Provider 失败时降级到备用 behavior | `[on_provider_failed]\nmode = "fallback_behavior"\ntarget = "safe_mode"` |
 | 让人审某个工具调用 | `[capabilities].approval_required = ["exec_bash"]`(沿用 v0 占位语义) |
 
