@@ -213,9 +213,9 @@ Step Record History 压缩：
 
 通过分级机制，可以**有机会完全丢弃 ActionResults，只保留思考链路骨架**。
 
-> **TODO**：分级机制的精确定义是本文档的核心目标之一，但暂时挂起 —— 现在主要在推进 driver / behavior 配置简化 + forward_msg 错误引导这些周边修改，等周边稳定后回到这块写详细 spec。详见末尾"未完成事项"§2。
+> 分级机制的精确定义 参考Agent Tool Result Protocol 以及 LLM Compress
 
-### 在Input触发推理前，通过LLM 压缩，释放Context Window
+### 在Input触发推理前，通过(LLM)压缩，释放Context Window
 
 目的：将一组中间的 Message Pair,压缩成一个Message Pair
 [system] [user [a-call u-result] [a-call u-result] [a-call u-result] assistant]@round1 .... [user [a-call u-result] [a-call u-result]  assistant]@round22 [user assistant]@round23  **user**
@@ -281,14 +281,14 @@ fork前
 
 思路一 重新渲染：把parent context的history，渲染进入tool的user message （目前这种用的比较多，兼容性强）
 
-[tool-system] **[user [a-call u-result] [a-call u-result] [a-call u-result] assistant]@round1 [user [a-call u-result] + tool user** --推理--> assistant message(u-result)
+[tool-system] **[history from parent context] + tool user** --推理--> assistant message(u-result)
 
 如果旁路压根不渲染任何parent context的记录，这是context window负担最轻的方法，缺点是要求上层对参数的使用要非常精确：
 
-[tool-system] **user tool-params** --推理--> assistant message(u-result)
+[tool-system] **tool-params user** --推理--> assistant message(u-result)
 
 join后主干：[system] [user [a-call u-result] [a-call u-result] [a-call u-result] assistant]@round1 [user [a-call u-result] a-call u-result
-看起来就是一次标准的tool call完成
+看起来就是一次标准的tool call完成,完全丢弃了tool内部推理累计的消息。
 
 思路二 直接继承：插入两条消息继续推理 （注意：这是一条反模式）
 
@@ -296,7 +296,7 @@ join后主干：[system] [user [a-call u-result] [a-call u-result] [a-call u-res
 join后主干 [system] [user [a-call u-result] [a-call u-result] [a-call u-result] assistant]@round1 [user [a-call u-result] a-call u-result
 看起来也是一次标准的tool call完成
 
-> 插入 **插入固定assistant message** 这一条通常会带来语义漂移，不好控制
+> 插入 **插入固定assistant message** 这一条通常会带来语义漂移，因此是反模式
 
 
 ### 在Behavior Loop中,fork是一次特殊的beahvior状态切换
@@ -321,7 +321,7 @@ fork 后的 sub-ctx 入口是**一条** user message，内部分两段（XML sec
 
 > sub 看到的是**结构化的 StepRecord history**（thought / observation / next_behavior / self_report 等字段），不是父的 message 序列原样回放。这是 fork 跟"原样继承消息"路线的根本区别。
 
-**继承粒度是个谱，由 fork 模板决定，不是 0/1**：
+**继承粒度是由 fork 模板决定，不是 0/1**：
 
 | 粒度 | 内容 | 适用 |
 |---|---|---|
@@ -369,35 +369,6 @@ fork 的 invariant 只在 **message list 一层**：
 
 #### Fork 嵌套
 
-sub-ctx 自己也能 fork 出 sub-sub-ctx，形成调用栈，每层独立 join。栈深通常很浅（1-2 层），语义上不限。
-
-
-## 未完成事项（TODO）
-
-本文档当前已对齐 beta2.2 实现（driver 简化版 + InterruptMode 双模 + Fork 隔离语义 + WorkSession END 硬关闭等都已落地）。仍待完成的设计 / 实现项，按优先级：
-
-1. **Pending Event 的 Ban Mask 动态化**  
-   当前 `PullEventPolicy::Filter(...)` 只支持静态命名空间过滤（`timer.*` 这类），没做"按 session 当前状态动态生成 mask"。文档中"Wait User Message 状态下屏蔽所有非 user message event"这种状态机驱动的 Filter Layer 还没实现。  
-   *依赖*：需要先确定 session 状态枚举与 hook point 的耦合方式；和"forward_msg 错误引导新 session"是同一组周边修改的一部分。
-
-2. **Step Record History 分级机械压缩的精确定义**（本文档的核心目标之一）  
-   "压缩 History Message §机械压缩 §Step Record History 压缩"段目前只是大纲，需要给出：  
-   - 合并粒度（多个 step → 一个还是两个 step-record-history message？边界怎么切）  
-   - 字段降级阶梯（thought / observation / actions / action_results / next_behavior / self_report 各级保留 vs 丢弃的优先级序）  
-   - 触发时机（hot tail 主动压 vs 接近 context limit 被动压）  
-   - 与 `[on_llm_message_compress]`（context window ratio 自动压缩）的协作关系，避免两套机制重叠误压  
-   *现状*：周边修改（driver 简化、forward_msg 引导）推进完之后回到这块。
-
-3. **forward_message 在 SessionStatus::Ended 时的错误引导**  
-   当前 [agent.rs:1671](../../src/frame/opendan/src/agent.rs) 处只返回泛型 "target session ... has ended"。按 "Session END 的两种解释" §"硬关闭是产品级判断" 一段的设计意图，错误体应当显式告知大模型"需要开新 WorkSession 承载"，并把可用的 workspace / parent-session 链接也带上，使 LLM 能直接 fork 出新 session 继续推进。  
-   *现状*：代码修改已在推进中（参见 memory `project_worksession_no_freeze_use_forward_link`）。
-
----
-
-## 结论 专注于开发sub-behavior / llm_* tools
-
-- 这两种模式的本质，都是把这个问题的边界划清楚
-- 对于这个 LLM 的 Behavior 模式来讲，它其实跟基于 llm_* tool 开发也差不多，但它可以用到更多的session全局状态.
-
+sub-ctx 自己也能 fork 出 sub-sub-ctx，形成调用栈，每层独立 join。为了防止跑飞，目前限制的栈深通常很浅（1-2 层），语义上不限。
 
 
