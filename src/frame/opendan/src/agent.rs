@@ -1740,6 +1740,7 @@ impl AIAgent {
         } else {
             title.trim().to_string()
         };
+        let runner = self.task_executor_runner_id()?;
         let task = task_mgr
             .create_task(
                 &task_name,
@@ -1760,7 +1761,7 @@ impl AIAgent {
                         "execution": {
                             "session_id": session_id,
                             "workspace_id": workspace_id,
-                            "runner": self.task_executor_runner_id(),
+                            "runner": runner.clone(),
                             "status": "creating"
                         }
                     }
@@ -1769,7 +1770,7 @@ impl AIAgent {
                 &app_id,
                 Some(CreateTaskOptions {
                     session_id: Some(session_id.to_string()),
-                    runner: Some(self.task_executor_runner_id()),
+                    runner: Some(runner),
                     ..Default::default()
                 }),
             )
@@ -1801,6 +1802,16 @@ impl AIAgent {
         } else {
             "Agent session created"
         };
+        let runner = match self.task_executor_runner_id() {
+            Ok(runner) => runner,
+            Err(err) => {
+                warn!(
+                    "opendan.agent[{}]: cannot resolve task executor runner for task {} update: {err:#}",
+                    self.agent_name, binding.task_id
+                );
+                return;
+            }
+        };
         let execution_status = if auto_started { "running" } else { "idle" };
         if let Err(err) = task_mgr
             .update_task(
@@ -1815,7 +1826,7 @@ impl AIAgent {
                             "workspace_id": workspace_id,
                             "workspace_status": workspace_status,
                             "behavior": behavior,
-                            "runner": self.task_executor_runner_id(),
+                            "runner": runner,
                             "status": execution_status
                         }
                     }
@@ -2369,7 +2380,24 @@ mod tests {
         }
     }
 
+    fn ensure_test_task_runner_config(root: &PathBuf) {
+        std::fs::create_dir_all(root).expect("mkdir agent root");
+        let path = root.join("agent.toml");
+        if path.exists() {
+            return;
+        }
+        std::fs::write(
+            path,
+            r#"
+[runtime.task_executor]
+runner_id = "agent"
+"#,
+        )
+        .expect("write test agent.toml");
+    }
+
     fn test_agent(root: PathBuf) -> Arc<AIAgent> {
+        ensure_test_task_runner_config(&root);
         let worklog = WorklogService::new(WorklogToolConfig::with_db_path(root.join("worklog.db")))
             .expect("create worklog");
         let runtime = AgentRuntime::new(
@@ -2380,6 +2408,7 @@ mod tests {
     }
 
     fn test_agent_with_task_mgr(root: PathBuf, task_mgr: MemoryTaskMgr) -> Arc<AIAgent> {
+        ensure_test_task_runner_config(&root);
         let worklog = WorklogService::new(WorklogToolConfig::with_db_path(root.join("worklog.db")))
             .expect("create worklog");
         let runtime = AgentRuntime::new(

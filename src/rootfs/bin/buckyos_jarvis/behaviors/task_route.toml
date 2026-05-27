@@ -34,10 +34,8 @@ on_wakeup = """
 
 [capabilities]
 
-# disptach_task 是新API，将一个task forward到一个已有的worksession里
 tool_whitelist = [
   "create_worksession",
-  "disptach_task",
   "read",
   "exec_bash",
   "llm_understand_media"

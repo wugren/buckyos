@@ -2,25 +2,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use buckyos_api::{AiMessage, AiRole, CreateTaskOptions, Task, TaskFilter, TaskStatus};
-use log::{info, warn};
+use buckyos_api::{
+    get_buckyos_api_runtime, AiMessage, AiRole, CreateTaskOptions, Task, TaskFilter, TaskStatus,
+};
+use log::{error, info, warn};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::agent::{AIAgent, CreateWorkSessionParams};
-use crate::session_model::{InterruptMode, PendingInput};
+use crate::session_model::{InterruptMode, PendingInput, SessionMeta, SessionStatus};
 
 pub const TASK_TYPE_AGENT_DELEGATE: &str = "agent.delegate";
 pub const TASK_TYPE_HUMAN_INPUT: &str = "human.input";
-const TASK_ROUTE_BEHAVIOR: &str = "task_route";
 
 impl AIAgent {
-    pub fn task_executor_runner_id(&self) -> String {
+    pub fn task_executor_runner_id(&self) -> Result<String> {
         let configured = self.config.toml.runtime.task_executor.runner_id.trim();
         if configured.is_empty() {
-            self.agent_id()
+            let runtime = get_buckyos_api_runtime().map_err(|err| {
+                anyhow!(
+                    "task executor runner_id is unset and BuckyOS runtime is unavailable: {err}"
+                )
+            })?;
+            let runner = runtime.get_full_appid().trim().to_string();
+            if runner.is_empty() {
+                Err(anyhow!(
+                    "task executor runner_id resolved to empty full_appid"
+                ))
+            } else {
+                Ok(runner)
+            }
         } else {
-            configured.to_string()
+            Ok(configured.to_string())
         }
     }
 
@@ -31,13 +44,22 @@ impl AIAgent {
         if self.runtime.task_mgr.is_none() {
             return None;
         }
+        let runner = match self.task_executor_runner_id() {
+            Ok(runner) => runner,
+            Err(err) => {
+                error!(
+                    "opendan.task_inbox[{}]: cannot resolve task executor runner: {err:#}",
+                    self.agent_name
+                );
+                std::process::exit(1);
+            }
+        };
         Some(tokio::spawn(async move {
-            self.run_task_inbox().await;
+            self.run_task_inbox(runner).await;
         }))
     }
 
-    async fn run_task_inbox(self: Arc<Self>) {
-        let runner = self.task_executor_runner_id();
+    async fn run_task_inbox(self: Arc<Self>, runner: String) {
         let poll_ms = self
             .config
             .toml
@@ -48,8 +70,8 @@ impl AIAgent {
         let (wake_tx, mut wake_rx) = mpsc::channel::<()>(16);
 
         if let Some(kevent) = self.runtime.kevent_client.clone() {
-            let event_id = runner_task_ready_event_id(&runner);
-            match kevent.create_event_reader(vec![event_id.clone()]).await {
+            let event_ids = task_executor_event_ids(&runner);
+            match kevent.create_event_reader(event_ids.clone()).await {
                 Ok(reader) => {
                     let wake_tx = wake_tx.clone();
                     let shutdown = self.pump_shutdown.clone();
@@ -73,8 +95,8 @@ impl AIAgent {
                         }
                     });
                     info!(
-                        "opendan.task_inbox[{}]: subscribed {}",
-                        self.agent_name, event_id
+                        "opendan.task_inbox[{}]: subscribed {:?}",
+                        self.agent_name, event_ids
                     );
                 }
                 Err(err) => {
@@ -86,25 +108,25 @@ impl AIAgent {
             }
         }
 
-        self.clone().sweep_agent_delegate_tasks().await;
+        self.clone().sweep_agent_delegate_tasks(&runner).await;
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms));
         loop {
             tokio::select! {
                 _ = self.pump_shutdown.notified() => break,
                 _ = interval.tick() => {
-                    self.clone().sweep_agent_delegate_tasks().await;
+                    self.clone().sweep_agent_delegate_tasks(&runner).await;
                 }
                 wake = wake_rx.recv() => {
                     if wake.is_none() {
                         break;
                     }
-                    self.clone().sweep_agent_delegate_tasks().await;
+                    self.clone().sweep_agent_delegate_tasks(&runner).await;
                 }
             }
         }
     }
 
-    async fn sweep_agent_delegate_tasks(self: Arc<Self>) {
+    async fn sweep_agent_delegate_tasks(self: Arc<Self>, runner: &str) {
         for status in [
             TaskStatus::Pending,
             TaskStatus::WaitingForApproval,
@@ -117,7 +139,7 @@ impl AIAgent {
             };
             let filter = TaskFilter {
                 task_type: Some(TASK_TYPE_AGENT_DELEGATE.to_string()),
-                runner: Some(self.task_executor_runner_id()),
+                runner: Some(runner.to_string()),
                 status: Some(status),
                 ..Default::default()
             };
@@ -132,7 +154,7 @@ impl AIAgent {
                 }
             };
             for task in tasks {
-                if let Err(err) = self.clone().process_agent_delegate_task(task).await {
+                if let Err(err) = self.clone().process_agent_delegate_task(task, runner).await {
                     warn!(
                         "opendan.task_executor[{}]: process delegate task failed: {err:#}",
                         self.agent_name
@@ -142,27 +164,40 @@ impl AIAgent {
         }
     }
 
-    async fn process_agent_delegate_task(self: Arc<Self>, task: Task) -> Result<()> {
+    async fn process_agent_delegate_task(
+        self: Arc<Self>,
+        mut task: Task,
+        runner: &str,
+    ) -> Result<()> {
         if task.status == TaskStatus::Canceled {
             return self
-                .reflect_task_control_to_session(task, "canceled", InterruptMode::Discard)
+                .reflect_task_control_to_session(task, runner, "canceled", InterruptMode::Discard)
                 .await;
         }
         if task.status.is_terminal() {
             return Ok(());
         }
-        if task.runner != self.task_executor_runner_id() {
+        if task.runner != runner {
             return Ok(());
         }
         if task.status == TaskStatus::Paused {
             return self
-                .reflect_task_control_to_session(task, "paused", InterruptMode::Discard)
+                .reflect_task_control_to_session(task, runner, "paused", InterruptMode::Discard)
                 .await;
         }
         if task.status == TaskStatus::WaitingForApproval
             && !self.clone().resume_waiting_delegate_task(&task).await?
         {
             return Ok(());
+        }
+        if task.status == TaskStatus::WaitingForApproval {
+            let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+                return Err(anyhow!("task manager unavailable"));
+            };
+            task = task_mgr.get_task(task.id).await?;
+            if task.status.is_terminal() {
+                return Ok(());
+            }
         }
 
         let data = task.data.clone();
@@ -171,9 +206,21 @@ impl AIAgent {
             session.wake().await;
             return Ok(());
         }
+        if self
+            .clone()
+            .recover_existing_bound_session(&task, runner)
+            .await?
+        {
+            return Ok(());
+        }
         if let Some(session_id) = route_session_id(&data) {
-            let session = self.clone().ensure_session(&session_id).await?;
-            session.wake().await;
+            self.clone()
+                .fail_task_route(
+                    task,
+                    Some(session_id),
+                    "task_route sessions are no longer used for agent.delegate execution",
+                )
+                .await?;
             return Ok(());
         }
 
@@ -182,8 +229,79 @@ impl AIAgent {
             return Ok(());
         }
 
-        self.clone().start_task_route_session(task).await?;
+        self.clone()
+            .fail_task_route(
+                task,
+                None,
+                "agent.delegate data is not specific enough to create a WorkSession directly",
+            )
+            .await?;
         Ok(())
+    }
+
+    async fn recover_existing_bound_session(
+        self: Arc<Self>,
+        task: &Task,
+        runner: &str,
+    ) -> Result<bool> {
+        let Some(bound) = find_bound_worksession(&self.config.layout.sessions_dir, task.id) else {
+            return Ok(false);
+        };
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return Err(anyhow!("task manager unavailable"));
+        };
+
+        if bound.ended {
+            task_mgr
+                .update_task(
+                    task.id,
+                    Some(TaskStatus::Failed),
+                    Some(task.progress),
+                    Some(
+                        "Existing bound agent session already ended before task recovery"
+                            .to_string(),
+                    ),
+                    Some(json!({
+                        "agent_delegate": {
+                            "execution": {
+                                "session_id": bound.session_id,
+                                "workspace_id": bound.workspace_id,
+                                "behavior": bound.behavior,
+                                "runner": runner,
+                                "status": "ended",
+                                "recovered_at_ms": now_ms()
+                            }
+                        }
+                    })),
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        task_mgr
+            .update_task(
+                task.id,
+                Some(TaskStatus::Running),
+                Some(task.progress.max(10.0)),
+                Some("Recovered existing agent session binding".to_string()),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": bound.session_id,
+                            "workspace_id": bound.workspace_id,
+                            "behavior": bound.behavior,
+                            "runner": runner,
+                            "status": "running",
+                            "recovered_at_ms": now_ms()
+                        }
+                    }
+                })),
+            )
+            .await?;
+
+        let session = self.clone().ensure_session(&bound.session_id).await?;
+        session.wake().await;
+        Ok(true)
     }
 
     async fn create_worksession_by_task_id(self: Arc<Self>, task: Task) -> Result<()> {
@@ -233,63 +351,29 @@ impl AIAgent {
         Ok(())
     }
 
-    async fn start_task_route_session(self: Arc<Self>, task: Task) -> Result<()> {
+    async fn fail_task_route(
+        self: Arc<Self>,
+        task: Task,
+        route_session_id: Option<String>,
+        reason: &str,
+    ) -> Result<()> {
         let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
             return Err(anyhow!("task manager unavailable"));
         };
         task_mgr
             .update_task(
                 task.id,
-                Some(TaskStatus::Running),
-                Some(3.0),
-                Some("Routing task with task_route session".to_string()),
+                Some(TaskStatus::Failed),
+                Some(task.progress),
+                Some(reason.to_string()),
                 Some(json!({
                     "agent_delegate": {
                         "route": {
-                            "status": "routing",
-                            "strategy": "task_route"
-                        }
-                    }
-                })),
-            )
-            .await?;
-
-        let objective = render_task_route_objective(&task)?;
-        let outcome = self
-            .clone()
-            .create_work_session(CreateWorkSessionParams {
-                title: format!("Route task {}", task.id),
-                objective,
-                workspace_id: None,
-                behavior: Some(TASK_ROUTE_BEHAVIOR.to_string()),
-                created_by_session_id: delegate_string(&task.data, "owner_session_id")
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| format!("task-{}", task.id)),
-                reason_messages: vec![format!(
-                    "agent.delegate task {} requires task_route before worksession creation",
-                    task.id
-                )],
-                task_binding: None,
-                task_id: None,
-                auto_start: true,
-                bind_task: false,
-            })
-            .await?;
-
-        task_mgr
-            .update_task(
-                task.id,
-                Some(TaskStatus::Running),
-                Some(5.0),
-                Some("Task route session started".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "route": {
-                            "status": "routing",
-                            "strategy": "task_route",
-                            "session_id": outcome.session_id,
-                            "workspace_id": outcome.workspace_id,
-                            "behavior": outcome.behavior
+                            "status": "failed",
+                            "strategy": "fail_first",
+                            "session_id": route_session_id,
+                            "reason": reason,
+                            "failed_at_ms": now_ms()
                         }
                     }
                 })),
@@ -301,10 +385,11 @@ impl AIAgent {
     async fn reflect_task_control_to_session(
         self: Arc<Self>,
         task: Task,
+        runner: &str,
         status: &'static str,
         mode: InterruptMode,
     ) -> Result<()> {
-        if task.runner != self.task_executor_runner_id() {
+        if task.runner != runner {
             return Ok(());
         }
         if task_control_already_reflected(&task.data, status) {
@@ -465,7 +550,7 @@ impl AIAgent {
                         "question": question,
                         "required_by": {
                             "task_id": parent.id,
-                            "executor": self.task_executor_runner_id(),
+                            "executor": self.task_executor_runner_id()?,
                         },
                         "candidates": candidates,
                         "response_schema": {
@@ -605,24 +690,6 @@ fn direct_task_workspace_id(data: &Value) -> Option<String> {
         })
 }
 
-fn render_task_route_objective(task: &Task) -> Result<String> {
-    let data = serde_json::to_string_pretty(&task.data)?;
-    Ok(format!(
-        "Route TaskManager task `{}` for OpenDAN execution.\n\n\
-         Task facts:\n\
-         - task_id: {}\n\
-         - task_name: {}\n\
-         - task_type: {}\n\
-         - runner: {}\n\
-         - user_id: {}\n\
-         - app_id: {}\n\n\
-         Task data:\n{}\n\n\
-         Decide the workspace/session route, then create the business WorkSession by calling `create_worksession` with `task_id: {}`. \
-         Do not perform the business task in this route session.",
-        task.id, task.id, task.name, task.task_type, task.runner, task.user_id, task.app_id, data, task.id
-    ))
-}
-
 fn task_control_already_reflected(data: &Value, status: &str) -> bool {
     data.pointer("/agent_delegate/execution/status")
         .and_then(Value::as_str)
@@ -657,8 +724,59 @@ fn human_input_response_text(data: &Value) -> Option<String> {
         .or_else(|| serde_json::to_string_pretty(response).ok())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundWorkSession {
+    session_id: String,
+    workspace_id: Option<String>,
+    behavior: String,
+    ended: bool,
+}
+
+fn find_bound_worksession(
+    sessions_dir: &std::path::Path,
+    task_id: i64,
+) -> Option<BoundWorkSession> {
+    let entries = std::fs::read_dir(sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta_path = path.join(".meta").join("session.json");
+        let Ok(bytes) = std::fs::read(meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+            continue;
+        };
+        if !meta.kind.is_work_family() {
+            continue;
+        }
+        let Some(binding) = meta.task_binding.as_ref() else {
+            continue;
+        };
+        if binding.task_id != task_id {
+            continue;
+        }
+        return Some(BoundWorkSession {
+            session_id: meta.session_id,
+            workspace_id: meta.workspace_id,
+            behavior: meta.current_behavior,
+            ended: meta.status == SessionStatus::Ended,
+        });
+    }
+    None
+}
+
 fn runner_task_ready_event_id(runner: &str) -> String {
     format!("/task_mgr/runner/{}/task_ready", runner.trim())
+}
+
+fn task_executor_event_ids(runner: &str) -> Vec<String> {
+    vec![
+        runner_task_ready_event_id(runner),
+        "/task_mgr/**".to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -706,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_workspace_hints_use_task_route() {
+    fn ambiguous_workspace_hints_are_not_direct() {
         let task = task(json!({
             "agent_delegate": {
                 "purpose": "Do the task",
@@ -717,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_task_data_uses_task_route() {
+    fn unrecognized_task_data_is_not_direct() {
         let task = task(json!({
             "input": "free-form task"
         }));
@@ -725,12 +843,53 @@ mod tests {
     }
 
     #[test]
-    fn task_route_objective_instructs_create_by_task_id() {
-        let task = task(json!({
-            "input": "free-form task"
-        }));
-        let objective = render_task_route_objective(&task).expect("objective");
-        assert!(objective.contains("task_id: 7"));
-        assert!(objective.contains("`create_worksession` with `task_id: 7`"));
+    fn task_executor_subscribes_runner_and_task_changes() {
+        assert_eq!(
+            task_executor_event_ids("agent"),
+            vec![
+                "/task_mgr/runner/agent/task_ready".to_string(),
+                "/task_mgr/**".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_existing_bound_worksession_by_task_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("ws-bound").join(".meta");
+        std::fs::create_dir_all(&session_dir).expect("mkdir meta");
+        let mut meta = SessionMeta::new(
+            "ws-bound".to_string(),
+            crate::session_model::SessionKind::Work,
+            "work_default".to_string(),
+            "owner".to_string(),
+        );
+        meta.workspace_id = Some("workspace-1".to_string());
+        meta.task_binding = Some(crate::session_model::AgentTaskBinding {
+            task_id: 7,
+            root_task_id: 7,
+            root_id: "7".to_string(),
+            task_type: TASK_TYPE_AGENT_DELEGATE.to_string(),
+            runner: "agent".to_string(),
+            task_name: "delegate".to_string(),
+            user_id: "user".to_string(),
+            app_id: "opendan".to_string(),
+            parent_id: None,
+        });
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec_pretty(&meta).expect("serialize meta"),
+        )
+        .expect("write meta");
+
+        assert_eq!(
+            find_bound_worksession(dir.path(), 7),
+            Some(BoundWorkSession {
+                session_id: "ws-bound".to_string(),
+                workspace_id: Some("workspace-1".to_string()),
+                behavior: "work_default".to_string(),
+                ended: false,
+            })
+        );
     }
 }
