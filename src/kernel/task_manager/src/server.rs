@@ -167,6 +167,16 @@ impl TaskManagerService {
         Some(event_id)
     }
 
+    fn runner_task_ready_event_id(runner: &str) -> Option<String> {
+        let trimmed = runner.trim();
+        if trimmed.is_empty() || trimmed.contains('/') {
+            return None;
+        }
+        let event_id = format!("/task_mgr/runner/{}/task_ready", trimmed);
+        validate_eventid(event_id.as_str()).ok()?;
+        Some(event_id)
+    }
+
     /// Returns true if the rate-limit gate is open and updates the last-emit
     /// timestamp. `Status` / `Error` kinds always pass and refresh the gate so
     /// a low-priority emit doesn't fire right after a critical one.
@@ -225,6 +235,44 @@ impl TaskManagerService {
             );
         }
         payload
+    }
+
+    fn build_task_ready_payload(&self, task: &Task, source_method: &str) -> Value {
+        json!({
+            "event_kind": "task_ready",
+            "task_id": task.id,
+            "root_id": task.root_id,
+            "parent_id": task.parent_id,
+            "user_id": task.user_id,
+            "app_id": task.app_id,
+            "session_id": task.session_id,
+            "task_type": task.task_type,
+            "runner": task.runner,
+            "status": task.status.to_string(),
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "source_method": source_method,
+        })
+    }
+
+    async fn publish_task_ready_event(&self, task: &Task, source_method: &str) {
+        if task.status != TaskStatus::Pending {
+            return;
+        }
+        let Some(event_id) = Self::runner_task_ready_event_id(task.runner.as_str()) else {
+            return;
+        };
+        let payload = self.build_task_ready_payload(task, source_method);
+        if let Err(err) = self
+            .kevent_client
+            .pub_event(event_id.as_str(), payload)
+            .await
+        {
+            warn!(
+                "task_mgr.publish_task_ready_event failed: event_id={} task_id={} runner={} err={}",
+                event_id, task.id, task.runner, err
+            );
+        }
     }
 
     /// Publish a task-changed event. Status / Error transitions always fire;
@@ -506,6 +554,7 @@ impl TaskManagerHandler for TaskManagerService {
         }
 
         task.id = task_id;
+        self.publish_task_ready_event(&task, "create_task").await;
         Ok(task)
     }
 
@@ -1179,6 +1228,23 @@ mod tests {
         );
         assert_eq!(TaskManagerService::root_event_id("workflow#default"), None);
         assert_eq!(TaskManagerService::root_event_id("workflow/default"), None);
+    }
+
+    #[test]
+    fn runner_task_ready_event_id_uses_runner_inbox_path() {
+        assert_eq!(
+            TaskManagerService::runner_task_ready_event_id("node-1"),
+            Some("/task_mgr/runner/node-1/task_ready".to_string())
+        );
+        assert_eq!(
+            TaskManagerService::runner_task_ready_event_id("app.control_panel"),
+            Some("/task_mgr/runner/app.control_panel/task_ready".to_string())
+        );
+        assert_eq!(TaskManagerService::runner_task_ready_event_id(""), None);
+        assert_eq!(
+            TaskManagerService::runner_task_ready_event_id("bad/runner"),
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
