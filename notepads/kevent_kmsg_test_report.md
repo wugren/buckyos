@@ -183,6 +183,76 @@ RUSTUP_TOOLCHAIN=stable LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo test -p kmsg --
 
 ## 7. 未完成项与阻塞
 
+### 7.0 rich 最新二进制重建确认
+
+根据 review 反馈，已在 rich 上确认不依赖现有旧安装，而是在当前分支最新提交重新构建并更新运行产物。
+
+执行提交：
+
+```text
+11251f8ea94407e32698ef833a1acef2af485594
+```
+
+构建命令：
+
+```bash
+cd /home/ss/work/buckyos/src
+RUSTUP_TOOLCHAIN=stable LIBCLANG_PATH=/usr/lib/llvm-18/lib /root/.local/bin/uv run buckyos-build.py --skip-web --target=x86_64-unknown-linux-gnu
+```
+
+结果：通过。构建日志确认重新复制并更新了以下关键服务到 `/opt/buckyos/bin`：
+
+- `node-daemon/node_daemon`
+- `kmsg/kmsg`
+- `system-config/system_config`
+- `verify-hub/verify_hub`
+- `scheduler/scheduler`
+- `control-panel/control_panel`
+- `msg-center/msg_center`
+- `opendan/opendan`
+
+重启命令：
+
+```bash
+cd /home/ss/work/buckyos/src
+/root/.local/bin/uv run stop.py
+systemctl restart buckyos
+```
+
+运行态确认：
+
+```text
+/opt/buckyos/bin/node-daemon/node_daemon --enable_active
+/opt/buckyos/bin/system-config/system_config
+/opt/buckyos/bin/verify-hub/verify_hub
+/opt/buckyos/bin/kmsg/kmsg
+/opt/buckyos/bin/scheduler/scheduler
+/opt/buckyos/bin/control-panel/control_panel
+```
+
+监听端口确认：
+
+```text
+3181 node_daemon
+3200 system_config
+3300 verify_hub
+4020 control_panel
+4030 kmsg
+```
+
+重建后补充探针：
+
+```json
+{"status":"ok"}
+{"result":"buckycli::devtest::after-rebuild-20260527","sys":[0]}
+{"result":1,"sys":[0]}
+{"result":[{"created_at":1779891522,"headers":{"probe":"after-rebuild"},"index":1,"payload":[97,102,116,101,114,45,114,101,98,117,105,108,100]}],"sys":[0]}
+{"result":{"first_index":1,"last_index":1,"message_count":1,"size_bytes":13},"sys":[0]}
+{"result":null,"sys":[0]}
+```
+
+结论：rich 已运行当前分支最新构建产物，`kevent` 直连发布和 `kmsg` create/post/read/stats/delete 闭环在重建后继续通过。
+
 ### 7.1 DV runner 未执行完成
 
 计划中的命令：
@@ -228,4 +298,3 @@ rich 当前没有 `deno`。由于 gateway 已阻塞 DV，本轮未继续安装 D
 - kmsg 模块测试通过，运行态 `4030` 直连验证通过。
 - kmsg 当前实现中 config retention / max_messages / 权限字段未被强制执行，已由 `sled_contract.rs` 作为当前行为偏差显式记录。
 - 完整 DV 仍被 rich 的 `cyfs_gateway` 运行态阻塞，需先修复 gateway 启动契约或恢复 3180 网关入口后继续。
-
