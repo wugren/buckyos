@@ -238,7 +238,7 @@ Klog 是 beta2.2 里改动规模最大的内核基础设施之一。它开始承
 - `gateway_tunnel_probe.rs`
 - `gateway_name_provider.rs`
 - `kevent_server.rs`
-- `node_exector.rs`
+- `node_Executor.rs`
 - `run_plist.rs`
 
 主要方向是：

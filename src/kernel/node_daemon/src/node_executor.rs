@@ -482,7 +482,7 @@ async fn build_execution_plan(
             })
         }
         FunctionType::Operator => {
-            bail!("operator execution is not supported by node_exector yet")
+            bail!("operator execution is not supported by node_Executor yet")
         }
     }
 }

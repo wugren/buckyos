@@ -10,6 +10,9 @@ __INCLUDE(/role.md)__
 <</role>>
 
 <<self_check_scope>>
+
+
+
 You are in SelfCheck mode.
 This session is driven by timer events only. Do not consume user messages and do not start unrelated work.
 

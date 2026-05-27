@@ -5,11 +5,12 @@ use std::sync::{Arc, Weak};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use buckyos_api::{
-    match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient,
+    match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient, TaskStatus,
     UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
 use ndn_lib::{MsgContent, MsgObjKind, MsgObject};
+use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -67,6 +68,7 @@ use crate::task_dispatch::TaskDispatch;
 /// message". Interpreted only at the session layer; the waist treats it as
 /// an opaque jump-target string.
 pub const NEXT_BEHAVIOR_WAIT_USER_MSG: &str = "WAIT_USER_MSG";
+pub const NEXT_BEHAVIOR_WAIT_FOR_MSG: &str = "WAIT_FOR_MSG";
 const MAX_PENDING_INPUTS: usize = 256;
 const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
 const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
@@ -4043,9 +4045,16 @@ impl AgentSession {
                                 self.session_id
                             );
                         }
-                        return self.handle_process_end(final_snapshot).await;
+                        let action = self.handle_process_end(final_snapshot.clone()).await?;
+                        if matches!(action, NextAction::End) {
+                            self.feedback_task_completed(&final_snapshot, Some(trimmed))
+                                .await;
+                        }
+                        return Ok(action);
                     }
-                    if trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_USER_MSG) {
+                    if trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_USER_MSG)
+                        || trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_FOR_MSG)
+                    {
                         // Behavior state machine yields: current intent has
                         // run its course, no autonomous next step — park
                         // the session until the next user message arrives.
@@ -4073,6 +4082,8 @@ impl AgentSession {
                             );
                         }
                         self.persist_snapshot(&final_snapshot).await;
+                        self.feedback_task_waiting_for_input(&final_snapshot, Some(trimmed))
+                            .await;
                         return Ok(NextAction::WaitForMsg);
                     }
                     // Switch — preserve history by handing the post-run
@@ -4118,6 +4129,7 @@ impl AgentSession {
                 if matches!(self.kind, SessionKind::Ui) {
                     Ok(NextAction::WaitForMsg)
                 } else {
+                    self.feedback_task_completed(&final_snapshot, None).await;
                     Ok(NextAction::End)
                 }
             }
@@ -4233,6 +4245,8 @@ impl AgentSession {
                         message: format!("budget exhausted: {:?}", which),
                     })
                     .await;
+                self.feedback_task_failed(format!("budget exhausted: {:?}", which))
+                    .await;
                 self.discard_snapshot();
                 if matches!(self.kind, SessionKind::SelfImprove) {
                     self.mark_improvement_budget_exhausted().await;
@@ -4269,6 +4283,7 @@ impl AgentSession {
                                 message: error.to_string(),
                             })
                             .await;
+                        self.feedback_task_failed(error.to_string()).await;
                         self.discard_snapshot();
                         Ok(NextAction::WaitForMsg)
                     }
@@ -4290,6 +4305,8 @@ impl AgentSession {
                         message: format!("context limit reached: {:?}", which),
                     })
                     .await;
+                self.feedback_task_failed(format!("context limit reached: {:?}", which))
+                    .await;
                 Ok(NextAction::WaitForMsg)
             }
             LLMContextOutcome::Interrupted {
@@ -4307,8 +4324,182 @@ impl AgentSession {
                         message: format!("inference interrupted: {reason}"),
                     })
                     .await;
+                self.feedback_task_canceled(format!("inference interrupted: {reason}"))
+                    .await;
                 Ok(NextAction::WaitForMsg)
             }
+        }
+    }
+
+    async fn task_binding(&self) -> Option<crate::session_model::AgentTaskBinding> {
+        self.meta.lock().await.task_binding.clone()
+    }
+
+    async fn feedback_task_completed(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        next_behavior: Option<&str>,
+    ) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.complete_on_end {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let report = final_snapshot.state.last_report.clone().unwrap_or_default();
+        let patch = json!({
+            "agent_delegate": {
+                "execution": {
+                    "session_id": self.session_id,
+                    "workspace_id": self.workspace_id().await,
+                    "status": "completed",
+                },
+                "result": {
+                    "status": "completed",
+                    "report": report,
+                    "next_behavior": next_behavior,
+                }
+            }
+        });
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Completed),
+                Some(100.0),
+                Some("Agent session completed".to_string()),
+                Some(patch),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task completed failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_waiting_for_input(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        next_behavior: Option<&str>,
+    ) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.create_human_input_on_wait {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(agent) = self.parent_agent.upgrade() else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let Ok(task) = client.get_task(binding.task_id).await else {
+            return;
+        };
+        if task.status.is_terminal() {
+            return;
+        }
+        let report = final_snapshot
+            .state
+            .last_report
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("The agent needs user input before it can continue.");
+        let question = if next_behavior.is_some() {
+            report.to_string()
+        } else {
+            "The agent is waiting for user input.".to_string()
+        };
+        if let Err(err) = agent
+            .create_human_input_task(&task, &question, "agent_wait_user_msg", Vec::new())
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: create human input task failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_failed(&self, message: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.fail_on_error {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Failed),
+                None,
+                Some(message.clone()),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "status": "failed",
+                        },
+                        "error": {
+                            "message": message,
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task failed failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_canceled(&self, reason: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.cancel_on_interrupt {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Canceled),
+                None,
+                Some(reason.clone()),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "status": "canceled",
+                            "reason": reason,
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task canceled failed: {err:#}",
+                self.session_id
+            );
         }
     }
 
@@ -5656,7 +5847,7 @@ async fn build_agent_session_env(
     session_dir: &Path,
     behavior: &BehaviorCfg,
 ) -> AgentSessionEnv {
-    let (kind, title, objective, owner, workspace_id, one_line, bg_events) = {
+    let (kind, title, objective, owner, workspace_id, one_line, bg_events, task_binding) = {
         let meta = meta.lock().await;
         (
             meta.kind,
@@ -5666,6 +5857,7 @@ async fn build_agent_session_env(
             meta.workspace_id.clone(),
             meta.one_line_status.clone(),
             meta.background_events.clone(),
+            meta.task_binding.clone(),
         )
     };
     let session_objective = if objective.trim().is_empty() {
@@ -5711,6 +5903,7 @@ async fn build_agent_session_env(
             bg_events,
             ..Default::default()
         },
+        task: task_binding.map(Into::into),
     }
 }
 

@@ -7,7 +7,6 @@
   - `doc/opendan/OpenDAN Long Task & Sub-Agent.md`
   - `doc/opendan/Agent 协作.md`
 
-> 文件名沿用当前路径中的 `Exector` 拼写，正文统一使用 `Executor`。
 
 ## 1. 背景
 

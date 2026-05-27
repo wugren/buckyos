@@ -43,8 +43,8 @@ use crate::msg_center_pump::{self, PumpConfig};
 use crate::paths;
 use crate::session_event_pump::SessionEventPump;
 use crate::session_model::{
-    PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary, TimerEventKind,
-    TimerReason, TimerTargetType, TimerTriggerType, UI_CLOCK_TIMER_EVENT_ID,
+    AgentTaskBinding, PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    TimerEventKind, TimerReason, TimerTargetType, TimerTriggerType, UI_CLOCK_TIMER_EVENT_ID,
     UI_CLOCK_TIMER_INTERVAL_MS,
 };
 use crate::tool_plan::{self, ResolvedToolPlan, SessionBinRenderer, ToolPlanToml};
@@ -208,7 +208,7 @@ pub struct AIAgent {
     shutdown_rx: Arc<Mutex<Option<ShutdownRx>>>,
     /// Signalled when `run()` is exiting, so the msg-center pump task can
     /// drop its kevent reader and return promptly.
-    pump_shutdown: Arc<Notify>,
+    pub(crate) pump_shutdown: Arc<Notify>,
     /// Per-session kevent subscription pump. `None` when the runtime has
     /// no `kevent_client` (CLI / test). Cheap to keep around: idle pump
     /// just parks on its `refresh` Notify when no session subscribes.
@@ -420,6 +420,7 @@ impl AIAgent {
         self.clone().ensure_ui_clock_timer().await;
 
         let pump_handle = self.clone().spawn_msg_center_pump();
+        let task_inbox_handle = self.clone().spawn_task_inbox();
         let event_pump_handle = self.event_pump.as_ref().map(|p| {
             let p = p.clone();
             tokio::spawn(async move { p.run().await })
@@ -437,6 +438,9 @@ impl AIAgent {
             // Best-effort: pump task observes `pump_shutdown` and exits on its
             // own; we just wait so the kevent reader is fully closed before
             // the agent drops.
+            let _ = handle.await;
+        }
+        if let Some(handle) = task_inbox_handle {
             let _ = handle.await;
         }
         if let Some(handle) = event_pump_handle {
@@ -1552,6 +1556,7 @@ impl AIAgent {
             behavior,
             created_by_session_id,
             reason_messages,
+            task_binding,
         } = params;
         if objective.trim().is_empty() {
             return Err(anyhow!("create_work_session: objective must not be empty"));
@@ -1606,6 +1611,7 @@ impl AIAgent {
         seed.title = title.trim().to_string();
         seed.objective = objective.trim().to_string();
         seed.workspace_id = Some(workspace_id.clone());
+        seed.task_binding = task_binding;
 
         // Write a readme.md capturing the origin context so a later
         // human / debugger can see why this work session exists.
@@ -1776,6 +1782,7 @@ pub struct CreateWorkSessionParams {
     pub behavior: Option<String>,
     pub created_by_session_id: String,
     pub reason_messages: Vec<String>,
+    pub task_binding: Option<AgentTaskBinding>,
 }
 
 /// Result of [`AIAgent::create_work_session`].
@@ -2441,6 +2448,7 @@ mod tests {
                 behavior: None,
                 created_by_session_id: "ui-1".to_string(),
                 reason_messages: Vec::new(),
+                task_binding: None,
             })
             .await
             .expect("create work session");
@@ -2470,6 +2478,7 @@ mod tests {
                 behavior: Some("  ".to_string()),
                 created_by_session_id: "ui-1".to_string(),
                 reason_messages: Vec::new(),
+                task_binding: None,
             })
             .await
             .expect("create work session");

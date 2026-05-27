@@ -194,6 +194,8 @@ pub struct SessionMeta {
     pub last_report_delivery: Option<ReportDeliveryState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_continuation: Option<InternalContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding: Option<AgentTaskBinding>,
 }
 
 impl SessionMeta {
@@ -228,6 +230,7 @@ impl SessionMeta {
             process_stack: Vec::new(),
             last_report_delivery: None,
             internal_continuation: None,
+            task_binding: None,
         };
         meta.ensure_default_event_subscriptions(0);
         meta
@@ -252,6 +255,20 @@ impl SessionMeta {
         });
         true
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTaskBinding {
+    pub task_id: i64,
+    pub root_task_id: i64,
+    pub root_id: String,
+    pub task_type: String,
+    pub runner: String,
+    pub task_name: String,
+    pub user_id: String,
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

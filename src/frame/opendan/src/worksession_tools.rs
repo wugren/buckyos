@@ -302,6 +302,7 @@ impl TypedTool for CreateWorksessionTool {
                 behavior: args.behavior,
                 created_by_session_id: self.source_session_id.clone(),
                 reason_messages: args.reason_message,
+                task_binding: None,
             })
             .await
             .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;

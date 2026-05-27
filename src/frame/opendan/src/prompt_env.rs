@@ -23,7 +23,9 @@ use llm_context::{
 };
 use serde_json::{json, Value as Json};
 
-use crate::session_model::{BackgroundHint, BgEventSnapshot, EventRef, PendingInput, SessionKind};
+use crate::session_model::{
+    AgentTaskBinding, BackgroundHint, BgEventSnapshot, EventRef, PendingInput, SessionKind,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default)]
@@ -94,6 +96,36 @@ pub struct AgentSessionEnv {
     pub notebook_list_text: String,
     pub notebook_last_items_text: String,
     pub llm_context: LlmContextEnv,
+    pub task: Option<TaskEnv>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskEnv {
+    pub task_id: i64,
+    pub root_task_id: i64,
+    pub root_id: String,
+    pub task_type: String,
+    pub runner: String,
+    pub task_name: String,
+    pub user_id: String,
+    pub app_id: String,
+    pub parent_id: Option<i64>,
+}
+
+impl From<AgentTaskBinding> for TaskEnv {
+    fn from(binding: AgentTaskBinding) -> Self {
+        Self {
+            task_id: binding.task_id,
+            root_task_id: binding.root_task_id,
+            root_id: binding.root_id,
+            task_type: binding.task_type,
+            runner: binding.runner,
+            task_name: binding.task_name,
+            user_id: binding.user_id,
+            app_id: binding.app_id,
+            parent_id: binding.parent_id,
+        }
+    }
 }
 
 impl AgentSessionEnv {
@@ -145,6 +177,8 @@ pub fn build_render_vars(env: &AgentSessionEnv) -> RenderVars {
         .with_var("paths", paths_object(env))
         .with_var("input", input_object(env))
         .with_var("current_context", current_context_object(env))
+        .with_var("task", task_object(env))
+        .with_var("task_executor", task_executor_object(env))
         .with_var("runtime", runtime_object(env))
         .with_var("notebook", notebook_object(env))
         .with_var("llm_context", llm_context_object(env))
@@ -228,6 +262,8 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "session.objective" => Some(Json::String(env.session_objective.clone())),
         "session.owner" => Some(Json::String(env.session_owner.clone())),
         "session.current_behavior" => Some(Json::String(env.behavior_name.clone())),
+        "session.task_id" => Some(task_number(env, |task| task.task_id)),
+        "session.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
         "session.current_todo" => Some(env.session_current_todo.clone()),
         "session.current_todo_list" => Some(Json::String(env.session_current_todo_list.clone())),
         "session.background_hint_changed" => Some(Json::Bool(env.background_hint_changed())),
@@ -296,6 +332,25 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "runtime.recent_activity" => Some(Json::String(env.recent_activity.clone())),
         "runtime.has_activity" => Some(Json::Bool(env.has_recent_activity())),
 
+        "task" => Some(task_object(env)),
+        "task.id" | "task.task_id" => Some(task_number(env, |task| task.task_id)),
+        "task.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
+        "task.root_id" => Some(task_string(env, |task| task.root_id.as_str())),
+        "task.type" | "task.task_type" => Some(task_string(env, |task| task.task_type.as_str())),
+        "task.runner" => Some(task_string(env, |task| task.runner.as_str())),
+        "task.name" | "task.task_name" => Some(task_string(env, |task| task.task_name.as_str())),
+        "task.user_id" => Some(task_string(env, |task| task.user_id.as_str())),
+        "task.app_id" => Some(task_string(env, |task| task.app_id.as_str())),
+        "task.parent_id" => Some(match env.task.as_ref().and_then(|task| task.parent_id) {
+            Some(id) => Json::from(id),
+            None => Json::Null,
+        }),
+
+        "task_executor" => Some(task_executor_object(env)),
+        "task_executor.has_task" => Some(Json::Bool(env.task.is_some())),
+        "task_executor.task_id" => Some(task_number(env, |task| task.task_id)),
+        "task_executor.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
+
         "notebook" => Some(notebook_object(env)),
         "notebook.list_text" => Some(Json::String(env.notebook_list_text.clone())),
         "notebook.last_items_text" => Some(Json::String(env.notebook_last_items_text.clone())),
@@ -344,6 +399,8 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "objective": env.session_objective,
         "owner": env.session_owner,
         "current_behavior": env.behavior_name,
+        "task_id": env.task.as_ref().map(|task| task.task_id),
+        "root_task_id": env.task.as_ref().map(|task| task.root_task_id),
         "current_todo": env.session_current_todo.clone(),
         "current_todo_list": env.session_current_todo_list,
         "background_hint_changed": env.background_hint_changed(),
@@ -353,6 +410,50 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "has_title": env.has_title(),
         "has_current_todo": env.has_current_todo(),
     })
+}
+
+fn task_object(env: &AgentSessionEnv) -> Json {
+    match &env.task {
+        Some(task) => json!({
+            "id": task.task_id,
+            "task_id": task.task_id,
+            "root_task_id": task.root_task_id,
+            "root_id": task.root_id,
+            "type": task.task_type,
+            "task_type": task.task_type,
+            "runner": task.runner,
+            "name": task.task_name,
+            "task_name": task.task_name,
+            "user_id": task.user_id,
+            "app_id": task.app_id,
+            "parent_id": task.parent_id,
+        }),
+        None => Json::Null,
+    }
+}
+
+fn task_executor_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "has_task": env.task.is_some(),
+        "task": task_object(env),
+        "task_id": env.task.as_ref().map(|task| task.task_id),
+        "root_task_id": env.task.as_ref().map(|task| task.root_task_id),
+    })
+}
+
+fn task_number(env: &AgentSessionEnv, f: impl Fn(&TaskEnv) -> i64) -> Json {
+    env.task
+        .as_ref()
+        .map(f)
+        .map(Json::from)
+        .unwrap_or(Json::Null)
+}
+
+fn task_string<'a>(env: &'a AgentSessionEnv, f: impl Fn(&'a TaskEnv) -> &'a str) -> Json {
+    env.task
+        .as_ref()
+        .map(|task| Json::String(f(task).to_string()))
+        .unwrap_or(Json::Null)
 }
 
 fn resolve_json_path(value: &Json, path: &str) -> Option<Json> {
@@ -813,6 +914,7 @@ mod tests {
                 behavior_history: vec![json!({"step_index": 6, "behavior_name": "chat_route"})],
                 agent_global_state: json!({"mood": "steady"}),
             },
+            task: None,
         }
     }
 
@@ -843,6 +945,7 @@ mod tests {
             notebook_list_text: String::new(),
             notebook_last_items_text: String::new(),
             llm_context: LlmContextEnv::default(),
+            task: None,
         }
     }
 
@@ -861,7 +964,18 @@ mod tests {
 
     #[tokio::test]
     async fn loader_resolves_phase1_keys() {
-        let env = sample_env();
+        let mut env = sample_env();
+        env.task = Some(TaskEnv {
+            task_id: 42,
+            root_task_id: 40,
+            root_id: "40".to_string(),
+            task_type: "agent.delegate".to_string(),
+            runner: "jarvis".to_string(),
+            task_name: "delegate".to_string(),
+            user_id: "user".to_string(),
+            app_id: "opendan".to_string(),
+            parent_id: None,
+        });
         let loader = AgentSessionValueLoader::new(env.clone());
         assert_eq!(
             loader.load("$session.id").await.unwrap(),
@@ -888,6 +1002,11 @@ mod tests {
         assert_eq!(
             loader.load("$session.current_todo.content").await.unwrap(),
             Some(Json::String("do thing details".into()))
+        );
+        assert_eq!(loader.load("$task.id").await.unwrap(), Some(Json::from(42)));
+        assert_eq!(
+            loader.load("$task_executor.has_task").await.unwrap(),
+            Some(Json::Bool(true))
         );
         assert_eq!(
             loader.load("$session.has_current_todo").await.unwrap(),

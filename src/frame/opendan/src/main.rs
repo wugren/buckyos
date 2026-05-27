@@ -97,6 +97,7 @@ impl WorkSessionQuickTestSpec {
             behavior: self.behavior,
             created_by_session_id: self.created_by_session_id,
             reason_messages: self.reason_messages,
+            task_binding: None,
         }
     }
 }

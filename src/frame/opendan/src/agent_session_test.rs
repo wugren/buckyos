@@ -951,6 +951,7 @@ __INCLUDE(/role.md)__
         notebook_list_text: String::new(),
         notebook_last_items_text: String::new(),
         llm_context: LlmContextEnv::default(),
+        task: None,
     };
     let detail = render_template_failure_detail(
         &behavior,
@@ -1234,6 +1235,7 @@ fn session_meta_round_trips_pending_inputs() {
         }],
         last_report_delivery: None,
         internal_continuation: None,
+        task_binding: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let restored: SessionMeta = serde_json::from_str(&json).unwrap();

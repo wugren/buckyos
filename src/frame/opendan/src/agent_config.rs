@@ -107,6 +107,7 @@ pub struct RuntimeCfg {
     /// agent can read or attach host-readable files. Path traversal (`..`) is
     /// still rejected by each tool.
     pub filesystem_policy: FilesystemPolicy,
+    pub task_executor: TaskExecutorCfg,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +130,25 @@ impl Default for RuntimeCfg {
             language: "en".to_string(),
             preserve_attachment_tag_in_egress: false,
             filesystem_policy: FilesystemPolicy::default(),
+            task_executor: TaskExecutorCfg::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TaskExecutorCfg {
+    pub enabled: bool,
+    pub runner_id: String,
+    pub poll_interval_ms: u64,
+}
+
+impl Default for TaskExecutorCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            runner_id: String::new(),
+            poll_interval_ms: 5_000,
         }
     }
 }
@@ -251,6 +271,7 @@ pub struct SessionDriverCfg {
     pub switch_mode: SwitchMode,
     pub inject_background_environment: bool,
     pub report_delivery: ReportDeliveryMode,
+    pub task_feedback: TaskFeedbackCfg,
     pub on_init: HookPointCfg,
     pub on_behavior_switch: HookPointCfg,
     pub on_behavior_step_ob: HookPointCfg,
@@ -263,6 +284,7 @@ impl Default for SessionDriverCfg {
             switch_mode: SwitchMode::Normal,
             inject_background_environment: true,
             report_delivery: ReportDeliveryMode::FinalOnly,
+            task_feedback: TaskFeedbackCfg::default(),
             on_init: HookPointCfg {
                 filter: BehaviorFilter::All,
                 pull_msg: PullMsgPolicy::None,
@@ -287,6 +309,28 @@ impl Default for SessionDriverCfg {
                 pull_event: PullEventPolicy::None,
                 load_background_hits: LoadBackgroundHintsPolicy::None,
             },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TaskFeedbackCfg {
+    pub enabled: bool,
+    pub complete_on_end: bool,
+    pub fail_on_error: bool,
+    pub cancel_on_interrupt: bool,
+    pub create_human_input_on_wait: bool,
+}
+
+impl Default for TaskFeedbackCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            complete_on_end: true,
+            fail_on_error: true,
+            cancel_on_interrupt: true,
+            create_human_input_on_wait: true,
         }
     }
 }
