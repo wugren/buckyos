@@ -247,7 +247,7 @@ pub async fn start_workflow_service() -> Result<()> {
 
 fn start_schedule_loop(rpc: Arc<WorkflowRpcHandler>) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             ticker.tick().await;
             rpc.scan_due_schedules().await;

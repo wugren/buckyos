@@ -64,6 +64,15 @@ pub enum WorkflowScheduledTaskSchedule {
         #[serde(default)]
         timezone: Option<String>,
     },
+    RunEvery {
+        every_sec: u64,
+        #[serde(default)]
+        start_at: Option<i64>,
+        #[serde(default)]
+        end_at: Option<i64>,
+        #[serde(default)]
+        timezone: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

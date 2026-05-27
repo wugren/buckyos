@@ -78,11 +78,17 @@ pub const TOOL_UPDATE_SESSION_TOPIC: &str = "update_session_topic";
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CreateWorksessionArgs {
     /// Short label for the new work session (≤ 80 chars; informational).
+    #[serde(default)]
     pub title: String,
     /// Goal / task statement. Surfaced into the system prompt of the new
-    /// session. Required — a worksession without an objective wouldn't
-    /// know what to do.
+    /// session. Required unless `task_id` points at a Task whose data can
+    /// supply the objective.
+    #[serde(default)]
     pub objective: String,
+    /// Existing TaskManager task to bind. When set, title/objective/workspace
+    /// may be derived from the task data.
+    #[serde(default)]
+    pub task_id: Option<i64>,
     /// Reuse an existing workspace by id. Empty / absent ⇒ mint a fresh
     /// workspace bound to the new session.
     #[serde(default)]
@@ -95,6 +101,8 @@ pub struct CreateWorksessionArgs {
     /// new session's `readme.md` for audit / debugging.
     #[serde(default)]
     pub reason_message: Vec<String>,
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
 }
 
 /// Tool output — same shape returned to the calling LLM as JSON.
@@ -111,6 +119,7 @@ pub struct CreateWorksessionOutput {
     pub status: String,
     pub worker_status: String,
     pub auto_started: bool,
+    pub task_id: Option<i64>,
     pub followup_routing: WorksessionFollowupRouting,
 }
 
@@ -238,7 +247,7 @@ impl TypedTool for CreateWorksessionTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new work session bound to a workspace and start its worker. Returns the new session id."
+        "Create a new work session bound to a workspace. Set auto_start=false to create it without running the first turn."
     }
 
     fn calling(&self) -> CallingConventions {
@@ -263,19 +272,33 @@ impl TypedTool for CreateWorksessionTool {
         {
             parts.push(format!("behavior={behavior}"));
         }
+        if !args.auto_start {
+            parts.push("auto_start=false".to_string());
+        }
         Some(parts.join(" "))
     }
 
     fn build_summary(&self, output: &Self::Output) -> String {
-        format!(
-            "created and started worksession {} titled `{}` on workspace {} ({}) with behavior {}. Future user follow-up for this task must be forwarded automatically with forward_msg target_worksession_id={}",
-            output.session_id,
-            output.title,
-            output.workspace_id,
-            output.workspace_status,
-            output.behavior,
-            output.session_id
-        )
+        if output.auto_started {
+            format!(
+                "created and started worksession {} titled `{}` on workspace {} ({}) with behavior {}. Future user follow-up for this task must be forwarded automatically with forward_msg target_worksession_id={}",
+                output.session_id,
+                output.title,
+                output.workspace_id,
+                output.workspace_status,
+                output.behavior,
+                output.session_id
+            )
+        } else {
+            format!(
+                "created idle worksession {} titled `{}` on workspace {} ({}) with behavior {}. Start or forward follow-up only when this task should run.",
+                output.session_id,
+                output.title,
+                output.workspace_id,
+                output.workspace_status,
+                output.behavior
+            )
+        }
     }
 
     fn build_title(&self, output: &Self::Output) -> Option<String> {
@@ -303,10 +326,19 @@ impl TypedTool for CreateWorksessionTool {
                 created_by_session_id: self.source_session_id.clone(),
                 reason_messages: args.reason_message,
                 task_binding: None,
+                task_id: args.task_id,
+                auto_start: args.auto_start,
+                bind_task: true,
             })
             .await
             .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-        let followup_routing = worksession_followup_routing(&outcome.session_id);
+        let followup_routing =
+            worksession_followup_routing(&outcome.session_id, outcome.auto_started);
+        let worker_status = if outcome.auto_started {
+            "started"
+        } else {
+            "idle"
+        };
         Ok(CreateWorksessionOutput {
             session_id: outcome.session_id,
             title: outcome.title,
@@ -314,11 +346,16 @@ impl TypedTool for CreateWorksessionTool {
             workspace_status: outcome.workspace_status,
             behavior: outcome.behavior,
             status: "created".to_string(),
-            worker_status: "started".to_string(),
-            auto_started: true,
+            worker_status: worker_status.to_string(),
+            auto_started: outcome.auto_started,
+            task_id: outcome.task_id,
             followup_routing,
         })
     }
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 /// `forward_msg` arguments.
@@ -756,6 +793,9 @@ impl TypedTool for TryCreateWorksessionTool {
         )
         .await;
         Ok(match (created, output) {
+            (Some(created), ContextOutput::Json { content }) => {
+                merge_created_worksession_output(created, content)
+            }
             (Some(created), _) => created,
             (None, ContextOutput::Json { content }) => content,
             (None, ContextOutput::Text { content }) => parse_jsonish_text(&content)
@@ -846,19 +886,63 @@ async fn created_worksession_output_from_diff(
             "status": "created",
             "worker_status": "started",
             "auto_started": true,
-            "followup_routing": worksession_followup_routing(&summary.session_id),
+            "followup_routing": worksession_followup_routing(&summary.session_id, true),
         }));
     }
     None
 }
 
-fn worksession_followup_routing(session_id: &str) -> WorksessionFollowupRouting {
+fn merge_created_worksession_output(
+    mut detected: serde_json::Value,
+    sub_output: serde_json::Value,
+) -> serde_json::Value {
+    let Some(auto_started) = sub_output
+        .get("auto_started")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        return detected;
+    };
+    if let Some(map) = detected.as_object_mut() {
+        map.insert(
+            "auto_started".to_string(),
+            serde_json::Value::Bool(auto_started),
+        );
+        map.insert(
+            "worker_status".to_string(),
+            serde_json::Value::String(if auto_started { "started" } else { "idle" }.to_string()),
+        );
+        if let Some(session_id) = map
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            map.insert(
+                "followup_routing".to_string(),
+                serde_json::to_value(worksession_followup_routing(&session_id, auto_started))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    detected
+}
+
+fn worksession_followup_routing(
+    session_id: &str,
+    auto_started: bool,
+) -> WorksessionFollowupRouting {
+    let instruction = if auto_started {
+        format!(
+            "The worksession has already started. Future user follow-up information for this task must be forwarded automatically with forward_msg target_worksession_id={session_id}."
+        )
+    } else {
+        format!(
+            "The worksession was created idle. Forward user follow-up with forward_msg target_worksession_id={session_id} only when this task should run."
+        )
+    };
     WorksessionFollowupRouting {
         tool: TOOL_FORWARD_MSG.to_string(),
         target_worksession_id: session_id.to_string(),
-        instruction: format!(
-            "The worksession has already started. Future user follow-up information for this task must be forwarded automatically with forward_msg target_worksession_id={session_id}."
-        ),
+        instruction,
     }
 }
 
@@ -944,6 +1028,8 @@ fn render_sub_system_prompt(
          - Otherwise create a worksession.\n\n\
          Step 2: if creating, decide whether to reuse an existing workspace or \
          create a fresh workspace. Then call `create_worksession` exactly once with:\n   \
+            - `task_id`: set only when an existing TaskManager task should own \
+              this worksession; otherwise omit it\n   \
             - `title`: short label you synthesize\n   \
             - `objective`: the work to do, in your own words\n   \
             - `workspace_id`: empty to mint a new workspace, or the id of an \
@@ -951,7 +1037,9 @@ fn render_sub_system_prompt(
             - `behavior`: empty to use the agent's default, override only when \
               you have a strong reason\n   \
             - `reason_message`: 0–3 verbatim user messages from the inherited \
-              parent recent history that explain why this worksession is needed\n\
+              parent recent history that explain why this worksession is needed\n   \
+            - `auto_start`: false only when the session should be created for \
+              later use without running its first turn; otherwise true\n\
          After `create_worksession` returns, return JSON only with the final \
          worksession information from the tool result. ",
     );
@@ -1190,6 +1278,29 @@ mod tests {
     }
 
     #[test]
+    fn create_worksession_auto_start_defaults_to_true() {
+        let args: CreateWorksessionArgs = serde_json::from_value(serde_json::json!({
+            "title": "Task",
+            "objective": "Do the task"
+        }))
+        .expect("args");
+
+        assert!(args.auto_start);
+    }
+
+    #[test]
+    fn create_worksession_accepts_auto_start_false() {
+        let args: CreateWorksessionArgs = serde_json::from_value(serde_json::json!({
+            "title": "Task",
+            "objective": "Do the task",
+            "auto_start": false
+        }))
+        .expect("args");
+
+        assert!(!args.auto_start);
+    }
+
+    #[test]
     fn try_create_summary_tells_parent_session_work_started_and_how_to_route_followups() {
         let tool = TryCreateWorksessionTool::new(Weak::new(), "ui-session");
         let output = serde_json::json!({
@@ -1198,7 +1309,7 @@ mod tests {
             "status": "created",
             "worker_status": "started",
             "auto_started": true,
-            "followup_routing": worksession_followup_routing("work-1"),
+            "followup_routing": worksession_followup_routing("work-1", true),
         });
 
         let summary = tool.build_summary(&output);
@@ -1206,6 +1317,38 @@ mod tests {
         assert!(summary.contains("created and started worksession work-1"));
         assert!(summary.contains("Future user follow-up"));
         assert!(summary.contains("forward_msg target_worksession_id=work-1"));
+    }
+
+    #[test]
+    fn created_worksession_diff_output_preserves_idle_auto_start() {
+        let detected = serde_json::json!({
+            "session_id": "work-1",
+            "worker_status": "started",
+            "auto_started": true,
+            "followup_routing": worksession_followup_routing("work-1", true),
+        });
+        let sub_output = serde_json::json!({
+            "session_id": "work-1",
+            "worker_status": "idle",
+            "auto_started": false,
+            "followup_routing": worksession_followup_routing("work-1", false),
+        });
+
+        let merged = merge_created_worksession_output(detected, sub_output);
+
+        assert_eq!(
+            merged.get("auto_started").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            merged.get("worker_status").and_then(|v| v.as_str()),
+            Some("idle")
+        );
+        assert!(merged
+            .pointer("/followup_routing/instruction")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("created idle"));
     }
 
     fn summary(

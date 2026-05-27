@@ -892,10 +892,14 @@ impl WorkflowRpcHandler {
         let normalized_expr = match &schedule {
             ScheduleSpec::Cron { expr, .. } => Some(expr.clone()),
             ScheduleSpec::Once { .. } => None,
+            ScheduleSpec::RunEvery { .. } => None,
         };
         let timezone = match &schedule {
             ScheduleSpec::Cron { timezone, .. } => timezone.clone(),
             ScheduleSpec::Once { timezone, .. } => timezone.clone().unwrap_or_else(|| "UTC".into()),
+            ScheduleSpec::RunEvery { timezone, .. } => {
+                timezone.clone().unwrap_or_else(|| "UTC".into())
+            }
         };
         Ok(json!({
             "ok": true,
@@ -971,21 +975,31 @@ impl WorkflowRpcHandler {
         }
 
         let active = self.active_schedule_runs(&schedule.schedule_id).await;
-        if active >= schedule.policy.max_parallel_runs {
-            let _ = self
+        if active > 0 {
+            let completed = self
                 .schedules
                 .complete_fire(
                     &fire.fire_id,
                     FireStatus::Skipped,
                     None,
-                    Some("max_parallel_runs_reached".to_string()),
+                    Some("previous_run_still_active".to_string()),
                 )
+                .await
+                .unwrap_or(fire);
+            let updated = self
+                .schedules
+                .update(&schedule.schedule_id, |record| {
+                    record.state.last_fire_at = Some(fire_time);
+                    record.state.last_error = Some("previous_run_still_active".to_string());
+                    if !manual {
+                        record.state.next_fire_at = next_fire_after(&record.schedule, fire_time);
+                    }
+                })
                 .await;
-            return Err(json!({
-                "ok": false,
-                "error": "max_parallel_runs_reached",
-                "schedule_id": schedule_id,
-            }));
+            if let Some(record) = updated.as_ref() {
+                self.update_scheduled_task_root_task(record).await;
+            }
+            return Ok(completed);
         }
 
         match &schedule.target {
@@ -1078,7 +1092,7 @@ impl WorkflowRpcHandler {
                             record.state.next_fire_at = None;
                         } else if !manual {
                             record.state.next_fire_at =
-                                next_fire_after(&record.schedule, Utc::now().timestamp());
+                                next_fire_after(&record.schedule, fire_time);
                         }
                     })
                     .await;
@@ -1140,6 +1154,7 @@ impl WorkflowRpcHandler {
                     crate::RunStatus::Completed
                         | crate::RunStatus::Failed
                         | crate::RunStatus::Aborted
+                        | crate::RunStatus::BudgetExhausted
                 )
             {
                 count += 1;
@@ -1306,6 +1321,7 @@ fn schedule_trigger_context(schedule: &WorkflowSchedule, fire_time: i64, manual:
     let (cron, timezone) = match &schedule.schedule {
         ScheduleSpec::Cron { expr, timezone, .. } => (Some(expr.clone()), Some(timezone.clone())),
         ScheduleSpec::Once { timezone, .. } => (None, timezone.clone()),
+        ScheduleSpec::RunEvery { timezone, .. } => (None, timezone.clone()),
     };
     json!({
         "kind": "schedule",
@@ -1620,6 +1636,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_scheduled_task_accepts_run_every_seconds() {
+        let handler = make_handler();
+        let resp = handler
+            .handle_rpc_call(
+                make_req(
+                    "validate_scheduled_task",
+                    json!({
+                        "schedule": {
+                            "kind": "run_every",
+                            "every_sec": 5,
+                            "start_at": Utc::now().timestamp()
+                        }
+                    }),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .expect("dispatch ok");
+        let value = match resp.result {
+            RPCResult::Success(v) => v,
+            RPCResult::Failed(err) => panic!("validate failed: {:?}", err),
+        };
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["normalized_expr"], Value::Null);
+        assert_eq!(value["next_fire_times"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn create_pause_resume_archive_scheduled_task_roundtrip() {
         let handler = make_handler();
         let submit = handler
@@ -1754,5 +1798,81 @@ mod tests {
             RPCResult::Failed(err) => panic!("second run_now failed: {:?}", err),
         };
         assert_eq!(second_value["fire"]["run_id"], first_run_id);
+    }
+
+    #[tokio::test]
+    async fn run_every_skips_fire_when_previous_run_is_active() {
+        let handler = make_handler();
+        let submit = handler
+            .handle_rpc_call(
+                make_req(
+                    "submit_definition",
+                    json!({
+                        "owner": {"user_id": "u", "app_id": "a"},
+                        "definition": sample_human_definition_value(),
+                    }),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let workflow_id = match submit.result {
+            RPCResult::Success(v) => v["workflow_id"].as_str().unwrap().to_string(),
+            RPCResult::Failed(err) => panic!("submit failed: {:?}", err),
+        };
+        let first_fire_time = Utc::now().timestamp() - 10;
+        let create = handler
+            .handle_rpc_call(
+                make_req(
+                    "create_scheduled_task",
+                    json!({
+                        "owner": {"user_id": "u", "app_id": "a"},
+                        "name": "fast-loop",
+                        "schedule": {
+                            "kind": "run_every",
+                            "every_sec": 5,
+                            "start_at": first_fire_time
+                        },
+                        "target": {"kind": "workflow.run", "workflow_id": workflow_id, "input": {"x": 1}},
+                    }),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let schedule_id = match create.result {
+            RPCResult::Success(v) => v["schedule_id"].as_str().unwrap().to_string(),
+            RPCResult::Failed(err) => panic!("create schedule failed: {:?}", err),
+        };
+        handler
+            .schedules
+            .update(&schedule_id, |record| {
+                record.state.next_fire_at = Some(first_fire_time);
+            })
+            .await;
+
+        handler.scan_due_schedules().await;
+        handler.scan_due_schedules().await;
+
+        let history = handler
+            .handle_rpc_call(
+                make_req(
+                    "get_scheduled_task_history",
+                    json!({"schedule_id": schedule_id, "limit": 10}),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let value = match history.result {
+            RPCResult::Success(v) => v,
+            RPCResult::Failed(err) => panic!("history failed: {:?}", err),
+        };
+        let fires = value["fires"].as_array().unwrap();
+        assert!(fires.iter().any(|fire| fire["status"] == "run_created"));
+        assert!(fires.iter().any(|fire| fire["status"] == "skipped"));
+
+        let schedule = handler.schedules.get(&schedule_id).await.unwrap();
+        assert_eq!(schedule.state.next_fire_at, Some(first_fire_time + 10));
     }
 }

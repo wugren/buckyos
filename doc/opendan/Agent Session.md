@@ -51,8 +51,15 @@ LLM 推理循环、tool dispatch、step 记录和 resume 逻辑,而是:
 > 默认 driver 由 [`default_self_check_driver` / `default_self_improve_driver`](../../src/frame/opendan/src/agent_config.rs)
 > 提供。
 
-Work Session 创建后会写入 `title`、`objective`、`workspace_id`,并在 worker 空闲且没有 pending input 时触发一次
-bootstrap turn。这个首轮输入来自 `objective`,不是一条 `PendingInput::Msg`。
+Work Session 创建后会写入 `title`、`objective`、`workspace_id` 和可选的
+`task_binding`，并在 worker 空闲且没有 pending input 时触发一次 bootstrap turn。这个首轮输入来自
+`objective`,不是一条 `PendingInput::Msg`。
+
+TaskMgr 绑定规则：
+
+- 通过 `task_id` 创建 Work Session 时，`title` / `objective` / `workspace_id` 可以从 Task data 回填。
+- 未指定 `task_id` 时，OpenDAN 会自动创建一个 `agent.delegate` Task 并写入 `task_binding`。
+- WorkSession 状态变化会同步到 Task；TaskMgr 侧将 Task 置为 `Paused` / `Canceled` 时，会反向中断对应 WorkSession。
 
 TODO:
 

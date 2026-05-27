@@ -8,12 +8,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::agent::{AIAgent, CreateWorkSessionParams};
-use crate::session_model::{AgentTaskBinding, PendingInput};
+use crate::session_model::{InterruptMode, PendingInput};
 
 pub const TASK_TYPE_AGENT_DELEGATE: &str = "agent.delegate";
 pub const TASK_TYPE_HUMAN_INPUT: &str = "human.input";
-
-const DEFAULT_HUMAN_INPUT_KIND: &str = "agent_wait_user_msg";
+const TASK_ROUTE_BEHAVIOR: &str = "task_route";
 
 impl AIAgent {
     pub fn task_executor_runner_id(&self) -> String {
@@ -110,6 +109,8 @@ impl AIAgent {
             TaskStatus::Pending,
             TaskStatus::WaitingForApproval,
             TaskStatus::Running,
+            TaskStatus::Paused,
+            TaskStatus::Canceled,
         ] {
             let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
                 return;
@@ -142,11 +143,21 @@ impl AIAgent {
     }
 
     async fn process_agent_delegate_task(self: Arc<Self>, task: Task) -> Result<()> {
+        if task.status == TaskStatus::Canceled {
+            return self
+                .reflect_task_control_to_session(task, "canceled", InterruptMode::Discard)
+                .await;
+        }
         if task.status.is_terminal() {
             return Ok(());
         }
         if task.runner != self.task_executor_runner_id() {
             return Ok(());
+        }
+        if task.status == TaskStatus::Paused {
+            return self
+                .reflect_task_control_to_session(task, "paused", InterruptMode::Discard)
+                .await;
         }
         if task.status == TaskStatus::WaitingForApproval
             && !self.clone().resume_waiting_delegate_task(&task).await?
@@ -160,23 +171,22 @@ impl AIAgent {
             session.wake().await;
             return Ok(());
         }
-
-        let route = resolve_route(&task)?;
-        if route.needs_human_input {
-            self.clone()
-                .create_human_input_task(
-                    &task,
-                    route
-                        .question
-                        .as_deref()
-                        .unwrap_or("Please provide the missing task input."),
-                    route.kind.as_deref().unwrap_or(DEFAULT_HUMAN_INPUT_KIND),
-                    route.candidates,
-                )
-                .await?;
+        if let Some(session_id) = route_session_id(&data) {
+            let session = self.clone().ensure_session(&session_id).await?;
+            session.wake().await;
             return Ok(());
         }
 
+        if task_data_supports_direct_worksession(&task.data) {
+            self.clone().create_worksession_by_task_id(task).await?;
+            return Ok(());
+        }
+
+        self.clone().start_task_route_session(task).await?;
+        Ok(())
+    }
+
+    async fn create_worksession_by_task_id(self: Arc<Self>, task: Task) -> Result<()> {
         let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
             return Err(anyhow!("task manager unavailable"));
         };
@@ -185,62 +195,84 @@ impl AIAgent {
                 task.id,
                 Some(TaskStatus::Running),
                 Some(5.0),
-                Some("Creating agent session".to_string()),
+                Some("Creating agent session from task data".to_string()),
                 Some(json!({
                     "agent_delegate": {
-                        "route": route.data,
+                        "route": {
+                            "status": "direct",
+                            "strategy": "create_worksession_by_taskid"
+                        }
                     }
                 })),
             )
             .await?;
 
-        let purpose = delegate_string(&task.data, "purpose")
-            .or_else(|| {
-                task.data
-                    .pointer("/agent_delegate/input/text")
+        self.clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: String::new(),
+                objective: String::new(),
+                workspace_id: direct_task_workspace_id(&task.data),
+                behavior: task
+                    .data
+                    .pointer("/agent_delegate/execution/behavior")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
+                    .map(str::to_string),
+                created_by_session_id: delegate_string(&task.data, "owner_session_id")
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("task-{}", task.id)),
+                reason_messages: vec![format!(
+                    "agent.delegate task {} used direct task_id worksession creation",
+                    task.id
+                )],
+                task_binding: None,
+                task_id: Some(task.id),
+                auto_start: true,
+                bind_task: true,
             })
-            .unwrap_or_else(|| task.name.clone());
-        let title = task
-            .data
-            .pointer("/agent_delegate/title")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| task.name.clone());
-        let owner_session_id = delegate_string(&task.data, "owner_session_id")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| format!("task-{}", task.id));
-        let behavior = task
-            .data
-            .pointer("/agent_delegate/execution/behavior")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+            .await?;
+        Ok(())
+    }
 
-        let binding = AgentTaskBinding {
-            task_id: task.id,
-            root_task_id: task.root_id.parse::<i64>().unwrap_or(task.id),
-            root_id: task.root_id.clone(),
-            task_type: task.task_type.clone(),
-            runner: task.runner.clone(),
-            task_name: task.name.clone(),
-            user_id: task.user_id.clone(),
-            app_id: task.app_id.clone(),
-            parent_id: task.parent_id,
+    async fn start_task_route_session(self: Arc<Self>, task: Task) -> Result<()> {
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return Err(anyhow!("task manager unavailable"));
         };
+        task_mgr
+            .update_task(
+                task.id,
+                Some(TaskStatus::Running),
+                Some(3.0),
+                Some("Routing task with task_route session".to_string()),
+                Some(json!({
+                    "agent_delegate": {
+                        "route": {
+                            "status": "routing",
+                            "strategy": "task_route"
+                        }
+                    }
+                })),
+            )
+            .await?;
+
+        let objective = render_task_route_objective(&task)?;
         let outcome = self
             .clone()
             .create_work_session(CreateWorkSessionParams {
-                title,
-                objective: purpose,
-                workspace_id: route.workspace_id.clone(),
-                behavior,
-                created_by_session_id: owner_session_id,
+                title: format!("Route task {}", task.id),
+                objective,
+                workspace_id: None,
+                behavior: Some(TASK_ROUTE_BEHAVIOR.to_string()),
+                created_by_session_id: delegate_string(&task.data, "owner_session_id")
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("task-{}", task.id)),
                 reason_messages: vec![format!(
-                    "agent.delegate task {} assigned to runner {}",
-                    task.id, task.runner
+                    "agent.delegate task {} requires task_route before worksession creation",
+                    task.id
                 )],
-                task_binding: Some(binding),
+                task_binding: None,
+                task_id: None,
+                auto_start: true,
+                bind_task: false,
             })
             .await?;
 
@@ -248,17 +280,81 @@ impl AIAgent {
             .update_task(
                 task.id,
                 Some(TaskStatus::Running),
-                Some(10.0),
-                Some("Agent session started".to_string()),
+                Some(5.0),
+                Some("Task route session started".to_string()),
                 Some(json!({
                     "agent_delegate": {
-                        "route": merge_route_session(route.data, &outcome.session_id, &outcome.workspace_id),
-                        "execution": {
+                        "route": {
+                            "status": "routing",
+                            "strategy": "task_route",
                             "session_id": outcome.session_id,
                             "workspace_id": outcome.workspace_id,
-                            "workspace_status": outcome.workspace_status,
-                            "behavior": outcome.behavior,
-                            "runner": self.task_executor_runner_id(),
+                            "behavior": outcome.behavior
+                        }
+                    }
+                })),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn reflect_task_control_to_session(
+        self: Arc<Self>,
+        task: Task,
+        status: &'static str,
+        mode: InterruptMode,
+    ) -> Result<()> {
+        if task.runner != self.task_executor_runner_id() {
+            return Ok(());
+        }
+        if task_control_already_reflected(&task.data, status) {
+            return Ok(());
+        }
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return Err(anyhow!("task manager unavailable"));
+        };
+        let Some(session_id) = execution_session_id(&task.data) else {
+            task_mgr
+                .update_task(
+                    task.id,
+                    Some(task.status),
+                    Some(task.progress),
+                    Some(format!("Agent task {status} before session start")),
+                    Some(json!({
+                        "agent_delegate": {
+                            "execution": {
+                                "status": status,
+                                "control_observed_at_ms": now_ms(),
+                            }
+                        }
+                    })),
+                )
+                .await?;
+            return Ok(());
+        };
+        if let Ok(session) = self.clone().ensure_session(&session_id).await {
+            if let Err(err) = session.interrupt(mode).await {
+                warn!(
+                    "opendan.task_executor[{}]: interrupt session {} for task {} {} failed: {err:#}",
+                    self.agent_name, session_id, task.id, status
+                );
+            }
+        }
+        task_mgr
+            .update_task(
+                task.id,
+                Some(task.status),
+                Some(task.progress),
+                Some(format!("Agent session {status} by task manager")),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": session_id,
+                            "status": status,
+                            "control": {
+                                "status": status,
+                                "observed_at_ms": now_ms(),
+                            }
                         }
                     }
                 })),
@@ -422,76 +518,6 @@ impl AIAgent {
     }
 }
 
-struct RouteResolution {
-    data: Value,
-    workspace_id: Option<String>,
-    needs_human_input: bool,
-    question: Option<String>,
-    kind: Option<String>,
-    candidates: Vec<Value>,
-}
-
-fn resolve_route(task: &Task) -> Result<RouteResolution> {
-    let existing = task.data.pointer("/agent_delegate/route");
-    if existing
-        .and_then(|value| value.get("status"))
-        .and_then(Value::as_str)
-        == Some("need_human_input")
-    {
-        return Ok(RouteResolution {
-            data: existing.cloned().unwrap_or_else(|| json!({})),
-            workspace_id: None,
-            needs_human_input: true,
-            question: existing
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            kind: Some("select_workspace".to_string()),
-            candidates: Vec::new(),
-        });
-    }
-
-    let hints = task
-        .data
-        .pointer("/agent_delegate/workspace_hints")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if hints.len() > 1 {
-        return Ok(RouteResolution {
-            data: json!({
-                "status": "need_human_input",
-                "reason": "workspace_ambiguous",
-                "candidates": hints.clone(),
-            }),
-            workspace_id: None,
-            needs_human_input: true,
-            question: Some("Please select the workspace for this delegated task.".to_string()),
-            kind: Some("select_workspace".to_string()),
-            candidates: hints,
-        });
-    }
-    let workspace_id = hints.first().and_then(workspace_id_from_hint);
-    Ok(RouteResolution {
-        data: json!({
-            "status": "resolved",
-            "workspace_id": workspace_id.clone(),
-            "confidence": if workspace_id.is_some() { 0.85 } else { 0.5 },
-            "evidence": if workspace_id.is_some() {
-                vec!["matched workspace_hints"]
-            } else {
-                vec!["no workspace hint; create headless workspace"]
-            },
-            "requires_confirmation": false,
-        }),
-        workspace_id,
-        needs_human_input: false,
-        question: None,
-        kind: None,
-        candidates: Vec::new(),
-    })
-}
-
 fn workspace_id_from_hint(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -503,20 +529,6 @@ fn workspace_id_from_hint(value: &Value) -> Option<String> {
                 .map(str::to_string)
         })
         .or_else(|| value.get("id").and_then(Value::as_str).map(str::to_string))
-}
-
-fn merge_route_session(mut route: Value, session_id: &str, workspace_id: &str) -> Value {
-    if let Value::Object(map) = &mut route {
-        map.insert(
-            "target_session_id".to_string(),
-            Value::String(session_id.to_string()),
-        );
-        map.insert(
-            "workspace_id".to_string(),
-            Value::String(workspace_id.to_string()),
-        );
-    }
-    route
 }
 
 fn delegate_string(data: &Value, key: &str) -> Option<String> {
@@ -531,6 +543,98 @@ fn execution_session_id(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn route_session_id(data: &Value) -> Option<String> {
+    data.pointer("/agent_delegate/route/session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn task_data_supports_direct_worksession(data: &Value) -> bool {
+    let Some(delegate) = data.get("agent_delegate").and_then(Value::as_object) else {
+        return false;
+    };
+    let objective = delegate
+        .get("purpose")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            data.pointer("/agent_delegate/input/text")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if objective.is_none() {
+        return false;
+    }
+    let hints = data
+        .pointer("/agent_delegate/workspace_hints")
+        .and_then(Value::as_array);
+    if hints.map(|values| values.len()).unwrap_or(0) > 1 {
+        return false;
+    }
+    true
+}
+
+fn direct_task_workspace_id(data: &Value) -> Option<String> {
+    data.pointer("/agent_delegate/route/workspace_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            data.pointer("/agent_delegate/execution/workspace_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            data.pointer("/agent_delegate/workspace_id")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            data.pointer("/agent_delegate/workspace_hints")
+                .and_then(Value::as_array)
+                .and_then(|hints| {
+                    if hints.len() == 1 {
+                        hints.first().and_then(workspace_id_from_hint)
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
+fn render_task_route_objective(task: &Task) -> Result<String> {
+    let data = serde_json::to_string_pretty(&task.data)?;
+    Ok(format!(
+        "Route TaskManager task `{}` for OpenDAN execution.\n\n\
+         Task facts:\n\
+         - task_id: {}\n\
+         - task_name: {}\n\
+         - task_type: {}\n\
+         - runner: {}\n\
+         - user_id: {}\n\
+         - app_id: {}\n\n\
+         Task data:\n{}\n\n\
+         Decide the workspace/session route, then create the business WorkSession by calling `create_worksession` with `task_id: {}`. \
+         Do not perform the business task in this route session.",
+        task.id, task.id, task.name, task.task_type, task.runner, task.user_id, task.app_id, data, task.id
+    ))
+}
+
+fn task_control_already_reflected(data: &Value, status: &str) -> bool {
+    data.pointer("/agent_delegate/execution/status")
+        .and_then(Value::as_str)
+        .map(|value| value == status)
+        .unwrap_or(false)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn human_input_response_text(data: &Value) -> Option<String> {
@@ -587,33 +691,46 @@ mod tests {
     }
 
     #[test]
-    fn route_uses_single_workspace_hint() {
-        let route = resolve_route(&task(json!({
+    fn direct_schema_uses_single_workspace_hint() {
+        let task = task(json!({
             "agent_delegate": {
+                "purpose": "Do the task",
                 "workspace_hints": [{"workspace_id": "buckyos"}]
             }
-        })))
-        .unwrap();
-        assert_eq!(route.workspace_id.as_deref(), Some("buckyos"));
-        assert!(!route.needs_human_input);
+        }));
+        assert!(task_data_supports_direct_worksession(&task.data));
         assert_eq!(
-            route.data.get("status").and_then(Value::as_str),
-            Some("resolved")
+            direct_task_workspace_id(&task.data).as_deref(),
+            Some("buckyos")
         );
     }
 
     #[test]
-    fn route_requires_human_input_for_ambiguous_workspace() {
-        let route = resolve_route(&task(json!({
+    fn ambiguous_workspace_hints_use_task_route() {
+        let task = task(json!({
             "agent_delegate": {
+                "purpose": "Do the task",
                 "workspace_hints": ["a", "b"]
             }
-        })))
-        .unwrap();
-        assert!(route.needs_human_input);
-        assert_eq!(
-            route.data.get("reason").and_then(Value::as_str),
-            Some("workspace_ambiguous")
-        );
+        }));
+        assert!(!task_data_supports_direct_worksession(&task.data));
+    }
+
+    #[test]
+    fn unrecognized_task_data_uses_task_route() {
+        let task = task(json!({
+            "input": "free-form task"
+        }));
+        assert!(!task_data_supports_direct_worksession(&task.data));
+    }
+
+    #[test]
+    fn task_route_objective_instructs_create_by_task_id() {
+        let task = task(json!({
+            "input": "free-form task"
+        }));
+        let objective = render_task_route_objective(&task).expect("objective");
+        assert!(objective.contains("task_id: 7"));
+        assert!(objective.contains("`create_worksession` with `task_id: 7`"));
     }
 }

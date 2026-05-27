@@ -56,12 +56,18 @@ OpenDAN 里的 Agent Tool 在工程上由 `agent_tool` crate 的 `AgentToolManag
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `create_worksession` | 全参数版本：直接创建一个新的 Work session，绑 workspace、起 worker | `title`、`objective`、`workspace_id`（可选）、`behavior`（可选）、`reason_message`（可选，列表，写进 readme 留痕） |
+| `create_worksession` | 全参数版本：直接创建一个新的 Work session，绑 workspace，并绑定 TaskMgr Task；默认起 worker 执行首轮，也可只创建不执行 | `task_id`（可选，指定已有 Task 时可从 Task data 回填 `title` / `objective` / `workspace_id`）、`title`、`objective`、`workspace_id`（可选）、`behavior`（可选）、`reason_message`（可选，列表，写进 readme 留痕）、`auto_start`（可选，默认 `true`） |
 | `forward_msg` | 把本轮 origin user message（或 LLM 显式指定的文本）转发到另一个 worksession 的 pending 输入队列 | `target_worksession_id`、`message`（可选，省略时从 session 的 `current_origin_user_message()` 自动取） |
 | `try_create_worksession` | UI session 专用：fork 出一个短任务子上下文，让子 LLM 决定要不要建——它内部会调用 `create_worksession`；最终结果作为 JSON 透传给父 LLM | `reason`（自由文本说明） |
 
 三者都需要持有 `Weak<AIAgent>` 才能调 `create_work_session` / `forward_message` / `fork_and_run`，且 `source_session_id` 决定调用者身份和审计字段。
 > try_create_worksession 和 forward_msg 是UISession的核心路由Function , create_worksession 只在try_create_worksession启动的旁路llm_context中注册
+
+`create_worksession` 的 Task 绑定规则：
+
+- 调用时传入 `task_id`：直接绑定该 Task，并按顺序从 `data.agent_delegate.title` / `data.title`、`data.agent_delegate.purpose` / `data.agent_delegate.input.text` / `data.objective`、`data.agent_delegate.route.workspace_id` / `data.agent_delegate.execution.workspace_id` 回填缺省字段。
+- 调用时不传 `task_id`：自动创建一个 `agent.delegate` Task，`data.agent_delegate.execution.session_id` 指向新 WorkSession。
+- WorkSession 后续状态变化会写回 Task 的 `status` 和 `data.agent_delegate.execution`；TaskMgr 将 Task 改为 `Paused` / `Canceled` 时，AgentRuntime 轮询到后会中断对应 WorkSession。
 
 ### 3.3 关于 Action 集合
 

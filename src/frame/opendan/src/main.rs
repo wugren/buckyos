@@ -66,6 +66,7 @@ struct RootfsSyncEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct WorkSessionQuickTestSpec {
+    task_id: Option<i64>,
     title: String,
     objective: String,
     workspace_id: Option<String>,
@@ -73,17 +74,20 @@ struct WorkSessionQuickTestSpec {
     created_by_session_id: String,
     #[serde(alias = "reason_message")]
     reason_messages: Vec<String>,
+    auto_start: bool,
 }
 
 impl Default for WorkSessionQuickTestSpec {
     fn default() -> Self {
         Self {
+            task_id: None,
             title: String::new(),
             objective: String::new(),
             workspace_id: None,
             behavior: None,
             created_by_session_id: "worksession-test".to_string(),
             reason_messages: Vec::new(),
+            auto_start: true,
         }
     }
 }
@@ -98,6 +102,9 @@ impl WorkSessionQuickTestSpec {
             created_by_session_id: self.created_by_session_id,
             reason_messages: self.reason_messages,
             task_binding: None,
+            task_id: self.task_id,
+            auto_start: self.auto_start,
+            bind_task: true,
         }
     }
 }

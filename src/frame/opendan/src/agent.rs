@@ -24,7 +24,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use buckyos_api::{AiMessage, AiRole, TimerOptions};
+use buckyos_api::{
+    get_buckyos_api_runtime, AiMessage, AiRole, CreateTaskOptions, Task, TimerOptions,
+};
 use chrono::{Local, Utc};
 use log::{info, warn};
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -32,6 +34,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use crate::agent_bash::{build_session_tools, SessionBinLayout, SessionToolsBuild};
 use crate::agent_config::AgentConfig;
 use crate::agent_session::{AgentSession, AgentSessionBuild, SessionReply};
+use crate::agent_task_executor::TASK_TYPE_AGENT_DELEGATE;
 use crate::ai_runtime::AgentRuntime;
 use crate::contact::ContactLookup;
 use crate::dispatch::{
@@ -1550,14 +1553,48 @@ impl AIAgent {
         params: CreateWorkSessionParams,
     ) -> Result<CreateWorkSessionOutcome> {
         let CreateWorkSessionParams {
-            title,
-            objective,
-            workspace_id,
+            mut title,
+            mut objective,
+            mut workspace_id,
             behavior,
             created_by_session_id,
-            reason_messages,
-            task_binding,
+            mut reason_messages,
+            mut task_binding,
+            task_id,
+            auto_start,
+            bind_task,
         } = params;
+        if let Some(task_id) = task_id {
+            let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+                return Err(anyhow!(
+                    "create_work_session: task_id was specified but task manager is unavailable"
+                ));
+            };
+            let task = client
+                .get_task(task_id)
+                .await
+                .map_err(|err| anyhow!("create_work_session: load task {task_id}: {err}"))?;
+            let defaults = work_session_defaults_from_task(&task);
+            if title.trim().is_empty() {
+                title = defaults.title;
+            }
+            if objective.trim().is_empty() {
+                objective = defaults.objective;
+            }
+            if workspace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                workspace_id = defaults.workspace_id;
+            }
+            reason_messages.push(format!(
+                "worksession created from task {} ({})",
+                task.id, task.task_type
+            ));
+            task_binding = Some(agent_task_binding_from_task(&task));
+        }
         if objective.trim().is_empty() {
             return Err(anyhow!("create_work_session: objective must not be empty"));
         }
@@ -1595,6 +1632,24 @@ impl AIAgent {
                 (new_ws_id, "created".to_string())
             }
         };
+        if bind_task && task_binding.is_none() {
+            match self
+                .create_task_for_work_session(
+                    &new_session_id,
+                    title.trim(),
+                    objective.trim(),
+                    &workspace_id,
+                    &created_by_session_id,
+                )
+                .await
+            {
+                Ok(binding) => task_binding = Some(binding),
+                Err(err) => warn!(
+                    "opendan.agent[{}]: create task for worksession {} failed: {err:#}",
+                    self.agent_name, new_session_id
+                ),
+            }
+        }
 
         // Seed an existing_meta so the session is created with the right
         // title / objective / kind / workspace binding before its first
@@ -1612,6 +1667,7 @@ impl AIAgent {
         seed.objective = objective.trim().to_string();
         seed.workspace_id = Some(workspace_id.clone());
         seed.task_binding = task_binding;
+        let task_binding_for_update = seed.task_binding.clone();
 
         // Write a readme.md capturing the origin context so a later
         // human / debugger can see why this work session exists.
@@ -1636,10 +1692,23 @@ impl AIAgent {
                 Some(seed),
             )
             .await?;
-        // Wake the worker so the bootstrap turn runs even before the
-        // first external input — `needs_bootstrap_turn` will fire on the
-        // freshly-objective-bearing meta.
-        session.wake().await;
+        if auto_start {
+            // Wake the worker so the bootstrap turn runs even before the
+            // first external input — `needs_bootstrap_turn` will fire on the
+            // freshly-objective-bearing meta.
+            session.wake().await;
+        }
+        if let Some(binding) = task_binding_for_update.as_ref() {
+            self.update_work_session_task_started(
+                binding,
+                &new_session_id,
+                &workspace_id,
+                &workspace_status,
+                &behavior_name,
+                auto_start,
+            )
+            .await;
+        }
 
         Ok(CreateWorkSessionOutcome {
             session_id: new_session_id,
@@ -1647,7 +1716,134 @@ impl AIAgent {
             workspace_id,
             workspace_status,
             behavior: behavior_name,
+            auto_started: auto_start,
+            task_id: task_binding_for_update
+                .as_ref()
+                .map(|binding| binding.task_id),
         })
+    }
+
+    async fn create_task_for_work_session(
+        &self,
+        session_id: &str,
+        title: &str,
+        objective: &str,
+        workspace_id: &str,
+        created_by_session_id: &str,
+    ) -> Result<AgentTaskBinding> {
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return Err(anyhow!("task manager unavailable"));
+        };
+        let (user_id, app_id) = self.default_task_identity(created_by_session_id);
+        let task_name = if title.trim().is_empty() {
+            meaningful_workspace_name(title, objective)
+        } else {
+            title.trim().to_string()
+        };
+        let task = task_mgr
+            .create_task(
+                &task_name,
+                TASK_TYPE_AGENT_DELEGATE,
+                Some(serde_json::json!({
+                    "agent_delegate": {
+                        "version": 1,
+                        "purpose": objective,
+                        "title": title,
+                        "requester_agent_id": self.agent_id(),
+                        "owner_session_id": created_by_session_id,
+                        "input": {
+                            "text": objective
+                        },
+                        "workspace_hints": [{
+                            "workspace_id": workspace_id
+                        }],
+                        "execution": {
+                            "session_id": session_id,
+                            "workspace_id": workspace_id,
+                            "runner": self.task_executor_runner_id(),
+                            "status": "creating"
+                        }
+                    }
+                })),
+                &user_id,
+                &app_id,
+                Some(CreateTaskOptions {
+                    session_id: Some(session_id.to_string()),
+                    runner: Some(self.task_executor_runner_id()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|err| anyhow!("create task: {err}"))?;
+        Ok(agent_task_binding_from_task(&task))
+    }
+
+    async fn update_work_session_task_started(
+        &self,
+        binding: &AgentTaskBinding,
+        session_id: &str,
+        workspace_id: &str,
+        workspace_status: &str,
+        behavior: &str,
+        auto_started: bool,
+    ) {
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let status = if auto_started {
+            Some(buckyos_api::TaskStatus::Running)
+        } else {
+            None
+        };
+        let progress = if auto_started { Some(10.0) } else { None };
+        let message = if auto_started {
+            "Agent session started"
+        } else {
+            "Agent session created"
+        };
+        let execution_status = if auto_started { "running" } else { "idle" };
+        if let Err(err) = task_mgr
+            .update_task(
+                binding.task_id,
+                status,
+                progress,
+                Some(message.to_string()),
+                Some(serde_json::json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": session_id,
+                            "workspace_id": workspace_id,
+                            "workspace_status": workspace_status,
+                            "behavior": behavior,
+                            "runner": self.task_executor_runner_id(),
+                            "status": execution_status
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.agent[{}]: update worksession task {} started failed: {err:#}",
+                self.agent_name, binding.task_id
+            );
+        }
+    }
+
+    fn default_task_identity(&self, created_by_session_id: &str) -> (String, String) {
+        if let Ok(runtime) = get_buckyos_api_runtime() {
+            let user_id = runtime
+                .get_owner_user_id()
+                .or_else(|| runtime.user_id.clone())
+                .unwrap_or_else(|| created_by_session_id.to_string());
+            return (user_id, runtime.get_app_id());
+        }
+        let fallback_user = if created_by_session_id.trim().is_empty() {
+            self.agent_id()
+        } else {
+            created_by_session_id.to_string()
+        };
+        (fallback_user, self.agent_id())
     }
 
     pub(crate) async fn allocate_workspace_id(&self, name: &str) -> String {
@@ -1783,6 +1979,9 @@ pub struct CreateWorkSessionParams {
     pub created_by_session_id: String,
     pub reason_messages: Vec<String>,
     pub task_binding: Option<AgentTaskBinding>,
+    pub task_id: Option<i64>,
+    pub auto_start: bool,
+    pub bind_task: bool,
 }
 
 /// Result of [`AIAgent::create_work_session`].
@@ -1795,6 +1994,100 @@ pub struct CreateWorkSessionOutcome {
     /// without parsing free-form text.
     pub workspace_status: String,
     pub behavior: String,
+    pub auto_started: bool,
+    pub task_id: Option<i64>,
+}
+
+struct WorkSessionTaskDefaults {
+    title: String,
+    objective: String,
+    workspace_id: Option<String>,
+}
+
+fn work_session_defaults_from_task(task: &Task) -> WorkSessionTaskDefaults {
+    let data = &task.data;
+    let title = data
+        .pointer("/agent_delegate/title")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| data.get("title").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| task.name.clone());
+    let objective = data
+        .pointer("/agent_delegate/purpose")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            data.pointer("/agent_delegate/input/text")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| data.get("objective").and_then(serde_json::Value::as_str))
+        .or_else(|| data.get("purpose").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| task.name.clone());
+    let workspace_id = data
+        .pointer("/agent_delegate/route/workspace_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            data.pointer("/agent_delegate/execution/workspace_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            data.pointer("/agent_delegate/workspace_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| data.get("workspace_id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            data.pointer("/agent_delegate/workspace_hints")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|hints| {
+                    if hints.len() == 1 {
+                        hints.first().and_then(workspace_id_from_task_hint)
+                    } else {
+                        None
+                    }
+                })
+        });
+    WorkSessionTaskDefaults {
+        title,
+        objective,
+        workspace_id,
+    }
+}
+
+fn workspace_id_from_task_hint(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+pub(crate) fn agent_task_binding_from_task(task: &Task) -> AgentTaskBinding {
+    AgentTaskBinding {
+        task_id: task.id,
+        root_task_id: task.root_id.parse::<i64>().unwrap_or(task.id),
+        root_id: task.root_id.clone(),
+        task_type: task.task_type.clone(),
+        runner: task.runner.clone(),
+        task_name: task.name.clone(),
+        user_id: task.user_id.clone(),
+        app_id: task.app_id.clone(),
+        parent_id: task.parent_id,
+    }
 }
 
 /// Mint a stable, short id with a prefix. Uses uuid v4 so concurrent
@@ -1933,8 +2226,13 @@ mod tests {
     use crate::agent_session::WorksessionReportPhase;
     use crate::worklog::{WorklogService, WorklogToolConfig};
     use async_trait::async_trait;
-    use buckyos_api::{AiMethodRequest, AiMethodResponse, AiccClient, AiccHandler, CancelResponse};
+    use buckyos_api::{
+        AiMethodRequest, AiMethodResponse, AiccClient, AiccHandler, CancelResponse, TaskFilter,
+        TaskManagerClient, TaskManagerHandler, TaskPermissions, TaskStatus,
+    };
     use kRPC::{RPCContext, RPCErrors};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     #[test]
     fn sanitizes_session_segment() {
@@ -2079,6 +2377,312 @@ mod tests {
             Arc::new(worklog),
         );
         AIAgent::open(root, Arc::new(runtime)).expect("open test agent")
+    }
+
+    fn test_agent_with_task_mgr(root: PathBuf, task_mgr: MemoryTaskMgr) -> Arc<AIAgent> {
+        let worklog = WorklogService::new(WorklogToolConfig::with_db_path(root.join("worklog.db")))
+            .expect("create worklog");
+        let runtime = AgentRuntime::new(
+            Arc::new(AiccClient::new_in_process(Box::new(NoopAicc))),
+            Arc::new(worklog),
+        )
+        .with_task_mgr(Arc::new(TaskManagerClient::new_in_process(Box::new(
+            task_mgr,
+        ))));
+        AIAgent::open(root, Arc::new(runtime)).expect("open test agent")
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryTaskMgr {
+        inner: Arc<MemoryTaskMgrInner>,
+    }
+
+    #[derive(Default)]
+    struct MemoryTaskMgrInner {
+        next_id: AtomicI64,
+        tasks: std::sync::Mutex<Vec<Task>>,
+    }
+
+    impl MemoryTaskMgr {
+        fn insert(&self, mut task: Task) -> Task {
+            if task.id == 0 {
+                task.id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            }
+            if task.root_id.is_empty() {
+                task.root_id = task.id.to_string();
+            }
+            self.inner.tasks.lock().unwrap().push(task.clone());
+            task
+        }
+
+        fn task(&self, id: i64) -> Task {
+            self.inner
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == id)
+                .cloned()
+                .expect("task")
+        }
+    }
+
+    #[async_trait]
+    impl TaskManagerHandler for MemoryTaskMgr {
+        async fn handle_create_task(
+            &self,
+            name: &str,
+            task_type: &str,
+            data: Option<serde_json::Value>,
+            opts: CreateTaskOptions,
+            user_id: &str,
+            app_id: &str,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Task, RPCErrors> {
+            let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let task = Task {
+                id,
+                user_id: user_id.to_string(),
+                app_id: app_id.to_string(),
+                session_id: opts.session_id.unwrap_or_default(),
+                parent_id: opts.parent_id,
+                root_id: opts.root_id.unwrap_or_else(|| id.to_string()),
+                name: name.to_string(),
+                task_type: task_type.to_string(),
+                runner: opts.runner.unwrap_or_default(),
+                status: TaskStatus::Pending,
+                progress: 0.0,
+                message: None,
+                data: data.unwrap_or_else(|| serde_json::json!({})),
+                permissions: opts.permissions.unwrap_or_default(),
+                created_at: 1,
+                updated_at: 1,
+            };
+            self.inner.tasks.lock().unwrap().push(task.clone());
+            Ok(task)
+        }
+
+        async fn handle_get_task(
+            &self,
+            id: i64,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Task, RPCErrors> {
+            self.inner
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == id)
+                .cloned()
+                .ok_or_else(|| RPCErrors::ReasonError(format!("task {id} not found")))
+        }
+
+        async fn handle_list_tasks(
+            &self,
+            filter: TaskFilter,
+            _source_user_id: Option<&str>,
+            _source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Vec<Task>, RPCErrors> {
+            Ok(self
+                .inner
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| {
+                    filter
+                        .task_type
+                        .as_ref()
+                        .map(|value| task.task_type == *value)
+                        .unwrap_or(true)
+                        && filter
+                            .runner
+                            .as_ref()
+                            .map(|value| task.runner == *value)
+                            .unwrap_or(true)
+                        && filter
+                            .status
+                            .map(|value| task.status == value)
+                            .unwrap_or(true)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn handle_list_tasks_by_time_range(
+            &self,
+            _app_id: Option<&str>,
+            _session_id: Option<&str>,
+            _task_type: Option<&str>,
+            _source_user_id: Option<&str>,
+            _source_app_id: Option<&str>,
+            _time_range: Range<u64>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Vec<Task>, RPCErrors> {
+            Ok(Vec::new())
+        }
+
+        async fn handle_get_subtasks(
+            &self,
+            parent_id: i64,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Vec<Task>, RPCErrors> {
+            Ok(self
+                .inner
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| task.parent_id == Some(parent_id))
+                .cloned()
+                .collect())
+        }
+
+        async fn handle_update_task(
+            &self,
+            id: i64,
+            status: Option<TaskStatus>,
+            progress: Option<f32>,
+            message: Option<String>,
+            data: Option<serde_json::Value>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or_else(|| RPCErrors::ReasonError(format!("task {id} not found")))?;
+            if let Some(status) = status {
+                task.status = status;
+            }
+            if let Some(progress) = progress {
+                task.progress = progress;
+            }
+            if let Some(message) = message {
+                task.message = Some(message);
+            }
+            if let Some(data) = data {
+                merge_json_test(&mut task.data, &data);
+            }
+            Ok(())
+        }
+
+        async fn handle_update_task_progress(
+            &self,
+            id: i64,
+            completed_items: u64,
+            total_items: u64,
+            ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            let progress = if total_items == 0 {
+                0.0
+            } else {
+                completed_items as f32 / total_items as f32
+            };
+            self.handle_update_task(id, None, Some(progress), None, None, ctx)
+                .await
+        }
+
+        async fn handle_update_task_status(
+            &self,
+            id: i64,
+            status: TaskStatus,
+            ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            self.handle_update_task(id, Some(status), None, None, None, ctx)
+                .await
+        }
+
+        async fn handle_update_task_error(
+            &self,
+            id: i64,
+            error_message: &str,
+            ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            self.handle_update_task(
+                id,
+                Some(TaskStatus::Failed),
+                None,
+                Some(error_message.to_string()),
+                None,
+                ctx,
+            )
+            .await
+        }
+
+        async fn handle_update_task_data(
+            &self,
+            id: i64,
+            data: serde_json::Value,
+            _ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or_else(|| RPCErrors::ReasonError(format!("task {id} not found")))?;
+            task.data = data;
+            Ok(())
+        }
+
+        async fn handle_cancel_task(
+            &self,
+            id: i64,
+            _recursive: bool,
+            ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            self.handle_update_task_status(id, TaskStatus::Canceled, ctx)
+                .await
+        }
+
+        async fn handle_delete_task(
+            &self,
+            id: i64,
+            _ctx: RPCContext,
+        ) -> std::result::Result<(), RPCErrors> {
+            self.inner
+                .tasks
+                .lock()
+                .unwrap()
+                .retain(|task| task.id != id);
+            Ok(())
+        }
+    }
+
+    fn merge_json_test(dst: &mut serde_json::Value, patch: &serde_json::Value) {
+        match (dst, patch) {
+            (serde_json::Value::Object(dst), serde_json::Value::Object(patch)) => {
+                for (key, value) in patch {
+                    merge_json_test(
+                        dst.entry(key.clone()).or_insert(serde_json::Value::Null),
+                        value,
+                    );
+                }
+            }
+            (dst, patch) => *dst = patch.clone(),
+        }
+    }
+
+    fn delegate_task(id: i64, data: serde_json::Value) -> Task {
+        Task {
+            id,
+            user_id: "user".to_string(),
+            app_id: "opendan".to_string(),
+            session_id: String::new(),
+            parent_id: None,
+            root_id: id.to_string(),
+            name: "delegate task".to_string(),
+            task_type: TASK_TYPE_AGENT_DELEGATE.to_string(),
+            runner: "agent".to_string(),
+            status: TaskStatus::Pending,
+            progress: 0.0,
+            message: None,
+            data,
+            permissions: TaskPermissions::default(),
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
     fn write_session_meta(agent: &AIAgent, mut meta: SessionMeta) {
@@ -2449,6 +3053,9 @@ mod tests {
                 created_by_session_id: "ui-1".to_string(),
                 reason_messages: Vec::new(),
                 task_binding: None,
+                task_id: None,
+                auto_start: true,
+                bind_task: true,
             })
             .await
             .expect("create work session");
@@ -2479,6 +3086,9 @@ mod tests {
                 created_by_session_id: "ui-1".to_string(),
                 reason_messages: Vec::new(),
                 task_binding: None,
+                task_id: None,
+                auto_start: true,
+                bind_task: true,
             })
             .await
             .expect("create work session");
@@ -2493,6 +3103,153 @@ mod tests {
             .delete_session_physical(&outcome.session_id)
             .await
             .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn create_work_session_can_skip_auto_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = test_agent(dir.path().to_path_buf());
+
+        let outcome = agent
+            .clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: "Deferred Work".to_string(),
+                objective: "Create the session without running it".to_string(),
+                workspace_id: None,
+                behavior: None,
+                created_by_session_id: "ui-1".to_string(),
+                reason_messages: Vec::new(),
+                task_binding: None,
+                task_id: None,
+                auto_start: false,
+                bind_task: true,
+            })
+            .await
+            .expect("create work session");
+        assert!(!outcome.auto_started);
+        let session = agent
+            .get_session(&outcome.session_id)
+            .await
+            .expect("session");
+        let meta = session.meta.lock().await;
+        assert_eq!(meta.status, SessionStatus::Idle);
+        assert!(!meta.bootstrap_done);
+        drop(meta);
+
+        agent
+            .delete_session_physical(&outcome.session_id)
+            .await
+            .expect("delete session");
+    }
+
+    #[tokio::test]
+    async fn create_work_session_by_task_id_uses_task_data_and_binds_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_mgr = MemoryTaskMgr::default();
+        let task = task_mgr.insert(delegate_task(
+            41,
+            serde_json::json!({
+                "agent_delegate": {
+                    "title": "Task title",
+                    "purpose": "Complete the task objective",
+                    "execution": {
+                        "workspace_id": "existing-workspace"
+                    }
+                }
+            }),
+        ));
+        let agent = test_agent_with_task_mgr(dir.path().to_path_buf(), task_mgr.clone());
+
+        let outcome = agent
+            .clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: String::new(),
+                objective: String::new(),
+                workspace_id: None,
+                behavior: None,
+                created_by_session_id: "ui-1".to_string(),
+                reason_messages: Vec::new(),
+                task_binding: None,
+                task_id: Some(task.id),
+                auto_start: false,
+                bind_task: true,
+            })
+            .await
+            .expect("create work session by task");
+
+        assert_eq!(outcome.title, "Task title");
+        assert_eq!(outcome.workspace_id, "existing-workspace");
+        assert_eq!(outcome.task_id, Some(task.id));
+        let session = agent
+            .get_session(&outcome.session_id)
+            .await
+            .expect("session");
+        let meta = session.meta.lock().await;
+        assert_eq!(meta.objective, "Complete the task objective");
+        assert_eq!(
+            meta.task_binding.as_ref().map(|binding| binding.task_id),
+            Some(task.id)
+        );
+        drop(meta);
+
+        let updated = task_mgr.task(task.id);
+        assert_eq!(updated.status, TaskStatus::Pending);
+        assert_eq!(
+            updated
+                .data
+                .pointer("/agent_delegate/execution/session_id")
+                .and_then(serde_json::Value::as_str),
+            Some(outcome.session_id.as_str())
+        );
+        assert_eq!(
+            updated
+                .data
+                .pointer("/agent_delegate/execution/status")
+                .and_then(serde_json::Value::as_str),
+            Some("idle")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_work_session_without_task_id_creates_bound_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_mgr = MemoryTaskMgr::default();
+        let agent = test_agent_with_task_mgr(dir.path().to_path_buf(), task_mgr.clone());
+
+        let outcome = agent
+            .clone()
+            .create_work_session(CreateWorkSessionParams {
+                title: "Generated task".to_string(),
+                objective: "Do generated work".to_string(),
+                workspace_id: None,
+                behavior: None,
+                created_by_session_id: "ui-1".to_string(),
+                reason_messages: Vec::new(),
+                task_binding: None,
+                task_id: None,
+                auto_start: true,
+                bind_task: true,
+            })
+            .await
+            .expect("create work session");
+
+        let task_id = outcome.task_id.expect("task id");
+        let task = task_mgr.task(task_id);
+        assert_eq!(task.task_type, TASK_TYPE_AGENT_DELEGATE);
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.session_id, outcome.session_id);
+        assert_eq!(
+            task.data
+                .pointer("/agent_delegate/purpose")
+                .and_then(serde_json::Value::as_str),
+            Some("Do generated work")
+        );
+        assert_eq!(
+            task.data
+                .pointer("/agent_delegate/execution/session_id")
+                .and_then(serde_json::Value::as_str),
+            Some(outcome.session_id.as_str())
+        );
     }
 
     #[tokio::test]

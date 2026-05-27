@@ -5347,12 +5347,66 @@ impl AgentSession {
             .update_ui_state(UI_SESSION_STATE_TYPING_KEY, serde_json::json!(typing));
         self.status.update_ui_state(
             UI_SESSION_STATE_STATUS_LINE_KEY,
-            self.status.status_line_value(one_line_status),
+            self.status.status_line_value(one_line_status.clone()),
         );
         if let Err(err) = self.flush_meta().await {
             warn!(
                 "opendan.session[{}]: flush after status set failed: {err:#}",
                 self.session_id
+            );
+        }
+        self.mirror_status_to_task(status, one_line_status).await;
+    }
+
+    async fn mirror_status_to_task(&self, status: SessionStatus, one_line_status: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !self.kind.is_work_family() {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let Ok(task) = client.get_task(binding.task_id).await else {
+            return;
+        };
+        if task.status.is_terminal() || task.status == TaskStatus::Paused {
+            return;
+        }
+        let task_status = task_status_for_session_status(status);
+        let progress = if matches!(task_status, Some(TaskStatus::Completed)) {
+            Some(100.0)
+        } else {
+            None
+        };
+        let message = task_message_for_session_status(status, &one_line_status);
+        let status_text = session_status_text(status);
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                task_status,
+                progress,
+                message,
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "workspace_id": self.workspace_id().await,
+                            "session_status": status_text,
+                            "status": status_text,
+                            "one_line_status": one_line_status,
+                            "updated_at_ms": now_ms(),
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: mirror status {:?} to task {} failed: {err:#}",
+                self.session_id, status, binding.task_id
             );
         }
     }
@@ -6522,6 +6576,44 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn task_status_for_session_status(status: SessionStatus) -> Option<TaskStatus> {
+    match status {
+        SessionStatus::Running | SessionStatus::WaitingTool => Some(TaskStatus::Running),
+        SessionStatus::WaitingInput => Some(TaskStatus::WaitingForApproval),
+        SessionStatus::Ended => Some(TaskStatus::Completed),
+        SessionStatus::Error => Some(TaskStatus::Failed),
+        SessionStatus::Idle => None,
+    }
+}
+
+fn task_message_for_session_status(status: SessionStatus, one_line_status: &str) -> Option<String> {
+    let fallback = match status {
+        SessionStatus::Idle => "Agent session idle",
+        SessionStatus::Running => "Agent session running",
+        SessionStatus::WaitingInput => "Agent session waiting for input",
+        SessionStatus::WaitingTool => "Agent session waiting for tool",
+        SessionStatus::Ended => "Agent session completed",
+        SessionStatus::Error => "Agent session failed",
+    };
+    let message = one_line_status.trim();
+    Some(if message.is_empty() {
+        fallback.to_string()
+    } else {
+        message.to_string()
+    })
+}
+
+fn session_status_text(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Running => "running",
+        SessionStatus::WaitingInput => "waiting_input",
+        SessionStatus::WaitingTool => "waiting_tool",
+        SessionStatus::Ended => "ended",
+        SessionStatus::Error => "error",
+    }
 }
 
 /// Build an `Observation` from a task_mgr kevent payload — returns `None`

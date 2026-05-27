@@ -38,6 +38,15 @@ pub enum ScheduleSpec {
         #[serde(default)]
         timezone: Option<String>,
     },
+    RunEvery {
+        every_sec: u64,
+        #[serde(default)]
+        start_at: Option<i64>,
+        #[serde(default)]
+        end_at: Option<i64>,
+        #[serde(default)]
+        timezone: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -577,6 +586,27 @@ pub fn schedule_spec_from_value(value: &Value) -> Result<ScheduleSpec, String> {
                     .map(str::to_string),
             })
         }
+        "run_every" => {
+            let every_sec = value
+                .get("every_sec")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "missing schedule.every_sec".to_string())?;
+            if every_sec == 0 {
+                return Err("schedule.every_sec must be greater than zero".to_string());
+            }
+            if let Some(timezone) = value.get("timezone").and_then(Value::as_str) {
+                validate_timezone(timezone)?;
+            }
+            Ok(ScheduleSpec::RunEvery {
+                every_sec,
+                start_at: value.get("start_at").and_then(Value::as_i64),
+                end_at: value.get("end_at").and_then(Value::as_i64),
+                timezone: value
+                    .get("timezone")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
         other => Err(format!("unsupported schedule.kind `{}`", other)),
     }
 }
@@ -634,9 +664,7 @@ pub fn schedule_policy_from_value(value: Option<&Value>) -> Result<SchedulePolic
             other => return Err(format!("unsupported policy.misfire `{}`", other)),
         };
     }
-    if let Some(value) = value.get("max_parallel_runs").and_then(Value::as_u64) {
-        policy.max_parallel_runs = value.max(1) as u32;
-    }
+    policy.max_parallel_runs = 1;
     if let Some(value) = value.get("catch_up_limit").and_then(Value::as_u64) {
         policy.catch_up_limit = value.max(1) as u32;
     }
@@ -653,6 +681,30 @@ pub fn next_fire_after(spec: &ScheduleSpec, after_ts: i64) -> Option<i64> {
                 Some(*run_at)
             } else {
                 None
+            }
+        }
+        ScheduleSpec::RunEvery {
+            every_sec,
+            start_at,
+            end_at,
+            ..
+        } => {
+            let every_sec = *every_sec as i64;
+            if every_sec <= 0 {
+                return None;
+            }
+            let start_at = start_at.unwrap_or(after_ts.saturating_add(every_sec));
+            let next = if start_at > after_ts {
+                start_at
+            } else {
+                let elapsed = after_ts.saturating_sub(start_at);
+                let steps = elapsed / every_sec + 1;
+                start_at.saturating_add(steps.saturating_mul(every_sec))
+            };
+            if end_at.map(|end| next > end).unwrap_or(false) {
+                None
+            } else {
+                Some(next)
             }
         }
         ScheduleSpec::Cron {

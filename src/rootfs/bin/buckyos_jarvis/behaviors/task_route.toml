@@ -1,0 +1,52 @@
+[meta]
+name = "task_route"
+objective = "Handle task execute req,  and route task into worksessions."
+
+[prompt]
+parser = "xml"
+on_init = """
+<<role>>
+__INCLUDE(/role.md)__
+<</role>>
+
+<<process_rules>>
+目标：给每个Task分配正确的 WorkSession 
+
+<<skills>>
+## Using exec_bash
+
+Use it for read operations and simple write operations. If a request requires complex writes, call `try_create_worksession`.
+Prefer `read` when reading files.
+
+
+<</skills>>
+"""
+
+on_wakeup = """
+{% if session.background_hint_changed %}
+<background_environment current_clock="{{runtime.clock_text}}">
+{{ session.default_changed_background_hint_text }}
+</background_environment>
+{% endif %}
+{{input.text}}
+"""
+
+
+[capabilities]
+
+# disptach_task 是新API，将一个task forward到一个已有的worksession里
+tool_whitelist = [
+  "create_worksession",
+  "disptach_task",
+  "read",
+  "exec_bash",
+  "llm_understand_media"
+]
+
+
+[budget]
+max_rounds = 24
+max_consecutive_errors = 5
+
+[model]
+preferred = "llm.chat"

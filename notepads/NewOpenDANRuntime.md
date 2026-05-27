@@ -841,7 +841,7 @@ UI session 不直接构造 worksession——它经过一个 **fork 出来的 sub
 落地。这套设计把"探索 / 选择"和"实际落地"拆成两个工具，加上 §8.4 的 `forward_msg`
 组成 UI session 操纵 worksession 的全部入口。
 
-### 8.1 `create_worksession`（全参数版，立即生效）
+### 8.1 `create_worksession`（全参数版，默认立即生效）
 
 > 不暴露给 UI session 顶层；只出现在 `try_create_worksession` fork 出的 sub-context 白名单里。
 
@@ -852,6 +852,7 @@ create_worksession {
     workspace_id: Option<String>,        // worksession的bind的workspace None ⇒ 新建 workspace；Some ⇒ 复用已有
     behavior: Option<String>,            // 默认 = AgentConfig.default_work_behavior
     reason_message: Vec<String>,         // 描述意图的原始 message  
+    auto_start: bool,                    // 默认 true；false ⇒ 只创建，不唤醒首轮执行
 }
 ```
 
@@ -865,10 +866,11 @@ create_worksession {
      按时序把 `Vec<String>` 拼成块状文本，worksession 推理时作为环境上下文片段进入
      system prompt（参考 §5 的"环境感知 message"）
 3. `workspace.set_current_session(workspace_id, Some(new_session_id))` 绑定
-4. **立即唤醒新 worksession**：`status = Idle` → 启动 worker → 因为 session.json 已有
+4. `auto_start=true` 时**立即唤醒新 worksession**：`status = Idle` → 启动 worker → 因为 session.json 已有
    `objective`，worker 在 build_or_resume 阶段构造首轮 `LLMContextRequest` 时把
    objective 渲染进 system prompt 即可开始推理，**不需要外部消息触发**。这是 worksession
    与 UI session 的本质区别——它是"任务驱动"而非"对话驱动"的。
+   - `auto_start=false` 时只创建并绑定 session/workspace，保持 Idle，不触发 bootstrap turn
    - 因此 `reason_message` 不进 `pending_inputs`：它只是 readme 里的起源凭据，objective
      才是工作驱动力
    - 这要求 worker loop 的"空 pending 等待"分支增加一种情形：work session + 有 objective
@@ -878,7 +880,8 @@ create_worksession {
    ```json
    { "session_id": "...", "title": "...", "workspace_id": "...",
      "workspace_status": "created" | "reused",
-     "behavior": "...", "status": "created" }
+     "behavior": "...", "status": "created",
+     "worker_status": "started" | "idle", "auto_started": true | false }
    ```
 
 ### 8.2 `try_create_worksession`（UI session 唯一暴露的入口）
