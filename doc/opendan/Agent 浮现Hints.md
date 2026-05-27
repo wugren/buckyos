@@ -1400,7 +1400,52 @@ Tag 淘汰、权重衰减、基础召回应尽量机械、可预测。
 
 ---
 
-## 22. 最终架构定位
+## 22. 系统边界与非目标
+
+明确写出本机制**不做**什么、以及它和邻居系统的边界，是避免功能蔓延的关键。
+
+### 22.1 与邻居系统的关系
+
+- **与 session-history**：history 是真理源（事件级），topic 是题眼（语义级）。history 不可写、只追加；topic 可覆盖。两者都挂在 `session_dir` 下，互不依赖。
+- **与 AgentNotebook**：AgentNotebook 是 Session 内的工作笔记；topic 是 Session 间被浮现的题眼。即便实现层把 topic 作为 AgentNotebook 的一个特化条目，**对外接口必须独立**，避免和普通笔记混淆。
+- **与 auto memory**（跨 Session 的 user / feedback / project / reference 类长期记忆）：topic 不进 auto memory；topic 是“短期 Session 题眼”，由浮现机制时效性消费。
+- **与 LLMContext**：本工具作为 standard tool 注册。Tool Result 遵循 `success | error | pending` 协议，但**永不返回 pending** —— 召回总是同步等待完成。即便召回失败也返回 `success` + `recall_status=Failed`，因为 Tag 更新的保底语义已完成。
+
+### 22.2 与浮现层的对接面
+
+浮现层是另一个子系统，本机制只产出它需要的原料。要保证：
+
+1. **可枚举**：浮现器能列出所有有 topic 的 Session（`/{sessions_root}/*/.meta/topic.md`）；
+2. **可粗筛**：`topic.md` 的 frontmatter（`updated_at`, `tags`）支持时间 / 标签维度的筛选；
+3. **可定位**：`topic.md` 与 `session_id` 是 1:1 映射，浮现器拿到 hit 后能直接定位到 `session_dir` 做深度调用；
+4. **当前 Session Tag 可读**：浮现层（含 `RecallService`）能读取 `tag_set.json`；
+5. **订阅可读**：呈现层能读取 `subscriptions.json`。
+
+“工具可见性也是被浮现的对象”（即一个无浮现内容的 Session 应当看不到任何 memory 相关 prompt 段）由浮现层自己实现；`update_session_topic` 本身**始终可见**（它是 Notepad 工具，不参与浮现）。
+
+### 22.3 明确不做的事
+
+记录已识别但**不在本机制范围内**的事情，避免将来误把功能塞进来：
+
+- **不做 Session Summary**：那是另一种产物，篇幅更长、面向人类阅读；
+- **不做自动 topic 抽取**：让模型自己判断什么时候写、写什么 —— 这是 Notepad 的语义；
+- **不做跨 Session 的 topic 合并 / 去重**：浮现层的职责；
+- **不做 embedding / 向量索引**：浮现层若需要，自己读 `topic.md` 建；
+- **不实现浮现层的索引、检索、注入逻辑**：那些是另一个工单；
+- **不实现 Tag 的 tier 升降级**（v0.2 全部 Transient，预留接口）；
+- **不实现异步召回入口**：本工具同步语义；异步入口未来另开；
+- **不在本工具内实现订阅状态监听器**：订阅中心是独立组件。
+
+### 22.4 未来扩展（不在 v0.2 范围）
+
+- **Tag tier 升降级**：由 LLM 召回路径决定，把高价值 Tag 提升到 Active / Pinned，避免被机械淘汰；
+- **异步召回入口**：例如 `OnUserMessageEnter` 钩子，允许在不阻塞主路径的前提下做后台召回；
+- **召回入口的策略路由**：不同入口注入不同的 `RecallPolicy`（关键路径上更保守、空闲时更激进）；
+- **跨 Session 的浮现器**：本文档只覆盖 Session 内的 Tag 维护与召回触发；跨 Session 的 topic 浮现由独立工单。
+
+---
+
+## 23. 最终架构定位
 
 OpenDAN 的观察世界机制可以概括为：
 
@@ -1432,7 +1477,7 @@ OpenDAN 的观察世界机制可以概括为：
 
 这套机制让 Agent 既不会被机械 RAG 的上下文洪水淹没，也不会因为完全依赖主动查询而陷入“不知道自己不知道”的盲区。
 
-## 23. 附录 原始语音
+## 24. 附录 原始语音
 
 ====
 这个文档介绍OpenDAN是如何系统性地把基于浮现的 Hints 这套体系贯穿起来，作为让 Agent 有机会获得更全面的全局信息的召回机制起点吧 

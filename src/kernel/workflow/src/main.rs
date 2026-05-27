@@ -18,6 +18,7 @@ mod executor_adapter;
 mod object_store;
 mod orchestrator;
 mod runtime;
+mod scheduled_task_manager;
 mod schema;
 mod server;
 mod state;
@@ -75,6 +76,7 @@ use http_body_util::combinators::BoxBody;
 use log::{error, info, warn};
 use std::sync::Arc;
 
+use crate::scheduled_task_manager::{ScheduleStore, ScheduleTaskMirrorClient};
 use crate::server::WorkflowRpcHandler;
 use crate::service_schemas::aicc::AiccAdapter;
 use crate::state::{DefinitionStore, RunStore, ServiceTracker};
@@ -142,6 +144,9 @@ pub async fn start_workflow_service() -> Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("workflow service login failed: {:?}", err))?;
     runtime.set_main_service_port(WORKFLOW_SERVICE_PORT).await;
+    let data_dir = runtime
+        .get_data_folder()
+        .map_err(|err| anyhow::anyhow!("workflow data folder unavailable: {:?}", err))?;
 
     // §6.3：Run / Step / Map shard / Thunk 同步到 task_manager。客户端拿不到
     // 时退化为 noop（参考 §1.2 的"task_manager 不可用时仍可推进 adapter 主路径"）。
@@ -160,7 +165,7 @@ pub async fn start_workflow_service() -> Result<()> {
     let tracker = match task_mgr_client.clone() {
         Some(client) => {
             info!("workflow tracker bound to task_manager");
-            ServiceTracker::from_task_manager(client, user_id, app_id)
+            ServiceTracker::from_task_manager(client, user_id.clone(), app_id.clone())
         }
         None => ServiceTracker::noop(),
     };
@@ -186,6 +191,7 @@ pub async fn start_workflow_service() -> Result<()> {
 
     let definitions = Arc::new(DefinitionStore::new());
     let runs = Arc::new(RunStore::new());
+    let schedules = Arc::new(ScheduleStore::load(data_dir.join("schedules.json")));
     // 一期使用进程内 dispatcher / object store；§5.1 提到的 sled / Named Object
     // Store 持久化是后续提交的工作。`func::*` 调度路径暂时不接 Scheduler，命中
     // 时会按 §6.2 落到 require_function_object 的明确错误。
@@ -209,9 +215,18 @@ pub async fn start_workflow_service() -> Result<()> {
     );
     subscriptions.start().await;
 
-    let rpc = Arc::new(
-        WorkflowRpcHandler::new(definitions, runs, orchestrator).with_subscriptions(subscriptions),
-    );
+    let mut rpc_handler = WorkflowRpcHandler::new(definitions, runs, orchestrator)
+        .with_schedules(schedules)
+        .with_subscriptions(subscriptions);
+    if let Some(client) = task_mgr_client.clone() {
+        rpc_handler = rpc_handler.with_schedule_mirror(Arc::new(ScheduleTaskMirrorClient::new(
+            client,
+            user_id.clone(),
+            app_id.clone(),
+        )));
+    }
+    let rpc = Arc::new(rpc_handler);
+    start_schedule_loop(rpc.clone());
     let server = Arc::new(WorkflowHttpServer::new(rpc));
 
     let runner = Runner::new(WORKFLOW_SERVICE_PORT);
@@ -228,6 +243,16 @@ pub async fn start_workflow_service() -> Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("workflow runner exited: {:?}", err))?;
     Ok(())
+}
+
+fn start_schedule_loop(rpc: Arc<WorkflowRpcHandler>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            rpc.scan_due_schedules().await;
+        }
+    });
 }
 
 #[tokio::main]

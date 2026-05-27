@@ -52,6 +52,15 @@ where
         &self,
         workflow: &CompiledWorkflow,
     ) -> WorkflowResult<(WorkflowRun, Vec<EventEnvelope>)> {
+        self.create_run_with_metrics(workflow, BTreeMap::new())
+            .await
+    }
+
+    pub async fn create_run_with_metrics(
+        &self,
+        workflow: &CompiledWorkflow,
+        metrics: BTreeMap<String, Value>,
+    ) -> WorkflowResult<(WorkflowRun, Vec<EventEnvelope>)> {
         let now = Utc::now().timestamp();
         let mut node_states = BTreeMap::new();
         for node_id in workflow.nodes.keys() {
@@ -70,7 +79,7 @@ where
             branch_iterations: BTreeMap::new(),
             pending_thunks: BTreeMap::new(),
             activated_nodes: workflow.graph.start_nodes.iter().cloned().collect(),
-            metrics: BTreeMap::new(),
+            metrics,
             human_waiting_nodes: BTreeSet::new(),
             map_states: BTreeMap::new(),
             par_states: BTreeMap::new(),
