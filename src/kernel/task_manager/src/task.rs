@@ -5,6 +5,7 @@ pub use buckyos_api::{Task, TaskPermissions, TaskScope, TaskStatus};
 pub fn new_task(
     name: String,
     task_type: String,
+    runner: String,
     user_id: String,
     app_id: String,
     session_id: String,
@@ -22,6 +23,7 @@ pub fn new_task(
         root_id: String::new(),
         name,
         task_type,
+        runner,
         status: TaskStatus::Pending,
         progress: 0.0,
         message: None,

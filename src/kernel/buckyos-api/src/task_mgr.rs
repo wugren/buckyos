@@ -26,7 +26,7 @@ pub const TASK_MANAGER_SERVICE_PORT: u16 = 3380;
 pub const TASK_MANAGER_RDB_INSTANCE_ID: &str = "task-mgr-main";
 /// Version of the task table schema. Bump whenever the DDL below changes in a
 /// way that is not trivially re-idempotent, so the scheduler can detect drift.
-pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 2;
+pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 3;
 
 /// Sqlite DDL for the task-manager database. `CREATE TABLE IF NOT EXISTS` so
 /// the migration is safe to re-run on every process start.
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS task (
     name            TEXT NOT NULL,
     title           TEXT,
     task_type       TEXT NOT NULL,
+    runner          TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
     progress        REAL NOT NULL,
     total_items     INTEGER NOT NULL DEFAULT 0,
@@ -60,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC)
 CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runner_status ON task(runner, status);
 "#;
 
 /// Postgres DDL for the task-manager database. Same logical schema as the
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS task (
     name            TEXT NOT NULL,
     title           TEXT,
     task_type       TEXT NOT NULL,
+    runner          TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
     progress        REAL NOT NULL,
     total_items     BIGINT NOT NULL DEFAULT 0,
@@ -93,6 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC)
 CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runner_status ON task(runner, status);
 "#;
 
 /// Default rdb-instance config for the task-manager service. The scheduler
@@ -217,6 +221,7 @@ pub struct Task {
     pub root_id: String,
     pub name: String,
     pub task_type: String,
+    pub runner: String,
     pub status: TaskStatus,
     pub progress: f32,
     pub message: Option<String>,
@@ -232,6 +237,7 @@ pub struct CreateTaskOptions {
     pub parent_id: Option<i64>,
     pub root_id: Option<String>,
     pub session_id: Option<String>,
+    pub runner: Option<String>,
     pub priority: Option<u8>,
 }
 
@@ -249,6 +255,7 @@ pub struct TaskFilter {
     pub app_id: Option<String>,
     pub session_id: Option<String>,
     pub task_type: Option<String>,
+    pub runner: Option<String>,
     pub status: Option<TaskStatus>,
     pub parent_id: Option<i64>,
     pub root_id: Option<String>,
@@ -293,6 +300,8 @@ pub struct TaskManagerCreateTaskReq {
     pub name: String,
     pub task_type: String,
     #[serde(default)]
+    pub runner: String,
+    #[serde(default)]
     pub data: Option<Value>,
     #[serde(default)]
     pub permissions: Option<TaskPermissions>,
@@ -316,6 +325,7 @@ impl TaskManagerCreateTaskReq {
     pub fn new(
         name: String,
         task_type: String,
+        runner: String,
         data: Option<Value>,
         permissions: Option<TaskPermissions>,
         parent_id: Option<i64>,
@@ -333,6 +343,7 @@ impl TaskManagerCreateTaskReq {
         Self {
             name,
             task_type,
+            runner,
             data,
             permissions,
             parent_id,
@@ -366,6 +377,8 @@ pub struct TaskManagerCreateDownloadTaskReq {
     #[serde(default)]
     pub root_id: Option<String>,
     #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
     pub priority: Option<u8>,
     #[serde(default)]
     pub user_id: String,
@@ -385,6 +398,7 @@ impl TaskManagerCreateDownloadTaskReq {
         parent_id: Option<i64>,
         permissions: Option<TaskPermissions>,
         root_id: Option<String>,
+        runner: Option<String>,
         priority: Option<u8>,
         user_id: String,
         app_id: String,
@@ -402,6 +416,7 @@ impl TaskManagerCreateDownloadTaskReq {
             parent_id,
             permissions,
             root_id,
+            runner,
             priority,
             user_id,
             app_id,
@@ -446,6 +461,8 @@ pub struct TaskManagerListTasksReq {
     #[serde(default)]
     pub task_type: Option<String>,
     #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
     pub status: Option<TaskStatus>,
     #[serde(default)]
     pub parent_id: Option<i64>,
@@ -467,6 +484,7 @@ impl TaskManagerListTasksReq {
             app_id: filter.app_id,
             session_id: filter.session_id,
             task_type: filter.task_type,
+            runner: filter.runner,
             status: filter.status,
             parent_id: filter.parent_id,
             root_id: filter.root_id,
@@ -789,6 +807,7 @@ impl TaskManagerClient {
                 let req = TaskManagerCreateTaskReq::new(
                     name.to_string(),
                     task_type.to_string(),
+                    opts.runner.unwrap_or_default(),
                     data,
                     opts.permissions,
                     opts.parent_id,
@@ -853,6 +872,7 @@ impl TaskManagerClient {
                     opts.parent_id,
                     opts.permissions,
                     opts.root_id,
+                    opts.runner,
                     opts.priority,
                     user_id.to_string(),
                     app_id.to_string(),
@@ -1516,6 +1536,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions,
                     parent_id,
                     root_id,
+                    runner,
                     priority,
                     user_id,
                     app_id,
@@ -1532,6 +1553,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     parent_id,
                     root_id,
                     session_id,
+                    runner: Some(runner),
                     priority,
                 };
                 let task = self
@@ -1558,6 +1580,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     parent_id: create_req.parent_id,
                     root_id: create_req.root_id,
                     session_id: create_req.session_id,
+                    runner: create_req.runner,
                     priority: create_req.priority,
                 };
                 let task_id = self
@@ -1586,6 +1609,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     app_id,
                     session_id,
                     task_type,
+                    runner,
                     status,
                     parent_id,
                     root_id,
@@ -1596,6 +1620,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     app_id,
                     session_id,
                     task_type,
+                    runner,
                     status,
                     parent_id,
                     root_id,

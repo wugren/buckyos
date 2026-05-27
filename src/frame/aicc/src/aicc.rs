@@ -4204,6 +4204,7 @@ mod tests {
                 root_id: String::new(),
                 name: name.to_string(),
                 task_type: task_type.to_string(),
+                runner: opts.runner.unwrap_or_default(),
                 status: TaskStatus::Pending,
                 progress: 0.0,
                 message: None,

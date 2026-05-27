@@ -201,6 +201,7 @@ impl TaskManagerService {
             "app_id": after.app_id,
             "session_id": after.session_id,
             "task_type": after.task_type,
+            "runner": after.runner,
             "from_status": before.status.to_string(),
             "to_status": after.status.to_string(),
             "progress": after.progress,
@@ -348,6 +349,7 @@ impl TaskManagerService {
                 None,
                 None,
                 None,
+                None,
                 user_id,
             )
             .await
@@ -459,6 +461,7 @@ impl TaskManagerHandler for TaskManagerService {
         let mut task = new_task(
             name.to_string(),
             task_type.to_string(),
+            opts.runner.clone().unwrap_or_default(),
             request_ctx.user_id.clone(),
             request_ctx.app_id.clone(),
             opts.session_id.clone().unwrap_or_default(),
@@ -634,6 +637,7 @@ impl TaskManagerHandler for TaskManagerService {
                 filter.app_id.as_deref(),
                 filter.session_id.as_deref(),
                 filter.task_type.as_deref(),
+                filter.runner.as_deref(),
                 filter.status,
                 filter.parent_id,
                 filter.root_id.as_deref(),
@@ -663,7 +667,7 @@ impl TaskManagerHandler for TaskManagerService {
         let request_ctx = request_context_from_source(source_user_id, source_app_id);
         let tasks = self
             .db
-            .list_tasks_filtered(app_id, session_id, task_type, None, None, None, None)
+            .list_tasks_filtered(app_id, session_id, task_type, None, None, None, None, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -736,7 +740,16 @@ impl TaskManagerHandler for TaskManagerService {
 
             let before_tasks = self
                 .db
-                .list_tasks_filtered(None, None, None, None, None, Some(root_id.as_str()), None)
+                .list_tasks_filtered(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(root_id.as_str()),
+                    None,
+                )
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -801,7 +814,7 @@ impl TaskManagerHandler for TaskManagerService {
         let request_ctx = request_context_from_source(None, None);
         let tasks = self
             .db
-            .list_tasks_filtered(None, None, None, None, Some(parent_id), None, None)
+            .list_tasks_filtered(None, None, None, None, None, Some(parent_id), None, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -1018,7 +1031,7 @@ impl TaskManagerHandler for TaskManagerService {
         let request_ctx = request_context_from_source(source_user_id, source_app_id);
         let tasks = self
             .db
-            .list_tasks_filtered(None, Some(session_id), None, None, None, None, None)
+            .list_tasks_filtered(None, Some(session_id), None, None, None, None, None, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
         if let Some(task) = tasks

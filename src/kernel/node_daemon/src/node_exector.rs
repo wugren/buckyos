@@ -67,7 +67,6 @@ struct RunningThunkExecution {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeExecutorTaskPayload {
-    node_id: String,
     #[serde(default)]
     runner: Option<String>,
     #[serde(default)]
@@ -117,6 +116,7 @@ impl NodeExecutor {
             .list_tasks(
                 Some(TaskFilter {
                     task_type: Some(self.config.task_type.clone()),
+                    runner: Some(self.config.node_id.clone()),
                     status: Some(TaskStatus::Pending),
                     ..Default::default()
                 }),
@@ -146,10 +146,6 @@ impl NodeExecutor {
 
     async fn maybe_start_task(&self, task: Task) -> Result<bool> {
         let payload = NodeExecutorTaskPayload::from_task(&task)?;
-        if payload.node_id != self.config.node_id {
-            return Ok(false);
-        }
-
         let thunk_obj_id = payload
             .thunk_obj_id
             .clone()
@@ -432,10 +428,6 @@ impl NodeExecutorTaskPayload {
             .context("task.data.thunk is required")?;
         let function_object = extract_required_value::<FunctionObject>(data, "function_object")
             .context("task.data.function_object is required")?;
-        let node_id = extract_string(data, "node_id")
-            .or_else(|| data.pointer("/dispatch/node_id").and_then(Value::as_str))
-            .ok_or_else(|| anyhow::anyhow!("task.data.node_id is required"))?
-            .to_string();
         let runner = extract_string(data, "runner")
             .or_else(|| data.pointer("/dispatch/runner").and_then(Value::as_str))
             .map(ToString::to_string);
@@ -447,7 +439,6 @@ impl NodeExecutorTaskPayload {
             .map(ToString::to_string);
 
         Ok(Self {
-            node_id,
             runner,
             thunk_obj_id,
             thunk,
@@ -644,6 +635,7 @@ mod tests {
             root_id: "7".to_string(),
             name: "dispatch".to_string(),
             task_type: NODE_EXECUTOR_TASK_TYPE.to_string(),
+            runner: String::new(),
             status: TaskStatus::Pending,
             progress: 0.0,
             message: None,
@@ -692,7 +684,6 @@ mod tests {
         }));
 
         let payload = NodeExecutorTaskPayload::from_task(&task).unwrap();
-        assert_eq!(payload.node_id, "node-1");
         assert_eq!(payload.runner.as_deref(), Some("package-runner"));
     }
 
@@ -711,9 +702,20 @@ mod tests {
         }));
 
         let payload = NodeExecutorTaskPayload::from_task(&task).unwrap();
-        assert_eq!(payload.node_id, "node-2");
         assert_eq!(payload.runner.as_deref(), Some("script-runner:python"));
         assert_eq!(payload.thunk_obj_id.as_deref(), Some("thunk:abcdef"));
+    }
+
+    #[test]
+    fn parses_payload_without_node_id() {
+        let mut task = sample_task(json!({
+            "thunk": sample_thunk(),
+            "function_object": sample_function_object(FunctionType::ExecPkg),
+        }));
+        task.runner = "node-from-task-runner".to_string();
+
+        let payload = NodeExecutorTaskPayload::from_task(&task).unwrap();
+        assert_eq!(payload.runner, None);
     }
 
     #[tokio::test]
