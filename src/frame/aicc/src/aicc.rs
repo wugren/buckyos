@@ -4162,7 +4162,7 @@ mod tests {
     use super::*;
     use buckyos_api::{
         AiPayload, AiTaskOptions, CreateTaskOptions, ModelSpec, Requirements, Task, TaskFilter,
-        TaskManagerClient, TaskManagerHandler, TaskStatus, TypedTaskData,
+        TaskManagerClient, TaskManagerHandler, TaskNote, TaskStatus, TypedTaskData,
     };
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
@@ -4172,7 +4172,9 @@ mod tests {
 
     struct MockTaskMgrHandler {
         counter: Mutex<u64>,
+        note_counter: Mutex<u64>,
         tasks: Arc<Mutex<HashMap<i64, Task>>>,
+        notes: Arc<Mutex<HashMap<i64, Vec<TaskNote>>>>,
     }
 
     fn aicc_task_data(task: &Task) -> Option<AiccComputeTaskData> {
@@ -4256,6 +4258,78 @@ mod tests {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| RPCErrors::ReasonError(format!("mock task {} not found", id)))
+        }
+
+        async fn handle_add_task_note(
+            &self,
+            task_id: i64,
+            note_type: Option<&str>,
+            content: &str,
+            data: Option<serde_json::Value>,
+            source_user_id: Option<&str>,
+            source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<TaskNote, RPCErrors> {
+            let task = self
+                .tasks
+                .lock()
+                .expect("tasks lock")
+                .get(&task_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RPCErrors::ReasonError(format!("mock task {} not found", task_id))
+                })?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let mut guard = self.note_counter.lock().expect("note counter lock");
+            *guard += 1;
+            let note = TaskNote {
+                id: *guard as i64,
+                task_id,
+                note_type: note_type.unwrap_or("human").to_string(),
+                content: content.to_string(),
+                data: data.unwrap_or_else(|| json!({})),
+                author_user_id: source_user_id.unwrap_or(&task.user_id).to_string(),
+                author_app_id: source_app_id.unwrap_or(&task.app_id).to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            self.notes
+                .lock()
+                .expect("notes lock")
+                .entry(task_id)
+                .or_default()
+                .push(note.clone());
+            Ok(note)
+        }
+
+        async fn handle_list_task_notes(
+            &self,
+            task_id: i64,
+            _source_user_id: Option<&str>,
+            _source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Vec<TaskNote>, RPCErrors> {
+            if !self
+                .tasks
+                .lock()
+                .expect("tasks lock")
+                .contains_key(&task_id)
+            {
+                return Err(RPCErrors::ReasonError(format!(
+                    "mock task {} not found",
+                    task_id
+                )));
+            }
+            Ok(self
+                .notes
+                .lock()
+                .expect("notes lock")
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn handle_list_tasks(
@@ -4768,7 +4842,9 @@ mod tests {
         }
         let taskmgr = TaskManagerClient::new_in_process(Box::new(MockTaskMgrHandler {
             counter: Mutex::new(0),
+            note_counter: Mutex::new(0),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            notes: Arc::new(Mutex::new(HashMap::new())),
         }));
         center.set_task_manager_client(Arc::new(taskmgr));
         center

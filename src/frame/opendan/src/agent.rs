@@ -2297,7 +2297,7 @@ mod tests {
     use async_trait::async_trait;
     use buckyos_api::{
         AiMethodRequest, AiMethodResponse, AiccClient, AiccHandler, CancelResponse, TaskFilter,
-        TaskManagerClient, TaskManagerHandler, TaskPermissions, TaskStatus,
+        TaskManagerClient, TaskManagerHandler, TaskNote, TaskPermissions, TaskStatus,
     };
     use kRPC::{RPCContext, RPCErrors};
     use std::ops::Range;
@@ -2487,7 +2487,9 @@ runner_id = "agent"
     #[derive(Default)]
     struct MemoryTaskMgrInner {
         next_id: AtomicI64,
+        next_note_id: AtomicI64,
         tasks: std::sync::Mutex<Vec<Task>>,
+        notes: std::sync::Mutex<Vec<TaskNote>>,
     }
 
     impl MemoryTaskMgr {
@@ -2562,6 +2564,59 @@ runner_id = "agent"
                 .find(|task| task.id == id)
                 .cloned()
                 .ok_or_else(|| RPCErrors::ReasonError(format!("task {id} not found")))
+        }
+
+        async fn handle_add_task_note(
+            &self,
+            task_id: i64,
+            note_type: Option<&str>,
+            content: &str,
+            data: Option<serde_json::Value>,
+            source_user_id: Option<&str>,
+            source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<TaskNote, RPCErrors> {
+            let task = self
+                .inner
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == task_id)
+                .cloned()
+                .ok_or_else(|| RPCErrors::ReasonError(format!("task {task_id} not found")))?;
+            let id = self.inner.next_note_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let note = TaskNote {
+                id,
+                task_id,
+                note_type: note_type.unwrap_or("human").to_string(),
+                content: content.to_string(),
+                data: data.unwrap_or_else(|| serde_json::json!({})),
+                author_user_id: source_user_id.unwrap_or(&task.user_id).to_string(),
+                author_app_id: source_app_id.unwrap_or(&task.app_id).to_string(),
+                created_at: 1,
+                updated_at: 1,
+            };
+            self.inner.notes.lock().unwrap().push(note.clone());
+            Ok(note)
+        }
+
+        async fn handle_list_task_notes(
+            &self,
+            task_id: i64,
+            _source_user_id: Option<&str>,
+            _source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> std::result::Result<Vec<TaskNote>, RPCErrors> {
+            Ok(self
+                .inner
+                .notes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|note| note.task_id == task_id)
+                .cloned()
+                .collect())
         }
 
         async fn handle_list_tasks(

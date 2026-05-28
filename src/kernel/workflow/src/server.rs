@@ -1515,7 +1515,7 @@ mod tests {
     use super::*;
     use crate::{ExecutorRegistry, InMemoryObjectStore, InMemoryThunkDispatcher};
     use buckyos_api::{
-        CreateTaskOptions, Task, TaskFilter, TaskManagerClient, TaskManagerHandler,
+        CreateTaskOptions, Task, TaskFilter, TaskManagerClient, TaskManagerHandler, TaskNote,
         TaskPermissions, TaskStatus,
     };
     use std::collections::HashMap;
@@ -1531,7 +1531,9 @@ mod tests {
     #[derive(Default)]
     struct MemoryTaskState {
         next_id: i64,
+        next_note_id: i64,
         tasks: HashMap<i64, Task>,
+        notes: HashMap<i64, Vec<TaskNote>>,
     }
 
     impl MemoryTaskManager {
@@ -1539,7 +1541,9 @@ mod tests {
             Self {
                 inner: Arc::new(Mutex::new(MemoryTaskState {
                     next_id: 1,
+                    next_note_id: 1,
                     tasks: HashMap::new(),
+                    notes: HashMap::new(),
                 })),
             }
         }
@@ -1603,6 +1607,57 @@ mod tests {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| RPCErrors::ReasonError("task not found".to_string()))
+        }
+
+        async fn handle_add_task_note(
+            &self,
+            task_id: i64,
+            note_type: Option<&str>,
+            content: &str,
+            data: Option<Value>,
+            source_user_id: Option<&str>,
+            source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> RpcResult<TaskNote> {
+            let task = self
+                .inner
+                .lock()
+                .await
+                .tasks
+                .get(&task_id)
+                .cloned()
+                .ok_or_else(|| RPCErrors::ReasonError("task not found".to_string()))?;
+            let now = Utc::now().timestamp() as u64;
+            let mut inner = self.inner.lock().await;
+            let id = inner.next_note_id;
+            inner.next_note_id += 1;
+            let note = TaskNote {
+                id,
+                task_id,
+                note_type: note_type.unwrap_or("human").to_string(),
+                content: content.to_string(),
+                data: data.unwrap_or(Value::Null),
+                author_user_id: source_user_id.unwrap_or(&task.user_id).to_string(),
+                author_app_id: source_app_id.unwrap_or(&task.app_id).to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            inner.notes.entry(task_id).or_default().push(note.clone());
+            Ok(note)
+        }
+
+        async fn handle_list_task_notes(
+            &self,
+            task_id: i64,
+            _source_user_id: Option<&str>,
+            _source_app_id: Option<&str>,
+            _ctx: RPCContext,
+        ) -> RpcResult<Vec<TaskNote>> {
+            let inner = self.inner.lock().await;
+            if !inner.tasks.contains_key(&task_id) {
+                return Err(RPCErrors::ReasonError("task not found".to_string()));
+            }
+            Ok(inner.notes.get(&task_id).cloned().unwrap_or_default())
         }
 
         async fn handle_list_tasks(
