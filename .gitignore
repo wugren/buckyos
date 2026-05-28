@@ -69,3 +69,5 @@ src/apps/sys_test/web/dist/
 src/frame/desktop/dist/favicon.svg
 aicc_remote_runner.toml
 test/aicc_test/rust_runner/target
+.dev_buckyos
+.dev_buckyos_*
