@@ -68,6 +68,39 @@ impl LlmClient for RecordingLlm {
     }
 }
 
+struct RecoverOnceLlm {
+    response: AiResponse,
+    seen: Mutex<Vec<Vec<AiMessage>>>,
+    failed: Mutex<bool>,
+}
+
+impl RecoverOnceLlm {
+    fn new(response: AiResponse) -> Self {
+        Self {
+            response,
+            seen: Mutex::new(Vec::new()),
+            failed: Mutex::new(false),
+        }
+    }
+
+    fn seen(&self) -> Vec<Vec<AiMessage>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmClient for RecoverOnceLlm {
+    async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
+        self.seen.lock().unwrap().push(req.messages);
+        let mut failed = self.failed.lock().unwrap();
+        if !*failed {
+            *failed = true;
+            return Err(LLMComputeError::Provider("temporary aicc failure".into()));
+        }
+        Ok(self.response.clone())
+    }
+}
+
 struct EchoTools;
 
 #[async_trait]
@@ -107,6 +140,23 @@ impl StepResultHook for CustomStepResultHook {
                 format!("custom step result {}", step.meta.step_index),
             )),
             history_inputs: Vec::new(),
+            skip_next_inference: false,
+        })
+    }
+}
+
+struct SkipStepResultHook;
+
+#[async_trait]
+impl StepResultHook for SkipStepResultHook {
+    async fn on_behavior_step_ob(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+        _step: &crate::behavior_loop::StepRecord,
+    ) -> Result<StepResultHookOutput, String> {
+        Ok(StepResultHookOutput {
+            skip_next_inference: true,
+            ..Default::default()
         })
     }
 }
@@ -579,6 +629,45 @@ async fn behavior_turn_tail_renders_after_inherited_steps_and_clears_after_infer
 }
 
 #[tokio::test]
+async fn behavior_loop_keeps_recoverable_error_out_of_system_messages() {
+    let llm = Arc::new(RecoverOnceLlm::new(text_response(
+        "<response><thinking>recovered</thinking><next_behavior>END</next_behavior></response>",
+    )));
+    let mut req = base_request();
+    req.behavior_name = "do".into();
+    req.input = vec![
+        AiMessage::text(AiRole::System, "static system prompt"),
+        AiMessage::text(AiRole::User, "Continue TASK_ANCHOR."),
+    ];
+    let deps = LLMContextDeps::new(llm.clone(), Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()));
+    let mut ctx = LLMContext::new(req, deps);
+
+    let outcome = ctx.run().await;
+    assert!(matches!(outcome, LLMContextOutcome::Done { .. }));
+
+    let seen = llm.seen();
+    assert_eq!(seen.len(), 2);
+    let retry_messages = &seen[1];
+    let error_messages: Vec<&AiMessage> = retry_messages
+        .iter()
+        .filter(|m| m.text_content().contains("error: llm provider failed"))
+        .collect();
+    assert_eq!(error_messages.len(), 1);
+    assert_eq!(error_messages[0].role, AiRole::User);
+    assert_eq!(retry_messages[0].role, AiRole::System);
+    assert_eq!(retry_messages[0].text_content(), "static system prompt");
+    assert!(
+        retry_messages
+            .iter()
+            .skip(1)
+            .all(|m| m.role != AiRole::System),
+        "only the static system prefix may use AiRole::System"
+    );
+}
+
+#[tokio::test]
 async fn behavior_loop_ignores_next_behavior_when_actions_exist() {
     let llm = Arc::new(ScriptedLlm::new(vec![
         text_response(
@@ -686,6 +775,31 @@ async fn behavior_loop_on_behavior_step_ob_overrides_next_user_message() {
             .any(|m| m.role == AiRole::User && m.text_content() == "custom step result 0"),
         "custom on_behavior_step_ob user message should be rendered into the next inference"
     );
+}
+
+#[tokio::test]
+async fn behavior_loop_on_behavior_step_ob_can_skip_next_inference() {
+    let llm = Arc::new(RecordingLlm::new(text_response(
+        r#"<response>
+<thinking>run action</thinking>
+<actions><exec_bash>echo done</exec_bash></actions>
+</response>"#,
+    )));
+    let mut req = base_request();
+    req.behavior_name = "plan".into();
+    let deps = LLMContextDeps::new(llm.clone(), Arc::new(EchoTools))
+        .with_result_parser(Arc::new(XmlBehaviorParser::new()))
+        .with_step_renderer(Arc::new(XmlStepRenderer::new()))
+        .with_step_result_hook(Arc::new(SkipStepResultHook));
+    let mut ctx = LLMContext::new(req, deps);
+
+    let outcome = ctx.run().await;
+    assert!(matches!(outcome, LLMContextOutcome::Done { .. }));
+    assert_eq!(llm.seen().len(), 1);
+    let snapshot = ctx.snapshot();
+    assert_eq!(snapshot.state.steps.len(), 1);
+    assert_eq!(snapshot.state.steps[0].action_results.len(), 1);
+    assert!(snapshot.state.steps[0].next_user_message.is_none());
 }
 
 #[tokio::test]

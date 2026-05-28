@@ -169,11 +169,12 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 | `worklog_manage` | bash / call | worklog 结构化管理 | `src/lib.rs` |
 | `check_task` | CLI | 轮询 pending task | `src/cli.rs` |
 | `cancel_task` | CLI | 取消 pending task | `src/cli.rs` |
+| `finish_task` | CLI | 结束 task（完成/失败） | `src/cli.rs` |
 
 说明：
 
 - `bind_external_workspace` / `list_external_workspaces` 当前主要走结构化调用
-- `check_task` / `cancel_task` 是 CLI 暴露能力，不走 `AgentTool` trait 的常规注册路径
+- `check_task` / `cancel_task` / `finish_task` 是 CLI 暴露能力，不走 `AgentTool` trait 的常规注册路径
 - `read_file` 是 legacy CLI 兼容工具，不再是 v2 Agent Action；当前 Action 应使用 `read`
 - `list_session` 常量已预留，但当前文档不把它当作已完成 builtin tool
 
@@ -638,6 +639,28 @@ cancel_task <task_id> [--recursive]
   - `task`
   - `interrupt_error`
 
+### 5.14 `finish_task`
+
+用途：
+
+- 把指定 task 结束为完成或失败
+
+CLI 输入：
+
+```bash
+finish_task <task_id> [failed] [--message <text>]
+```
+
+输出约定：
+
+- 默认调用 TaskManager `update_task` 写入 `Completed` 和 `progress=100.0`
+- `failed` / `--failed` 调用 TaskManager `update_task_error` 写入 `Failed` 和错误消息
+- 返回更新后的 task 结果封装
+- builtin 风格结果仍应优先满足 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`
+- detail 常见字段：
+  - `task`
+  - `finish_outcome`
+
 ## 6. 后续文档拆分建议
 
 为了避免这份文档继续膨胀，建议后续按主题拆成几个子文档：
@@ -649,7 +672,7 @@ cancel_task <task_id> [--recursive]
 3. `workspace_tools_protocol.md`
    统一整理 workspace 相关工具
 4. `task_tools_protocol.md`
-   统一整理 `check_task / cancel_task` 和 pending 轮询模型
+   统一整理 `check_task / cancel_task / finish_task` 和 pending 轮询模型
 
 ## 7. 文档维护原则
 

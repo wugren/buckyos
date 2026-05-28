@@ -776,6 +776,7 @@ impl AIComputeCenter {
         if let Some(task_options) = request.task_options.as_ref() {
             create_task_opts.parent_id = task_options.parent_id;
         }
+        create_task_opts.root_id = resolve_task_root_id(request, invoke_ctx);
 
         let taskmgr = self.taskmgr.as_ref().cloned().ok_or_else(|| {
             warn!(
@@ -3569,6 +3570,12 @@ fn extract_rootid_from_complete_request(request: &AiMethodRequest) -> Option<Str
     })
 }
 
+fn resolve_task_root_id(request: &AiMethodRequest, invoke_ctx: &InvokeCtx) -> Option<String> {
+    extract_rootid_from_complete_request(request)
+        .or_else(|| extract_session_id_from_complete_request(request))
+        .or_else(|| Some(resolve_default_rootid(invoke_ctx)))
+}
+
 fn resolve_default_rootid(invoke_ctx: &InvokeCtx) -> String {
     let app_seed = invoke_ctx
         .caller_app_id
@@ -3586,12 +3593,8 @@ fn build_initial_aicc_task_data(
     invoke_ctx: &InvokeCtx,
 ) -> serde_json::Value {
     let session_id = extract_session_id_from_complete_request(request);
-    let rootid = extract_rootid_from_complete_request(request)
-        .or_else(|| session_id.clone())
-        .unwrap_or_else(|| resolve_default_rootid(invoke_ctx));
 
     json!({
-        "rootid": rootid.clone(),
         "session_id": session_id.clone(),
         "owner_session_id": session_id.clone(),
         "aicc": {
@@ -3602,7 +3605,6 @@ fn build_initial_aicc_task_data(
             "updated_at_ms": now_ms(),
             "tenant_id": invoke_ctx.tenant_id,
             "event_ref": event_ref,
-            "rootid": rootid,
             "session_id": session_id,
             "request": request,
             "provider_input": serde_json::Value::Null,
@@ -4201,7 +4203,7 @@ mod tests {
                 app_id: app_id.to_string(),
                 session_id: opts.session_id.unwrap_or_default(),
                 parent_id: opts.parent_id,
-                root_id: String::new(),
+                root_id: opts.root_id.unwrap_or_else(|| (*guard).to_string()),
                 name: name.to_string(),
                 task_type: task_type.to_string(),
                 runner: opts.runner.unwrap_or_default(),
@@ -4816,10 +4818,9 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("succeeded")
         );
-        assert_eq!(
-            task.data.get("rootid").and_then(|value| value.as_str()),
-            Some("aicc-default")
-        );
+        assert_eq!(task.root_id, "aicc-default");
+        assert!(task.data.get("rootid").is_none());
+        assert!(task.data.pointer("/aicc/rootid").is_none());
     }
 
     #[tokio::test]
@@ -4997,7 +4998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_persists_rootid_and_session_id_from_request_options() {
+    async fn complete_persists_root_id_and_session_id_from_request_options() {
         let registry = Registry::default();
         let catalog = ModelCatalog::default();
         catalog.set_mapping(
@@ -5042,20 +5043,13 @@ mod tests {
                     == Some(response.task_id.as_str())
             })
             .expect("aicc task should exist");
-        assert_eq!(
-            task.data.get("rootid").and_then(|value| value.as_str()),
-            Some("session-xyz")
-        );
+        assert_eq!(task.root_id, "session-xyz");
         assert_eq!(
             task.data.get("session_id").and_then(|value| value.as_str()),
             Some("session-xyz")
         );
-        assert_eq!(
-            task.data
-                .pointer("/aicc/rootid")
-                .and_then(|value| value.as_str()),
-            Some("session-xyz")
-        );
+        assert!(task.data.get("rootid").is_none());
+        assert!(task.data.pointer("/aicc/rootid").is_none());
     }
 
     #[tokio::test]

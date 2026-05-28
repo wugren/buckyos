@@ -52,7 +52,8 @@ for tool_name in \
   create_workspace \
   bind_workspace \
   check_task \
-  cancel_task
+  cancel_task \
+  finish_task
 do
   ln -sfn "${AGENT_TOOL_BIN}" "${TOOL_DIR}/${tool_name}"
 done

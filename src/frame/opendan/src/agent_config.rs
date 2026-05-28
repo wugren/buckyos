@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! [identity]            agent_did / display_name
-//! [runtime]             cancel_reason / language / preserve_attachment_tag_in_egress / filesystem_policy
+//! [runtime]             cancel_reason / language / preserve_attachment_tag_in_egress / filesystem_policy / task_executor / task_route
 //! [dispatch]            default_class + ordered match-rule list
 //! [session.<class>]     per-class kind / loop_mode / default_behavior /
 //!                       session_id_strategy / process_stack_limit / driver
@@ -108,6 +108,7 @@ pub struct RuntimeCfg {
     /// still rejected by each tool.
     pub filesystem_policy: FilesystemPolicy,
     pub task_executor: TaskExecutorCfg,
+    pub task_route: TaskRouteCfg,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +132,7 @@ impl Default for RuntimeCfg {
             preserve_attachment_tag_in_egress: false,
             filesystem_policy: FilesystemPolicy::default(),
             task_executor: TaskExecutorCfg::default(),
+            task_route: TaskRouteCfg::default(),
         }
     }
 }
@@ -150,6 +152,18 @@ impl Default for TaskExecutorCfg {
             runner_id: String::new(),
             poll_interval_ms: 5_000,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TaskRouteCfg {
+    pub enabled: bool,
+}
+
+impl Default for TaskRouteCfg {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -858,6 +872,8 @@ mod tests {
         assert!(cfg.toml.identity.agent_did.is_empty());
         assert_eq!(cfg.cancel_reason(), "user requested cancel");
         assert_eq!(cfg.language(), "en");
+        assert!(cfg.toml.runtime.task_executor.enabled);
+        assert!(cfg.toml.runtime.task_route.enabled);
         assert_eq!(cfg.default_behavior_for_class("ui"), "ui_default");
         assert_eq!(cfg.default_behavior_for_class("work"), "work_default");
         assert_eq!(cfg.default_behavior_for_class("self_check"), "self_check");
@@ -890,6 +906,12 @@ mod tests {
                 language = "zh-CN"
                 preserve_attachment_tag_in_egress = true
                 filesystem_policy = "unrestricted"
+
+                [runtime.task_executor]
+                enabled = false
+
+                [runtime.task_route]
+                enabled = false
 
                 [dispatch]
                 default_class = "ui"
@@ -942,6 +964,8 @@ mod tests {
         assert_eq!(cfg.toml.identity.display_name, "Alice");
         assert_eq!(cfg.cancel_reason(), "user canceled");
         assert_eq!(cfg.language(), "zh");
+        assert!(!cfg.toml.runtime.task_executor.enabled);
+        assert!(!cfg.toml.runtime.task_route.enabled);
         assert!(cfg.toml.runtime.preserve_attachment_tag_in_egress);
         assert_eq!(
             cfg.toml.runtime.filesystem_policy,
@@ -1052,7 +1076,7 @@ mod tests {
         assert_eq!(work.process_stack_limit, 8);
         assert_eq!(work.driver.report_delivery, ReportDeliveryMode::TopLevel);
         let self_check = cfg.session_class("self_check").unwrap();
-        assert!(!self_check.enabled);
+        assert!(self_check.enabled);
         assert_eq!(self_check.kind, SessionKind::SelfCheck);
         assert_eq!(
             self_check.driver.on_behavior_switch.pull_event,

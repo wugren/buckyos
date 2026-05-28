@@ -233,6 +233,25 @@ async fn post_send_creates_owner_and_tunnel_outbox_records() {
 }
 
 #[tokio::test]
+async fn post_send_rejects_message_without_target() {
+    let (center, _tmp) = new_center("post_send_without_target").await;
+    let author = DID::new("bns", "author-empty-target");
+    let msg = make_msg(author.clone(), Vec::new(), MsgObjKind::Chat);
+
+    let err = center
+        .handle_post_send(msg, None, None, ctx())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, kRPC::RPCErrors::ParseRequestError(_)));
+    let owner_outbox = center
+        .handle_peek_box(author, BoxKind::Outbox, None, None, None, ctx())
+        .await
+        .unwrap();
+    assert!(owner_outbox.is_empty());
+}
+
+#[tokio::test]
 async fn report_delivery_handles_success_and_failure_paths() {
     let (center, _tmp) = new_center("report_delivery").await;
     let sender = DID::new("bns", "sender-c");

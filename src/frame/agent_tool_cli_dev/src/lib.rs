@@ -37,11 +37,12 @@ use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
 
 const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
+const TOOL_FINISH_TASK: &str = "finish_task";
 const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
-const TOOL_NAMES: [&str; 16] = [
+const TOOL_NAMES: [&str; 17] = [
     "Glob",
     "Grep",
     "dcrontab",
@@ -58,6 +59,7 @@ const TOOL_NAMES: [&str; 16] = [
     TOOL_AGENT_NOTEBOOK_SNAKE,
     TOOL_CHECK_TASK,
     TOOL_CANCEL_TASK,
+    TOOL_FINISH_TASK,
 ];
 const AGENT_MEMORY_ROOT_ENV: &str = "AGENT_MEMORY_ROOT";
 const AGENT_MEMORY_DIR_NAME: &str = "memory";
@@ -136,8 +138,8 @@ impl CliRuntimeEnv {
 
 /// What the parser produced. The dispatcher resolves the tool against
 /// the registry and asks it to parse its own argv via
-/// `AgentTool::parse_cli_args`. Pseudo-tools (`check_task`/`cancel_task`)
-/// stay as variants because they don't live in the tool registry.
+/// `AgentTool::parse_cli_args`. Pseudo-tools (`check_task`/`cancel_task`/
+/// `finish_task`) stay as variants because they don't live in the tool registry.
 #[derive(Clone, Debug)]
 enum ParsedCommand {
     CommandNotFound {
@@ -160,6 +162,12 @@ enum ParsedCommand {
         task_id: i64,
         recursive: bool,
     },
+    FinishTask {
+        tool_name: String,
+        task_id: i64,
+        outcome: FinishTaskOutcome,
+        message: Option<String>,
+    },
     AgentMemory {
         tool_name: String,
         invocation: AgentMemoryInvocation,
@@ -168,6 +176,12 @@ enum ParsedCommand {
         tool_name: String,
         invocation: AgentNotebookInvocation,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishTaskOutcome {
+    Completed,
+    Failed,
 }
 
 /// Parsed `agent-memory` command before execution. Mirrors §3.1/§4.x of the
@@ -371,6 +385,43 @@ async fn execute(
                 EXIT_SUCCESS,
             ))
         }
+        ParsedCommand::FinishTask {
+            tool_name,
+            task_id,
+            outcome,
+            message,
+        } => {
+            let task_mgr = build_task_manager_client(&env).await?;
+            match outcome {
+                FinishTaskOutcome::Completed => {
+                    task_mgr
+                        .update_task(
+                            task_id,
+                            Some(TaskStatus::Completed),
+                            Some(100.0),
+                            message.clone(),
+                            None,
+                        )
+                        .await
+                }
+                FinishTaskOutcome::Failed => {
+                    let error_message = message
+                        .clone()
+                        .unwrap_or_else(|| "failed by finish_task".to_string());
+                    task_mgr.update_task_error(task_id, &error_message).await
+                }
+            }
+            .map_err(|err| {
+                AgentToolError::ExecFailed(format!("finish task `{task_id}` failed: {err}"))
+            })?;
+            let task = task_mgr.get_task(task_id).await.map_err(|err| {
+                AgentToolError::ExecFailed(format!("reload task `{task_id}` failed: {err}"))
+            })?;
+            Ok(render_cli_output(
+                &build_finish_task_result(&tool_name, task, outcome),
+                EXIT_SUCCESS,
+            ))
+        }
     }
 }
 
@@ -487,6 +538,7 @@ fn parse_tool_command(
     match tool_name.as_str() {
         TOOL_CHECK_TASK => parse_check_task_cli_command(tool_name, tokens),
         TOOL_CANCEL_TASK => parse_cancel_task_cli_command(tool_name, tokens),
+        TOOL_FINISH_TASK => parse_finish_task_cli_command(tool_name, tokens),
         TOOL_AGENT_MEMORY | TOOL_AGENT_MEMORY_SNAKE => {
             parse_agent_memory_cli_command(tool_name, tokens)
         }
@@ -535,6 +587,89 @@ fn parse_cancel_task_cli_command(
         task_id: parse_task_id_arg(&task_tokens, TOOL_CANCEL_TASK)?,
         recursive,
     })
+}
+
+fn parse_finish_task_cli_command(
+    tool_name: String,
+    tokens: &[String],
+) -> Result<ParsedCommand, AgentToolError> {
+    let mut outcome = FinishTaskOutcome::Completed;
+    let mut message: Option<String> = None;
+    let mut task_tokens = Vec::new();
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        match token.as_str() {
+            "--failed" | "--fail" => outcome = FinishTaskOutcome::Failed,
+            "--success" | "--completed" | "--complete" => outcome = FinishTaskOutcome::Completed,
+            "--status" => {
+                idx += 1;
+                let value = tokens.get(idx).ok_or_else(|| {
+                    with_tool_usage("missing value for `--status`", TOOL_FINISH_TASK)
+                })?;
+                outcome = parse_finish_task_outcome(value)?;
+            }
+            "--message" | "--reason" => {
+                idx += 1;
+                let value = tokens.get(idx).ok_or_else(|| {
+                    with_tool_usage(format!("missing value for `{token}`"), TOOL_FINISH_TASK)
+                })?;
+                message = Some(value.clone());
+            }
+            value if matches_finish_task_outcome_token(value) => {
+                outcome = parse_finish_task_outcome(value)?;
+            }
+            value if value.contains('=') => {
+                let (key, raw_value) = value
+                    .split_once('=')
+                    .ok_or_else(|| with_tool_usage("invalid key=value arg", TOOL_FINISH_TASK))?;
+                match key {
+                    "status" | "outcome" => outcome = parse_finish_task_outcome(raw_value)?,
+                    "message" | "reason" | "error" | "error_message" => {
+                        message = Some(raw_value.to_string())
+                    }
+                    _ => task_tokens.push(value.to_string()),
+                }
+            }
+            _ => task_tokens.push(token.clone()),
+        }
+        idx += 1;
+    }
+
+    Ok(ParsedCommand::FinishTask {
+        tool_name,
+        task_id: parse_task_id_arg(&task_tokens, TOOL_FINISH_TASK)?,
+        outcome,
+        message,
+    })
+}
+
+fn matches_finish_task_outcome_token(value: &str) -> bool {
+    matches!(
+        value,
+        "success"
+            | "succeeded"
+            | "complete"
+            | "completed"
+            | "finish"
+            | "finished"
+            | "fail"
+            | "failed"
+            | "error"
+    )
+}
+
+fn parse_finish_task_outcome(value: &str) -> Result<FinishTaskOutcome, AgentToolError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "success" | "succeeded" | "complete" | "completed" | "finish" | "finished" => {
+            Ok(FinishTaskOutcome::Completed)
+        }
+        "fail" | "failed" | "error" => Ok(FinishTaskOutcome::Failed),
+        _ => Err(with_tool_usage(
+            format!("unsupported finish status `{}`", value.trim()),
+            TOOL_FINISH_TASK,
+        )),
+    }
 }
 
 fn parse_task_id_arg(tokens: &[String], tool_name: &str) -> Result<i64, AgentToolError> {
@@ -2841,6 +2976,7 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
         match name {
             TOOL_CHECK_TASK => "check_task <task_id>".to_string(),
             TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]".to_string(),
+            TOOL_FINISH_TASK => "finish_task <task_id> [failed] [--message <text>]".to_string(),
             _ => format!("{name} ..."),
         }
     };
@@ -2868,6 +3004,7 @@ fn with_tool_usage(message: impl Into<String>, tool_name: &str) -> AgentToolErro
     let usage = match tool_name {
         TOOL_CHECK_TASK => "check_task <task_id>",
         TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]",
+        TOOL_FINISH_TASK => "finish_task <task_id> [failed] [--message <text>]",
         _ => "agent_tool <tool> ...",
     };
     AgentToolError::InvalidArgs(format!("{}\nUsage: {usage}", message.into()))
@@ -3364,6 +3501,42 @@ fn build_cancel_task_result(
         .with_task_id(task.id.to_string())
 }
 
+fn build_finish_task_result(
+    tool_name: &str,
+    task: Task,
+    outcome: FinishTaskOutcome,
+) -> AgentToolResult {
+    let mut detail = normalized_task_detail(&task);
+    if let Some(map) = detail.as_object_mut() {
+        map.insert("task".to_string(), json!(task.clone()));
+        map.insert(
+            "finish_outcome".to_string(),
+            Json::String(
+                match outcome {
+                    FinishTaskOutcome::Completed => "completed",
+                    FinishTaskOutcome::Failed => "failed",
+                }
+                .to_string(),
+            ),
+        );
+    }
+    let outcome_text = match outcome {
+        FinishTaskOutcome::Completed => "finished",
+        FinishTaskOutcome::Failed => "failed",
+    };
+
+    AgentToolResult::from_details(detail)
+        .with_status(AgentToolStatus::Success)
+        .with_result(format!("{outcome_text} task {}", task.id))
+        .with_title(format!("{tool_name} {} {outcome_text} => success", task.id))
+        .with_tool(tool_name)
+        .with_cmd_line(match outcome {
+            FinishTaskOutcome::Completed => format!("{tool_name} {}", task.id),
+            FinishTaskOutcome::Failed => format!("{tool_name} {} failed", task.id),
+        })
+        .with_task_id(task.id.to_string())
+}
+
 fn normalized_task_detail(task: &Task) -> Json {
     let mut detail = if task.data.is_object() {
         task.data.clone()
@@ -3613,9 +3786,9 @@ mod tests {
             vec![
                 OsString::from("/tmp/edit_file"),
                 OsString::from("notes.txt"),
-                OsString::from("--pos-chunk"),
+                OsString::from("--old-string"),
                 OsString::from("world"),
-                OsString::from("--new-content"),
+                OsString::from("--new-string"),
                 OsString::from("buckyos"),
             ],
             test_env(root.clone(), cwd.clone()),
@@ -3647,7 +3820,7 @@ mod tests {
         assert_eq!(payload["status"], "success");
         assert_eq!(
             payload["detail"]["tools"].as_array().map(|v| v.len()),
-            Some(15)
+            Some(TOOL_NAMES.len())
         );
     }
 
@@ -4023,6 +4196,65 @@ mod tests {
                 assert_eq!(tool_name, TOOL_CANCEL_TASK);
                 assert_eq!(task_id, 7);
                 assert!(recursive);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_finish_task_subcommand_accepts_task_id() {
+        let parsed = parse_command(
+            &[
+                OsString::from(MAIN_BINARY_NAME),
+                OsString::from(TOOL_FINISH_TASK),
+                OsString::from("task_id=9"),
+            ],
+            Path::new("/tmp"),
+        )
+        .expect("parse finish_task");
+
+        match parsed {
+            ParsedCommand::FinishTask {
+                tool_name,
+                task_id,
+                outcome,
+                message,
+            } => {
+                assert_eq!(tool_name, TOOL_FINISH_TASK);
+                assert_eq!(task_id, 9);
+                assert_eq!(outcome, FinishTaskOutcome::Completed);
+                assert_eq!(message, None);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_finish_task_failed_accepts_message() {
+        let parsed = parse_command(
+            &[
+                OsString::from(MAIN_BINARY_NAME),
+                OsString::from(TOOL_FINISH_TASK),
+                OsString::from("9"),
+                OsString::from("failed"),
+                OsString::from("--message"),
+                OsString::from("cannot route task"),
+            ],
+            Path::new("/tmp"),
+        )
+        .expect("parse finish_task failed");
+
+        match parsed {
+            ParsedCommand::FinishTask {
+                tool_name,
+                task_id,
+                outcome,
+                message,
+            } => {
+                assert_eq!(tool_name, TOOL_FINISH_TASK);
+                assert_eq!(task_id, 9);
+                assert_eq!(outcome, FinishTaskOutcome::Failed);
+                assert_eq!(message.as_deref(), Some("cannot route task"));
             }
             other => panic!("unexpected parsed command: {other:?}"),
         }

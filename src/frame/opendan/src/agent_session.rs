@@ -48,6 +48,7 @@ use crate::behavior_hooks::{
 use crate::llm_context_helper::{
     apply_overrides_to_snapshot, run_fork_sub_context, ForkSubContextInput, RequestOverrides,
 };
+use crate::local_workspace::LocalWorkspaceManager;
 use crate::prompt_env::{self, AgentSessionEnv, LlmContextEnv};
 use crate::round_history::{
     CompactionTarget, ContextMode, HistoryEvent, InterruptMode as HistoryInterruptMode,
@@ -61,6 +62,7 @@ pub use crate::session_model::{
     ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
+use crate::worksession_tools::render_workspace_inventory;
 
 /// Sentinel emitted by a behavior parser in
 /// `LLMBehaviorResult.next_behavior` to mean "current intent ran its course,
@@ -300,6 +302,21 @@ struct TurnMessage {
     runtime_auto: bool,
 }
 
+enum RenderedUserMessage {
+    NotConfigured,
+    Empty,
+    Text(String),
+}
+
+impl RenderedUserMessage {
+    fn into_text(self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::NotConfigured | Self::Empty => None,
+        }
+    }
+}
+
 struct OpenDanStepResultHook {
     template: String,
     behavior: BehaviorCfg,
@@ -430,7 +447,15 @@ impl StepResultHook for OpenDanStepResultHook {
             .map_err(|err| err.to_string())?;
         let rendered = rendered.trim();
         if rendered.is_empty() {
-            return Ok(StepResultHookOutput::default());
+            self.discard_selected_pending(&selected_keys).await;
+            warn!(
+                "opendan.session[{}]: rendered empty user message hook=on_behavior_step_ob behavior=`{}`; skipping next inference",
+                self.session_id, self.behavior.meta.name
+            );
+            return Ok(StepResultHookOutput {
+                skip_next_inference: true,
+                ..Default::default()
+            });
         }
 
         self.discard_selected_pending(&selected_keys).await;
@@ -444,6 +469,7 @@ impl StepResultHook for OpenDanStepResultHook {
         Ok(StepResultHookOutput {
             user_message: Some(AiMessage::text(AiRole::User, rendered.to_string())),
             history_inputs: Vec::new(),
+            skip_next_inference: false,
         })
     }
 }
@@ -859,6 +885,13 @@ impl AgentSession {
         continuation: InternalContinuation,
     ) -> Result<NextAction> {
         let messages = continuation.user_messages;
+        if messages.is_empty() {
+            warn!(
+                "opendan.session[{}]: skipped internal continuation `{}` with empty user message; skipping inference",
+                self.session_id, continuation.reason
+            );
+            return Ok(NextAction::Continue);
+        }
         let seed = RoundSeed {
             trigger: RoundTrigger::SystemEvent {
                 source: "session.internal_continuation".to_string(),
@@ -1023,6 +1056,19 @@ impl AgentSession {
         }
     }
 
+    async fn handle_end_action(&self) -> bool {
+        match session_end_disposition(self.kind) {
+            SessionEndDisposition::Idle => {
+                self.set_status(SessionStatus::Idle).await;
+                true
+            }
+            SessionEndDisposition::Ended => {
+                self.finish_ended().await;
+                false
+            }
+        }
+    }
+
     /// Convenience: enqueue a locally-injected human message. The synthetic
     /// `record_id` distinguishes CLI / test injections from msg-center
     /// records (which use the upstream record id).
@@ -1082,7 +1128,9 @@ impl AgentSession {
                             self.set_status(SessionStatus::WaitingTool).await
                         }
                         NextAction::End => {
-                            self.finish_ended().await;
+                            if self.handle_end_action().await {
+                                continue;
+                            }
                             return;
                         }
                     },
@@ -1150,8 +1198,14 @@ impl AgentSession {
                     let bootstrap_message = self
                         .render_on_behavior_switch_input_text("none", &behavior, None, None)
                         .await
+                        .into_text()
                         .map(|text| AiMessage::text(AiRole::User, text));
                     let bootstrap_messages = bootstrap_message.into_iter().collect::<Vec<_>>();
+                    if bootstrap_messages.is_empty() {
+                        self.mark_bootstrap_done().await;
+                        self.set_status(SessionStatus::WaitingInput).await;
+                        continue;
+                    }
                     self.set_current_origin_msg(
                         bootstrap_messages
                             .first()
@@ -1180,7 +1234,9 @@ impl AgentSession {
                                 self.set_status(SessionStatus::WaitingTool).await
                             }
                             NextAction::End => {
-                                self.finish_ended().await;
+                                if self.handle_end_action().await {
+                                    continue;
+                                }
                                 return;
                             }
                         },
@@ -1527,7 +1583,9 @@ impl AgentSession {
                                     self.set_status(SessionStatus::WaitingTool).await
                                 }
                                 NextAction::End => {
-                                    self.finish_ended().await;
+                                    if self.handle_end_action().await {
+                                        continue;
+                                    }
                                     return;
                                 }
                             }
@@ -1613,15 +1671,20 @@ impl AgentSession {
                     continue;
                 }
             };
-            let round_inputs = if let Some(text) = wakeup_template_text {
-                vec![AiMessage::text(AiRole::User, text)]
-            } else {
-                let mut round_inputs =
-                    prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
-                if let Some(batch) = format_event_batch_for_turn(&turn_events) {
-                    round_inputs.push(AiMessage::text(AiRole::User, batch));
+            let round_inputs = match wakeup_template_text {
+                RenderedUserMessage::Text(text) => vec![AiMessage::text(AiRole::User, text)],
+                RenderedUserMessage::Empty => {
+                    self.discard_consumed(&consumed_keys).await;
+                    continue;
                 }
-                round_inputs
+                RenderedUserMessage::NotConfigured => {
+                    let mut round_inputs =
+                        prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
+                    if let Some(batch) = format_event_batch_for_turn(&turn_events) {
+                        round_inputs.push(AiMessage::text(AiRole::User, batch));
+                    }
+                    round_inputs
+                }
             };
             info!(
                 "opendan.session[{}]: build user input hook=on_wakeup msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
@@ -1716,7 +1779,9 @@ impl AgentSession {
                             self.set_status(SessionStatus::WaitingTool).await
                         }
                         NextAction::End => {
-                            self.finish_ended().await;
+                            if self.handle_end_action().await {
+                                continue;
+                            }
                             return;
                         }
                     }
@@ -3479,7 +3544,7 @@ impl AgentSession {
                 ai_message_log_preview(message)
             );
         } else if !turn_messages.is_empty() {
-            info!(
+            warn!(
                 "opendan.session[{}]: skipped empty user message trace={} behavior=`{}` source_messages={}",
                 self.session_id,
                 trace_id,
@@ -4766,7 +4831,7 @@ impl AgentSession {
                 self.session_id
             );
         }
-        let messages = self
+        let messages: Vec<AiMessage> = self
             .render_on_behavior_switch_input_text(
                 &prev.meta.name,
                 &new_cfg,
@@ -4774,9 +4839,13 @@ impl AgentSession {
                 Some(from_context),
             )
             .await
+            .into_text()
             .map(|text| AiMessage::text(AiRole::User, text))
             .into_iter()
             .collect();
+        if messages.is_empty() {
+            return Ok(NextAction::Continue);
+        }
         self.set_internal_continuation(InternalContinuation {
             reason: format!("behavior_switch:{}->{}", prev.meta.name, new_cfg.meta.name),
             user_messages: messages,
@@ -4791,10 +4860,12 @@ impl AgentSession {
         next: &BehaviorCfg,
         from_context_report: Option<&str>,
         from_context: Option<serde_json::Value>,
-    ) -> Option<String> {
-        let template = next.prompt.on_behavior_switch.as_deref().map(str::trim)?;
+    ) -> RenderedUserMessage {
+        let Some(template) = next.prompt.on_behavior_switch.as_deref().map(str::trim) else {
+            return RenderedUserMessage::NotConfigured;
+        };
         if template.is_empty() {
-            return None;
+            return RenderedUserMessage::NotConfigured;
         }
         let mut env = self.build_prompt_env(next).await;
         let pending = self.meta.lock().await.pending_inputs.clone();
@@ -4850,39 +4921,43 @@ impl AgentSession {
         match prompt_env::render_template(template, &env, &extras).await {
             Ok(text) => {
                 let text = text.trim().to_string();
-                if !text.is_empty() {
-                    info!(
-                        "opendan.session[{}]: rendered user message hook=on_behavior_switch from=`{}` to=`{}` chars={} preview=`{}`",
-                        self.session_id,
-                        prev_name,
-                        next.meta.name,
-                        text.chars().count(),
-                        text_log_preview(&text)
+                if text.is_empty() {
+                    warn!(
+                        "opendan.session[{}]: rendered empty user message hook=on_behavior_switch from=`{}` to=`{}`; skipping next inference",
+                        self.session_id, prev_name, next.meta.name
                     );
+                    return RenderedUserMessage::Empty;
                 }
-                Some(text)
+                info!(
+                    "opendan.session[{}]: rendered user message hook=on_behavior_switch from=`{}` to=`{}` chars={} preview=`{}`",
+                    self.session_id,
+                    prev_name,
+                    next.meta.name,
+                    text.chars().count(),
+                    text_log_preview(&text)
+                );
+                RenderedUserMessage::Text(text)
             }
             Err(err) => {
                 warn!(
                     "opendan.session[{}]: render on_behavior_switch for behavior `{}` failed: {err}",
                     self.session_id, next.meta.name
                 );
-                None
+                RenderedUserMessage::NotConfigured
             }
         }
-        .filter(|text| !text.is_empty())
     }
 
     async fn render_on_wakeup_input_text(
         &self,
         llm_context: LlmContextEnv,
-    ) -> Result<Option<String>> {
+    ) -> Result<RenderedUserMessage> {
         let behavior = self.load_current_behavior().await?;
         let Some(template) = behavior.prompt.on_wakeup.as_deref().map(str::trim) else {
-            return Ok(None);
+            return Ok(RenderedUserMessage::NotConfigured);
         };
         if template.is_empty() {
-            return Ok(None);
+            return Ok(RenderedUserMessage::NotConfigured);
         }
         let mut env = self.build_prompt_env(&behavior).await;
         apply_hook_env_to_prompt_env(&mut env, llm_context);
@@ -4911,9 +4986,13 @@ impl AgentSession {
                 rendered.chars().count(),
                 text_log_preview(&rendered)
             );
-            Ok(Some(rendered))
+            Ok(RenderedUserMessage::Text(rendered))
         } else {
-            Ok(None)
+            warn!(
+                "opendan.session[{}]: rendered empty user message hook=on_wakeup behavior=`{}`; skipping next inference",
+                self.session_id, behavior.meta.name
+            );
+            Ok(RenderedUserMessage::Empty)
         }
     }
 
@@ -5125,15 +5204,15 @@ impl AgentSession {
 
         let on_behavior_switch_text = if parent_frame.fork {
             match self.agent_config.load_behavior(&parent_frame.current) {
-                Ok(parent_cfg) => {
-                    self.render_on_behavior_switch_input_text(
+                Ok(parent_cfg) => self
+                    .render_on_behavior_switch_input_text(
                         child_entry.as_str(),
                         &parent_cfg,
                         Some(child_report.as_str()),
                         None,
                     )
                     .await
-                }
+                    .into_text(),
                 Err(err) => {
                     warn!(
                         "opendan.session[{}]: load parent behavior `{}` after fork pop failed: {err:#}",
@@ -5925,6 +6004,7 @@ async fn build_agent_session_env(
         .map(|ws| agent_config.layout.workspaces_dir.join(ws));
     let (notebook_list_text, notebook_last_items_text) =
         build_notebook_prompt_texts(agent_config, owner.trim(), agent_name);
+    let runtime_workspace_list_text = build_runtime_workspace_list_text(agent_config).await;
     AgentSessionEnv {
         session_id: session_id.to_string(),
         session_kind: AgentSessionEnv::kind_str(kind),
@@ -5951,6 +6031,7 @@ async fn build_agent_session_env(
         input_has_events: false,
         recent_activity: one_line.trim().to_string(),
         clock_unix_ms: now_ms(),
+        runtime_workspace_list_text,
         notebook_list_text,
         notebook_last_items_text,
         llm_context: LlmContextEnv {
@@ -5958,6 +6039,20 @@ async fn build_agent_session_env(
             ..Default::default()
         },
         task: task_binding.map(Into::into),
+    }
+}
+
+async fn build_runtime_workspace_list_text(agent_config: &AgentConfig) -> String {
+    let manager = LocalWorkspaceManager::new(agent_config.layout.workspaces_dir.clone());
+    match manager.list().await {
+        Ok(mut workspaces) => {
+            workspaces.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+            render_workspace_inventory(&workspaces)
+        }
+        Err(err) => {
+            warn!("opendan.session: build workspace list prompt text failed: {err}");
+            String::new()
+        }
     }
 }
 
@@ -6338,6 +6433,19 @@ fn stable_report_hash(report: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEndDisposition {
+    Idle,
+    Ended,
+}
+
+fn session_end_disposition(kind: SessionKind) -> SessionEndDisposition {
+    match kind {
+        SessionKind::SelfCheck => SessionEndDisposition::Idle,
+        _ => SessionEndDisposition::Ended,
+    }
 }
 
 fn idle_worker_retire_ms(kind: SessionKind) -> u64 {

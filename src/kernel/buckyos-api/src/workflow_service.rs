@@ -76,41 +76,13 @@ pub enum WorkflowScheduledTaskSchedule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum WorkflowScheduledTaskTarget {
-    Remind {
-        text: String,
-        #[serde(default)]
-        to: Option<String>,
-    },
-    AgentTask {
-        title: String,
-        objective: String,
-        workspace_id: String,
-        #[serde(default)]
-        behavior: Option<String>,
-        #[serde(default)]
-        agent: Option<String>,
-    },
-    #[serde(rename = "workflow.run")]
-    WorkflowRun {
-        workflow_id: String,
-        #[serde(default)]
-        input: Value,
-    },
-    #[serde(rename = "opendan.command")]
-    OpenDANCommand {
-        command: String,
-        #[serde(default)]
-        args: Value,
-    },
-    #[serde(rename = "service.rpc")]
-    ServiceRpc {
-        service: String,
-        method: String,
-        #[serde(default)]
-        params: Value,
-    },
+pub struct WorkflowScheduledTaskTarget {
+    pub task_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    pub name_template: String,
+    #[serde(default)]
+    pub data_template: Value,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +117,8 @@ pub struct WorkflowScheduledTaskState {
     #[serde(default)]
     pub last_fire_at: Option<i64>,
     #[serde(default)]
+    pub last_task_id: Option<i64>,
+    #[serde(default)]
     pub last_run_id: Option<String>,
     #[serde(default)]
     pub consecutive_failures: u32,
@@ -174,7 +148,8 @@ pub struct WorkflowScheduledTask {
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowScheduledTaskFireStatus {
     Created,
-    RunCreated,
+    #[serde(alias = "run_created")]
+    TaskCreated,
     Skipped,
     Failed,
 }
@@ -187,6 +162,8 @@ pub struct WorkflowScheduledTaskFireRecord {
     pub fire_time: i64,
     pub manual: bool,
     pub status: WorkflowScheduledTaskFireStatus,
+    #[serde(default)]
+    pub task_id: Option<i64>,
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]

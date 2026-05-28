@@ -1,4 +1,4 @@
-use buckyos_api::{CreateTaskOptions, TaskManagerClient, TaskStatus};
+use buckyos_api::{CreateTaskOptions, TaskFilter, TaskManagerClient, TaskStatus};
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -50,42 +50,16 @@ pub enum ScheduleSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ScheduleTarget {
-    Remind {
-        text: String,
-        #[serde(default)]
-        to: Option<String>,
-    },
-    AgentTask {
-        title: String,
-        objective: String,
-        workspace_id: String,
-        #[serde(default)]
-        behavior: Option<String>,
-        #[serde(default)]
-        agent: Option<String>,
-    },
-    #[serde(rename = "workflow.run")]
-    WorkflowRun {
-        workflow_id: String,
-        #[serde(default)]
-        input: Value,
-    },
-    #[serde(rename = "opendan.command")]
-    OpenDANCommand {
-        command: String,
-        #[serde(default)]
-        args: Value,
-    },
-    #[serde(rename = "service.rpc")]
-    ServiceRpc {
-        service: String,
-        method: String,
-        #[serde(default)]
-        params: Value,
-    },
+pub struct ScheduleSubtaskTemplate {
+    pub task_type: String,
+    #[serde(default)]
+    pub runner: Option<String>,
+    pub name_template: String,
+    #[serde(default)]
+    pub data_template: Value,
 }
+
+pub type ScheduleTarget = ScheduleSubtaskTemplate;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +103,8 @@ pub struct ScheduleState {
     pub next_fire_at: Option<i64>,
     #[serde(default)]
     pub last_fire_at: Option<i64>,
+    #[serde(default)]
+    pub last_task_id: Option<i64>,
     #[serde(default)]
     pub last_run_id: Option<String>,
     #[serde(default)]
@@ -182,7 +158,8 @@ impl WorkflowSchedule {
 #[serde(rename_all = "snake_case")]
 pub enum FireStatus {
     Created,
-    RunCreated,
+    #[serde(alias = "run_created")]
+    TaskCreated,
     Skipped,
     Failed,
 }
@@ -195,6 +172,8 @@ pub struct ScheduleFireRecord {
     pub fire_time: i64,
     pub manual: bool,
     pub status: FireStatus,
+    #[serde(default)]
+    pub task_id: Option<i64>,
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]
@@ -276,12 +255,10 @@ impl ScheduleStore {
             .filter(|schedule| owner.map(|o| schedule.owner == *o).unwrap_or(true))
             .filter(|schedule| status.map(|s| schedule.status == s).unwrap_or(true))
             .filter(|schedule| name.map(|n| schedule.name.contains(n)).unwrap_or(true))
-            .filter(|schedule| match (workflow_id, &schedule.target) {
-                (Some(want), ScheduleTarget::WorkflowRun { workflow_id, .. }) => {
-                    workflow_id == want
-                }
-                (Some(_), _) => false,
-                (None, _) => true,
+            .filter(|schedule| {
+                workflow_id
+                    .map(|want| schedule_workflow_id(&schedule.target) == Some(want))
+                    .unwrap_or(true)
             })
             .cloned()
             .collect();
@@ -344,6 +321,7 @@ impl ScheduleStore {
             fire_time,
             manual,
             status: FireStatus::Created,
+            task_id: None,
             run_id: None,
             error: None,
             created_at: now,
@@ -359,6 +337,7 @@ impl ScheduleStore {
         &self,
         fire_id: &str,
         status: FireStatus,
+        task_id: Option<i64>,
         run_id: Option<String>,
         error: Option<String>,
     ) -> Option<ScheduleFireRecord> {
@@ -366,6 +345,7 @@ impl ScheduleStore {
         let updated = {
             let fire = guard.fires_by_id.get_mut(fire_id)?;
             fire.status = status;
+            fire.task_id = task_id;
             fire.run_id = run_id;
             fire.error = error;
             fire.updated_at = Utc::now().timestamp();
@@ -498,68 +478,94 @@ impl ScheduleTaskMirrorClient {
             .map_err(|err| err.to_string())
     }
 
-    pub async fn create_agent_delegate_task(
+    pub async fn create_fire_subtask(
         &self,
         schedule: &WorkflowSchedule,
-        fire: &ScheduleFireRecord,
+        rendered: &RenderedScheduleSubtask,
     ) -> Result<i64, String> {
-        let ScheduleTarget::AgentTask {
-            title,
-            objective,
-            workspace_id,
-            behavior,
-            agent,
-        } = &schedule.target
-        else {
-            return Err("schedule target is not agent_task".to_string());
+        let Some(parent_id) = schedule.task_mirror.root_task_id else {
+            return Err("schedule root task is missing".to_string());
         };
-        let runner = agent
+        let root_id = schedule
+            .task_mirror
+            .root_id
             .clone()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| schedule.owner.app_id.clone());
+            .unwrap_or_else(|| schedule.schedule_id.clone());
         let task = self
             .client
             .create_task(
-                title,
-                "agent.delegate",
-                Some(json!({
-                    "agent_delegate": {
-                        "version": 1,
-                        "purpose": objective,
-                        "title": title,
-                        "requester_agent_id": schedule.owner.app_id,
-                        "owner_session_id": format!("schedule-{}", schedule.schedule_id),
-                        "input": {
-                            "text": objective
-                        },
-                        "workspace_hints": [{
-                            "workspace_id": workspace_id
-                        }],
-                        "trigger": {
-                            "schedule_id": schedule.schedule_id,
-                            "fire_id": fire.fire_id,
-                            "fire_time": fire.fire_time,
-                            "manual": fire.manual
-                        },
-                        "execution": {
-                            "workspace_id": workspace_id,
-                            "behavior": behavior,
-                            "runner": runner,
-                            "status": "pending"
-                        }
-                    }
-                })),
+                rendered.name.as_str(),
+                rendered.task_type.as_str(),
+                Some(rendered.data.clone()),
                 schedule.owner.user_id.as_str(),
                 schedule.owner.app_id.as_str(),
                 Some(CreateTaskOptions {
-                    runner: Some(runner),
-                    root_id: Some(schedule.schedule_id.clone()),
+                    runner: rendered.runner.clone(),
+                    parent_id: Some(parent_id),
+                    root_id: Some(root_id),
                     ..Default::default()
                 }),
             )
             .await
             .map_err(|err| err.to_string())?;
         Ok(task.id)
+    }
+
+    pub async fn active_fire_subtasks(&self, schedule: &WorkflowSchedule) -> Result<u32, String> {
+        let Some(parent_id) = schedule.task_mirror.root_task_id else {
+            return Ok(0);
+        };
+        let tasks = self
+            .client
+            .list_tasks(
+                Some(TaskFilter {
+                    parent_id: Some(parent_id),
+                    root_id: schedule.task_mirror.root_id.clone(),
+                    ..Default::default()
+                }),
+                Some(schedule.owner.user_id.as_str()),
+                Some(schedule.owner.app_id.as_str()),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(tasks
+            .iter()
+            .filter(|task| !task.status.is_terminal())
+            .count() as u32)
+    }
+
+    pub async fn find_fire_subtask_by_run_id(
+        &self,
+        schedule: &WorkflowSchedule,
+        run_id: &str,
+    ) -> Result<Option<i64>, String> {
+        let Some(parent_id) = schedule.task_mirror.root_task_id else {
+            return Ok(None);
+        };
+        let tasks = self
+            .client
+            .list_tasks(
+                Some(TaskFilter {
+                    parent_id: Some(parent_id),
+                    root_id: schedule.task_mirror.root_id.clone(),
+                    task_type: Some("workflow/run".to_string()),
+                    ..Default::default()
+                }),
+                Some(schedule.owner.user_id.as_str()),
+                Some(schedule.owner.app_id.as_str()),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(tasks
+            .iter()
+            .find(|task| {
+                task.data
+                    .pointer("/workflow/run_id")
+                    .and_then(Value::as_str)
+                    == Some(run_id)
+            })
+            .map(|task| task.id))
     }
 }
 
@@ -573,6 +579,7 @@ fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {
             "target": schedule.target,
             "next_fire_at": schedule.state.next_fire_at,
             "last_fire_at": schedule.state.last_fire_at,
+            "last_task_id": schedule.state.last_task_id,
             "last_run_id": schedule.state.last_run_id,
             "consecutive_failures": schedule.state.consecutive_failures,
             "last_error": schedule.state.last_error,
@@ -690,74 +697,398 @@ pub fn schedule_spec_from_value(value: &Value) -> Result<ScheduleSpec, String> {
 }
 
 pub fn schedule_target_from_value(value: &Value) -> Result<ScheduleTarget, String> {
+    if value.get("task_type").is_some() {
+        return schedule_subtask_template_from_value(value);
+    }
     let kind = value
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing target.kind".to_string())?;
     match kind {
-        "remind" => Ok(ScheduleTarget::Remind {
-            text: value
+        "remind" => {
+            let text = value
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.text".to_string())?
-                .to_string(),
-            to: value.get("to").and_then(Value::as_str).map(str::to_string),
-        }),
-        "agent_task" | "task" => Ok(ScheduleTarget::AgentTask {
-            title: value
+                .to_string();
+            let to = value
+                .get("to")
+                .and_then(Value::as_str)
+                .unwrap_or("self")
+                .to_string();
+            Ok(ScheduleSubtaskTemplate {
+                task_type: "workflow.send_message".to_string(),
+                runner: Some("workflow".to_string()),
+                name_template: "remind: ${schedule.name} [${fire.fire_id}]".to_string(),
+                data_template: json!({
+                    "send_message": {
+                        "to": to,
+                        "text": text,
+                        "trigger": trigger_template()
+                    }
+                }),
+            })
+        }
+        "agent_task" | "task" => {
+            let title = value
                 .get("title")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.title".to_string())?
-                .to_string(),
-            objective: value
+                .to_string();
+            let objective = value
                 .get("objective")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.objective".to_string())?
-                .to_string(),
-            workspace_id: value
+                .to_string();
+            let workspace_id = value
                 .get("workspace_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.workspace_id".to_string())?
-                .to_string(),
-            behavior: value
-                .get("behavior")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            agent: value
+                .to_string();
+            let runner = value
                 .get("agent")
                 .and_then(Value::as_str)
-                .map(str::to_string),
-        }),
-        "workflow.run" => Ok(ScheduleTarget::WorkflowRun {
-            workflow_id: value
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "${schedule.owner.app_id}".to_string());
+            Ok(ScheduleSubtaskTemplate {
+                task_type: "agent.delegate".to_string(),
+                runner: Some(runner.clone()),
+                name_template: title.clone(),
+                data_template: json!({
+                    "agent_delegate": {
+                        "version": 1,
+                        "purpose": objective,
+                        "title": title,
+                        "requester_agent_id": "${schedule.owner.app_id}",
+                        "owner_session_id": "schedule-${schedule.schedule_id}",
+                        "input": {
+                            "text": objective
+                        },
+                        "workspace_hints": [{
+                            "workspace_id": workspace_id
+                        }],
+                        "trigger": trigger_template(),
+                        "execution": {
+                            "workspace_id": workspace_id,
+                            "behavior": value.get("behavior").cloned().unwrap_or(Value::Null),
+                            "runner": runner,
+                            "status": "pending"
+                        }
+                    }
+                }),
+            })
+        }
+        "workflow.run" => {
+            let workflow_id = value
                 .get("workflow_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.workflow_id".to_string())?
-                .to_string(),
-            input: value.get("input").cloned().unwrap_or(Value::Null),
-        }),
-        "opendan.command" => Ok(ScheduleTarget::OpenDANCommand {
-            command: value
+                .to_string();
+            Ok(ScheduleSubtaskTemplate {
+                task_type: "workflow.run".to_string(),
+                runner: Some("workflow".to_string()),
+                name_template: "workflow/run: ${schedule.name} [${fire.fire_id}]".to_string(),
+                data_template: json!({
+                    "workflow_run": {
+                        "workflow_id": workflow_id,
+                        "input": value.get("input").cloned().unwrap_or(Value::Null),
+                        "trigger": trigger_template()
+                    }
+                }),
+            })
+        }
+        "opendan.command" => {
+            let command = value
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.command".to_string())?
-                .to_string(),
-            args: value.get("args").cloned().unwrap_or(Value::Null),
-        }),
-        "service.rpc" => Ok(ScheduleTarget::ServiceRpc {
-            service: value
+                .to_string();
+            Ok(ScheduleSubtaskTemplate {
+                task_type: "opendan.command".to_string(),
+                runner: Some("opendan".to_string()),
+                name_template: "opendan.command: ${schedule.name} [${fire.fire_id}]".to_string(),
+                data_template: json!({
+                    "opendan_command": {
+                        "command": command,
+                        "args": value.get("args").cloned().unwrap_or(Value::Null),
+                        "trigger": trigger_template()
+                    }
+                }),
+            })
+        }
+        "service.rpc" => {
+            let service = value
                 .get("service")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.service".to_string())?
-                .to_string(),
-            method: value
+                .to_string();
+            let method = value
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target.method".to_string())?
-                .to_string(),
-            params: value.get("params").cloned().unwrap_or(Value::Null),
-        }),
+                .to_string();
+            Ok(ScheduleSubtaskTemplate {
+                task_type: "service.rpc".to_string(),
+                runner: Some(service.clone()),
+                name_template: "service.rpc: ${schedule.name} [${fire.fire_id}]".to_string(),
+                data_template: json!({
+                    "service_rpc": {
+                        "service": service,
+                        "method": method,
+                        "params": value.get("params").cloned().unwrap_or(Value::Null),
+                        "trigger": trigger_template()
+                    }
+                }),
+            })
+        }
         other => Err(format!("unsupported target.kind `{}`", other)),
+    }
+}
+
+pub fn schedule_subtask_template_from_value(
+    value: &Value,
+) -> Result<ScheduleSubtaskTemplate, String> {
+    let task_type = value
+        .get("task_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing target.task_type".to_string())?
+        .to_string();
+    let name_template = value
+        .get("name_template")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing target.name_template".to_string())?
+        .to_string();
+    Ok(ScheduleSubtaskTemplate {
+        task_type,
+        runner: value
+            .get("runner")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        name_template,
+        data_template: value.get("data_template").cloned().unwrap_or(Value::Null),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedScheduleSubtask {
+    pub task_type: String,
+    pub runner: Option<String>,
+    pub name: String,
+    pub data: Value,
+}
+
+pub fn render_subtask_template(
+    schedule: &WorkflowSchedule,
+    fire: &ScheduleFireRecord,
+) -> RenderedScheduleSubtask {
+    let context = render_context(schedule, fire);
+    RenderedScheduleSubtask {
+        task_type: render_string(&schedule.target.task_type, &context),
+        runner: schedule
+            .target
+            .runner
+            .as_ref()
+            .map(|value| render_string(value, &context)),
+        name: render_string(&schedule.target.name_template, &context),
+        data: render_value(&schedule.target.data_template, &context),
+    }
+}
+
+pub fn schedule_workflow_id(target: &ScheduleSubtaskTemplate) -> Option<&str> {
+    if target.task_type != "workflow.run" {
+        return None;
+    }
+    target
+        .data_template
+        .pointer("/workflow_run/workflow_id")
+        .and_then(Value::as_str)
+}
+
+pub fn validate_subtask_template(target: &ScheduleSubtaskTemplate) -> Result<(), String> {
+    if target.task_type.trim().is_empty() {
+        return Err("target.task_type must not be empty".to_string());
+    }
+    if target.name_template.trim().is_empty() {
+        return Err("target.name_template must not be empty".to_string());
+    }
+    if let Some(runner) = target.runner.as_deref() {
+        if runner.trim().is_empty() {
+            return Err("target.runner must not be empty".to_string());
+        }
+    }
+    match target.task_type.as_str() {
+        "agent.delegate" => validate_agent_delegate_template(target),
+        "workflow.send_message" => validate_send_message_template(target),
+        "workflow.run" => schedule_workflow_id(target)
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| ())
+            .ok_or_else(|| {
+                "workflow.run target requires data_template.workflow_run.workflow_id".to_string()
+            }),
+        _ => Ok(()),
+    }
+}
+
+fn validate_agent_delegate_template(target: &ScheduleSubtaskTemplate) -> Result<(), String> {
+    let delegate = target
+        .data_template
+        .get("agent_delegate")
+        .ok_or_else(|| "agent.delegate target requires data_template.agent_delegate".to_string())?;
+    for field in ["title", "purpose"] {
+        if delegate
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(format!("agent.delegate target requires `{}`", field));
+        }
+    }
+    let workspace_count = delegate
+        .get("workspace_hints")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("workspace_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_some()
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if workspace_count != 1 {
+        return Err("agent.delegate target requires exactly one workspace_id".to_string());
+    }
+    Ok(())
+}
+
+fn validate_send_message_template(target: &ScheduleSubtaskTemplate) -> Result<(), String> {
+    let send_message = target.data_template.get("send_message").ok_or_else(|| {
+        "workflow.send_message target requires data_template.send_message".to_string()
+    })?;
+    if send_message
+        .get("to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err("workflow.send_message target requires recipient `to`".to_string());
+    }
+    if send_message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err("workflow.send_message target requires non-empty text".to_string());
+    }
+    Ok(())
+}
+
+fn trigger_template() -> Value {
+    json!({
+        "schedule_id": "${schedule.schedule_id}",
+        "fire_id": "${fire.fire_id}",
+        "fire_time": "${fire.fire_time}",
+        "manual": "${fire.manual}"
+    })
+}
+
+fn render_context(schedule: &WorkflowSchedule, fire: &ScheduleFireRecord) -> Value {
+    json!({
+        "schedule": {
+            "schedule_id": schedule.schedule_id,
+            "name": schedule.name,
+            "owner": {
+                "user_id": schedule.owner.user_id,
+                "app_id": schedule.owner.app_id
+            }
+        },
+        "fire": {
+            "fire_id": fire.fire_id,
+            "fire_key": fire.fire_key,
+            "fire_time": fire.fire_time,
+            "manual": fire.manual
+        }
+    })
+}
+
+fn render_value(value: &Value, context: &Value) -> Value {
+    match value {
+        Value::String(raw) => placeholder_value(raw, context)
+            .unwrap_or_else(|| Value::String(render_string(raw, context))),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| render_value(item, context))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), render_value(value, context)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn render_string(raw: &str, context: &Value) -> String {
+    let mut out = raw.to_string();
+    for key in [
+        "schedule.schedule_id",
+        "schedule.name",
+        "schedule.owner.user_id",
+        "schedule.owner.app_id",
+        "fire.fire_id",
+        "fire.fire_key",
+        "fire.fire_time",
+        "fire.manual",
+    ] {
+        let needle = format!("${{{}}}", key);
+        if out.contains(&needle) {
+            if let Some(value) = value_at_path(context, key) {
+                out = out.replace(&needle, value_to_template_string(value).as_str());
+            }
+        }
+    }
+    out
+}
+
+fn placeholder_value(raw: &str, context: &Value) -> Option<Value> {
+    let trimmed = raw.trim();
+    let key = trimmed.strip_prefix("${")?.strip_suffix('}')?;
+    value_at_path(context, key).cloned()
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn value_to_template_string(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        _ => value.to_string(),
     }
 }
 

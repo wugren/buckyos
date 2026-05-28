@@ -7,6 +7,12 @@ language = "zh"
 preserve_attachment_tag_in_egress = false
 filesystem_policy = "unrestricted"
 
+[runtime.task_executor]
+enabled = true
+
+[runtime.task_route]
+enabled = true
+
 [[channel]]
 type = "msg_center"
 
@@ -136,7 +142,7 @@ pull_msg = "one"
 pull_event = "none"
 
 [session.self_check]
-enabled = false
+enabled = true
 kind = "self_check"
 loop_mode = "behavior"
 default_behavior = "self_check"
@@ -145,7 +151,7 @@ process_stack_limit = 2
 
 [session.self_check.driver]
 switch_mode = "normal"
-inject_background_environment = false
+inject_background_environment = true
 report_delivery = "final_only"
 
 [session.self_check.driver.on_init]

@@ -338,6 +338,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | `$runtime.clock_text` | `{{ runtime.clock_text }}` | string | Driver 冻结环境时的本地时间，格式 `DD-MM HH:MM`，24 小时制 |
 | `$runtime.recent_activity` | `{{ runtime.recent_activity }}` | string | `OneLineStatusSink` 当前值 |
 | `$runtime.has_activity` | `{{ runtime.has_activity }}` | bool | recent activity 是否非空 |
+| `$runtime.workspace_list_text` | `{{ runtime.workspace_list_text }}` | string | `render_workspace_inventory` 渲染出的 workspace 列表文本，按 `updated_at_ms` 倒序读取当前 Agent workspace registry |
 
 ### 3.7 `notebook`
 

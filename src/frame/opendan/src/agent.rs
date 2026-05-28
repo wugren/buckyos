@@ -1344,7 +1344,7 @@ impl AIAgent {
         }
     }
 
-    async fn ensure_session_inner(
+    pub(crate) async fn ensure_session_inner(
         self: Arc<Self>,
         session_id: String,
         kind: SessionKind,

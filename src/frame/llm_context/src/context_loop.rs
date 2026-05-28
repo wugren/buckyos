@@ -654,13 +654,12 @@ impl LLMContext {
                     });
                 }
                 // The observation message has already been appended to
-                // accumulated by the caller (tool path); for non-tool
-                // recoverable errors we push a system message describing
-                // the error so the next inference can see it.
+                // accumulated by the caller (tool path); non-tool errors use
+                // a user observation so the next inference can see it.
                 if !matches!(&err, LLMComputeError::ToolFailed { .. }) {
                     self.state
                         .accumulated
-                        .push(AiMessage::text(AiRole::System, format!("error: {err}")));
+                        .push(AiMessage::text(AiRole::User, format!("error: {err}")));
                 }
                 None
             }
@@ -941,7 +940,9 @@ impl LLMContext {
             //    consecutive-error counter.
             if let Some(err) = error_to_bump {
                 self.finish_step(&mut new_step);
-                self.apply_step_result_hook(&mut new_step).await;
+                if self.apply_step_result_hook(&mut new_step).await {
+                    return self.finish_done_behavior(new_step, response).await;
+                }
                 self.sediment(new_step);
                 if let Some(outcome) = self.bump_consecutive_errors(err).await {
                     return outcome;
@@ -950,7 +951,9 @@ impl LLMContext {
             }
 
             self.finish_step(&mut new_step);
-            self.apply_step_result_hook(&mut new_step).await;
+            if self.apply_step_result_hook(&mut new_step).await {
+                return self.finish_done_behavior(new_step, response).await;
+            }
             self.sediment(new_step);
         }
     }
@@ -1127,16 +1130,19 @@ impl LLMContext {
         step.meta.ended_at_ms = Some(now_ms());
     }
 
-    async fn apply_step_result_hook(&mut self, step: &mut StepRecord) {
+    async fn apply_step_result_hook(&mut self, step: &mut StepRecord) -> bool {
         if step.action_results.is_empty() && step.messages_sent.is_empty() {
-            return;
+            return false;
         }
         let Some(hook) = self.deps.step_result_hook.clone() else {
-            return;
+            return false;
         };
         let snapshot = self.snapshot();
         match hook.on_behavior_step_ob(&snapshot, step).await {
             Ok(output) => {
+                if output.skip_next_inference {
+                    return true;
+                }
                 if let Some(message) = output.user_message {
                     step.next_user_message = Some(normalize_user_message(message));
                 }
@@ -1151,6 +1157,7 @@ impl LLMContext {
                 );
             }
         }
+        false
     }
 
     /// Outer-loop counterpart to `handle_error`'s FeedAsObservation cap.

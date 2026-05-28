@@ -1036,9 +1036,17 @@ fn to_workflow_schedule(trigger: &TriggerArgs) -> WorkflowScheduledTaskSchedule 
 
 fn to_workflow_target(target: &TargetArgs) -> WorkflowScheduledTaskTarget {
     match target {
-        TargetArgs::Remind { text, to } => WorkflowScheduledTaskTarget::Remind {
-            text: text.clone(),
-            to: to.clone(),
+        TargetArgs::Remind { text, to } => WorkflowScheduledTaskTarget {
+            task_type: "workflow.send_message".to_string(),
+            runner: Some("workflow".to_string()),
+            name_template: "remind: ${schedule.name} [${fire.fire_id}]".to_string(),
+            data_template: json!({
+                "send_message": {
+                    "to": to.clone().unwrap_or_else(|| "self".to_string()),
+                    "text": text,
+                    "trigger": trigger_template()
+                }
+            }),
         },
         TargetArgs::Task {
             title,
@@ -1046,14 +1054,49 @@ fn to_workflow_target(target: &TargetArgs) -> WorkflowScheduledTaskTarget {
             workspace_id,
             behavior,
             agent,
-        } => WorkflowScheduledTaskTarget::AgentTask {
-            title: title.clone(),
-            objective: objective.clone(),
-            workspace_id: workspace_id.clone(),
-            behavior: behavior.clone(),
-            agent: agent.clone(),
-        },
+        } => {
+            let runner = agent
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "${schedule.owner.app_id}".to_string());
+            WorkflowScheduledTaskTarget {
+                task_type: "agent.delegate".to_string(),
+                runner: Some(runner.clone()),
+                name_template: title.clone(),
+                data_template: json!({
+                    "agent_delegate": {
+                        "version": 1,
+                        "title": title,
+                        "purpose": objective,
+                        "requester_agent_id": "${schedule.owner.app_id}",
+                        "owner_session_id": "schedule-${schedule.schedule_id}",
+                        "input": {
+                            "text": objective
+                        },
+                        "workspace_hints": [{
+                            "workspace_id": workspace_id
+                        }],
+                        "trigger": trigger_template(),
+                        "execution": {
+                            "workspace_id": workspace_id,
+                            "behavior": behavior,
+                            "runner": runner,
+                            "status": "pending"
+                        }
+                    }
+                }),
+            }
+        }
     }
+}
+
+fn trigger_template() -> Json {
+    json!({
+        "schedule_id": "${schedule.schedule_id}",
+        "fire_id": "${fire.fire_id}",
+        "fire_time": "${fire.fire_time}",
+        "manual": "${fire.manual}"
+    })
 }
 
 fn build_policy(raw: &str) -> Result<WorkflowScheduledTaskPolicy, AgentToolError> {
@@ -1111,12 +1154,13 @@ fn first_env(keys: &[&str]) -> Option<String> {
 }
 
 fn target_kind(target: &WorkflowScheduledTaskTarget) -> &'static str {
-    match target {
-        WorkflowScheduledTaskTarget::Remind { .. } => "remind",
-        WorkflowScheduledTaskTarget::AgentTask { .. } => "task",
-        WorkflowScheduledTaskTarget::WorkflowRun { .. } => "workflow",
-        WorkflowScheduledTaskTarget::OpenDANCommand { .. } => "opendan",
-        WorkflowScheduledTaskTarget::ServiceRpc { .. } => "service",
+    match target.task_type.as_str() {
+        "workflow.send_message" => "remind",
+        "agent.delegate" => "task",
+        "workflow.run" => "workflow",
+        "opendan.command" => "opendan",
+        "service.rpc" => "service",
+        _ => "subtask",
     }
 }
 
@@ -1142,6 +1186,7 @@ fn schedule_detail(record: &WorkflowScheduledTask) -> Json {
         "state": {
             "next_fire_at": record.state.next_fire_at.map(rfc3339),
             "last_fire_at": record.state.last_fire_at.map(rfc3339),
+            "last_task_id": record.state.last_task_id,
             "last_run_id": record.state.last_run_id,
             "last_error": record.state.last_error,
         },
@@ -1175,25 +1220,39 @@ fn trigger_detail(schedule: &WorkflowScheduledTaskSchedule) -> Json {
 }
 
 fn target_detail(target: &WorkflowScheduledTaskTarget) -> Json {
-    match target {
-        WorkflowScheduledTaskTarget::Remind { text, to } => {
-            json!({ "kind": "remind", "to": to.clone().unwrap_or_else(|| "self".to_string()), "text": text })
+    match target.task_type.as_str() {
+        "workflow.send_message" => {
+            let send_message = target.data_template.get("send_message");
+            json!({
+                "kind": "remind",
+                "task_type": target.task_type,
+                "runner": target.runner.clone(),
+                "to": send_message.and_then(|value| value.get("to")).and_then(Json::as_str).unwrap_or("self"),
+                "text": send_message.and_then(|value| value.get("text")).and_then(Json::as_str).unwrap_or_default()
+            })
         }
-        WorkflowScheduledTaskTarget::AgentTask {
-            title,
-            objective,
-            workspace_id,
-            behavior,
-            agent,
-        } => json!({
-            "kind": "task",
-            "title": title,
-            "objective": objective,
-            "workspace_id": workspace_id,
-            "behavior": behavior,
-            "agent": agent,
-        }),
-        other => json!(other),
+        "agent.delegate" => {
+            let delegate = target.data_template.get("agent_delegate");
+            let workspace_id = delegate
+                .and_then(|value| value.get("workspace_hints"))
+                .and_then(Json::as_array)
+                .and_then(|items| items.first())
+                .and_then(|value| value.get("workspace_id"))
+                .and_then(Json::as_str);
+            json!({
+                "kind": "task",
+                "task_type": target.task_type,
+                "runner": target.runner.clone(),
+                "title": delegate.and_then(|value| value.get("title")).and_then(Json::as_str).unwrap_or_default(),
+                "objective": delegate.and_then(|value| value.get("purpose")).and_then(Json::as_str).unwrap_or_default(),
+                "workspace_id": workspace_id,
+                "behavior": delegate
+                    .and_then(|value| value.pointer("/execution/behavior"))
+                    .cloned()
+                    .unwrap_or(Json::Null),
+            })
+        }
+        _ => json!(target),
     }
 }
 
@@ -1217,6 +1276,7 @@ fn fire_detail(fire: &WorkflowScheduledTaskFireRecord) -> Json {
         "fire_time": rfc3339(fire.fire_time),
         "manual": fire.manual,
         "status": fire.status,
+        "task_id": fire.task_id,
         "run_id": fire.run_id,
         "error": fire.error,
     })

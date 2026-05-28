@@ -162,8 +162,9 @@ TaskMgr 支持任务树：
 
 1. 如果创建参数 `parent_id` 存在，使用父任务 `root_id`。
 2. 否则如果 `CreateTaskOptions.root_id` 非空，使用该值。
-3. 否则从 `data` 中尝试读取 `/root_id`、`/rootid`、`/meta/root_id`、`/meta/rootid`。
-4. 否则根任务落库后用自身 `id` 作为 `root_id`。
+3. 否则根任务落库后用自身 `id` 作为 `root_id`。
+
+TaskMgr 不再从 `Task.data` 中的 `root_id`、`rootid`、`meta.root_id` 或 `meta.rootid` 推导根任务分组。调用方必须使用接口层 `root_id` 字段。
 
 这个模型用于 Workflow 等复杂任务：一个 Run 可以是根任务，Step、Thunk、Map shard 作为子孙任务挂在同一棵树下，外部通过 `root_id` 查询或订阅整棵树。
 
@@ -267,12 +268,6 @@ TaskData schema 与 `task_type` 的绑定关系如下。一个任务的 `task_ty
 
 ```json
 {
-  "root_id": "optional-root-id",
-  "rootid": "optional-root-id",
-  "meta": {
-    "root_id": "optional-root-id",
-    "rootid": "optional-root-id"
-  },
   "owner_session_id": "optional-owner-session-id",
   "completed_items": 1,
   "total_items": 10
@@ -281,7 +276,7 @@ TaskData schema 与 `task_type` 的绑定关系如下。一个任务的 `task_ty
 
 说明：
 
-- `root_id` / `rootid` / `meta.root_id` / `meta.rootid`：创建根任务时 TaskMgr 会尝试读取这些字段作为 `Task.root_id`。如果请求参数中已有 `CreateTaskOptions.root_id`，则优先使用请求参数。
+- `Task.root_id`：创建根任务时只能由接口层 `CreateTaskOptions.root_id` / `TaskManagerCreateTaskReq.root_id` 指定；子任务继承父任务 `root_id`。`Task.data` 内的 root 字段不再有 TaskMgr 语义。
 - `Task.session_id`：OpenDAN、AICC 等模块用于把任务归到一次会话或 agent loop，应优先写入 task 顶层字段而不是塞进 `app_id` 或 `data`。
 - `owner_session_id`：业务 data 中的归因字段，仅用于模块内部语义，不参与 TaskMgr 核心过滤。
 - `completed_items` / `total_items`：`update_task_progress` 会把这两个字段同步写入 `data`，并据此计算 `Task.progress`。
@@ -543,7 +538,7 @@ aicc.compute
 | 项 | 说明 |
 | --- | --- |
 | 绑定 task_type | `aicc.compute` |
-| data 主 namespace | `aicc`，外加根字段 `rootid` / `owner_session_id` |
+| data 主 namespace | `aicc`，外加根字段 `owner_session_id` |
 | 创建方 | AICC |
 | 更新方 | AICC `TaskAuditSink` / provider task event sink |
 | 消费方 | AICC、OpenDAN、TaskMgr UI |
@@ -552,7 +547,6 @@ aicc.compute
 
 ```json
 {
-  "rootid": "session-or-default-root",
   "session_id": "optional-session-id",
   "owner_session_id": "optional-session-id",
   "aicc": {
@@ -563,7 +557,6 @@ aicc.compute
     "updated_at_ms": 1730000000000,
     "tenant_id": "user-or-tenant",
     "event_ref": "optional-event-ref",
-    "rootid": "session-or-default-root",
     "session_id": "optional-session-id",
     "request": {},
     "provider_input": null,
@@ -620,8 +613,7 @@ OpenDAN Behavior 创建 LLM 行为任务时写入：
   "wakeup_id": "wakeup-...",
   "kind": "behavior",
   "session_id": "session-...",
-  "owner_session_id": "session-...",
-  "rootid": "agent-session-root"
+  "owner_session_id": "session-..."
 }
 ```
 

@@ -109,21 +109,6 @@ fn request_context_from_source_or_rpc(
     request_ctx
 }
 
-fn parse_root_id_from_task_data(data: &Value) -> Option<String> {
-    for pointer in ["/root_id", "/rootid", "/meta/root_id", "/meta/rootid"] {
-        let value = data
-            .pointer(pointer)
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(|item| item.to_string());
-        if value.is_some() {
-            return value;
-        }
-    }
-    None
-}
-
 fn unique_task_name_conflict(err: &RPCErrors) -> bool {
     matches!(
         err,
@@ -533,8 +518,6 @@ impl TaskManagerHandler for TaskManagerService {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string())
         {
-            task.root_id = root_id;
-        } else if let Some(root_id) = parse_root_id_from_task_data(&task.data) {
             task.root_id = root_id;
         }
 
@@ -1286,7 +1269,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_create_task_uses_data_rootid_for_record_root_id() {
+    async fn test_create_task_ignores_data_rootid_for_record_root_id() {
         let (server, _temp_dir) = setup_test_environment().await;
         let ip = IpAddr::from_str("127.0.0.1").unwrap();
 
@@ -1301,21 +1284,30 @@ mod tests {
         let create_req = create_rpc_request("create_task", create_params);
         let create_resp = server.handle_rpc_call(create_req, ip).await.unwrap();
         let task_id = if let RPCResult::Success(result) = create_resp.result {
-            assert_eq!(result["task"]["root_id"], "session-alpha");
-            result["task_id"]
+            let task_id = result["task_id"]
                 .as_i64()
-                .expect("task_id should be present")
+                .expect("task_id should be present");
+            let expected_root_id = task_id.to_string();
+            assert_eq!(
+                result["task"]["root_id"].as_str(),
+                Some(expected_root_id.as_str())
+            );
+            task_id
         } else {
             panic!("Failed to create task");
         };
 
-        let list_req = create_rpc_request("list_tasks", json!({ "root_id": "session-alpha" }));
+        let list_req = create_rpc_request("list_tasks", json!({ "root_id": task_id.to_string() }));
         let list_resp = server.handle_rpc_call(list_req, ip).await.unwrap();
         if let RPCResult::Success(result) = list_resp.result {
             let tasks = result["tasks"].as_array().expect("tasks should be array");
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0]["id"], task_id);
-            assert_eq!(tasks[0]["root_id"], "session-alpha");
+            let expected_root_id = task_id.to_string();
+            assert_eq!(
+                tasks[0]["root_id"].as_str(),
+                Some(expected_root_id.as_str())
+            );
         } else {
             panic!("Failed to list tasks by root_id");
         }
@@ -1330,10 +1322,7 @@ mod tests {
             "name": "grouped_task_req_root",
             "task_type": "test_type",
             "app_name": "test_app",
-            "root_id": "session-beta",
-            "data": {
-                "rootid": "session-alpha"
-            }
+            "root_id": "session-beta"
         });
         let create_req = create_rpc_request("create_task", create_params);
         let create_resp = server.handle_rpc_call(create_req, ip).await.unwrap();

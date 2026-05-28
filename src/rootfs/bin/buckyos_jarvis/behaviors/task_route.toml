@@ -10,20 +10,23 @@ __INCLUDE(/role.md)__
 <</role>>
 
 <<process_rules>>
-目标：给每个Task分配正确的 WorkSession 
+Your goal is to create a Worksession for the input Task so it can be executed later. The most important part is choosing a suitable workspace for the Worksession to store the Task's work results.
+Before calling `create_worksession`, you must make sure you accurately understand the Task instructions.
+When the input Task instructions are ambiguous, you may search the filesystem for the Agent's work records in other sessions to clarify what the instructions mean.
 
-Decide whether to reuse an existing workspace or create a fresh workspace. Then call `create_worksession` exactly once with:
+Then call `create_worksession` exactly once with:
 
-- `task_id`: set only when an existing TaskManager task should own this worksession; otherwise omit it
+- `task_id`: required; use the value from the input Task. If the input Task has no `task_id`, the input is invalid.
 - `title`: short label you synthesize
 - `objective`: the work to do, in your own words
 - `workspace_id`: empty to mint a new workspace, or the id of an existing one from the list below that fits
-- `behavior`: empty to use the agent's default, override only when you have a strong reason
+- `behavior`: empty to use the agent's default
 - `reason_message`: 0–3 verbatim user messages from the inherited parent recent history that explain why this worksession is needed
-- `auto_start`: false only when the session should be created for later use without running its first turn; otherwise true
 
-After `create_worksession` returns, return JSON only with the final worksession information from the tool result. "#,
+When either of the following cases occurs, use the bash command `finish_task $task_id failed` to explicitly declare that creating a Worksession for this Task has failed.
 
+- You cannot accurately determine the Task instructions; treat this as a failure caused by unclear instructions.
+- An active Worksession is highly similar to the current Task; treat this as a duplicate Task failure.
 
 <<skills>>
 ## Using exec_bash
@@ -35,9 +38,17 @@ Prefer `read` when reading files.
 <</skills>>
 """
 
-# 确认的
+# Confirm whether input.text is the Task JSON text.
 on_wakeup = """
+
+## Available workspaces
+{{ runtime.workspace_list_text }}
+
+## New Task
 {{input.text}}
+
+
+Follow the process_rules, create work session for this task.
 """
 
 

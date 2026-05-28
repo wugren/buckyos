@@ -322,6 +322,8 @@ pub struct StepResultHookOutput {
     pub user_message: Option<AiMessage>,
     /// Extra history inputs to append before the next behavior inference.
     pub history_inputs: Vec<HistoryInputRecord>,
+    /// Stop the behavior loop instead of starting the next inference.
+    pub skip_next_inference: bool,
 }
 
 #[async_trait]

@@ -39,6 +39,22 @@ fn pending_event(event_id: &str) -> PendingInput {
     }
 }
 
+#[test]
+fn self_check_behavior_end_keeps_session_idle() {
+    assert_eq!(
+        session_end_disposition(SessionKind::SelfCheck),
+        SessionEndDisposition::Idle
+    );
+    assert_eq!(
+        session_end_disposition(SessionKind::Work),
+        SessionEndDisposition::Ended
+    );
+    assert_eq!(
+        session_end_disposition(SessionKind::SelfImprove),
+        SessionEndDisposition::Ended
+    );
+}
+
 #[tokio::test]
 async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
     let dir = tempfile::tempdir().unwrap();
@@ -243,6 +259,97 @@ step observed
     assert!(text.contains("step observed"));
     assert!(!text.contains("forwarded follow-up"));
     assert_eq!(meta.lock().await.pending_inputs.len(), 1);
+}
+
+#[tokio::test]
+async fn on_behavior_step_ob_empty_render_skips_next_inference() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "plan"
+
+        [prompt]
+        on_behavior_step_ob = """
+{% if input.has_events %}
+{{ input.text }}
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/plan.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "plan".to_string(),
+        "owner".to_string(),
+    );
+    meta.pending_inputs
+        .push(pending_msg("m1", "follow-up details"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        agent_name: "jarvis".to_string(),
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+
+    assert!(output.skip_next_inference);
+    assert!(output.user_message.is_none());
+    assert!(meta.lock().await.pending_inputs.is_empty());
 }
 
 #[test]
@@ -948,6 +1055,7 @@ __INCLUDE(/role.md)__
         input_has_events: false,
         recent_activity: String::new(),
         clock_unix_ms: 1,
+        runtime_workspace_list_text: String::new(),
         notebook_list_text: String::new(),
         notebook_last_items_text: String::new(),
         llm_context: LlmContextEnv::default(),

@@ -10,10 +10,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::agent::{AIAgent, CreateWorkSessionParams};
-use crate::session_model::{InterruptMode, PendingInput, SessionMeta, SessionStatus};
+use crate::session_model::{InterruptMode, PendingInput, SessionKind, SessionMeta, SessionStatus};
 
 pub const TASK_TYPE_AGENT_DELEGATE: &str = "agent.delegate";
 pub const TASK_TYPE_HUMAN_INPUT: &str = "human.input";
+const TASK_ROUTE_BEHAVIOR: &str = "task_route";
 
 impl AIAgent {
     pub fn task_executor_runner_id(&self) -> Result<String> {
@@ -214,13 +215,14 @@ impl AIAgent {
             return Ok(());
         }
         if let Some(session_id) = route_session_id(&data) {
-            self.clone()
-                .fail_task_route(
-                    task,
-                    Some(session_id),
-                    "task_route sessions are no longer used for agent.delegate execution",
-                )
-                .await?;
+            if !self.config.toml.runtime.task_route.enabled {
+                self.clone()
+                    .fail_task_route_disabled(task, Some(session_id))
+                    .await?;
+                return Ok(());
+            }
+            let session = self.clone().ensure_session(&session_id).await?;
+            session.wake().await;
             return Ok(());
         }
 
@@ -229,13 +231,11 @@ impl AIAgent {
             return Ok(());
         }
 
-        self.clone()
-            .fail_task_route(
-                task,
-                None,
-                "agent.delegate data is not specific enough to create a WorkSession directly",
-            )
-            .await?;
+        if !self.config.toml.runtime.task_route.enabled {
+            self.clone().fail_task_route_disabled(task, None).await?;
+            return Ok(());
+        }
+        self.clone().route_task_via_task_route(task).await?;
         Ok(())
     }
 
@@ -351,15 +351,93 @@ impl AIAgent {
         Ok(())
     }
 
-    async fn fail_task_route(
+    async fn route_task_via_task_route(self: Arc<Self>, task: Task) -> Result<()> {
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
+            return Err(anyhow!("task manager unavailable"));
+        };
+        let session_id = format!("task-route-{}", task.id);
+        let session_dir = self.config.layout.session_dir(&session_id);
+        let existing_meta = load_session_meta(&session_dir);
+        let session = if let Some(meta) = existing_meta {
+            self.clone()
+                .ensure_session_inner(
+                    session_id.clone(),
+                    meta.kind,
+                    meta.owner.clone(),
+                    Some(meta.current_behavior.clone()),
+                    Some(meta),
+                )
+                .await?
+        } else {
+            let created_by_session_id = delegate_string(&task.data, "owner_session_id")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("task-{}", task.id));
+            let mut meta = SessionMeta::new(
+                session_id.clone(),
+                SessionKind::Work,
+                TASK_ROUTE_BEHAVIOR.to_string(),
+                created_by_session_id,
+            );
+            meta.title = format!("Route task {}", task.id);
+            meta.objective = format!("Create a WorkSession for task {}", task.id);
+            meta.workspace_id = Some(session_id.clone());
+            meta.bootstrap_done = true;
+            self.clone()
+                .ensure_session_inner(
+                    session_id.clone(),
+                    SessionKind::Work,
+                    meta.owner.clone(),
+                    Some(TASK_ROUTE_BEHAVIOR.to_string()),
+                    Some(meta),
+                )
+                .await?
+        };
+
+        let input_text = task_route_input_text(&task);
+        session
+            .enqueue_pending(PendingInput::Msg {
+                record_id: format!("task-route-{}", task.id),
+                from: format!("task:{}", task.id),
+                from_did: None,
+                from_name: Some("TaskManager".to_string()),
+                tunnel_did: None,
+                text: input_text.clone(),
+                ai_message: AiMessage::text(AiRole::User, input_text),
+            })
+            .await?;
+        let update_result = task_mgr
+            .update_task(
+                task.id,
+                Some(TaskStatus::Running),
+                Some(task.progress.max(1.0)),
+                Some("Routing agent task via task_route".to_string()),
+                Some(json!({
+                    "agent_delegate": {
+                        "route": {
+                            "status": "routed",
+                            "strategy": "task_route_behavior",
+                            "session_id": session_id,
+                            "routed_at_ms": now_ms()
+                        }
+                    }
+                })),
+            )
+            .await;
+        session.wake().await;
+        update_result?;
+        Ok(())
+    }
+
+    async fn fail_task_route_disabled(
         self: Arc<Self>,
         task: Task,
         route_session_id: Option<String>,
-        reason: &str,
     ) -> Result<()> {
         let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
             return Err(anyhow!("task manager unavailable"));
         };
+        let reason =
+            "agent.delegate task requires task_route, but runtime.task_route.enabled is false";
         task_mgr
             .update_task(
                 task.id,
@@ -370,7 +448,7 @@ impl AIAgent {
                     "agent_delegate": {
                         "route": {
                             "status": "failed",
-                            "strategy": "fail_first",
+                            "strategy": "task_route_disabled",
                             "session_id": route_session_id,
                             "reason": reason,
                             "failed_at_ms": now_ms()
@@ -722,6 +800,27 @@ fn human_input_response_text(data: &Value) -> Option<String> {
                 .map(str::to_string)
         })
         .or_else(|| serde_json::to_string_pretty(response).ok())
+}
+
+fn task_route_input_text(task: &Task) -> String {
+    serde_json::to_string_pretty(&json!({
+        "task_id": task.id,
+        "root_task_id": task.root_id.parse::<i64>().unwrap_or(task.id),
+        "root_id": task.root_id.as_str(),
+        "task_type": task.task_type.as_str(),
+        "runner": task.runner.as_str(),
+        "task_name": task.name.as_str(),
+        "user_id": task.user_id.as_str(),
+        "app_id": task.app_id.as_str(),
+        "parent_id": task.parent_id,
+        "data": &task.data,
+    }))
+    .unwrap_or_else(|_| format!(r#"{{"task_id":{}}}"#, task.id))
+}
+
+fn load_session_meta(session_dir: &std::path::Path) -> Option<SessionMeta> {
+    let bytes = std::fs::read(session_dir.join(".meta").join("session.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

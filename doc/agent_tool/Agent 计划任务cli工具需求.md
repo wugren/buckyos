@@ -11,9 +11,9 @@ Agent / Bash
   -> agent_tool dcrontab ...
   -> Workflow ScheduleStore (kernel/workflow/src/scheduled_task_manager.rs)
   -> Workflow 定时触发
-  -> 命中 target：
-       remind  -> 直接走 msg_center / 本地 inbox
-       task    -> TaskMgr 创建 agent.delegate 任务，由 AgentTaskExecutor 拾起
+  -> 按 Workflow schedule schema 创建 fire subtask：
+       remind  -> workflow.send_message subtask，由 workflow/message executor 调 msg_center
+       task    -> agent.delegate subtask，由 AgentTaskExecutor 拾起
 ```
 
 底层数据模型见 [workflow的定时触发器和计划任务管理.md](../../notepads/workflow的定时触发器和计划任务管理.md)；本文件只定义 OpenDAN AgentTool CLI 的需求。
@@ -21,12 +21,12 @@ Agent / Bash
 > 当前实现状态参考：
 > - 时间触发已经有 `ScheduleSpec::{Cron, Once, RunEvery}` 三种形式 (`src/kernel/workflow/src/scheduled_task_manager.rs`)。
 > - 任务派发已经有 `agent.delegate` task + `AgentTaskExecutor` 走 `create_worksession_by_task_id` 直接落 WorkSession 的路径 (`src/frame/opendan/src/agent_task_executor.rs`)。
-> - 现有 `ScheduleTarget` 中的 `WorkflowRun` / `OpenDANCommand` / `ServiceRpc` 在本 CLI 版本里**不暴露**，需要新增/收敛到 `Remind` 与 `AgentTask` 两类（beta2.2 接受 breaking change）。
+> - CLI 短形式仍只暴露 `remind` 与 `task`，但后端 payload 统一映射为 Workflow schedule 的 fire subtask template，不再依赖 `ScheduleTarget::{Remind, AgentTask}` 的特殊执行分支。
 
 ## 2. 设计目标
 
 1. CLI 把"crontab 的时间表达力"暴露给 Agent，三类时间触发都要支持：一次性 `run_at`、定时器 `every`、标准 crontab。
-2. 计划任务的 payload 在这一版只暴露两类：`remind` 和 `task`，不直接暴露 workflow / RPC。
+2. 计划任务的 CLI payload 在这一版只暴露两类：`remind` 和 `task`，后端统一转成 Workflow schedule schema。
 3. 命中 `task` 时落地的是**标准 Agent Task Schema**（title / objective / workspace_id），TaskExecutor 不再需要从 `task.data` 里反解执行参数。
 4. 所有 CLI 输出遵循 `AgentToolResult` JSON envelope。
 5. 缺少 `OPENDAN_SESSION_ID` 也能跑（可作为普通终端工具），但必须能定位 owner/agent。
@@ -196,11 +196,11 @@ agent_tool dcrontab add --run-at "2026-06-01T20:00:00+08:00" \
 - `--to` 缺省时：通过 agent_tool 的 inbox 通道，把 reminder 作为一条系统消息丢回 agent session，agent 在下一次唤醒会看到。
 - `--to` 指定时：走 contact_manager 的发信路径，最终调用 msg_center 的 `post_send`，sender 为本 agent DID。如果指定 `--to` 但 contact 无法解析，schedule 入库前要在 validate 阶段失败，给出明确的 `UNKNOWN_RECIPIENT` 错误。
 
-`remind` **不创建 TaskMgr 任务**。它是一条消息事件，不是一份工作。
+`remind` 会被编译成 `workflow.send_message` fire subtask，而不是由 CLI 或 schedule manager 直接发消息。该 subtask 的 executor 调用 Message Center，并把结果写回 subtask status / data / message。fire record 只保留 `fire_id` 与 `task_id` 的调度关联。
 
 ### 6.2 `task`：到点指派一份 Agent 任务
 
-最小语义：到点用预填好的 Agent Task Schema 创建一个 `agent.delegate` 任务，由 AgentTaskExecutor 拾起、直接落 WorkSession。
+最小语义：到点用预填好的 Agent Task Schema 创建一个 `agent.delegate` fire subtask，由 AgentTaskExecutor 拾起、直接落 WorkSession。CLI 不直接创建普通 TaskMgr task，schedule manager 也不 hardcode agent task 业务逻辑。
 
 这一版**故意收缩 schema**：调度侧只需要三个字段就能构成可执行的标准任务：
 
@@ -288,7 +288,7 @@ agent_tool dcrontab show sch_1
 agent_tool dcrontab show scan-new-images
 ```
 
-返回完整 schedule、后续触发时间、最近执行状态、对应的 TaskMgr root task id（仅 `task` 类型有；`remind` 没有 TaskMgr root task）。
+返回完整 schedule、后续触发时间、最近执行状态、对应的 TaskMgr root task id。所有 schedule 都有 root task；`remind` / `task` 的差异体现在 fire subtask 的 `task_type`。
 
 ## 9. `pause` / `resume` / `remove`
 
@@ -314,8 +314,8 @@ agent_tool dcrontab run-now scan-new-images --reason "manual test"
 语义：
 
 - 手动创建一次 fire record（`manual = true`），不改变 `next_fire_at`。
-- 对 `task` 类目标：直接创建一个 `agent.delegate` task，返回 `task_id`。
-- 对 `remind` 类目标：立刻投递消息，不入 TaskMgr。
+- 对 `task` 类目标：按 template 创建 `agent.delegate` fire subtask，返回 `task_id`。
+- 对 `remind` 类目标：按 template 创建 `workflow.send_message` fire subtask，返回 `task_id`；消息投递结果由该 subtask 的 executor 写回。
 
 返回字段：`fire_id`、（如适用）`task_id`。
 
@@ -441,37 +441,28 @@ CLI 在 OpenDAN session 中运行时读取：
 
 | CLI | Workflow / TaskMgr API |
 | --- | --- |
-| `add` | `workflow.create_schedule`（新 ScheduleTarget 变体见下） |
-| `list` | `workflow.list_schedules` |
-| `show` | `workflow.get_schedule` |
-| `pause` | `workflow.pause_schedule` |
-| `resume` | `workflow.resume_schedule` |
-| `remove` | `workflow.archive_schedule` |
-| `run-now` | `workflow.run_schedule_now` |
-| `validate` | `workflow.validate_schedule` |
-| `history` | `workflow.get_schedule_history` |
+| `add` | `workflow.create_scheduled_task`，payload 为 fire subtask template |
+| `list` | `workflow.list_scheduled_tasks` |
+| `show` | `workflow.get_scheduled_task` |
+| `pause` | `workflow.pause_scheduled_task` |
+| `resume` | `workflow.resume_scheduled_task` |
+| `remove` | `workflow.archive_scheduled_task` |
+| `run-now` | `workflow.run_scheduled_task_now` |
+| `validate` | `workflow.validate_scheduled_task` |
+| `history` | `workflow.get_scheduled_task_history` |
 
-`ScheduleTarget` 需要从现有的 `WorkflowRun` / `OpenDANCommand` / `ServiceRpc` 收敛或扩展为：
+CLI 后端不再表达 `ScheduleTarget::{Remind, AgentTask}` 特殊语义，而是统一构造 `target` fire subtask template：
 
 ```rust
-pub enum ScheduleTarget {
-    Remind {
-        text: String,
-        to: Option<String>,        // None = self / agent inbox
-    },
-    AgentTask {
-        title: String,
-        objective: String,
-        workspace_id: String,
-        behavior: Option<String>,
-        agent: Option<String>,     // runner DID/id；None = 当前 agent
-    },
-    // 旧的 WorkflowRun / OpenDANCommand / ServiceRpc 在本 CLI 版本不暴露；
-    // 是否保留为内部 variant 由 Workflow 侧决定（beta2.2 允许 breaking change）
+pub struct ScheduleSubtaskTemplate {
+    pub task_type: String,          // workflow.send_message / agent.delegate
+    pub runner: Option<String>,     // workflow 或目标 agent runtime id
+    pub name_template: String,
+    pub data_template: serde_json::Value,
 }
 ```
 
-CLI 不直接调用 TaskMgr 创建 recurring task —— 是否 mirror、何时 mirror 由 Workflow ScheduleStore 决定。
+CLI 不直接调用 TaskMgr 创建 recurring task，也不直接写 ScheduleStore 本地文件。Workflow ScheduleStore 负责 root task mirror 与每次 fire subtask creation。
 
 ## 17. 实现位置建议
 
@@ -486,8 +477,7 @@ src/frame/opendan/src/agent_bash.rs                # session tool 软链
 修改：
 
 ```text
-src/kernel/workflow/src/scheduled_task_manager.rs  # ScheduleTarget 新增 Remind / AgentTask 变体
-                                                   # 触发路径分支：Remind -> msg_center；AgentTask -> task_mgr.create_task("agent.delegate", ...)
+src/kernel/workflow/src/scheduled_task_manager.rs  # ScheduleSubtaskTemplate / root task mirror / fire subtask creation
 ```
 
 实现要点：
@@ -495,7 +485,7 @@ src/kernel/workflow/src/scheduled_task_manager.rs  # ScheduleTarget 新增 Remin
 - 走 `TypedTool` + `parse_cli_args`。
 - 三种时间触发用 clap 的 group 互斥校验。
 - target 子命令用 clap subcommand 表达 `remind` / `task`。
-- AgentTask 触发时构造的 task.data 至少包含：
+- `task` 映射为 `agent.delegate` subtask template，data_template 至少包含：
 
   ```json
   {
@@ -515,7 +505,7 @@ src/kernel/workflow/src/scheduled_task_manager.rs  # ScheduleTarget 新增 Remin
 
   目的是落到 `task_data_supports_direct_worksession` 命中分支：单一 workspace_id + 非空 purpose，直接 `create_worksession_by_task_id`，不再走 `task.data` 二次推断。
 
-如果 Workflow ScheduleTarget 扩展还没合入，P0 可以先把 `add` 直接落入新变体并 stub 触发链；validate 必须可用。CLI 端**不要落地为本地文件**形成第二套真相源。
+`remind` 映射为 `workflow.send_message` subtask template。当前方案选择 Workflow service 内置该 task type 的 runner/executor 归属：schedule manager 只创建 subtask，具体 Message Center 调用和结果写回由 `workflow.send_message` executor 完成。CLI 端**不要落地为本地文件**形成第二套真相源。
 
 ## 18. 典型用例
 
@@ -585,13 +575,13 @@ agent_tool dcrontab run-now "扫描新增图片" --reason "test new schedule"
 ## 19. 验收标准
 
 1. `add` 三种时间触发都可用，互斥校验明确报错。
-2. `add ... remind` 不创建 TaskMgr 任务；`add ... task` 触发后能产生 `agent.delegate` task。
+2. `add ... remind` 触发后创建 `workflow.send_message` fire subtask；`add ... task` 触发后创建 `agent.delegate` fire subtask，二者都挂在 schedule root task 下。
 3. `task` 触发产生的任务命中 `task_data_supports_direct_worksession`，AgentTaskExecutor 走 `create_worksession_by_task_id`，WorkSession 拿到的 `title` / `objective` / `workspace_id` 与 schedule 字段完全一致。
 4. `remind --to owner` 能成功发出消息；目标 contact 不可解析时 schedule 在 validate 阶段失败。
 5. `validate` 至少返回 3 个未来触发时间（Once 类型 1 个）。
 6. `list` / `show` 能区分展示 `remind` 与 `task` 两类 target。
 7. `pause` 后不再触发；`resume` 重新计算 next_fire_at。
-8. `run-now` 对 `task` 返回新的 `task_id`，对 `remind` 直接发送，不污染 `next_fire_at`。
+8. `run-now` 返回新的 `fire_id` / `task_id`，不污染 `next_fire_at`。
 9. CLI 输出满足 `AgentToolResult` 协议。
 10. 缺少 `OPENDAN_SESSION_ID` 时，显式传 `--agent` / `--owner` 仍可工作。
 11. CLI 不直接写 ScheduleStore 或 TaskMgr 的本地文件。

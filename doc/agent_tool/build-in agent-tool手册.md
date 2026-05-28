@@ -34,8 +34,9 @@
 | [`unsubscribe_event`](#17-unsubscribe_event) | llm_tool_call | 取消订阅 KEvent | `opendan/src/buildin_tool.rs` |
 | [`check_task`](#18-check_task) | CLI 伪工具 | 轮询 pending task | `agent_tool_cli_dev/src/lib.rs` |
 | [`cancel_task`](#19-cancel_task) | CLI 伪工具 | 取消 pending task | `agent_tool_cli_dev/src/lib.rs` |
-| [`agent-memory`](#20-agent-memory) | CLI | 长期记忆 KV 存取 | `agent_tool_cli_dev/src/lib.rs` |
-| [`agent-notebook`](#21-agent-notebook) | CLI | Agent notebook 读写 | `agent_tool_cli_dev/src/lib.rs` |
+| [`finish_task`](#20-finish_task) | CLI 伪工具 | 结束 task（完成/失败） | `agent_tool_cli_dev/src/lib.rs` |
+| [`agent-memory`](#21-agent-memory) | CLI | 长期记忆 KV 存取 | `agent_tool_cli_dev/src/lib.rs` |
+| [`agent-notebook`](#22-agent-notebook) | CLI | Agent notebook 读写 | `agent_tool_cli_dev/src/lib.rs` |
 
 CLI 伪工具不走 `AgentTool` trait 注册，只在 `agent_tool` 二进制内分发。`agent-memory` / `agent-notebook` 是 CLI-only 子命令，没有对应的 `TypedTool` 注册。
 
@@ -1205,7 +1206,54 @@ agent_tool cancel_task 12345 --recursive
 
 ---
 
-## 20. `agent-memory`
+## 20. `finish_task`
+
+CLI 伪工具：把指定 task 结束为 `Completed` 或 `Failed`。默认是 `Completed`，失败结束时写入 TaskManager error/message。
+
+### Prompt
+
+无 LLM `ToolSpec`。`usage`: `finish_task <task_id> [failed] [--message <text>]`
+
+### Bash 支持
+
+CLI-only，调用方式同 `check_task`。
+
+### CLI 命令解释 + 常用例子
+
+```bash
+agent_tool finish_task 12345
+agent_tool finish_task --task-id 12345
+agent_tool finish_task task_id=12345
+agent_tool finish_task 12345 failed
+agent_tool finish_task 12345 --failed --message "cannot route task"
+```
+
+### 输出示例
+
+```json
+{
+  "agent_tool_protocol": "1",
+  "status": "success",
+  "cmd_name": "finish_task",
+  "cmd_args": "finish_task 12345",
+  "title": "finish_task 12345 finished => success",
+  "summary": "finished task 12345",
+  "task_id": "12345",
+  "detail": {
+    "task_id": "12345",
+    "task_status": "Completed",
+    "task_progress": 100.0,
+    "finish_outcome": "completed",
+    "task": { "...": "..." }
+  }
+}
+```
+
+失败结束时顶层 `status` 仍是 `success`，表示 CLI 已成功把 task 标记为失败；业务失败状态在 `detail.task_status` / task 数据中体现。
+
+---
+
+## 21. `agent-memory`
 
 CLI-only，Agent 长期记忆的 KV 存取入口。可执行文件名 `agent-memory` / `agent_memory`。
 
@@ -1292,7 +1340,7 @@ agent-memory compact
 
 ---
 
-## 21. `agent-notebook`
+## 22. `agent-notebook`
 
 CLI-only，对应 `agent_tool::agent_notebook`。Agent 私有笔记 / system context 拼装入口。
 

@@ -1123,7 +1123,7 @@ fn render_worksession_inventory(summaries: &[SessionSummary]) -> String {
 
 /// Render the workspace inventory section. Caps to [`MAX_WORKSPACE_LIST`]
 /// entries (sorted upstream by recency).
-fn render_workspace_inventory(workspaces: &[WorkspaceRecord]) -> String {
+pub(crate) fn render_workspace_inventory(workspaces: &[WorkspaceRecord]) -> String {
     if workspaces.is_empty() {
         return "(no workspaces yet — leave `workspace_id` empty in `create_worksession` to mint a fresh one)\n".to_string();
     }
