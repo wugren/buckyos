@@ -20,7 +20,7 @@ import type {
   WorkflowScheduleSpec,
   WorkflowScheduleStatus,
   WorkflowScheduleTaskPayload,
-} from '../mock/types'
+} from '../../../api/task_mgr'
 import type { TaskCenterNav } from '../components/layout/navigation'
 
 interface ScheduledTasksPageProps {

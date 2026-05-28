@@ -8,7 +8,7 @@ import type {
   WorkflowScheduleTaskPayload,
   SystemNotification,
   SystemEvent,
-} from './types'
+} from './task_mgr.ts'
 
 function makeTask(
   overrides: Partial<Task> & Pick<Task, 'taskId' | 'title' | 'type' | 'status'>,

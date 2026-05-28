@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { useI18n } from '../../../i18n/provider'
 import { useTaskCenterStore } from '../hooks/use-task-center-store'
-import type { Task } from '../mock/types'
+import type { Task } from '../../../api/task_mgr'
 import type { TaskCenterNav, TaskCenterPage } from '../components/layout/navigation'
 
 function statusIcon(status: Task['status'], size = 16) {

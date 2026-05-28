@@ -7,7 +7,7 @@ import { useThemeMode } from '../../theme/provider'
 import { StandaloneAppTitleBar } from '../../desktop/StandaloneAppTitleBar'
 import { MobileNavProvider } from '../../desktop/windows/MobileNavContext'
 import { TaskCenterStoreContext } from './hooks/use-task-center-store'
-import { TaskCenterMockStore } from './mock/store'
+import { createTaskCenterModel } from '../../api/task_mgr'
 import { TaskCenterShell } from './components/layout/TaskCenterShell'
 import type { TaskCenterNav } from './components/layout/navigation'
 import { HomePage } from './pages/HomePage'
@@ -47,7 +47,7 @@ export function TaskCenterRoute() {
   const { locale } = useI18n()
   const { themeMode } = useThemeMode()
   const taskId = searchParams.get('taskid') ?? undefined
-  const [store] = useState(() => new TaskCenterMockStore())
+  const [store] = useState(() => createTaskCenterModel())
 
   return (
     <main className="flex h-dvh min-h-dvh flex-col bg-[color:var(--cp-bg)] px-0 py-0 md:block md:h-auto md:px-5 md:py-5">

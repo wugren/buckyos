@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import type { AppContentLoaderProps } from '../types'
 import { TaskCenterStoreContext } from './hooks/use-task-center-store'
-import { TaskCenterMockStore } from './mock/store'
+import { createTaskCenterModel } from '../../api/task_mgr'
 import { TaskCenterShell } from './components/layout/TaskCenterShell'
 import type { TaskCenterNav } from './components/layout/navigation'
 import { HomePage } from './pages/HomePage'
@@ -38,7 +38,7 @@ function PageRouter({
 }
 
 export function TaskCenterAppPanel(_props: AppContentLoaderProps) {
-  const [store] = useState(() => new TaskCenterMockStore())
+  const [store] = useState(() => createTaskCenterModel())
 
   return (
     <TaskCenterStoreContext.Provider value={store}>

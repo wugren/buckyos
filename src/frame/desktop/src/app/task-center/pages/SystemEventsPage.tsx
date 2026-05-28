@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { useI18n } from '../../../i18n/provider'
 import { useTaskCenterStore } from '../hooks/use-task-center-store'
-import type { SystemEvent, SystemEventType } from '../mock/types'
+import type { SystemEvent, SystemEventType } from '../../../api/task_mgr'
 import type { TaskCenterNav } from '../components/layout/navigation'
 
 function eventIcon(eventType: SystemEventType) {
