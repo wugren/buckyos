@@ -2,6 +2,7 @@
 name = "plan"
 objective = "Plan a worksession, decide the next concrete execution step, and switch to do when ready."
 
+# worksession开始运行后必然和一个task绑定
 [prompt]
 parser = "xml"
 on_init = """
