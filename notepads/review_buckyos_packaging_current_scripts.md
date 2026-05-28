@@ -591,8 +591,17 @@
 ## 10. 建议改造顺序
 
 1. 先处理空转/半空转清单：删除确定不要的旧入口、fallback、无效 hook/wrapper、未使用参数和脏兼容；对应该接线的字段建立明确修改点。
+
+   处理记录：commit `c2d19e8c`。修改文件和行号：`make_local_pkg.py` 删除 `VERSION_FILE` / `_default_version()` / 外层 `--no-sync-scripts` 入口（原约 `41`、`515-519`、`944`、`992`），`src/bucky_project.yaml:181` 修正 Windows `system_service` 为合法 bool，`src/publish/make_local_osx_pkg.py` 删除未使用 welcome 生成、`--extra-bundle`、macOS uninstall hook materialize/sync（原约 `421-458`、`575-592`、`1219-1223`、`1354-1361`、`1420-1424`），`src/publish/make_local_win_installer.py` 删除 `--no-sync-scripts` 并去掉 `system_service` 逗号兼容（当前相关逻辑已收敛到 `242-259`、`301-309`），删除整文件 `src/publish/macos_pkg/scripts/preinstall`、`postinstall`、`uninstall`、`buckyos_uninstall`。
+
 2. 修入口和配置基础：`--format`、canonical arch、产物命名、`show-plan`、补齐 Windows/macOS/Linux publish 配置、加入 `default_selected`，收紧 bool/type/default_target 校验。
+
+   处理记录：commit `4fe751a2`。修改文件和行号：`make_local_pkg.py:90-108` 增加 bool/type 校验，`make_local_pkg.py:378-474` 生成三平台 publish manifest 和 `default_selected`，`make_local_pkg.py:538-566` 支持 Linux `--format deb|rpm` 与 canonical `arm64`，`make_local_pkg.py:981`、`1053`、`1139`、`1156` 增加入口参数，`make_local_pkg.py:1196`、`1215` 增加 `show-plan`；`src/bucky_project.yaml:133-184` 补齐 Linux/macOS/Windows publish 配置和三组件默认选择；`src/publish/make_local_osx_pkg.py:270-328`、`344-373` 解析 `default_selected` 与类型/布尔校验，`src/publish/make_local_osx_pkg.py:664` 改 macOS 产物名；`src/publish/make_local_win_installer.py:242-259`、`280-320`、`345-370` 增加同类校验和 `default_selected`，`src/publish/make_local_win_installer.py:633`、`1334-1335` 改 Windows 产物名；`src/publish/make_local_deb.py:124-159` 收紧 `apps.*` layout 校验。
+
 3. 修正各平台真实行为：payload 白名单、module/data path 缺失失败、非 `buckyos` app 组件按 modules 收敛、Windows 静默分支和 exit code、macOS Docker 检查改 `docker info`、deb preinst/postinst 修正。
+
+   处理记录：commit `54c53a44`。修改文件和行号：`src/publish/make_local_deb.py:256-269` 声明 module 缺失失败，`src/publish/deb_template/DEBIAN/postinst:45` 首装 stop service 容错；`src/publish/make_local_osx_pkg.py:398-401` 增加 CLI pkg staging target，`src/publish/make_local_osx_pkg.py:431-444` module 缺失失败，`src/publish/make_local_osx_pkg.py:496-498` 移除 Distribution 全局 Docker socket 检查，`src/publish/make_local_osx_pkg.py:580-607` 非 bundle app 按 modules/data_paths 收敛；`src/publish/macos_pkg/scripts/BuckyOSApp_postinstall:4-20` 固定 `/Applications/BuckyOS.app`，`src/publish/macos_pkg/scripts/buckycli_postinstall:28-49` 安装到 `~/.buckycli` 并写 PATH；`src/publish/make_local_win_installer.py:517-547` module/data 缺失失败，`src/publish/make_local_win_installer.py:389-403`、`933-940` 默认安装目录来自配置，`src/publish/make_local_win_installer.py:922-1049` 静默分支和稳定 exit code，`src/publish/make_local_win_installer.py:1107-1114` buckycli 写入 PATH，`src/publish/make_local_win_installer.py:1301-1317` app 组件按 manifest modules 收敛。
+
 4. 补 hook：Windows/macOS/Linux 都按文件命名规则发现；Linux 拼接到 maintainer scripts；删除 macOS 无效 uninstall hook 打包方式，并维护独立 `uninstall_for_macos` 文档。
 5. 在正确逻辑上抽取跨平台共通模块：统一配置加载、字段校验、platform component filtering、manifest 生成、路径展开、arch/产物命名、hook discovery 框架和基础 verify 框架。
 6. 统一 manifest 解析：公共模块处理 `module_items/data_items/clean_items` 语义；module/data path 缺失直接失败。
