@@ -31,7 +31,7 @@ use tokio::time::{sleep, Duration};
 use agent_tool::{
     AgentToolError, AgentToolManager, BashRunOutput, BashRunRequest, BashRunner, BashTarget,
     BinOverlayConfig, EditFileTool, ExecBashTool, FileToolConfig, LlmBashConfig,
-    NoopFileWriteAudit, ReadTool, SessionRuntimeContext, WriteFileTool,
+    LlmUnderstandMediaTool, NoopFileWriteAudit, ReadTool, SessionRuntimeContext, WriteFileTool,
 };
 
 use crate::agent_config::FilesystemPolicy;
@@ -54,6 +54,7 @@ const TMUX_GC_TRIGGER_COUNT: usize = 16;
 /// reaped during GC. 24h is long enough to span an LLM run but short enough
 /// that crashed agents don't leak forever.
 const TMUX_GC_IDLE_SECS: u64 = 24 * 60 * 60;
+const TMUX_BANNER_COMMAND_PREVIEW_CHARS: usize = 512;
 
 /// Env var that gates the bash `command_not_found_handle` proxy injected by
 /// [`build_exec_script`]. When set on the exec_bash request env, its value
@@ -291,10 +292,11 @@ impl BashRunner for TmuxBashRunner {
         // pane history — the exit-code marker is namespaced by run_id, so
         // scrollback residue can't fool the fallback parser, and keeping
         // history makes after-the-fact audit possible.
+        let banner_command = banner_command_text(&req.command, &script_path);
         let banner = format!(
             "printf '\\n\\033[1;36m# exec_bash[%s]\\033[0m %s\\n' {run} {cmd}",
             run = shell_quote(&run_id),
-            cmd = shell_quote(&req.command),
+            cmd = shell_quote(&banner_command),
         );
         send_keys(&tmux_target, &banner).await?;
 
@@ -390,6 +392,7 @@ pub fn build_default_tool_manager(
     let _ = manager.register_tool(ReadTool::new(file_cfg.clone()));
     let _ = manager.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()));
     let _ = manager.register_typed_tool(EditFileTool::new(file_cfg, audit));
+    let _ = manager.register_tool(LlmUnderstandMediaTool::new());
 
     Arc::new(manager)
 }
@@ -573,6 +576,21 @@ fn shell_quote(raw: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn banner_command_text(command: &str, script_path: &Path) -> String {
+    if command.chars().count() <= TMUX_BANNER_COMMAND_PREVIEW_CHARS {
+        return command.to_string();
+    }
+    let preview: String = command
+        .chars()
+        .take(TMUX_BANNER_COMMAND_PREVIEW_CHARS)
+        .collect();
+    format!(
+        "{preview}... [truncated; full command is {} bytes in {}]",
+        command.len(),
+        script_path.display()
+    )
 }
 
 async fn ensure_tmux_session(name: &str, cwd: &Path) -> Result<(), AgentToolError> {
@@ -1109,6 +1127,16 @@ mod tests {
     }
 
     #[test]
+    fn banner_command_text_truncates_long_commands() {
+        let dir = tempdir().unwrap();
+        let command = "x".repeat(TMUX_BANNER_COMMAND_PREVIEW_CHARS * 4);
+        let text = banner_command_text(&command, &dir.path().join("run.exec.sh"));
+        assert!(text.len() < command.len());
+        assert!(text.contains("truncated"));
+        assert!(text.contains("run.exec.sh"));
+    }
+
+    #[test]
     fn exec_script_carries_cwd_env_and_markers() {
         let dir = tempdir().unwrap();
         let stdout = dir.path().join("out");
@@ -1258,6 +1286,38 @@ mod tests {
 
         // Tear down the per-session tmux session so we don't leak between
         // test runs. Best-effort; ignore errors.
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &build_tmux_session_name(&sid)])
+            .output()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn tmux_runner_executes_long_command() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            eprintln!("tmux not available; skipping integration test");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("rt");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let runner = TmuxBashRunner::new(&runtime);
+
+        let sid = format!("test_long_{}", now_ms());
+        let ctx = ctx_for(&sid);
+        let payload = "x".repeat(TMUX_BANNER_COMMAND_PREVIEW_CHARS * 16);
+        let req = BashRunRequest {
+            command: format!("printf {}", shell_quote(&payload)),
+            cwd: dir.path().to_path_buf(),
+            timeout_ms: 5_000,
+            max_output_bytes: payload.len() + 128,
+            env: Vec::new(),
+            target: BashTarget::Local,
+        };
+        let output = runner.run(&ctx, req).await.expect("run ok");
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, payload);
+
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", &build_tmux_session_name(&sid)])
             .output()

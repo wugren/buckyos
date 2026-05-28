@@ -701,7 +701,7 @@ def render_llm_entry_html(index: int, timestamp: str, direction: str, meta: dict
 
     return (
         f"<article class=\"entry {css_class}\" id=\"entry-{index}\">"
-        f"<details open>"
+        f"<details>"
         f"<summary><span class=\"badge\">{entry_title}</span> "
         f"<span class=\"time\">{html.escape(timestamp)}</span></summary>"
         f"<div class=\"meta\">{render_meta_html(meta, payload)}</div>"
@@ -720,7 +720,7 @@ def render_error_html(index: int, timestamp: str, meta_str: str) -> str:
         rows.append(f"<span class=\"error-text\"><b>{html.escape(tail_key)}</b>: {html.escape(str(tail_value))}</span>")
     return (
         f"<article class=\"entry error\" id=\"entry-{index}\">"
-        f"<details open>"
+        f"<details>"
         f"<summary><span class=\"badge\">ERROR</span> <span class=\"time\">{html.escape(timestamp)}</span></summary>"
         f"<div class=\"meta\">{''.join(rows)}</div>"
         f"</details>"

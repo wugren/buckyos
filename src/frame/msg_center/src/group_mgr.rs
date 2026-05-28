@@ -19,19 +19,18 @@
 
 use buckyos_api::{
     group_action, parse_group_request, DIDEntityKind, DIDMemberKind, ExpandedDID,
-    GroupAccessDecision, GroupApproveMemberReq, GroupAttributionPolicy, GroupCheckAccessReq,
-    GroupCollectionPolicy, GroupCreateReq, GroupCreateSubgroupReq, GroupDoc, GroupEndpoints,
-    GroupEvent, GroupEventType, GroupExpandMembersReq, GroupExpansionPolicy, GroupExpansionPurpose,
-    GroupExpansionSnapshot, GroupGetDocReq, GroupInviteMemberReq, GroupListByMemberReq,
-    GroupListMembersReq, GroupListParentsReq, GroupListSubgroupsReq, GroupMemberProof,
-    GroupMemberProofScope, GroupMemberRecord, GroupMemberState, GroupPolicy, GroupProfilePatch,
-    GroupPurpose, GroupRejectMemberReq, GroupRemoveMemberReq, GroupRequestJoinReq, GroupRole,
-    GroupSettings, GroupSubgroup, GroupSubgroupPatch, GroupSubmitMemberProofReq, GroupSummary,
-    GroupUpdateAttributionPolicyReq, GroupUpdateCollectionPolicyReq, GroupUpdateMemberRoleReq,
-    GroupUpdateProfileReq, GroupUpdateSubgroupReq, JoinPolicy, MembershipVisibility,
-    NestedGroupPolicy, PostPolicy, RdbBackend, GROUP_DOC_OBJ_TYPE, GROUP_DOC_SCHEMA_VERSION,
-    GROUP_EVENT_OBJ_TYPE, GROUP_EVENT_SCHEMA_VERSION, GROUP_EXPANSION_SNAPSHOT_OBJ_TYPE,
-    GROUP_EXPANSION_SNAPSHOT_SCHEMA_VERSION,
+    GroupAccessDecision, GroupApproveMemberReq, GroupCheckAccessReq, GroupCollectionPolicy,
+    GroupCreateReq, GroupCreateSubgroupReq, GroupDoc, GroupEndpoints, GroupEvent, GroupEventType,
+    GroupExpandMembersReq, GroupExpansionPolicy, GroupExpansionPurpose, GroupExpansionSnapshot,
+    GroupGetDocReq, GroupInviteMemberReq, GroupListByMemberReq, GroupListMembersReq,
+    GroupListParentsReq, GroupListSubgroupsReq, GroupMemberProof, GroupMemberProofScope,
+    GroupMemberRecord, GroupMemberState, GroupProfilePatch, GroupRejectMemberReq,
+    GroupRemoveMemberReq, GroupRequestJoinReq, GroupRole, GroupSettings, GroupSubgroup,
+    GroupSubgroupPatch, GroupSubmitMemberProofReq, GroupSummary, GroupUpdateAttributionPolicyReq,
+    GroupUpdateCollectionPolicyReq, GroupUpdateMemberRoleReq, GroupUpdateProfileReq,
+    GroupUpdateSubgroupReq, JoinPolicy, NestedGroupPolicy, PostPolicy, RdbBackend,
+    GROUP_DOC_OBJ_TYPE, GROUP_DOC_SCHEMA_VERSION, GROUP_EVENT_OBJ_TYPE, GROUP_EVENT_SCHEMA_VERSION,
+    GROUP_EXPANSION_SNAPSHOT_OBJ_TYPE, GROUP_EXPANSION_SNAPSHOT_SCHEMA_VERSION,
 };
 use kRPC::RPCErrors;
 use log::{debug, info};
@@ -1356,6 +1355,7 @@ impl GroupMgr {
         Ok(summaries)
     }
 
+    #[allow(dead_code)]
     pub async fn is_group_did(
         &self,
         host_owner: Option<&DID>,
@@ -2263,6 +2263,7 @@ fn policy_digest_string(policy: &GroupCollectionPolicy) -> String {
 // off raw RPC params without re-encoding.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub fn parse_request<T: serde::de::DeserializeOwned>(
     value: serde_json::Value,
     type_name: &str,
@@ -2276,8 +2277,9 @@ mod tests {
     use buckyos_api::{
         DIDMemberKind, GroupCreateProfile, GroupCreateReq, GroupExpandMembersReq,
         GroupExpansionPurpose, GroupInviteMemberReq, GroupListByMemberReq, GroupListMembersReq,
-        GroupMemberProof, GroupMemberProofScope, GroupMemberState, GroupRole,
-        GroupSubmitMemberProofReq, GROUP_MEMBER_PROOF_OBJ_TYPE, GROUP_MEMBER_PROOF_SCHEMA_VERSION,
+        GroupMemberProof, GroupMemberProofScope, GroupMemberState, GroupPurpose, GroupRole,
+        GroupSubmitMemberProofReq, MembershipVisibility, GROUP_MEMBER_PROOF_OBJ_TYPE,
+        GROUP_MEMBER_PROOF_SCHEMA_VERSION,
     };
     use tempfile::tempdir;
 

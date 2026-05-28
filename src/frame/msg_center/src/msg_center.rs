@@ -83,6 +83,7 @@ impl MessageCenter {
     /// Read-only accessor for the group manager. Used by tests and by the
     /// in-process `MsgCenterClient` adapter so callers do not need to lift
     /// the GroupMgr through every API surface.
+    #[allow(dead_code)]
     pub fn group_mgr(&self) -> &GroupMgr {
         &self.group_mgr
     }
@@ -1031,6 +1032,12 @@ impl MessageCenter {
         send_ctx: Option<SendContext>,
         idempotency_key: Option<String>,
     ) -> std::result::Result<PostSendResult, RPCErrors> {
+        if msg.to.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "post_send requires at least one target in msg.to".to_string(),
+            ));
+        }
+
         let send_contact_mgr_owner = send_ctx
             .as_ref()
             .and_then(|ctx| ctx.contact_mgr_owner.clone());

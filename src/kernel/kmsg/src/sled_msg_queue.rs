@@ -178,6 +178,7 @@ impl SledMsgQueue {
             .map_err(|err| RPCErrors::ReasonError(format!("Failed to decode message: {}", err)))
     }
 
+    #[allow(dead_code)]
     fn encode_message(message: &Message) -> std::result::Result<Vec<u8>, RPCErrors> {
         serde_json::to_vec(message)
             .map_err(|err| RPCErrors::ReasonError(format!("Failed to encode message: {}", err)))

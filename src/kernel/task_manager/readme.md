@@ -36,19 +36,21 @@ TaskManager服务提供以下RPC方法：
 - `update_task_error`: 更新任务错误信息
 - `update_task_data`: 更新任务数据
 - `delete_task`: 删除任务
+- `delete_tasks_by_session`: 删除同一 `session_id` 下的一组任务
 
 ### TypeScript客户端API
 
 TaskManager客户端提供以下方法：
 
-- `createTask(name, task_type, app_name, data?)`: 创建新任务
+- `createTask(name, task_type, app_name, data?, session_id?)`: 创建新任务
 - `getTask(id)`: 获取任务信息
-- `listTasks(filter?)`: 列出任务
+- `listTasks(filter?)`: 列出任务，filter 支持 `app_id`、`session_id`、`task_type`、`status`、`parent_id`、`root_id`
 - `updateTaskStatus(id, status)`: 更新任务状态
 - `updateTaskProgress(id, completed_items, total_items)`: 更新任务进度
 - `updateTaskError(id, error_message)`: 更新任务错误信息
 - `updateTaskData(id, data)`: 更新任务数据
 - `deleteTask(id)`: 删除任务
+- `deleteTasksBySession(session_id)`: 删除同一会话下的任务
 - `pauseTask(id)`: 暂停任务
 - `resumeTask(id)`: 恢复任务
 - `completeTask(id)`: 完成任务

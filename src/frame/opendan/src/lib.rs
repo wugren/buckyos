@@ -35,7 +35,7 @@ pub mod session_model;
 pub mod llm_context_helper;
 
 // Phase-1 PromptRenderEngine integration (variable contract +
-// AgentSessionValueLoader + environment-block template). See
+// AgentSessionValueLoader). See
 // `doc/opendan/Agent Enviroment.md` §15.1.
 pub mod prompt_env;
 
@@ -55,6 +55,7 @@ pub mod tool_plan;
 
 // §9 step 6 — AIAgent::run, msg/event dispatch, session restoration, subscriptions.
 pub mod agent;
+pub mod agent_task_executor;
 
 // §9 step 6 — msg-center / kevent inbound pump that feeds AIAgent::inbox().
 pub mod msg_center_pump;

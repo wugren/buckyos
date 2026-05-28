@@ -189,7 +189,7 @@ pub struct HumanPolicy {
 #[serde(default)]
 pub struct ErrorPolicy {
     /// Recoverable errors are folded into the accumulated history as a
-    /// tool/system AiMessage so the LLM can self-correct. Once the count
+    /// tool/user observation so the LLM can self-correct. Once the count
     /// of consecutive recoverable errors exceeds `max_consecutive_errors`,
     /// the loop escalates to a terminal `Outcome::Error`.
     ///

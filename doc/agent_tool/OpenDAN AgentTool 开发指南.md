@@ -91,11 +91,12 @@ create_workspace
 bind_workspace
 check_task
 cancel_task
+finish_task
 ```
 
 注意：
 
-- `check_task` / `cancel_task` 是 CLI pseudo-tool，不在 `AgentToolManager` 注册表中。
+- `check_task` / `cancel_task` / `finish_task` 是 CLI pseudo-tool，不在 `AgentToolManager` 注册表中。
 - `load_memory` 当前是 Runtime 注册的 LLM/bash-capable tool，但没有加入 `agent_tool_cli_dev::TOOL_NAMES`，也没有默认 session 软链接。
 - `worklog_manage` 的 `TypedTool` 仍在 `agent_tool` crate 中，但当前 OpenDAN workshop 不再把它暴露成 Runtime tool，只保留 `tools.json` 参数解析给写审计复用。
 
@@ -133,6 +134,7 @@ EXEC_BASH_AGENT_CLI_TOOL_NAMES = [
 EXEC_BASH_ALWAYS_AVAILABLE_CLI_TOOL_NAMES = [
     "check_task",
     "cancel_task",
+    "finish_task",
 ]
 ```
 
@@ -140,8 +142,8 @@ EXEC_BASH_ALWAYS_AVAILABLE_CLI_TOOL_NAMES = [
 
 - session 没有 `loaded_tools` 时，使用默认 CLI 工具 + always-available 工具
 - behavior 配置为 `tools.mode = all` 时，`loaded_tools` 置空，因此仍使用默认集
-- behavior 配置为 allow-list 时，只从 allow-list 中保留 `EXEC_BASH_AGENT_CLI_TOOL_NAMES` 里的名字，再追加 `check_task` / `cancel_task`
-- behavior 配置为 none 时，会写入占位值，最终只剩 `check_task` / `cancel_task`
+- behavior 配置为 allow-list 时，只从 allow-list 中保留 `EXEC_BASH_AGENT_CLI_TOOL_NAMES` 里的名字，再追加 `check_task` / `cancel_task` / `finish_task`
+- behavior 配置为 none 时，会写入占位值，最终只剩 `check_task` / `cancel_task` / `finish_task`
 
 因此，当前 session 软链接目录只管理内置 CLI 工具子集；MCP 或其它 Runtime 注册工具不会自动出现在这个软链接目录里。
 
@@ -462,7 +464,7 @@ CLI exit code 常量在 `agent_tool` crate：
 
 反序列化兼容历史值 `external_callback`，但新输出不要再使用。
 
-当前 `exec` 长任务会通过 task manager 创建任务，并返回 `pending`。CLI 里的 `check_task <task_id>` / `cancel_task <task_id>` 通过 `TaskManagerClient` 查询或取消任务。
+当前 `exec` 长任务会通过 task manager 创建任务，并返回 `pending`。CLI 里的 `check_task <task_id>` / `cancel_task <task_id>` / `finish_task <task_id> [failed]` 通过 `TaskManagerClient` 查询、取消、完成或失败结束任务。
 
 ### 5.4 纯文本例外
 

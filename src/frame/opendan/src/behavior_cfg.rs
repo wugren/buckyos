@@ -8,7 +8,8 @@
 //! New schema groups fields into:
 //!   * `[meta]` — name / objective
 //!   * `[prompt]` — parser choice + per-event prompt templates
-//!     (`on_init` / `on_switch` / `on_input_msg` / `on_input_event`) + output spec
+//!     (`on_init` / `on_behavior_switch` / `on_behavior_step_ob` /
+//!     `on_input_event`) + output spec
 //!   * `[capabilities]` — tool_whitelist / approval_required / tool_plan
 //!     (v0 placeholder; §5.3 — will be redone in beta2.3 alongside skill
 //!     bundle / function-call tool unification)
@@ -80,23 +81,24 @@ impl BehaviorOutput {
 
 /// Prompt templates per "renders the prompt" event.
 ///
-/// `on_init` / `on_switch` are rendered through
+/// `on_init` / `on_behavior_switch` / `on_behavior_step_ob` / `on_wakeup` are rendered through
 /// `llm_context::PromptRenderEngine` (upon
 /// `{{ var }}` placeholders, `__VAR__` / `__ENV__` / `__INCLUDE__`
 /// directives) with the Phase-1 variable contract from
-/// `doc/opendan/Agent Enviroment.md` §15.1. `on_input_msg` /
-/// `on_input_event` still use the dynamic-payload-aware `{var}` substitution
-/// in `render_event_template` — this is a separate per-event format engine
-/// and is not affected by the system-prompt rendering pipeline.
+/// `doc/opendan/Agent Enviroment.md` §15.1. `on_input_event` still uses the
+/// dynamic-payload-aware `{var}` substitution in `render_event_template` —
+/// this is a separate per-event format engine and is not affected by the
+/// system-prompt rendering pipeline.
 ///
 /// **Per-event hook names map onto the actual prompt-construction sites
 /// the runtime has today**:
 ///
 /// | template          | callsite                              | empty ⇒              |
 /// |-------------------|---------------------------------------|---------------------|
-/// | `on_init`         | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
-/// | `on_switch`       | after `next_behavior` switch          | no synthetic input |
-/// | `on_input_msg`    | wraps each `PendingInput::Msg` text   | raw `AiMessage` is passed through (today's default) |
+/// | `on_init`              | `render_system_messages` (System body)| `role.md` + `self.md` + objective + readme fallback |
+/// | `on_behavior_switch`   | after `next_behavior` switch          | no synthetic input |
+/// | `on_behavior_step_ob`  | after behavior-loop action results    | default `<<last_step_action_results>>` user message |
+/// | `on_wakeup`            | idle / waiting pending-input wakeup   | built-in message / event formatting |
 /// | `on_input_event`  | behavior-wide event-format fallback   | falls through to subscription template, then to `format_event_for_turn_with_subscriptions` default |
 ///
 /// Available variables:
@@ -108,9 +110,13 @@ impl BehaviorOutput {
 ///     §15.1 for the complete set. Render-time extras: `{{ role_md }}`,
 ///     `{{ self_md }}` (pre-read from `agent_root/role.md` and
 ///     `agent_root/self.md`).
-///   * `on_input_msg`: `{msg_text}`, `{msg_from_did}`, `{msg_from_name}`
 ///   * `on_input_event`: `{event_id}`, `{event_data}` plus any top-level
 ///     scalar field of the JSON payload as `{<key>}`
+///   * `on_behavior_step_ob` (upon syntax): full Phase-1 contract plus render-time
+///     extras `{{ step }}`, `{{ step_result.default_user_message }}`,
+///     `{{ pending_inputs }}`, and `{{ pending_input_text }}`.
+///   * `on_wakeup` (upon syntax): full Phase-1 contract, with `input.*`
+///     populated from the driver-selected pending input.
 ///
 /// `__INCLUDE__` path rules for `on_init`:
 ///   * `/role.md` resolves from AgentRootFS, e.g. `<agent_root>/role.md`.
@@ -127,9 +133,11 @@ pub struct PromptCfg {
     pub parser_strict: bool,
     pub on_init: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_switch: Option<String>,
+    pub on_behavior_switch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_input_msg: Option<String>,
+    pub on_behavior_step_ob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_wakeup: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_input_event: Option<String>,
     pub output: BehaviorOutput,
@@ -141,8 +149,9 @@ impl Default for PromptCfg {
             parser: "xml".to_string(),
             parser_strict: false,
             on_init: String::new(),
-            on_switch: None,
-            on_input_msg: None,
+            on_behavior_switch: None,
+            on_behavior_step_ob: None,
+            on_wakeup: None,
             on_input_event: None,
             output: BehaviorOutput::Text,
         }
@@ -263,6 +272,8 @@ pub struct BehaviorCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_context_limit_reached: Option<HookPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_llm_message_compress: Option<HookPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_provider_failed: Option<HookPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_interrupt_graceful: Option<HookPoint>,
@@ -316,6 +327,11 @@ impl BehaviorCfg {
                 });
             }
         }
+        crate::behavior_hooks::resolve_llm_message_compress(self.on_llm_message_compress.as_ref())
+            .map_err(|err| BehaviorCfgError::Invalid {
+                name: self.meta.name.clone(),
+                reason: err.to_string(),
+            })?;
         Ok(())
     }
 
@@ -539,6 +555,11 @@ mod tests {
             [on_context_limit_reached]
             mode = "compress_then_continue"
 
+            [on_llm_message_compress]
+            mode = "context_window_ratio"
+            trigger_ratio = 0.8
+            target_ratio = 0.5
+
             [on_provider_failed]
             mode = "fallback_behavior"
             target = "safe_mode"
@@ -548,6 +569,10 @@ mod tests {
         assert_eq!(
             cfg.on_context_limit_reached.as_ref().unwrap().mode,
             "compress_then_continue"
+        );
+        assert_eq!(
+            cfg.on_llm_message_compress.as_ref().unwrap().mode,
+            "context_window_ratio"
         );
         assert_eq!(
             cfg.on_provider_failed
@@ -568,18 +593,56 @@ mod tests {
             [prompt]
             parser = "xml"
             on_init = "Hello {agent_name}, you are {behavior_name}."
-            on_switch = "Continue as {{ behavior.name }}."
-            on_input_msg = "[from {msg_from_did}] {msg_text}"
+            on_behavior_switch = "Continue as {{ behavior.name }}."
+            on_behavior_step_ob = "Observe {{ step_result.default_user_message }}."
+            on_wakeup = "{{ input.text }}"
         "#;
         let cfg = BehaviorCfg::from_toml_str(toml_src).unwrap();
         assert!(cfg.prompt.on_init.contains("{agent_name}"));
         assert_eq!(
-            cfg.prompt.on_switch.as_deref(),
+            cfg.prompt.on_behavior_switch.as_deref(),
             Some("Continue as {{ behavior.name }}.")
         );
         assert_eq!(
-            cfg.prompt.on_input_msg.as_deref(),
-            Some("[from {msg_from_did}] {msg_text}")
+            cfg.prompt.on_behavior_step_ob.as_deref(),
+            Some("Observe {{ step_result.default_user_message }}.")
         );
+        assert_eq!(cfg.prompt.on_wakeup.as_deref(), Some("{{ input.text }}"));
+    }
+
+    #[test]
+    fn jarvis_work_behaviors_define_runtime_prompt_hooks() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../rootfs/bin/buckyos_jarvis/behaviors");
+        for name in ["plan", "do"] {
+            let path = root.join(format!("{name}.toml"));
+            let cfg = BehaviorCfg::load_from_file(&path).unwrap();
+            assert!(
+                cfg.prompt
+                    .on_behavior_switch
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} must define [prompt].on_behavior_switch",
+                path.display()
+            );
+            assert!(
+                cfg.prompt
+                    .on_behavior_step_ob
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} must define [prompt].on_behavior_step_ob",
+                path.display()
+            );
+            if name == "plan" {
+                assert!(
+                    cfg.prompt
+                        .on_wakeup
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "{} must keep [prompt].on_wakeup parseable",
+                    path.display()
+                );
+            }
+        }
     }
 }

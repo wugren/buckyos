@@ -1,39 +1,9 @@
 mod common;
 
-use aicc::{
-    AIComputeCenter, CostEstimate, ModelCatalog, ProviderError, ProviderStartResult, Registry,
-    Router, TaskEventKind, TenantRouteConfig,
-};
-use buckyos_api::{AiMethodStatus, AiResponse, Capability, ResourceRef, TaskFilter, TaskStatus};
+use aicc::{AIComputeCenter, CostEstimate, ModelCatalog, ProviderStartResult, Registry};
+use buckyos_api::{AiMethodStatus, Capability, ResourceRef};
 use common::*;
-use std::collections::HashMap;
 use std::sync::Arc;
-
-fn setup_route_provider(
-    registry: &Registry,
-    catalog: &ModelCatalog,
-    instance_id: &str,
-    provider_type: &str,
-    model: &str,
-    cost: f64,
-    latency_ms: u64,
-) {
-    catalog.set_mapping(Capability::Llm, "llm.plan.default", provider_type, model);
-    let provider = Arc::new(MockProvider::new(
-        mock_instance(
-            instance_id,
-            provider_type,
-            vec![Capability::Llm],
-            vec!["plan".to_string()],
-        ),
-        CostEstimate {
-            estimated_cost_usd: Some(cost),
-            estimated_latency_ms: Some(latency_ms),
-        },
-        vec![Ok(ProviderStartResult::Started)],
-    ));
-    registry.add_provider(provider);
-}
 
 #[tokio::test]
 // 用例说明：

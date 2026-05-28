@@ -1,6 +1,7 @@
 use crate::{
     docker_command, external_command, gateway_etc_dir, sn_self_cert_state_path, ControlPanelServer,
-    DockerOverviewCacheEntry, GATEWAY_CONFIG_FILES, ZONE_CONFIG_FILES,
+    DockerOverviewCacheEntry, DOCKER_OVERVIEW_CACHE_TTL_SECS, GATEWAY_CONFIG_FILES,
+    ZONE_CONFIG_FILES,
 };
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use chrono::{DateTime, Utc};
@@ -751,6 +752,31 @@ impl ControlPanelServer {
         &self,
         req: RPCRequest,
     ) -> Result<RPCResponse, RPCErrors> {
+        {
+            let cache = self.docker_overview_cache.lock().await;
+            if let Some(cache) = cache.as_ref() {
+                if cache.captured_at.elapsed().as_secs() < DOCKER_OVERVIEW_CACHE_TTL_SECS {
+                    return Ok(RPCResponse::new(
+                        RPCResult::Success(cache.response.clone()),
+                        req.seq,
+                    ));
+                }
+            }
+        }
+
+        let _refresh_guard = self.docker_overview_refresh_lock.lock().await;
+        {
+            let cache = self.docker_overview_cache.lock().await;
+            if let Some(cache) = cache.as_ref() {
+                if cache.captured_at.elapsed().as_secs() < DOCKER_OVERVIEW_CACHE_TTL_SECS {
+                    return Ok(RPCResponse::new(
+                        RPCResult::Success(cache.response.clone()),
+                        req.seq,
+                    ));
+                }
+            }
+        }
+
         let response = json!({
             "available": false,
             "daemonRunning": false,

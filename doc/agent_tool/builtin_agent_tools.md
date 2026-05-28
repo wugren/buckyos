@@ -136,7 +136,7 @@ builtin tool 的标准输出协议是 `AgentToolResult`，详细字段见：
 
 - `read` 的 `content` 是读取结果，可以放在 `detail`
 - `write_file` 的 `content` 是输入参数，不应放在 `detail`
-- `edit_file` 的 `new_content` / `pos_chunk` 是输入参数，不应放在 `detail`
+- `edit_file` 的 `old_string` / `new_string` 是输入参数，不应放在 `detail`
 - `todo` / `worklog_manage` 的 `action` 是输入参数，不应只为了回显而放在 `detail`
 - `path`、`mode`、`range` 等输入参数默认不应复制到 `detail`，需要追踪调用时读取 arguments 或 `cmd_args`
 
@@ -158,7 +158,7 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 |---|---|---|---|
 | `read` | action / llm_tool_call | 按 uri/path 读取内容；无 `://` 时默认文件路径 | `src/read_tool.rs` |
 | `write_file` | action | 覆盖/追加写文件 | `src/file_tools.rs` |
-| `edit_file` | action | 基于锚点编辑文件 | `src/file_tools.rs` |
+| `edit_file` | action | 基于唯一 old_string 替换文件 | `src/file_tools.rs` |
 | `get_session` | bash | 读取 session 状态 | `src/lib.rs` |
 | `load_memory` | bash / llm_tool_call | 加载记忆摘要 | `src/lib.rs` |
 | `todo` | bash | 工作项 PDCA 管理 | `src/agent_todo_tool.rs` |
@@ -169,11 +169,12 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 | `worklog_manage` | bash / call | worklog 结构化管理 | `src/lib.rs` |
 | `check_task` | CLI | 轮询 pending task | `src/cli.rs` |
 | `cancel_task` | CLI | 取消 pending task | `src/cli.rs` |
+| `finish_task` | CLI | 结束 task（完成/失败） | `src/cli.rs` |
 
 说明：
 
 - `bind_external_workspace` / `list_external_workspaces` 当前主要走结构化调用
-- `check_task` / `cancel_task` 是 CLI 暴露能力，不走 `AgentTool` trait 的常规注册路径
+- `check_task` / `cancel_task` / `finish_task` 是 CLI 暴露能力，不走 `AgentTool` trait 的常规注册路径
 - `read_file` 是 legacy CLI 兼容工具，不再是 v2 Agent Action；当前 Action 应使用 `read`
 - `list_session` 常量已预留，但当前文档不把它当作已完成 builtin tool
 
@@ -261,18 +262,19 @@ detail 关键字段：
 
 用途：
 
-- 基于锚点字符串对文件做替换、前插、后插
+- 基于唯一 `old_string` 对文件做替换
 
 输入：
 
 ```json
 {
   "path": "string",
-  "pos_chunk": "string",
-  "new_content": "string",
-  "mode": "replace|after|before"
+  "old_string": "string",
+  "new_string": "string"
 }
 ```
+
+`new_string` 必须不同于 `old_string`。`old_string` 必须在文件中只出现一次；没有命中或命中多处都会失败。
 
 
 detail 关键字段：
@@ -287,10 +289,10 @@ detail 关键字段：
 
 - 顶层固定字段至少包含 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`
 - `cmd_name` 应为 `edit_file`
-- `cmd_args` 表达 path / pos_chunk / mode / new_content 等输入参数
-- `summary` 表达是否命中锚点、是否产生修改
+- `cmd_args` 表达 path / old_string / new_string 等输入参数
+- `summary` 表达是否产生修改
 - 主结果放 `detail`
-- `detail` 不应包含输入参数 `pos_chunk` 或 `new_content`
+- `detail` 不应包含输入参数 `old_string` 或 `new_string`
 
 ### 5.4 `get_session`
 
@@ -637,6 +639,28 @@ cancel_task <task_id> [--recursive]
   - `task`
   - `interrupt_error`
 
+### 5.14 `finish_task`
+
+用途：
+
+- 把指定 task 结束为完成或失败
+
+CLI 输入：
+
+```bash
+finish_task <task_id> [failed] [--message <text>]
+```
+
+输出约定：
+
+- 默认调用 TaskManager `update_task` 写入 `Completed` 和 `progress=100.0`
+- `failed` / `--failed` 调用 TaskManager `update_task_error` 写入 `Failed` 和错误消息
+- 返回更新后的 task 结果封装
+- builtin 风格结果仍应优先满足 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`
+- detail 常见字段：
+  - `task`
+  - `finish_outcome`
+
 ## 6. 后续文档拆分建议
 
 为了避免这份文档继续膨胀，建议后续按主题拆成几个子文档：
@@ -648,7 +672,7 @@ cancel_task <task_id> [--recursive]
 3. `workspace_tools_protocol.md`
    统一整理 workspace 相关工具
 4. `task_tools_protocol.md`
-   统一整理 `check_task / cancel_task` 和 pending 轮询模型
+   统一整理 `check_task / cancel_task / finish_task` 和 pending 轮询模型
 
 ## 7. 文档维护原则
 

@@ -103,19 +103,19 @@ pub fn bar() -> u32 { 42 }
 ### 1.3 `<edit_file>`
 
 ```xml
-<edit_file path="src/foo.rs" mode="replace_range" from_line="10" to_line="20"><![CDATA[
-new content for lines 10..=20
-]]></edit_file>
+<edit_file path="src/foo.rs">
+  <old_string><![CDATA[println!("hello");]]></old_string>
+  <new_string><![CDATA[println!("hi");]]></new_string>
+</edit_file>
 ```
 
 | 字段 | 形态 | 说明 |
 |---|---|---|
-| body | CDATA / text | 新内容 |
 | `path` | attr | 目标路径 |
-| `mode` | attr | `replace_range` / `insert_after` / `replace_match`（后续可扩） |
-| `from_line` / `to_line` | attr | 行号区间，1-based，闭区间 |
+| `old_string` | child body | 要被替换的原文，必须在文件中只出现一次 |
+| `new_string` | child body | 替换后的文本，必须不同于 `old_string` |
 
-具体 mode 与现有 `EditFileTool` 对齐，本文不重复其参数细节。
+如果 `old_string` 没有命中或命中多处，`edit_file` 失败，不做修改。
 
 ### 1.4 `<read>` —— uri 风格的"万能读"
 
@@ -250,6 +250,7 @@ new content for lines 10..=20
 2. **Self Report `<report>` 在 `<actions>` 外面**——它是当前 `LLMContext` 的 LastState 更新，跟 `<observation>` / `<thinking>` / `<next_behavior>` 同级。
 3. **SendMessage 形态用 `<sendmsg target=...>` 放在 `<actions>` 里面**——它是这一步内执行的副作用动作之一。
 4. `<next_behavior>` 保留，跟 v1 语义一致：终止本 behavior，可选携带下一个 behavior 名；但只能在 `<actions>` 为空时设置。
+5. LLM 不需要给每个 Action 输出 ID。运行时执行前会为 dispatchable action 分配上下文内唯一的自增 `call_id`；渲染下一轮 prompt 的 assistant/user message pair 时，assistant 原文中的对应 action 标签会补上该 `call_id`，`last_step_action_results` 的标题前也会加同一个 `#<call_id>` 前缀。
 
 ### 2.2 `<report>` 与 `<next_behavior>` 的共存规则
 

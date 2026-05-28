@@ -542,6 +542,7 @@ mod tests {
         #[schemars(description = "Message to echo.")]
         message: String,
         #[serde(default)]
+        #[allow(dead_code)]
         suffix: Option<String>,
     }
 

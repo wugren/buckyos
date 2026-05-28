@@ -20,6 +20,338 @@ fn todo_json(
     })
 }
 
+fn pending_msg(record_id: &str, text: &str) -> PendingInput {
+    PendingInput::Msg {
+        record_id: record_id.to_string(),
+        from: "alice".to_string(),
+        from_did: None,
+        from_name: None,
+        tunnel_did: None,
+        text: text.to_string(),
+        ai_message: AiMessage::text(AiRole::User, text.to_string()),
+    }
+}
+
+fn pending_event(event_id: &str) -> PendingInput {
+    PendingInput::Event {
+        event_id: event_id.to_string(),
+        data: serde_json::json!({"status": "Completed"}),
+    }
+}
+
+#[test]
+fn self_check_behavior_end_keeps_session_idle() {
+    assert_eq!(
+        session_end_disposition(SessionKind::SelfCheck),
+        SessionEndDisposition::Idle
+    );
+    assert_eq!(
+        session_end_disposition(SessionKind::Work),
+        SessionEndDisposition::Ended
+    );
+    assert_eq!(
+        session_end_disposition(SessionKind::SelfImprove),
+        SessionEndDisposition::Ended
+    );
+}
+
+#[tokio::test]
+async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "plan"
+
+        [prompt]
+        on_behavior_step_ob = """
+{{ default_last_step_action_results_text }}
+{% if input.has_msgs %}
+<<new_user_msgs>>
+{% for msg in input.msgs %}
+<message from={{msg.from}}>
+{{msg.text}}
+</message>
+{% endfor %}
+<</new_user_msgs>>
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/plan.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "plan".to_string(),
+        "owner".to_string(),
+    );
+    meta.pending_inputs
+        .push(pending_msg("m1", "follow-up details"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        agent_name: "jarvis".to_string(),
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+    let text = output
+        .user_message
+        .expect("rendered user message")
+        .text_content();
+
+    assert!(text.contains("<<new_user_msgs>>"));
+    assert!(text.contains("<message from=alice>"));
+    assert!(text.contains("follow-up details"));
+    assert!(meta.lock().await.pending_inputs.is_empty());
+    assert!(session_dir.join(".meta/session.json").exists());
+}
+
+#[tokio::test]
+async fn on_behavior_step_ob_top_filter_keeps_pending_msgs_out_of_fork_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "do"
+
+        [prompt]
+        on_behavior_step_ob = """
+step observed
+{% if input.has_msgs %}
+{{input.text}}
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/do.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "do".to_string(),
+        "owner".to_string(),
+    );
+    meta.process_stack.push(ProcessFrame {
+        entry: "plan".to_string(),
+        current: "plan".to_string(),
+        fork: true,
+    });
+    meta.pending_inputs
+        .push(pending_msg("m1", "forwarded follow-up"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.filter = BehaviorFilter::Top;
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        agent_name: "jarvis".to_string(),
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "do".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+    let text = output
+        .user_message
+        .expect("rendered user message")
+        .text_content();
+
+    assert!(text.contains("step observed"));
+    assert!(!text.contains("forwarded follow-up"));
+    assert_eq!(meta.lock().await.pending_inputs.len(), 1);
+}
+
+#[tokio::test]
+async fn on_behavior_step_ob_empty_render_skips_next_inference() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions/work-1");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let agent_config = Arc::new(AgentConfig::open(dir.path().to_path_buf()).unwrap());
+    let mut behavior = BehaviorCfg::from_toml_str(
+        r#"
+        [meta]
+        name = "plan"
+
+        [prompt]
+        on_behavior_step_ob = """
+{% if input.has_events %}
+{{ input.text }}
+{% endif %}
+"""
+    "#,
+    )
+    .unwrap();
+    behavior.source_path = Some(dir.path().join("behaviors/plan.toml"));
+
+    let mut meta = SessionMeta::new(
+        "work-1".to_string(),
+        SessionKind::Work,
+        "plan".to_string(),
+        "owner".to_string(),
+    );
+    meta.pending_inputs
+        .push(pending_msg("m1", "follow-up details"));
+    let meta = Arc::new(Mutex::new(meta));
+    let mut driver = SessionDriverCfg::default();
+    driver.on_behavior_step_ob.pull_msg = PullMsgPolicy::All;
+    driver.on_behavior_step_ob.pull_event = PullEventPolicy::None;
+
+    let hook = OpenDanStepResultHook {
+        template: behavior
+            .prompt
+            .on_behavior_step_ob
+            .clone()
+            .expect("step hook template"),
+        behavior,
+        agent_config,
+        agent_name: "jarvis".to_string(),
+        driver,
+        meta: meta.clone(),
+        session_id: "work-1".to_string(),
+        session_dir: session_dir.clone(),
+        excluded_pending_keys: HashSet::new(),
+    };
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "work-1".to_string(),
+        },
+        trace: Some("trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: Vec::new(),
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let snapshot = LLMContextSnapshot {
+        state: LLMContextState::from_request(&request, 0),
+        request,
+    };
+    let step = StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            compression_level: Default::default(),
+        },
+        ..Default::default()
+    };
+
+    let output = hook
+        .on_behavior_step_ob(&snapshot, &step)
+        .await
+        .expect("step hook render");
+
+    assert!(output.skip_next_inference);
+    assert!(output.user_message.is_none());
+    assert!(meta.lock().await.pending_inputs.is_empty());
+}
+
 #[test]
 fn compose_human_text_skips_empties() {
     let v = vec!["  ".to_string(), "hello".to_string(), "".to_string()];
@@ -46,14 +378,73 @@ fn compose_turn_message_preserves_structured_blocks() {
             },
         ],
     );
-    let out = compose_turn_message(&[msg], Some("environment".to_string())).unwrap();
+    let out = compose_turn_message(&[msg]).unwrap();
     assert_eq!(out.role, AiRole::User);
     assert_eq!(out.content.len(), 2);
-    assert_eq!(
-        out.text_content(),
-        "<background_environment>\nenvironment\n</background_environment>\n\nsee this"
-    );
+    assert_eq!(out.text_content(), "see this");
     assert!(matches!(out.content[1], AiContent::Image { .. }));
+}
+
+#[test]
+fn prepare_turn_messages_embeds_worksession_user_supplement_before_continue() {
+    let prepared = prepare_turn_messages_for_run(
+        vec![
+            TurnMessage {
+                message: AiMessage::text(AiRole::User, "玩法上要确定是Nokia玩法"),
+                runtime_auto: false,
+            },
+            TurnMessage {
+                message: AiMessage::text(
+                    AiRole::User,
+                    "## Current TodoList:\n\n- T01 [pending current] do it\n\nContinue from PROCESS_RULES.",
+                ),
+                runtime_auto: true,
+            },
+        ],
+        true,
+    );
+
+    assert_eq!(prepared.len(), 1);
+    let text = prepared[0].text_content();
+    assert!(text.contains("## Current TodoList:"));
+    assert!(text.contains("## 刚刚用户补充的信息\n\n玩法上要确定是Nokia玩法"));
+    assert!(
+        text.find("## 刚刚用户补充的信息").unwrap()
+            < text.find("Continue from PROCESS_RULES.").unwrap()
+    );
+    assert!(!text.starts_with("玩法上要确定是Nokia玩法"));
+}
+
+#[test]
+fn prepare_turn_messages_keeps_structured_user_message_outside_supplement() {
+    let prepared = prepare_turn_messages_for_run(
+        vec![
+            TurnMessage {
+                message: AiMessage::new(
+                    AiRole::User,
+                    vec![
+                        AiContent::text("see this"),
+                        AiContent::Image {
+                            source: buckyos_api::ResourceRef::url(
+                                "https://example.test/a.png".to_string(),
+                                Some("image/png".to_string()),
+                            ),
+                        },
+                    ],
+                ),
+                runtime_auto: false,
+            },
+            TurnMessage {
+                message: AiMessage::text(AiRole::User, "Continue from PROCESS_RULES."),
+                runtime_auto: true,
+            },
+        ],
+        true,
+    );
+
+    assert_eq!(prepared.len(), 2);
+    assert_eq!(prepared[0].text_content(), "see this");
+    assert!(matches!(prepared[0].content[1], AiContent::Image { .. }));
 }
 
 #[test]
@@ -99,6 +490,7 @@ fn append_turn_message_preserves_behavior_step_records() {
             content: serde_json::json!({"ok": true}),
             bytes: 12,
             truncated: false,
+            tool_result: None,
         }],
         ..Default::default()
     });
@@ -107,7 +499,8 @@ fn append_turn_message_preserves_behavior_step_records() {
     let snapshot = LLMContextSnapshot { request, state };
     let out = append_turn_message_to_snapshot(
         snapshot,
-        AiMessage::text(AiRole::User, "continue task"),
+        Some(AiMessage::text(AiRole::User, "continue task")),
+        Vec::new(),
         "new-trace",
         true,
     );
@@ -166,7 +559,8 @@ fn append_turn_message_promotes_current_behavior_step_as_hot_tail() {
     let snapshot = LLMContextSnapshot { request, state };
     let out = append_turn_message_to_snapshot(
         snapshot,
-        AiMessage::text(AiRole::User, "continue same behavior"),
+        Some(AiMessage::text(AiRole::User, "continue same behavior")),
+        Vec::new(),
         "new-trace",
         true,
     );
@@ -180,6 +574,225 @@ fn append_turn_message_promotes_current_behavior_step_as_hot_tail() {
         Some("do")
     );
     assert_eq!(out.state.next_step_index, 1);
+}
+
+#[test]
+fn append_turn_message_attaches_to_switch_step_next_user_message() {
+    // Behavior switch pair (Agent Context Messages.md §状态机切换):
+    // when the hot tail ended with `<next_behavior>`, the incoming
+    // on_behavior_switch user message must land on the step's
+    // `next_user_message` so the render shape stays
+    // `[assistant:next_behavior=X user:on_switch]` — never two
+    // consecutive user messages.
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "plan".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 3,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        assistant_text: "<response><next_behavior>DO</next_behavior></response>".to_string(),
+        next_behavior: Some("DO".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 4;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        Some(AiMessage::text(
+            AiRole::User,
+            "## Last Finish Todo Report: ...".to_string(),
+        )),
+        Vec::new(),
+        "new-trace",
+        true,
+    );
+
+    // The switch step is promoted to last_step, and the on_behavior_switch
+    // message is attached to its next_user_message — NOT pushed to accumulated.
+    assert!(out.state.steps.is_empty());
+    let last = out
+        .state
+        .last_step
+        .as_ref()
+        .expect("switch step must be the hot tail");
+    assert_eq!(last.meta.behavior_name, "plan");
+    assert_eq!(last.next_behavior.as_deref(), Some("DO"));
+    assert_eq!(
+        last.next_user_message
+            .as_ref()
+            .map(|msg| msg.text_content()),
+        Some("## Last Finish Todo Report: ...".to_string())
+    );
+    // accumulated stays at the system+initial prefix only — no trailing
+    // user message that would render as a second consecutive user turn.
+    assert_eq!(out.state.accumulated.len(), out.request.input.len());
+}
+
+#[test]
+fn append_process_end_history_input_preserves_steps_without_user_tail() {
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        thought: Some("planned todos".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 1;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        None,
+        vec![HistoryInputRecord {
+            source: "system".to_string(),
+            text: "Continue TASK_ANCHOR.".to_string(),
+            at_ms: 42,
+        }],
+        "new-trace",
+        true,
+    );
+
+    assert_eq!(out.state.accumulated.len(), out.request.input.len());
+    assert_eq!(out.state.steps.len(), 1);
+    assert_eq!(out.state.history_inputs.len(), 1);
+    assert_eq!(out.state.history_inputs[0].text, "Continue TASK_ANCHOR.");
+    assert!(out.state.last_step.is_none());
+}
+
+#[test]
+fn append_on_switch_message_after_step_history_as_user_tail() {
+    let request = LLMContextRequest {
+        owner: ContextOwnerRef::Agent {
+            session_id: "s-1".to_string(),
+        },
+        trace: Some("old-trace".to_string()),
+        objective: "objective".to_string(),
+        behavior_name: "do".to_string(),
+        input: vec![
+            AiMessage::text(AiRole::System, "system"),
+            AiMessage::text(AiRole::User, "initial"),
+        ],
+        model_policy: Default::default(),
+        tool_policy: Default::default(),
+        output: Default::default(),
+        budget: Default::default(),
+        human_policy: Default::default(),
+        error_policy: Default::default(),
+        forbid_next_behavior: false,
+    };
+    let mut state = LLMContextState::from_request(&request, 1);
+    state.steps.push(llm_context::behavior_loop::StepRecord {
+        meta: llm_context::behavior_loop::StepMeta {
+            behavior_name: "plan".to_string(),
+            step_index: 0,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            compression_level: Default::default(),
+        },
+        thought: Some("planned todos".to_string()),
+        ..Default::default()
+    });
+    state.next_step_index = 1;
+
+    let snapshot = LLMContextSnapshot { request, state };
+    let out = append_turn_message_to_snapshot(
+        snapshot,
+        Some(AiMessage::text(AiRole::User, "Continue TASK_ANCHOR.")),
+        Vec::new(),
+        "new-trace",
+        true,
+    );
+
+    assert_eq!(out.state.history_inputs.len(), 0);
+    assert_eq!(out.state.steps.len(), 1);
+    assert_eq!(out.state.accumulated.len(), out.request.input.len() + 1);
+    assert_eq!(
+        out.state.accumulated.last().map(|msg| msg.text_content()),
+        Some("Continue TASK_ANCHOR.".to_string())
+    );
+    assert!(out.state.last_step.is_none());
+    assert!(is_runtime_auto_user_pending("opendan:on_behavior_switch"));
+    assert!(!is_history_input_pending("on-behavior-switch-s-1-do-0"));
+}
+
+#[test]
+fn prune_legacy_internal_pending_inputs_keeps_external_inputs() {
+    let mut pending = vec![
+        PendingInput::Msg {
+            record_id: "on-behavior-switch-s-1-plan-1".to_string(),
+            from: "opendan:on_behavior_switch".to_string(),
+            from_did: None,
+            from_name: Some("on_behavior_switch".to_string()),
+            tunnel_did: None,
+            text: "old handoff".to_string(),
+            ai_message: AiMessage::text(AiRole::User, "old handoff"),
+        },
+        PendingInput::Msg {
+            record_id: "process-end:do:abc".to_string(),
+            from: "system".to_string(),
+            from_did: None,
+            from_name: Some("system".to_string()),
+            tunnel_did: None,
+            text: "[fork process `do` ended]".to_string(),
+            ai_message: AiMessage::text(AiRole::User, "[fork process `do` ended]"),
+        },
+        pending_msg("m1", "hello"),
+        pending_event("timer.reminder_check"),
+    ];
+
+    assert_eq!(prune_legacy_internal_pending_inputs(&mut pending), 2);
+    let keys = pending
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["msg:m1", "event:timer.reminder_check"]);
 }
 
 #[test]
@@ -215,16 +828,81 @@ fn pending_input_dedup_key_distinguishes_variants() {
 }
 
 #[test]
+fn driver_pull_selects_only_configured_pending_inputs() {
+    let cfg = HookPointCfg {
+        filter: crate::agent_config::BehaviorFilter::Top,
+        pull_msg: PullMsgPolicy::One,
+        pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+        load_background_hits: Default::default(),
+    };
+    let pending = vec![
+        pending_msg("m1", "first"),
+        pending_msg("m2", "second"),
+        pending_event("timer.reminder_check"),
+        pending_event("kvdoc.changed"),
+    ];
+    let selected = select_pending_for_hook_with_subscriptions(
+        &cfg,
+        &pending,
+        &std::collections::HashMap::new(),
+        &[],
+    );
+    let keys = selected
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["msg:m1", "event:timer.reminder_check"]);
+}
+
+#[test]
+fn driver_pull_keeps_task_events_internal_even_when_event_pull_is_none() {
+    let cfg = HookPointCfg {
+        filter: crate::agent_config::BehaviorFilter::Top,
+        pull_msg: PullMsgPolicy::None,
+        pull_event: PullEventPolicy::None,
+        load_background_hits: Default::default(),
+    };
+    let pending = vec![pending_msg("m1", "ignored"), pending_event("/task_mgr/7")];
+    let mut task_index = std::collections::HashMap::new();
+    task_index.insert(
+        "/task_mgr/7".to_string(),
+        PendingTaskCall {
+            call_id: "call-1".to_string(),
+            tool_name: "exec".to_string(),
+            task_id: 7,
+            event_pattern: "/task_mgr/7".to_string(),
+        },
+    );
+    let selected = select_pending_for_hook_with_subscriptions(&cfg, &pending, &task_index, &[]);
+    let keys = selected
+        .iter()
+        .map(PendingInput::dedup_key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["event:/task_mgr/7"]);
+}
+
+#[test]
 fn format_event_for_turn_includes_id_and_data() {
-    let s = format_event_for_turn("/timer/wake", &serde_json::json!({"tick": 1}));
-    assert!(s.contains("/timer/wake"));
-    assert!(s.contains("tick"));
+    let s = format_event_for_turn(
+        "timer.reminder_check",
+        &serde_json::json!({
+            "reason": {
+                "trigger_type": "precise_trigger",
+                "target_type": "reminder",
+                "target_id": "reminder-1",
+                "expected_trigger_time": "2026-05-24T15:00:00-07:00",
+                "reason": "check reminder-1"
+            }
+        }),
+    );
+    assert!(s.contains("timer.reminder_check"));
+    assert!(s.contains("reminder-1"));
 }
 
 #[test]
 fn format_event_for_turn_handles_null_payload() {
-    let s = format_event_for_turn("/timer/wake", &serde_json::Value::Null);
-    assert!(s.contains("/timer/wake"));
+    let s = format_event_for_turn("timer.hard_barrier", &serde_json::Value::Null);
+    assert!(s.contains("timer.hard_barrier"));
     assert!(!s.contains("null"));
 }
 
@@ -233,6 +911,7 @@ fn format_event_for_turn_uses_subscription_template() {
     let subscriptions = vec![EventSubscription {
         pattern: "/approval/**".to_string(),
         subscribed_at_ms: 0,
+        mode: EventSubscriptionMode::Full,
         message_template: Some("Approval changed to {status}: {message}".to_string()),
     }];
     let s = format_event_for_turn_with_subscriptions(
@@ -361,6 +1040,8 @@ __INCLUDE(/role.md)__
         session_owner: "owner".into(),
         session_current_todo: serde_json::Value::Null,
         session_current_todo_list: "(empty)".into(),
+        session_background_hints: Vec::new(),
+        session_default_changed_background_hint_text: String::new(),
         behavior_name: "do".into(),
         behavior_objective: "execute".into(),
         behavior_mode: "behavior",
@@ -374,6 +1055,11 @@ __INCLUDE(/role.md)__
         input_has_events: false,
         recent_activity: String::new(),
         clock_unix_ms: 1,
+        runtime_workspace_list_text: String::new(),
+        notebook_list_text: String::new(),
+        notebook_last_items_text: String::new(),
+        llm_context: LlmContextEnv::default(),
+        task: None,
     };
     let detail = render_template_failure_detail(
         &behavior,
@@ -427,6 +1113,139 @@ fn pending_event_replacement_keeps_terminal_over_progress() {
 }
 
 #[test]
+fn worksession_report_delivery_modes_match_context_depth() {
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Final,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Checkpoint,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::FinalOnly,
+        WorksessionReportPhase::Final,
+        1
+    ));
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::TopLevel,
+        WorksessionReportPhase::Checkpoint,
+        0
+    ));
+    assert!(!worksession_report_delivery_allows(
+        ReportDeliveryMode::TopLevel,
+        WorksessionReportPhase::Checkpoint,
+        1
+    ));
+    assert!(worksession_report_delivery_allows(
+        ReportDeliveryMode::All,
+        WorksessionReportPhase::Checkpoint,
+        3
+    ));
+}
+
+#[test]
+fn idle_worker_retire_timeout_depends_on_session_kind() {
+    assert_eq!(idle_worker_retire_ms(SessionKind::Ui), 15 * 60 * 1000);
+    assert_eq!(idle_worker_retire_ms(SessionKind::Work), 3 * 60 * 1000);
+    assert_eq!(
+        idle_worker_retire_ms(SessionKind::SelfImprove),
+        3 * 60 * 1000
+    );
+}
+
+#[test]
+fn worksession_report_msg_carries_source_metadata() {
+    let agent = name_lib::DID::from_str("did:dev:agent").unwrap();
+    let peer = name_lib::DID::from_str("did:dev:alice").unwrap();
+    let data = serde_json::json!({
+        "type": "worksession_report",
+        "report_id": "report:work-1:final:abc",
+        "source_session_id": "work-1",
+        "target_session_id": "ui-1",
+        "title": "build demo",
+        "objective": "ship the demo",
+        "workspace_id": "ws-1",
+        "behavior": "plan",
+        "context_depth": 0,
+        "phase": "final",
+        "report": "done",
+        "is_final": true,
+        "trace_id": "trace-1",
+        "created_at_ms": 42u64,
+    });
+
+    let msg = build_worksession_report_base_msg(&agent, &peer, "ui-1", &data);
+
+    assert_eq!(
+        worksession_report_content_title(&data),
+        "WorkSession report: build demo"
+    );
+    assert!(msg.content.content.is_empty());
+    assert_eq!(msg.thread.topic.as_deref(), Some("ui-1"));
+    assert_eq!(msg.thread.correlation_id.as_deref(), Some("work-1"));
+    assert_eq!(
+        msg.meta.get("message_type").and_then(|v| v.as_str()),
+        Some("worksession_report")
+    );
+    assert_eq!(
+        msg.meta
+            .get("source")
+            .and_then(|v| v.pointer("/kind"))
+            .and_then(|v| v.as_str()),
+        Some("worksession")
+    );
+    assert_eq!(
+        msg.meta
+            .get("source")
+            .and_then(|v| v.pointer("/session_id"))
+            .and_then(|v| v.as_str()),
+        Some("work-1")
+    );
+}
+
+#[test]
+fn worksession_report_normalizes_attachment_markers() {
+    let report =
+        "files\n<attachment>/tmp/a.html<attachment>\n<attachement>/tmp/b.css</attachement>";
+    let normalized = normalize_report_attachment_tags(report);
+
+    assert!(normalized.contains("<attachment>/tmp/a.html</attachment>"));
+    assert!(normalized.contains("<attachment>/tmp/b.css</attachment>"));
+    assert!(!normalized.contains("attachement"));
+}
+
+#[test]
+fn tg_route_extra_uses_chat_id_from_ui_session_id() {
+    let extra = tg_route_extra_for_session("tg:lzc_jarvis:-100123456").unwrap();
+    assert_eq!(
+        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
+        Some("-100123456")
+    );
+    assert!(tg_route_extra_for_session("ui-1").is_none());
+}
+
+#[test]
+fn worksession_report_extra_preserves_payload_and_adds_tg_route() {
+    let payload = serde_json::json!({
+        "type": "worksession_report",
+        "report_id": "report-1",
+        "report": "done"
+    });
+    let extra = with_tg_route_chat_id(payload, "tg:jarvis_bot:5397330802");
+    assert_eq!(
+        extra.get("report_id").and_then(|v| v.as_str()),
+        Some("report-1")
+    );
+    assert_eq!(
+        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
+        Some("5397330802")
+    );
+}
+
+#[test]
 fn pending_queue_limit_drops_events_then_non_mentions() {
     let mut pending = vec![
         PendingInput::Msg {
@@ -468,6 +1287,7 @@ fn session_meta_round_trips_pending_inputs() {
         kind: SessionKind::Ui,
         current_behavior: "ui_default".to_string(),
         status: SessionStatus::WaitingInput,
+        status_changed_at_ms: 0,
         owner: "alice".to_string(),
         one_line_status: String::new(),
         pending_inputs: vec![
@@ -481,17 +1301,28 @@ fn session_meta_round_trips_pending_inputs() {
                 ai_message: AiMessage::text(AiRole::User, "hi"),
             },
             PendingInput::Event {
-                event_id: "/timer/wake".to_string(),
-                data: serde_json::json!({"tick": 7}),
+                event_id: "timer.reminder_check".to_string(),
+                data: serde_json::json!({
+                    "reason": {
+                        "trigger_type": "precise_trigger",
+                        "target_type": "reminder",
+                        "target_id": "reminder-7",
+                        "expected_trigger_time": "2026-05-24T15:00:00-07:00",
+                        "reason": "check reminder-7"
+                    }
+                }),
             },
         ],
         peer_did: Some("did:dev:alice".to_string()),
         peer_tunnel_did: Some("did:dev:tunnel".to_string()),
         event_subscriptions: vec![EventSubscription {
-            pattern: "/timer/**".to_string(),
+            pattern: "timer.reminder_check".to_string(),
             subscribed_at_ms: 0,
+            mode: EventSubscriptionMode::Full,
             message_template: None,
         }],
+        background_events: Vec::new(),
+        background_hint_state: Default::default(),
         workspace_id: Some("ws-1".to_string()),
         pending_task_calls: vec![PendingTaskCall {
             call_id: "call-1".to_string(),
@@ -499,6 +1330,8 @@ fn session_meta_round_trips_pending_inputs() {
             task_id: 42,
             event_pattern: "/task_mgr/42".to_string(),
         }],
+        improvement_budget: None,
+        pending_improvement_tasks: Vec::new(),
         title: "design review".to_string(),
         objective: "draft the rollout plan".to_string(),
         bootstrap_done: true,
@@ -508,6 +1341,9 @@ fn session_meta_round_trips_pending_inputs() {
             current: "ui_default".to_string(),
             fork: false,
         }],
+        last_report_delivery: None,
+        internal_continuation: None,
+        task_binding: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let restored: SessionMeta = serde_json::from_str(&json).unwrap();
@@ -531,14 +1367,20 @@ fn session_meta_round_trips_pending_inputs() {
     }
     match &restored.pending_inputs[1] {
         PendingInput::Event { event_id, data } => {
-            assert_eq!(event_id, "/timer/wake");
-            assert_eq!(data.get("tick").and_then(|v| v.as_i64()), Some(7));
+            assert_eq!(event_id, "timer.reminder_check");
+            assert_eq!(
+                data.pointer("/reason/target_id").and_then(|v| v.as_str()),
+                Some("reminder-7")
+            );
         }
         _ => panic!("expected Event variant second"),
     }
     assert_eq!(restored.peer_did.as_deref(), Some("did:dev:alice"));
     assert_eq!(restored.event_subscriptions.len(), 1);
-    assert_eq!(restored.event_subscriptions[0].pattern, "/timer/**");
+    assert_eq!(
+        restored.event_subscriptions[0].pattern,
+        "timer.reminder_check"
+    );
     assert_eq!(restored.workspace_id.as_deref(), Some("ws-1"));
     assert_eq!(restored.pending_task_calls.len(), 1);
     assert_eq!(restored.pending_task_calls[0].task_id, 42);
@@ -600,7 +1442,9 @@ fn observation_from_task_event_translates_failed() {
     });
     let obs = observation_from_task_event("call-9", &payload).expect("terminal observation");
     match obs {
-        Observation::Error { call_id, message } => {
+        Observation::Error {
+            call_id, message, ..
+        } => {
             assert_eq!(call_id, "call-9");
             assert!(message.contains("network"));
         }
@@ -670,6 +1514,65 @@ fn compress_messages_drops_middle_and_keeps_tail() {
 }
 
 #[test]
+fn model_directory_context_window_resolves_logical_mount() {
+    let directory = serde_json::json!({
+        "providers": [{
+            "models": [{
+                "exact_model": "gpt-5@openai",
+                "provider_model_id": "gpt-5",
+                "logical_mounts": ["llm.chat"],
+                "capabilities": {"max_context_tokens": 128000}
+            }, {
+                "exact_model": "tiny@local",
+                "provider_model_id": "tiny",
+                "logical_mounts": ["llm.chat"],
+                "capabilities": {"max_context_tokens": 32000}
+            }]
+        }]
+    });
+    assert_eq!(
+        context_window_tokens_from_model_directory(&directory, "llm.chat"),
+        Some(32000)
+    );
+}
+
+#[test]
+fn model_directory_context_window_follows_directory_targets() {
+    let directory = serde_json::json!({
+        "directory": {
+            "llm.plan": {
+                "opus": {"target": "llm.opus", "weight": 1.0}
+            }
+        },
+        "providers": [{
+            "models": [{
+                "exact_model": "claude-opus@anthropic",
+                "provider_model_id": "claude-opus",
+                "logical_mounts": ["llm.opus"],
+                "capabilities": {"max_context_tokens": 200000}
+            }]
+        }]
+    });
+    assert_eq!(
+        context_window_tokens_from_model_directory(&directory, "llm.plan"),
+        Some(200000)
+    );
+}
+
+#[test]
+fn turns_since_last_compress_counts_user_turns_after_marker() {
+    let msgs = vec![
+        AiMessage::text(AiRole::System, "sys"),
+        AiMessage::text(AiRole::Assistant, "[LLM_MESSAGE_COMPRESS_META_V1]"),
+        AiMessage::text(AiRole::User, "[LLM_MESSAGE_COMPRESS_SUMMARY_V1] summary"),
+        AiMessage::text(AiRole::User, "u1"),
+        AiMessage::text(AiRole::Assistant, "a1"),
+        AiMessage::text(AiRole::User, "u2"),
+    ];
+    assert_eq!(turns_since_last_llm_message_compress(&msgs), 2);
+}
+
+#[test]
 fn merge_env_and_human_combines_both_with_env_first() {
     let m = merge_env_and_human(Some("E".into()), Some("H".into()));
     assert_eq!(m.as_deref(), Some("E\n\nH"));
@@ -686,6 +1589,74 @@ fn merge_env_and_human_handles_missing_pieces() {
         Some("e")
     );
     assert!(merge_env_and_human(None, None).is_none());
+}
+
+#[test]
+fn default_changed_background_hint_text_renders_list() {
+    let hints = vec![
+        BackgroundHint {
+            path: "event/presence.changed".to_string(),
+            kind: "event".to_string(),
+            text: r#"presence updated : {"online":true} (presence.changed)"#.to_string(),
+            fingerprint: "fp1".to_string(),
+            data: serde_json::Value::Null,
+        },
+        BackgroundHint {
+            path: "memory/user/preference/style".to_string(),
+            kind: "memory".to_string(),
+            text: "Memory may be relevant: /user/preference/style".to_string(),
+            fingerprint: "fp2".to_string(),
+            data: serde_json::Value::Null,
+        },
+    ];
+    assert_eq!(
+        render_changed_background_hint_text(&hints),
+        r#"- presence updated : {"online":true} (presence.changed)"#.to_string()
+            + "\n- Memory may be relevant: /user/preference/style"
+    );
+}
+
+#[test]
+fn background_event_hint_renders_reason_data_and_event_id() {
+    let hints = build_background_event_hints(&[BgEventSnapshot {
+        event_id: "timer".to_string(),
+        data: serde_json::json!({
+            "purpose": "current_clock",
+            "_timer": {
+                "timer_id": "t_1",
+                "tick_count": 1
+            }
+        }),
+        reason: None,
+        observed_at_ms: 1779769325008,
+    }]);
+    assert_eq!(hints.len(), 1);
+    assert_eq!(
+        hints[0].text,
+        r#"current_clock updated : {"_timer":{"tick_count":1,"timer_id":"t_1"},"purpose":"current_clock"} (timer)"#
+    );
+}
+
+#[test]
+fn default_changed_background_hint_text_falls_back_to_path() {
+    let hints = vec![BackgroundHint {
+        path: "notepad/project".to_string(),
+        kind: "notepad".to_string(),
+        text: String::new(),
+        fingerprint: "fp1".to_string(),
+        data: serde_json::Value::Null,
+    }];
+    assert_eq!(
+        render_changed_background_hint_text(&hints),
+        "- notepad/project"
+    );
+}
+
+#[test]
+fn background_hint_interval_blocks_one_minute_after_non_empty() {
+    assert!(!background_hint_interval_active(0, 10));
+    assert!(background_hint_interval_active(1_000, 60_999));
+    assert!(!background_hint_interval_active(1_000, 61_000));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-# Agent Todo CLI 工具需求
+# Agent Work Session Todo-List 需求
 
 > 来源：根据语音记录整理。本文档用于明确 Agent Todo CLI / 工具接口的核心概念、接口语义、状态流转和约束。
 

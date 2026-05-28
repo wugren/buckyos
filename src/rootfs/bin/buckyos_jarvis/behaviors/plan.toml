@@ -33,6 +33,8 @@ PLAN -> DO -> PLAN -> DO -> PLAN -> END.
 ## Planning Rules
 
 - Understand the current state before planning. If the OBJECTIVE is ambiguous, ask the Owner with `sendmsg`; do not guess.
+- Plans MUST be feasible in the known environment. For example, if Playwright is not installed, you MUST NOT create a verification plan that depends on Playwright. You MAY suggest starting a separate work session to extend the environment, such as installing a new toolchain or test tool, but you MUST NOT do that in the current work session.
+- Prefer planning from the guidance in assigned or relevant skills. Todos for release, deployment, publishing, or launch workflows MUST include explicit guidance.
 - Each todo title must state one concrete purpose in one sentence.
 - Each todo content must be executable: clear scope, key details, constraints, and any evidence already found.
 - Put important clues into the todo body so DO mode can focus on execution.
@@ -45,6 +47,7 @@ PLAN -> DO -> PLAN -> DO -> PLAN -> END.
 
 - This worksession already has a workspace : `{{ paths.workspace_root }}`. Put all deliverables and user-facing artifacts here.
 - Use `{{ paths.session_root }}` only for session-local runtime state, temporary notes, and internal planning records.
+- Eash todo boundaries MUST be clear. Each todo content SHOULD state whether it creates new files or directories, or whether it is limited to modifying specific files.
 
 ## Delegation
 
@@ -82,7 +85,8 @@ Read global state only when it can change the plan. Do not repeat large state du
 <</RESULT_PROTOCOL>>
 """
 
-on_switch = """
+#
+on_behavior_switch = """
 {% if from_context %}
 ## Last Finish Todo Report:
 {{from_context.report}}
@@ -92,12 +96,52 @@ on_switch = """
 
 {{ session.current_todo_list }}
 
+
+{% if input.has_msgs %}
+## New User Messages
+{% for msg in input.msgs %}
+<message>
+{{msg.text}}
+</message>
+{% endfor %}
+
+{% endif %}
+
 Continue from PROCESS_RULES.
 """
 
-on_input_event = """
-[event {event_id}]
-{event_data}
+# Plan模式可以在每个step都读取可能的用户输入和事件
+on_behavior_step_ob = """
+
+{{ default_last_step_action_results_text }}
+
+
+{% if input.has_msgs %}
+<<new_user_msgs>>
+{% for msg in input.msgs %}
+<message from={{msg.from}}>
+{{msg.text}}
+</message>
+{% endfor %}
+<</new_user_msgs>>
+{% endif %}
+"""
+
+# 这条路径其实不会进入，用来做DEMO
+on_wakeup = """
+{% if input.has_msgs %}
+{{ input.text }}
+{% endif %}
+
+{% if input.has_events %}
+<<new_events>>
+{% for event in input.events %}
+<event id={{event.event_id}}>
+{% if event.reason %}reason={{ event.reason }}{% endif %}
+</event>
+{% endfor %}
+<</new_events>>
+{% endif %}
 """
 
 [capabilities]
@@ -121,6 +165,14 @@ preferred = "llm.chat"
 
 [on_context_limit_reached]
 mode = "compress_then_continue"
+
+[on_llm_message_compress]
+mode = "context_window_ratio"
+trigger_ratio = 0.80
+target_ratio = 0.50
+hard_limit_ratio = 0.95
+min_turns_between_compress = 2
+preserve_cache_stability = true
 
 [on_interrupt_graceful]
 mode = "cancel_pending_tools_then_continue"

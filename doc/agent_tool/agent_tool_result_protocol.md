@@ -137,11 +137,12 @@ Agent Loop、WorkLog、`check_task`、审批等待、长任务等待都可以基
 
 ```text
 system
-user: behavior init | step_history
+user: step_history
 assistant: hot step intent
 user: hot step action results
 assistant: hot step intent
 user: hot step action results
+user: behavior init / on_behavior_switch UserMessage
 ```
 
 其中：
@@ -150,7 +151,7 @@ user: hot step action results
 - hot tail 是最近若干个完整 `(assistant, user)` step pair。
 - 当 context 不够时，hot tail 中较旧的一部分会合并进 `step_history`，并在 `step_history` 内压缩或裁剪。
 - `step_history` 是可选的；Behavior 刚开始且没有历史时，可以单独给一条 behavior init user message。
-- 如果既有 `step_history` 又需要注入 behavior init，init 内容应合并到 `step_history` 末尾，保证历史在时间顺序上连续。
+- 如果既有 `step_history` 又需要注入 behavior init / on_behavior_switch UserMessage，应先渲染 `step_history`，再追加该 UserMessage，保证沉淀历史在时间顺序上更早。
 
 ### Full Step
 
@@ -190,13 +191,15 @@ AgentToolResult.output | AgentToolResult.detail
 
 当前实现会把 action 渲染成紧凑的一行 command。后续如果 action result 已经是合法 `AgentToolResult`，标题应优先使用 `AgentToolResult.title`；否则按 action 参数降级构造。
 
+Behavior XML action 的 ID 由运行时执行前分配，LLM 不需要输出。最近 step 以 assistant/user pair 回灌时，assistant action 标签会补 `call_id="<id>"`，对应 action result 标题前会补 `#<id>`，用于把命令和执行结果稳定关联起来。
+
 | Action | 降级标题规则 |
 | --- | --- |
 | `exec_bash` | 使用 `command` 参数，压缩空白并截断到 160 字符 |
 | `read` | `read <path-or-uri> [first_chunk=...] [range=...]` |
 | `write_file` | `write_file <path> mode=<mode>` |
-| `edit_file` | `edit_file <path> mode=<mode> [anchor="..."]` |
-| 其它 action | `<name> key=value ...`，key 排序；跳过 `content` / `new_content` / `from_user_did` |
+| `edit_file` | `edit_file <path> [old_string="..."]` |
+| 其它 action | `<name> key=value ...`，key 排序；跳过 `content` / `old_string` / `new_string` / `from_user_did` |
 
 降级标题最终通常是：
 
@@ -325,8 +328,8 @@ AgentToolResult.summary | AgentToolResult.title
 
 - 自有 AgentTool 输出的协议 JSON 必须显式带上该字段
 - 当前版本为 `"1"`
-- 普通 bash 输出即使碰巧长得像 JSON，也不能仅凭内容猜成 AgentToolResult
-- `exec_bash` 只有在明确命中内置 AgentTool 命令，且 stdout JSON 带有合法协议标志时，才应把 stdout 解析为 AgentToolResult
+- 普通 bash 输出即使碰巧长得像 JSON，也不能仅凭 JSON 结构猜成 AgentToolResult
+- `exec_bash` 只有在 stdout 是带合法 `agent_tool_protocol` 的 AgentToolResult envelope 时，才应把 stdout 解析为 AgentToolResult
 
 版本演进规则：
 
@@ -549,9 +552,9 @@ read_file demo.txt range=1-20
 }
 ```
 
-如果 `exec_bash` 执行的是内置 AgentTool 命令，并且 stdout 明确是合法 AgentToolResult，`exec_bash` 可以把该结果转发为结构化工具结果。
+如果 `exec_bash` 执行的命令在 stdout 明确输出合法 AgentToolResult，`exec_bash` 可以把该结果转发为结构化工具结果。
 
-普通 bash 的 stdout 即使碰巧是 JSON，也不能被隐式当成 `detail` 或 AgentToolResult。
+普通 bash 的 stdout 即使碰巧是 JSON，也不能在缺少合法 `agent_tool_protocol` 时被隐式当成 `detail` 或 AgentToolResult。
 
 ## 内置 Agent Tool 约定
 

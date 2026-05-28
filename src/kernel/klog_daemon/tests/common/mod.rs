@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
@@ -44,6 +45,14 @@ pub struct QueryLogResponse {
     pub items: Vec<QueryLogEntry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TestRaftTiming {
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub heartbeat_interval_ms: u64,
+    pub install_snapshot_timeout_ms: u64,
+}
+
 pub struct TestNode {
     pub node_id: u64,
     pub port: u16,
@@ -66,15 +75,34 @@ impl Drop for TestNode {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         unregister_admin_port(self.port);
+        unregister_node_ports(self.port);
         let _ = std::fs::remove_file(&self.config_path);
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
 static RAFT_TO_ADMIN_PORT_MAP: OnceLock<Mutex<HashMap<u16, u16>>> = OnceLock::new();
+static RAFT_TO_NODE_PORTS_MAP: OnceLock<Mutex<HashMap<u16, TestNodePorts>>> = OnceLock::new();
+static RESERVED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+static TMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+struct TestNodePorts {
+    inter_node_port: u16,
+    admin_port: u16,
+    rpc_port: u16,
+}
 
 fn admin_port_map() -> &'static Mutex<HashMap<u16, u16>> {
     RAFT_TO_ADMIN_PORT_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn node_ports_map() -> &'static Mutex<HashMap<u16, TestNodePorts>> {
+    RAFT_TO_NODE_PORTS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn reserved_ports() -> &'static Mutex<HashSet<u16>> {
+    RESERVED_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn derive_admin_port(raft_port: u16) -> u16 {
@@ -98,7 +126,7 @@ fn unregister_admin_port(raft_port: u16) {
     }
 }
 
-fn resolve_admin_port(port_or_admin: u16) -> u16 {
+pub fn resolve_admin_port(port_or_admin: u16) -> u16 {
     if let Ok(m) = admin_port_map().lock() {
         if let Some(admin_port) = m.get(&port_or_admin) {
             return *admin_port;
@@ -108,6 +136,62 @@ fn resolve_admin_port(port_or_admin: u16) -> u16 {
         }
     }
     derive_admin_port(port_or_admin)
+}
+
+fn register_node_ports(raft_port: u16, inter_node_port: u16, admin_port: u16, rpc_port: u16) {
+    if let Ok(mut m) = node_ports_map().lock() {
+        m.insert(
+            raft_port,
+            TestNodePorts {
+                inter_node_port,
+                admin_port,
+                rpc_port,
+            },
+        );
+    }
+}
+
+fn unregister_node_ports(raft_port: u16) {
+    if let Ok(mut m) = node_ports_map().lock() {
+        m.remove(&raft_port);
+    }
+}
+
+fn resolve_node_ports(raft_port: u16) -> TestNodePorts {
+    if let Ok(m) = node_ports_map().lock()
+        && let Some(ports) = m.get(&raft_port)
+    {
+        return *ports;
+    }
+
+    TestNodePorts {
+        inter_node_port: raft_port,
+        admin_port: resolve_admin_port(raft_port),
+        rpc_port: raft_port,
+    }
+}
+
+fn reserve_port_pair(port: u16) -> bool {
+    let admin_port = derive_admin_port(port);
+    if port == admin_port {
+        return false;
+    }
+
+    let Ok(mut reserved) = reserved_ports().lock() else {
+        return false;
+    };
+    if reserved.contains(&port) || reserved.contains(&admin_port) {
+        return false;
+    }
+    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+        || std::net::TcpListener::bind(("127.0.0.1", admin_port)).is_err()
+    {
+        return false;
+    }
+
+    reserved.insert(port);
+    reserved.insert(admin_port);
+    true
 }
 
 fn normalize_join_targets_as_admin_endpoints(targets: &[String]) -> Vec<String> {
@@ -130,10 +214,12 @@ pub fn unique_tmp_path(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = TMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "buckyos_klog_daemon_it_{}_{}_{}",
+        "buckyos_klog_daemon_it_{}_{}_{}_{}",
         std::process::id(),
         nanos,
+        seq,
         tag
     ))
 }
@@ -144,11 +230,7 @@ pub fn choose_free_port() -> std::io::Result<u16> {
         let port = listener.local_addr()?.port();
         drop(listener);
 
-        let admin_port = derive_admin_port(port);
-        if port == admin_port {
-            continue;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", admin_port)).is_ok() {
+        if reserve_port_pair(port) {
             return Ok(port);
         }
     }
@@ -167,9 +249,6 @@ pub fn choose_unique_ports(count: usize) -> Result<Vec<u16>, String> {
         let p = choose_free_port().map_err(|e| format!("choose free port failed: {}", e))?;
         let admin_port = derive_admin_port(p);
         if p == admin_port || guard.contains(&p) || guard.contains(&admin_port) {
-            continue;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", admin_port)).is_err() {
             continue;
         }
         guard.insert(p);
@@ -210,7 +289,26 @@ pub fn write_config_file(
     auto_bootstrap: bool,
     join_targets: &[String],
     target_role: &str,
+    raft_timing: Option<TestRaftTiming>,
 ) -> Result<(), String> {
+    let raft_section = raft_timing
+        .map(|timing| {
+            format!(
+                r#"
+[raft]
+election_timeout_min_ms = {}
+election_timeout_max_ms = {}
+heartbeat_interval_ms = {}
+install_snapshot_timeout_ms = {}
+"#,
+                timing.election_timeout_min_ms,
+                timing.election_timeout_max_ms,
+                timing.heartbeat_interval_ms,
+                timing.install_snapshot_timeout_ms
+            )
+        })
+        .unwrap_or_default();
+
     let content = format!(
         r#"
 node_id = {node_id}
@@ -229,6 +327,7 @@ rpc_advertise_port = {rpc_port}
 [storage]
 data_dir = "{data_dir}"
 state_store_sync_write = true
+{raft_section}
 
 [cluster]
 name = "{cluster_name}"
@@ -257,6 +356,7 @@ config_change_conflict_extra_backoff_ms = 0
         admin_port = admin_port,
         rpc_port = rpc_port,
         data_dir = data_dir.display(),
+        raft_section = raft_section,
         cluster_name = cluster_name,
         auto_bootstrap = auto_bootstrap,
         join_targets = make_targets_toml(join_targets),
@@ -348,6 +448,48 @@ pub async fn spawn_node(
     join_targets: &[String],
     target_role: &str,
 ) -> Result<TestNode, String> {
+    spawn_node_with_optional_raft_timing(
+        node_id,
+        port,
+        cluster_name,
+        auto_bootstrap,
+        join_targets,
+        target_role,
+        None,
+    )
+    .await
+}
+
+pub async fn spawn_node_with_raft_timing(
+    node_id: u64,
+    port: u16,
+    cluster_name: &str,
+    auto_bootstrap: bool,
+    join_targets: &[String],
+    target_role: &str,
+    raft_timing: TestRaftTiming,
+) -> Result<TestNode, String> {
+    spawn_node_with_optional_raft_timing(
+        node_id,
+        port,
+        cluster_name,
+        auto_bootstrap,
+        join_targets,
+        target_role,
+        Some(raft_timing),
+    )
+    .await
+}
+
+async fn spawn_node_with_optional_raft_timing(
+    node_id: u64,
+    port: u16,
+    cluster_name: &str,
+    auto_bootstrap: bool,
+    join_targets: &[String],
+    target_role: &str,
+    raft_timing: Option<TestRaftTiming>,
+) -> Result<TestNode, String> {
     let data_dir = unique_tmp_path(&format!("node{}_data", node_id));
     let config_path = unique_tmp_path(&format!("node{}_config.toml", node_id));
     std::fs::create_dir_all(&data_dir)
@@ -378,10 +520,12 @@ pub async fn spawn_node(
         auto_bootstrap,
         &normalized_join_targets,
         target_role,
+        raft_timing,
     )?;
 
     let mut child = spawn_daemon_child(&config_path).await?;
     register_admin_port(port, admin_port);
+    register_node_ports(port, inter_node_port, admin_port, rpc_port);
 
     if let Err(e) = wait_node_http_ready_after_spawn(
         &mut child,
@@ -395,6 +539,7 @@ pub async fn spawn_node(
     .await
     {
         unregister_admin_port(port);
+        unregister_node_ports(port);
         return Err(e);
     }
 
@@ -762,12 +907,16 @@ pub async fn send_add_learner(
         .build()
         .map_err(|e| format!("failed to build http client: {}", e))?;
     let admin_port = resolve_admin_port(port);
+    let node_ports = resolve_node_ports(node_port);
     let url = format!(
-        "http://127.0.0.1:{}/klog/admin/add-learner?node_id={}&addr={}&port={}&blocking={}",
+        "http://127.0.0.1:{}/klog/admin/add-learner?node_id={}&addr={}&port={}&inter_port={}&admin_port={}&rpc_port={}&blocking={}",
         admin_port,
         node_id,
         addr,
         node_port,
+        node_ports.inter_node_port,
+        node_ports.admin_port,
+        node_ports.rpc_port,
         if blocking { "true" } else { "false" }
     );
     let resp = client
@@ -845,7 +994,7 @@ pub async fn add_learner_with_retry(
 
             let mut errs = Vec::new();
             for p in candidate_ports {
-                match send_add_learner(p, node_id, "127.0.0.1", node_port, true).await {
+                match send_add_learner(p, node_id, "127.0.0.1", node_port, false).await {
                     Ok(_) => {
                         errs.clear();
                         break;
@@ -1029,15 +1178,76 @@ pub async fn spawn_three_voter_cluster(
     port2: u16,
     port3: u16,
 ) -> Result<Vec<TestNode>, String> {
+    spawn_three_voter_cluster_with_optional_raft_timing(cluster_name, port1, port2, port3, None)
+        .await
+}
+
+pub async fn spawn_three_voter_cluster_with_raft_timing(
+    cluster_name: &str,
+    port1: u16,
+    port2: u16,
+    port3: u16,
+    raft_timing: TestRaftTiming,
+) -> Result<Vec<TestNode>, String> {
+    spawn_three_voter_cluster_with_optional_raft_timing(
+        cluster_name,
+        port1,
+        port2,
+        port3,
+        Some(raft_timing),
+    )
+    .await
+}
+
+async fn spawn_three_voter_cluster_with_optional_raft_timing(
+    cluster_name: &str,
+    port1: u16,
+    port2: u16,
+    port3: u16,
+    raft_timing: Option<TestRaftTiming>,
+) -> Result<Vec<TestNode>, String> {
     let join_seed = vec![format!("127.0.0.1:{}", port1)];
     let mut nodes = Vec::new();
-    nodes.push(spawn_node(1, port1, cluster_name, true, &[], "voter").await?);
+    nodes.push(
+        spawn_node_with_optional_raft_timing(
+            1,
+            port1,
+            cluster_name,
+            true,
+            &[],
+            "voter",
+            raft_timing,
+        )
+        .await?,
+    );
     wait_single_node_leader(port1, 1, Duration::from_secs(20)).await?;
 
-    nodes.push(spawn_node(2, port2, cluster_name, false, &join_seed, "voter").await?);
+    nodes.push(
+        spawn_node_with_optional_raft_timing(
+            2,
+            port2,
+            cluster_name,
+            false,
+            &join_seed,
+            "voter",
+            raft_timing,
+        )
+        .await?,
+    );
     let _ = wait_cluster_voters(&[port1, port2], &[1, 2], Duration::from_secs(40)).await?;
 
-    nodes.push(spawn_node(3, port3, cluster_name, false, &join_seed, "voter").await?);
+    nodes.push(
+        spawn_node_with_optional_raft_timing(
+            3,
+            port3,
+            cluster_name,
+            false,
+            &join_seed,
+            "voter",
+            raft_timing,
+        )
+        .await?,
+    );
     let _ =
         wait_cluster_voters(&[port1, port2, port3], &[1, 2, 3], Duration::from_secs(50)).await?;
     let leader =

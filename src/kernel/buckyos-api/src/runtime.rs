@@ -20,6 +20,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use tokio::sync::{OnceCell, RwLock};
 
+use ::kRPC::Result;
 use name_client::*;
 use name_lib::*;
 use named_store::NamedDataMgr;
@@ -36,6 +37,7 @@ use crate::scheduler_client::*;
 use crate::system_config::*;
 use crate::task_mgr::*;
 use crate::verify_hub_client::*;
+use crate::workflow_service::{WorkflowServiceClient, WORKFLOW_SERVICE_NAME};
 use crate::{
     get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, OPENDAN_SERVICE_NAME,
 };
@@ -2064,6 +2066,13 @@ impl BuckyOSRuntime {
         let krpc_client = self.get_zone_service_krpc_client("scheduler").await?;
         let client = SchedulerClient::new(krpc_client);
         Ok(client)
+    }
+
+    pub async fn get_workflow_service_client(&self) -> Result<WorkflowServiceClient> {
+        let krpc_client = self
+            .get_zone_service_krpc_client(WORKFLOW_SERVICE_NAME)
+            .await?;
+        Ok(WorkflowServiceClient::new(krpc_client))
     }
 
     pub async fn get_control_panel_client(&self) -> Result<ControlPanelClient> {

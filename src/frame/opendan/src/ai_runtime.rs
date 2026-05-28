@@ -11,9 +11,9 @@
 //! - [`OpenDanWorklogSink`]  → `WorklogSink`   (over `crate::worklog::WorklogService`)
 //! - [`SessionSnapshotHook`] → `TurnHook`      (writes `LLMContextSnapshot` to disk)
 //!
-//! Step 3 (`behavior_cfg`) will plug `LLMResultParser` / `StepRenderer` /
-//! `HistoryCompressor` on top of [`build_session_deps`] when the Behavior
-//! Loop is enabled for a given behavior.
+//! Step 3 (`behavior_cfg`) will plug `LLMResultParser` / `StepRenderer` on
+//! top of [`build_session_deps`] when the Behavior Loop is enabled for a
+//! given behavior.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -250,7 +250,9 @@ async fn resolve_aicc_task_id(
 
     let filter = TaskFilter {
         app_id: Some(AICC_SERVICE_SERVICE_NAME.to_string()),
+        session_id: None,
         task_type: None,
+        runner: None,
         status: None,
         parent_id: None,
         root_id: None,
@@ -338,6 +340,7 @@ impl ToolManager for OpendanToolAdapter {
             Err(err) => Observation::Error {
                 call_id,
                 message: err.to_string(),
+                tool_result: None,
             },
         }
     }
@@ -360,28 +363,37 @@ impl ToolManager for OpendanToolAdapter {
 }
 
 fn result_to_observation(call_id: String, result: AgentToolResult) -> Observation {
+    let tool_result = Some(result.to_tool_result_view());
     if matches!(result.status, AgentToolStatus::Pending) {
-        return Observation::Pending { call_id };
+        return Observation::Pending {
+            call_id,
+            tool_result,
+        };
     }
     let is_error = matches!(result.status, AgentToolStatus::Error);
     let summary = result.summary.clone();
     let title = result.title.clone();
     if is_error {
-        let message = if !summary.is_empty() {
+        let output = result.output.clone().unwrap_or_default();
+        let message = if !output.trim().is_empty() {
+            if summary.trim().is_empty() {
+                output
+            } else {
+                format!("{}\n```output\n{}\n```", summary.trim(), output.trim())
+            }
+        } else if !summary.is_empty() {
             summary
         } else if !title.is_empty() {
             title
         } else {
             "tool error".to_string()
         };
-        Observation::Error { call_id, message }
+        Observation::Error {
+            call_id,
+            message,
+            tool_result,
+        }
     } else {
-        // Per agent_tool protocol, only the canonical `output` is fed back to
-        // the LLM so history records carry the minimum needed for tiered
-        // compression — detail / cmd_args / stdout / stderr / title are
-        // metadata for the UI and worklog, not for the model. Tools that
-        // don't populate `output` (write_file / edit_file / ...) fall back
-        // to `summary`, which already embeds the operation result.
         let text = result
             .output
             .clone()
@@ -393,6 +405,7 @@ fn result_to_observation(call_id: String, result: AgentToolResult) -> Observatio
             content: Value::String(text),
             bytes,
             truncated: false,
+            tool_result,
         }
     }
 }
@@ -517,6 +530,7 @@ impl PolicyEngine for AgentPolicy {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use ::agent_tool::AgentToolStatus;
     use llm_context::request::{ContextOwnerRef, ToolMode, ToolPolicy};
     use std::collections::HashMap;
 
@@ -544,6 +558,26 @@ mod policy_tests {
             name: name.to_string(),
             args: HashMap::new(),
             call_id: "call-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn error_observation_keeps_tool_output() {
+        let result = AgentToolResult::from_details(json!({}))
+            .with_tool("exec_bash")
+            .with_command_metadata("exec_bash", "date -d @1")
+            .with_status(AgentToolStatus::Error)
+            .with_result("exit=1 in 10ms")
+            .with_output("date: illegal option -- d\nusage: date ...")
+            .with_return_code(1);
+
+        let obs = result_to_observation("call-1".to_string(), result);
+        match obs {
+            Observation::Error { message, .. } => {
+                assert!(message.contains("exit=1 in 10ms"));
+                assert!(message.contains("date: illegal option -- d"));
+            }
+            _ => panic!("expected error observation"),
         }
     }
 
@@ -919,8 +953,8 @@ pub struct SessionDepsInput {
 }
 
 /// Assemble per-session `LLMContextDeps`. Step 3 will compose the optional
-/// behavior-loop fields (`result_parser` / `step_renderer` /
-/// `history_compressor`) on top of the value returned here.
+/// behavior-loop fields (`result_parser` / `step_renderer`) on top of the
+/// value returned here.
 pub fn build_session_deps(runtime: &AgentRuntime, input: SessionDepsInput) -> LLMContextDeps {
     let SessionDepsInput {
         tools,

@@ -1,6 +1,6 @@
-# node_exector 需求
+# node_Executor 需求
 
-node_exector 的目的是执行scheduler下发的thunk object(Function Instance)
+node_Executor 的目的是执行scheduler下发的thunk object(Function Instance)
 这是node_daemon中的一个子模块，基本结构可以参考app_loader.rs
 
 ## 基本逻辑方式
@@ -10,7 +10,7 @@ node_exector 的目的是执行scheduler下发的thunk object(Function Instance)
 - 启动node_runner执行thunkojbect
 - 一个ThunkObject只能存在一个运行实例
 
-## node_exector运行不同类型的ThunkObject:
+## node_Executor运行不同类型的ThunkObject:
 
 两大类：
 1. 直接运行（脚本/pkg),主要是构造好参数

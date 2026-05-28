@@ -28,7 +28,7 @@ use buckyos_api::{
     BoxKind, Event, EventReader, KEventClient, KEventError, MsgCenterClient, MsgRecordWithObject,
     MsgState,
 };
-use llm_context::{parse_msg_object, MsgParseOutput};
+use llm_context::{parse_msg_object_text_attachments, MsgParseOutput};
 use ndn_lib::MsgObjKind;
 
 use crate::command_dispatcher::BUILTIN_COMMANDS;
@@ -313,10 +313,10 @@ async fn deliver_record(cfg: &PumpConfig, record: MsgRecordWithObject) -> bool {
         }
     }
 
-    // §3 — slash-command interception. `parse_msg_object` applies the
-    // registered command whitelist at the protocol boundary, so user text
-    // like `/etc/nginx ...` flows back into LLM inference unchanged.
-    let inbound = match parse_msg_object(msg, BUILTIN_COMMANDS) {
+    // §3 — slash-command interception. The parser applies the registered
+    // command whitelist at the protocol boundary, so user text like
+    // `/etc/nginx ...` flows back into LLM inference unchanged.
+    let inbound = match parse_msg_object_text_attachments(msg, BUILTIN_COMMANDS) {
         MsgParseOutput::ControlCommand(cmd) => Inbound::Command {
             record_id,
             from,

@@ -290,6 +290,7 @@ impl TaskManagerTaskTracker {
         // task table has UNIQUE(app_id, user_id, name); two runs of the same
         // workflow share workflow_name, so include run_id to disambiguate.
         let task_name = format!("{} [{}]", run.workflow_name, run.run_id);
+        let opts = run_task_options(run);
         let task = self
             .client
             .create_task(
@@ -305,7 +306,7 @@ impl TaskManagerTaskTracker {
                 })),
                 self.user_id.as_str(),
                 self.app_id.as_str(),
-                Some(CreateTaskOptions::with_root_id(run.run_id.clone())),
+                Some(opts),
             )
             .await
             .map_err(|err| WorkflowError::TaskTracker(err.to_string()))?;
@@ -559,6 +560,22 @@ impl WorkflowTaskTracker for TaskManagerTaskTracker {
             )
             .await
             .map_err(|err| WorkflowError::TaskTracker(err.to_string()))
+    }
+}
+
+fn run_task_options(run: &WorkflowRun) -> CreateTaskOptions {
+    let Some(schedule_task) = run.metrics.get("schedule_task") else {
+        return CreateTaskOptions::with_root_id(run.run_id.clone());
+    };
+    let parent_id = schedule_task.get("root_task_id").and_then(Value::as_i64);
+    let root_id = schedule_task
+        .get("root_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    CreateTaskOptions {
+        parent_id,
+        root_id: root_id.or_else(|| Some(run.run_id.clone())),
+        ..Default::default()
     }
 }
 

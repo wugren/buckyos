@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use buckyos_api::{AiMessage, AiResponse, AiToolCall};
 use serde_json::Value;
 
-use crate::behavior_loop::{HistoryCompressor, LLMResultParser, StepRenderer};
+use crate::behavior_loop::{LLMResultParser, StepRenderer, StepResultHook};
 use crate::error::LLMComputeError;
 use crate::interrupt::InferenceAbortToken;
 use crate::observation::Observation;
@@ -236,9 +236,9 @@ pub struct LLMContextDeps {
     /// AiMessages for the next inner-run. Required whenever `result_parser`
     /// is set.
     pub step_renderer: Option<Arc<dyn StepRenderer>>,
-    /// Behavior Loop: optional history compactor triggered between step
-    /// iterations. `None` disables compression entirely.
-    pub history_compressor: Option<Arc<dyn HistoryCompressor>>,
+    /// Behavior Loop: optional hook invoked after a behavior step has action
+    /// results. It may override the next rendered user message.
+    pub step_result_hook: Option<Arc<dyn StepResultHook>>,
 }
 
 impl LLMContextDeps {
@@ -252,7 +252,7 @@ impl LLMContextDeps {
             turn_hook: None,
             result_parser: None,
             step_renderer: None,
-            history_compressor: None,
+            step_result_hook: None,
         }
     }
 
@@ -286,8 +286,8 @@ impl LLMContextDeps {
         self
     }
 
-    pub fn with_history_compressor(mut self, compressor: Arc<dyn HistoryCompressor>) -> Self {
-        self.history_compressor = Some(compressor);
+    pub fn with_step_result_hook(mut self, hook: Arc<dyn StepResultHook>) -> Self {
+        self.step_result_hook = Some(hook);
         self
     }
 
@@ -297,7 +297,7 @@ impl LLMContextDeps {
     pub fn into_traditional(mut self) -> Self {
         self.result_parser = None;
         self.step_renderer = None;
-        self.history_compressor = None;
+        self.step_result_hook = None;
         self
     }
 }

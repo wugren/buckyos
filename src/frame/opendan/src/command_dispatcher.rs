@@ -10,14 +10,15 @@
 //! the registry without duplicating documentation.
 
 use crate::agent::AIAgent;
-use crate::session_model::{InterruptMode, SessionKind, SessionSummary};
+use crate::agent_session::{AgentSession, ManualCompressOutcome};
+use crate::session_model::{InterruptMode, SessionSummary};
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Names of all built-in commands. Anything not in this list is **not**
 /// treated as a command — the message falls through to LLM inference.
 pub const BUILTIN_COMMANDS: &[&str] = &[
-    "new", "clean", "stop", "cancel", "info", "list", "switch", "help",
+    "new", "clean", "stop", "cancel", "info", "list", "switch", "compress", "help",
 ];
 
 /// Returns `true` iff `name` matches a built-in command (case-insensitive
@@ -67,6 +68,7 @@ pub async fn run_command(
         "info" => info_session(agent, invocation).await,
         "list" => list_sessions(agent).await,
         "switch" => switch_session(agent, invocation).await,
+        "compress" => compress_session(agent, invocation).await,
         "help" => Ok(CommandOutcome {
             reply: render_help(),
         }),
@@ -128,12 +130,7 @@ async fn control_current_session(
     mode: InterruptMode,
     verb: &str,
 ) -> Result<CommandOutcome> {
-    let sid = agent.resolve_session_for_command(&inv.from).await?;
-    let Some(session) = agent.get_session(&sid).await else {
-        return Ok(CommandOutcome {
-            reply: format!("no active session for `{}`", inv.from),
-        });
-    };
+    let (sid, session) = ensure_current_session(agent, inv).await?;
     session.interrupt(mode).await?;
     Ok(CommandOutcome {
         reply: format!("session `{sid}` {verb}"),
@@ -141,18 +138,13 @@ async fn control_current_session(
 }
 
 async fn info_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result<CommandOutcome> {
-    let sid = match agent.resolve_session_for_command(&inv.from).await {
-        Ok(sid) => sid,
+    let session = match ensure_current_session(agent, inv).await {
+        Ok((_sid, session)) => session,
         Err(_) => {
             return Ok(CommandOutcome {
                 reply: render_agent_status(agent, &inv.from).await,
             });
         }
-    };
-    let Some(session) = agent.get_session(&sid).await else {
-        return Ok(CommandOutcome {
-            reply: render_agent_status(agent, &inv.from).await,
-        });
     };
     Ok(CommandOutcome {
         reply: render_summary(&session.summary().await),
@@ -168,10 +160,7 @@ async fn list_sessions(agent: &Arc<AIAgent>) -> Result<CommandOutcome> {
     }
     let mut out = String::from("active sessions:\n");
     for s in summaries {
-        let kind = match s.kind {
-            SessionKind::Ui => "ui",
-            SessionKind::Work => "work",
-        };
+        let kind = s.kind.as_str();
         let title = if s.title.is_empty() {
             "(no title)".to_string()
         } else {
@@ -186,10 +175,7 @@ async fn list_sessions(agent: &Arc<AIAgent>) -> Result<CommandOutcome> {
 }
 
 fn render_summary(s: &SessionSummary) -> String {
-    let kind = match s.kind {
-        SessionKind::Ui => "ui",
-        SessionKind::Work => "work",
-    };
+    let kind = s.kind.as_str();
     let title = if s.title.is_empty() {
         "(no title)"
     } else {
@@ -216,10 +202,7 @@ async fn render_agent_status(agent: &Arc<AIAgent>, from: &str) -> String {
     if !summaries.is_empty() {
         out.push('\n');
         for s in summaries {
-            let kind = match s.kind {
-                SessionKind::Ui => "ui",
-                SessionKind::Work => "work",
-            };
+            let kind = s.kind.as_str();
             out.push_str(&format!("  - {} [{kind}] {:?}\n", s.session_id, s.status));
         }
         if out.ends_with('\n') {
@@ -236,7 +219,7 @@ async fn switch_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result
             reply: "usage: /switch <session_id>".to_string(),
         });
     }
-    if agent.get_session(target).await.is_none() {
+    if agent.clone().ensure_session(target).await.is_err() {
         return Ok(CommandOutcome {
             reply: format!("session `{target}` not found"),
         });
@@ -245,6 +228,42 @@ async fn switch_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result
     Ok(CommandOutcome {
         reply: format!("tunnel `{}` now bound to session `{target}`", inv.from),
     })
+}
+
+async fn compress_session(agent: &Arc<AIAgent>, inv: &CommandInvocation) -> Result<CommandOutcome> {
+    let (sid, session) = ensure_current_session(agent, inv).await?;
+    let reply = match session.compress_context_window_once().await {
+        Ok(ManualCompressOutcome::NoSnapshot) => {
+            format!("session `{sid}` has no saved context to compress")
+        }
+        Ok(ManualCompressOutcome::NoChange {
+            messages,
+            tokens,
+            target_tokens,
+        }) => format!(
+            "session `{sid}` context already within target: {messages} messages, {tokens} tokens (target {target_tokens}); no compression applied"
+        ),
+        Ok(ManualCompressOutcome::Applied {
+            before_messages,
+            after_messages,
+            before_tokens,
+            after_tokens,
+            target_tokens,
+        }) => format!(
+            "session `{sid}` compressed context: messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens} (target {target_tokens})"
+        ),
+        Err(err) => format!("session `{sid}` compress failed: {err}"),
+    };
+    Ok(CommandOutcome { reply })
+}
+
+async fn ensure_current_session(
+    agent: &Arc<AIAgent>,
+    inv: &CommandInvocation,
+) -> Result<(String, Arc<AgentSession>)> {
+    let sid = agent.resolve_session_for_command(&inv.from).await?;
+    let session = agent.clone().ensure_session(&sid).await?;
+    Ok((sid, session))
 }
 
 fn render_help() -> String {
@@ -256,6 +275,7 @@ fn render_help() -> String {
     out.push_str("  /info             show current session status\n");
     out.push_str("  /list             list active sessions on this agent\n");
     out.push_str("  /switch <id>      bind this tunnel to a different session\n");
+    out.push_str("  /compress         manually compress current session context\n");
     out.push_str("  /help             show this message\n");
     out
 }
@@ -272,6 +292,7 @@ mod tests {
         assert!(is_known_command("stop"));
         assert!(is_known_command("cancel"));
         assert!(is_known_command("info"));
+        assert!(is_known_command("compress"));
         assert!(is_known_command("Help"));
         assert!(!is_known_command("etc"));
         assert!(!is_known_command("clear"));

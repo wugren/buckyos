@@ -1221,6 +1221,7 @@ mod test {
     use tokio::{task, time::sleep};
 
     use super::*;
+    #[allow(dead_code)]
     //#[tokio::test(flavor = "current_thread")]
     async fn test_server_interface() {
         {
@@ -1360,6 +1361,7 @@ mod test {
         drop(server);
     }
 
+    #[allow(dead_code)]
     //#[tokio::test(flavor = "current_thread")]
     async fn test_transaction_processing() {
         // Setup trust keys like in the existing test

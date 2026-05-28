@@ -51,6 +51,7 @@ impl StickyBindingStore {
         );
     }
 
+    #[allow(dead_code)]
     pub fn remove(&mut self, key: &StickyBindingKey) {
         self.bindings.remove(key);
     }

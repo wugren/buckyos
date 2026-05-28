@@ -12,7 +12,7 @@
 
 use crate::model_session::{LogicalNode, SessionConfig};
 use crate::model_types::{
-    FallbackMode, FallbackRule, LockedValue, ModelItem, ModelItemPatch, SchedulerProfile,
+    FallbackMode, FallbackRule, LockedValue, ModelItemPatch, SchedulerProfile,
 };
 use std::collections::BTreeMap;
 
@@ -26,6 +26,7 @@ struct Level2Item {
 
 enum FallbackPreset {
     Parent,
+    #[allow(dead_code)]
     Strict,
     Disabled,
 }
@@ -175,6 +176,11 @@ const LLM_TEMPLATES: &[Level2Template] = &[
     Level2Template {
         path: "llm.vision",
         items: &[
+            Level2Item {
+                name: "gpt",
+                target: "llm.gpt-standard",
+                weight: 3.0,
+            },
             Level2Item {
                 name: "opus",
                 target: "llm.opus",
@@ -327,6 +333,7 @@ pub fn level2_node_count(config: &SessionConfig) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_types::ModelItem;
 
     fn item_targets(items: &BTreeMap<String, ModelItem>) -> Vec<&str> {
         let mut out: Vec<&str> = items.values().map(|item| item.target.as_str()).collect();
@@ -399,6 +406,31 @@ mod tests {
                 "llm.qwen-small",
             ]
         );
+    }
+
+    #[test]
+    fn llm_vision_matches_doc_section_4() {
+        let config = build_default_session_config();
+        let vision_node = config
+            .logical_tree
+            .get("llm")
+            .and_then(|node| node.children.get("vision"))
+            .expect("llm.vision node");
+        let vision = vision_node.effective_items(None).expect("llm.vision items");
+        let targets = item_targets(&vision);
+        assert_eq!(
+            targets,
+            vec![
+                "llm.gemini-pro",
+                "llm.gpt-standard",
+                "llm.opus",
+                "llm.qwen-max",
+            ]
+        );
+        assert_eq!(vision.get("gpt").unwrap().weight, 3.0);
+        assert_eq!(vision.get("opus").unwrap().weight, 2.5);
+        assert_eq!(vision.get("gemini").unwrap().weight, 2.5);
+        assert_eq!(vision.get("qwen").unwrap().weight, 1.0);
     }
 
     #[test]

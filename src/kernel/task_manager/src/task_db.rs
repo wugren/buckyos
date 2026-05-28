@@ -113,11 +113,11 @@ impl TaskDb {
 
         let sql = self.render_sql(
             "INSERT INTO task (
-                name, title, task_type, status, progress,
+                name, title, task_type, runner, status, progress,
                 total_items, completed_items, error_message, data,
-                created_at, updated_at, user_id, app_id, parent_id,
+                created_at, updated_at, user_id, app_id, session_id, parent_id,
                 root_id, permissions, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id",
         );
 
@@ -125,6 +125,7 @@ impl TaskDb {
             .bind(task.name.clone())
             .bind(task.name.clone())
             .bind(task.task_type.clone())
+            .bind(task.runner.clone())
             .bind(task.status.to_string())
             .bind(task.progress as f64)
             .bind(0_i64)
@@ -135,6 +136,7 @@ impl TaskDb {
             .bind(updated_at)
             .bind(task.user_id.clone())
             .bind(task.app_id.clone())
+            .bind(task.session_id.clone())
             .bind(task.parent_id)
             .bind(task.root_id.clone())
             .bind(permissions_str)
@@ -144,9 +146,10 @@ impl TaskDb {
 
         let id: i64 = row.try_get("id")?;
         info!(
-            "task_db.create_task: id={} app_id={} user_id={} name={} task_type={} parent_id={:?} status={}",
+            "task_db.create_task: id={} app_id={} session_id={} user_id={} name={} task_type={} parent_id={:?} status={}",
             id,
             task.app_id,
+            task.session_id,
             task.user_id,
             task.name,
             task.task_type,
@@ -178,7 +181,9 @@ impl TaskDb {
     pub async fn list_tasks_filtered(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
+        runner: Option<&str>,
         status: Option<TaskStatus>,
         parent_id: Option<i64>,
         root_id: Option<&str>,
@@ -200,9 +205,17 @@ impl TaskDb {
             conditions.push("app_id = ?".to_string());
             params.push(Param::Text(app_id.to_string()));
         }
+        if let Some(session_id) = session_id {
+            conditions.push("session_id = ?".to_string());
+            params.push(Param::Text(session_id.to_string()));
+        }
         if let Some(task_type) = task_type {
             conditions.push("task_type = ?".to_string());
             params.push(Param::Text(task_type.to_string()));
+        }
+        if let Some(runner) = runner {
+            conditions.push("runner = ?".to_string());
+            params.push(Param::Text(runner.to_string()));
         }
         if let Some(status) = status {
             conditions.push("status = ?".to_string());
@@ -414,6 +427,15 @@ impl TaskDb {
         Ok(())
     }
 
+    pub async fn delete_tasks_by_session_id(&self, session_id: &str) -> DbResult<u64> {
+        let sql = self.render_sql("DELETE FROM task WHERE session_id = ?");
+        let result = sqlx::query(&sql)
+            .bind(session_id.to_string())
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Translate `?` placeholders into `$N` form for postgres. Other backends
     /// pass through unchanged.
     fn render_sql(&self, sql: &str) -> String {
@@ -506,6 +528,7 @@ fn task_from_row(row: AnyRow) -> DbResult<Task> {
     let id: i64 = row.try_get("id")?;
     let name: String = row.try_get("name")?;
     let task_type: String = row.try_get("task_type")?;
+    let runner: String = row.try_get("runner")?;
     let status: String = row.try_get("status")?;
     let progress: f64 = row.try_get("progress")?;
     let message: Option<String> = row.try_get("message")?;
@@ -515,6 +538,7 @@ fn task_from_row(row: AnyRow) -> DbResult<Task> {
     let root_id: Option<String> = row.try_get("root_id")?;
     let user_id: Option<String> = row.try_get("user_id")?;
     let app_id: Option<String> = row.try_get("app_id")?;
+    let session_id: Option<String> = row.try_get("session_id")?;
     let created_at: i64 = row.try_get("created_at")?;
     let updated_at: i64 = row.try_get("updated_at")?;
 
@@ -527,10 +551,12 @@ fn task_from_row(row: AnyRow) -> DbResult<Task> {
         id,
         user_id: user_id.unwrap_or_default(),
         app_id: app_id.unwrap_or_default(),
+        session_id: session_id.unwrap_or_default(),
         parent_id,
         root_id: resolved_root_id,
         name,
         task_type,
+        runner,
         // `data` / `permissions` are opaque JSON payloads written by callers
         // with different serde versions over time — tolerate parse failures
         // with an empty default since the column itself decoded fine.
@@ -578,8 +604,10 @@ mod tests {
             id: 0,
             name: name.to_string(),
             task_type: "test_type".to_string(),
+            runner: String::new(),
             user_id: "user1".to_string(),
             app_id: "app1".to_string(),
+            session_id: "session1".to_string(),
             parent_id: None,
             root_id: String::new(),
             status: TaskStatus::Pending,
@@ -638,7 +666,7 @@ mod tests {
         db.create_task(&create_test_task("task3")).await.unwrap();
 
         let tasks = db
-            .list_tasks_filtered(None, None, None, None, None, None)
+            .list_tasks_filtered(None, None, None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(tasks.len(), 3);
@@ -657,11 +685,11 @@ mod tests {
         db.create_task(&task2).await.unwrap();
 
         let app1_tasks = db
-            .list_tasks_filtered(Some("app1"), None, None, None, None, None)
+            .list_tasks_filtered(Some("app1"), None, None, None, None, None, None, None)
             .await
             .unwrap();
         let app2_tasks = db
-            .list_tasks_filtered(Some("app2"), None, None, None, None, None)
+            .list_tasks_filtered(Some("app2"), None, None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -669,6 +697,52 @@ mod tests {
         assert_eq!(app2_tasks.len(), 1);
         assert_eq!(app1_tasks[0].name, "task1");
         assert_eq!(app2_tasks[0].name, "task2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_list_and_delete_tasks_by_session() {
+        let (db, _temp_dir) = setup_test_db().await;
+
+        let mut task1 = create_test_task("session_task_1");
+        let mut task2 = create_test_task("session_task_2");
+        let mut task3 = create_test_task("other_session_task");
+        task1.app_id = "app1".to_string();
+        task2.app_id = "app2".to_string();
+        task1.session_id = "session-alpha".to_string();
+        task2.session_id = "session-alpha".to_string();
+        task3.session_id = "session-beta".to_string();
+
+        db.create_task(&task1).await.unwrap();
+        db.create_task(&task2).await.unwrap();
+        db.create_task(&task3).await.unwrap();
+
+        let session_tasks = db
+            .list_tasks_filtered(
+                None,
+                Some("session-alpha"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_tasks.len(), 2);
+
+        let deleted_count = db
+            .delete_tasks_by_session_id("session-alpha")
+            .await
+            .unwrap();
+        assert_eq!(deleted_count, 2);
+
+        let remaining = db
+            .list_tasks_filtered(None, None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "session-beta");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -684,11 +758,11 @@ mod tests {
         db.create_task(&task2).await.unwrap();
 
         let type1_tasks = db
-            .list_tasks_filtered(None, Some("type1"), None, None, None, None)
+            .list_tasks_filtered(None, None, Some("type1"), None, None, None, None, None)
             .await
             .unwrap();
         let type2_tasks = db
-            .list_tasks_filtered(None, Some("type2"), None, None, None, None)
+            .list_tasks_filtered(None, None, Some("type2"), None, None, None, None, None)
             .await
             .unwrap();
 
@@ -696,6 +770,28 @@ mod tests {
         assert_eq!(type2_tasks.len(), 1);
         assert_eq!(type1_tasks[0].name, "task1");
         assert_eq!(type2_tasks[0].name, "task2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_list_tasks_by_runner() {
+        let (db, _temp_dir) = setup_test_db().await;
+
+        let mut task1 = create_test_task("task1");
+        let mut task2 = create_test_task("task2");
+        task1.runner = "node-a".to_string();
+        task2.runner = "node-b".to_string();
+
+        db.create_task(&task1).await.unwrap();
+        db.create_task(&task2).await.unwrap();
+
+        let node_a_tasks = db
+            .list_tasks_filtered(None, None, None, Some("node-a"), None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(node_a_tasks.len(), 1);
+        assert_eq!(node_a_tasks[0].name, "task1");
+        assert_eq!(node_a_tasks[0].runner, "node-a");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -711,11 +807,29 @@ mod tests {
         db.create_task(&task2).await.unwrap();
 
         let running_tasks = db
-            .list_tasks_filtered(None, None, Some(TaskStatus::Running), None, None, None)
+            .list_tasks_filtered(
+                None,
+                None,
+                None,
+                None,
+                Some(TaskStatus::Running),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let completed_tasks = db
-            .list_tasks_filtered(None, None, Some(TaskStatus::Completed), None, None, None)
+            .list_tasks_filtered(
+                None,
+                None,
+                None,
+                None,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

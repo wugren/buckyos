@@ -505,6 +505,79 @@ impl ExecBashTool {
             "engine": output.engine,
         })
     }
+
+    fn try_forward_inner_agent_tool_result(
+        &self,
+        command: &str,
+        output: &BashRunOutput,
+    ) -> Option<AgentToolResult> {
+        if !command_is_simple_for_protocol_forward(command) {
+            return None;
+        }
+
+        let stdout = output.stdout.trim();
+        if stdout.is_empty() {
+            return None;
+        }
+
+        let mut result = match serde_json::from_str::<AgentToolResult>(stdout) {
+            Ok(result) => result,
+            Err(_) => return None,
+        };
+
+        if result.status == AgentToolStatus::Pending && result.task_id.is_none() {
+            log::warn!(
+                "exec_bash inner AgentTool returned pending without task_id; falling back to exec_bash envelope command={}",
+                command
+            );
+            return None;
+        }
+
+        if result.return_code.is_none() && output.exit_code != 0 {
+            result.return_code = Some(output.exit_code);
+        }
+
+        Some(result)
+    }
+}
+
+fn command_is_simple_for_protocol_forward(command: &str) -> bool {
+    if command_has_shell_operator(command) {
+        return false;
+    }
+    crate::tokenize_bash_command_line(command)
+        .map(|tokens| !tokens.is_empty())
+        .unwrap_or(false)
+}
+
+fn command_has_shell_operator(command: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '|' | ';' | '&' | '>' | '<' | '\n' | '\r' if !in_single && !in_double => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 #[async_trait]
@@ -607,6 +680,10 @@ impl AgentTool for ExecBashTool {
 
         let output = self.runner.run(ctx, request).await?;
 
+        if let Some(result) = self.try_forward_inner_agent_tool_result(&command, &output) {
+            return Ok(result);
+        }
+
         let summary = if output.exit_code == 0 {
             format!("exit=0 in {}ms", output.duration_ms)
         } else {
@@ -619,10 +696,12 @@ impl AgentTool for ExecBashTool {
         } else {
             AgentToolStatus::Error
         };
-        let mut result = build_builtin_tool_result(details, command.clone(), summary)
+        let fallback_cmd_line = format!("{} {}", self.tool_name(), command);
+        let mut result = build_builtin_tool_result(details, fallback_cmd_line, summary)
             .with_tool(self.tool_name())
             .with_status(status)
-            .with_return_code(output.exit_code);
+            .with_return_code(output.exit_code)
+            .refresh_default_title();
         if !output.output.is_empty() {
             result = result.with_output(output.output.clone());
         }
@@ -639,6 +718,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    use crate::AgentToolPendingReason;
     use tempfile::tempdir;
 
     fn ctx() -> SessionRuntimeContext {
@@ -657,6 +737,26 @@ mod tests {
         let workspace = dir.path().join("workspace");
         fs::create_dir_all(&workspace).expect("mkdir workspace");
         (dir, workspace)
+    }
+
+    #[cfg(unix)]
+    fn write_shim(path: &Path, stdout: &str, exit_code: i32) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {}\n",
+            stdout.replace('\'', "'\\''"),
+            exit_code
+        );
+        fs::write(path, script).expect("write shim");
+        let mut perms = fs::metadata(path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    fn exec_bash_with_overlay(workspace: PathBuf, bin_dir: PathBuf) -> ExecBashTool {
+        let cfg = LlmBashConfig::local_workspace(workspace)
+            .with_overlay(BinOverlayConfig::local(bin_dir));
+        ExecBashTool::new(cfg)
     }
 
     #[tokio::test]
@@ -728,6 +828,154 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn forwards_inner_builtin_envelope() {
+        let (dir, workspace) = ws();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        write_shim(
+            &bin_dir.join("fake_tool"),
+            r#"{"agent_tool_protocol":"1","status":"success","cmd_name":"fake_tool","detail":{"x":1}}"#,
+            0,
+        );
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
+
+        let result = tool
+            .call(&ctx(), json!({ "command": "fake_tool arg1" }))
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.status, AgentToolStatus::Success);
+        assert_eq!(result.cmd_name.as_deref(), Some("fake_tool"));
+        assert_eq!(result.details["x"], 1);
+        assert_eq!(result.output, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn forwards_inner_pending_envelope() {
+        let (dir, workspace) = ws();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        write_shim(
+            &bin_dir.join("fake_tool"),
+            r#"{"agent_tool_protocol":"1","status":"pending","cmd_name":"fake_tool","task_id":"42","pending_reason":"long_running","check_after":3,"detail":{"queued":true}}"#,
+            0,
+        );
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
+
+        let result = tool
+            .call(&ctx(), json!({ "command": "fake_tool start" }))
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.status, AgentToolStatus::Pending);
+        assert_eq!(result.task_id.as_deref(), Some("42"));
+        assert_eq!(
+            result.pending_reason,
+            Some(AgentToolPendingReason::LongRunning)
+        );
+        assert_eq!(result.check_after, Some(3));
+        assert_eq!(result.details["queued"], true);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn plain_bash_protocol_stdout_is_forwarded() {
+        let (_dir, workspace) = ws();
+        let tool = ExecBashTool::local_workspace(workspace);
+
+        let result = tool
+            .call(
+                &ctx(),
+                json!({ "command": "echo '{\"agent_tool_protocol\":\"1\",\"status\":\"success\",\"cmd_name\":\"echo_protocol\",\"detail\":{\"x\":1}}'" }),
+            )
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.status, AgentToolStatus::Success);
+        assert_eq!(result.cmd_name.as_deref(), Some("echo_protocol"));
+        assert_eq!(result.details["x"], 1);
+        assert_eq!(result.output, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn plain_bash_non_protocol_json_is_not_forwarded() {
+        let (_dir, workspace) = ws();
+        let tool = ExecBashTool::local_workspace(workspace);
+
+        let result = tool
+            .call(
+                &ctx(),
+                json!({ "command": "echo '{\"status\":\"success\"}'" }),
+            )
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.cmd_name.as_deref(), Some("exec_bash"));
+        assert_eq!(
+            result.details["stdout"].as_str().unwrap().trim(),
+            r#"{"status":"success"}"#
+        );
+        assert_eq!(
+            result.output.as_deref().unwrap_or_default().trim(),
+            r#"{"status":"success"}"#
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compound_command_is_not_forwarded() {
+        let (dir, workspace) = ws();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        write_shim(
+            &bin_dir.join("fake_tool"),
+            r#"{"agent_tool_protocol":"1","status":"success","cmd_name":"fake_tool","detail":{"x":1}}"#,
+            0,
+        );
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
+
+        let result = tool
+            .call(&ctx(), json!({ "command": "fake_tool args | cat" }))
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.cmd_name.as_deref(), Some("exec_bash"));
+        assert_eq!(result.details["exit_code"], 0);
+        assert!(result
+            .output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fake_tool"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn non_zero_exit_with_inner_envelope() {
+        let (dir, workspace) = ws();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        write_shim(
+            &bin_dir.join("fake_tool"),
+            r#"{"agent_tool_protocol":"1","status":"error","cmd_name":"fake_tool","detail":{"failed":true}}"#,
+            1,
+        );
+        let tool = exec_bash_with_overlay(workspace, bin_dir);
+
+        let result = tool
+            .call(&ctx(), json!({ "command": "fake_tool fail" }))
+            .await
+            .expect("call ok");
+
+        assert_eq!(result.status, AgentToolStatus::Error);
+        assert_eq!(result.return_code, Some(1));
+        assert_eq!(result.cmd_name.as_deref(), Some("fake_tool"));
+        assert_eq!(result.details["failed"], true);
+    }
+
+    #[tokio::test]
     async fn cwd_outside_workspace_rejected() {
         let (dir, workspace) = ws();
         let outside = dir.path().join("outside");
@@ -796,6 +1044,11 @@ mod tests {
         assert_eq!(result.status, AgentToolStatus::Error);
         assert_eq!(result.details["exit_code"], 7);
         assert_eq!(result.return_code, Some(7));
+        assert!(
+            result.title.contains("=> error"),
+            "failed command title must not say success: {}",
+            result.title
+        );
     }
 
     #[tokio::test]

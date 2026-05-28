@@ -1,12 +1,8 @@
 mod common;
 
-use aicc::{
-    AIComputeCenter, CostEstimate, ModelCatalog, ProviderError, ProviderStartResult, Registry,
-    Router, TaskEventKind, TenantRouteConfig,
-};
-use buckyos_api::{AiMethodStatus, AiResponse, Capability, ResourceRef, TaskFilter, TaskStatus};
+use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
+use buckyos_api::{Capability, TaskFilter};
 use common::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 fn setup_route_provider(

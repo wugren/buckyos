@@ -36,6 +36,7 @@ pub struct Owner {
 }
 
 impl Owner {
+    #[allow(dead_code)]
     pub fn new(user_id: impl Into<String>, app_id: impl Into<String>) -> Self {
         Self {
             user_id: user_id.into(),
@@ -89,6 +90,7 @@ pub struct DefinitionRecord {
     pub analysis: AnalysisReport,
     pub status: DefinitionStatus,
     pub version: u32,
+    #[allow(dead_code)]
     pub definition_hash: String,
     pub tags: Vec<String>,
     pub created_at: i64,
@@ -301,6 +303,7 @@ pub struct RunRecord {
     pub owner: Owner,
     pub events: Vec<EventEnvelope>,
     pub amendments: Vec<AmendmentRecord>,
+    #[allow(dead_code)]
     pub callback_url: Option<String>,
 }
 
@@ -403,6 +406,7 @@ impl ServiceTracker {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_task_manager_backed(&self) -> bool {
         matches!(self.inner, TrackerKind::TaskManager(_))
     }

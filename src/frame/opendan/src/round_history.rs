@@ -999,7 +999,7 @@ fn render_observation(observation: &Observation) -> String {
             rendered
         }
         Observation::Error { message, .. } => message.clone(),
-        Observation::Pending { call_id } => format!("pending: {call_id}"),
+        Observation::Pending { call_id, .. } => format!("pending: {call_id}"),
         Observation::Cancelled { reason, .. } => format!("cancelled: {reason}"),
     }
 }
@@ -1160,6 +1160,7 @@ mod tests {
                         content: json!("ok"),
                         bytes: 2,
                         truncated: false,
+                        tool_result: None,
                     }],
                     ..Default::default()
                 },

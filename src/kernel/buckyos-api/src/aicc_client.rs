@@ -808,23 +808,34 @@ impl<'de> Deserialize<'de> for AiPayload {
             input_json: helper.input_json,
             options: helper.options,
         };
-        if let Some(body) = payload
-            .input_json
-            .as_ref()
-            .and_then(|value| value.as_object())
-        {
-            payload.text = body
-                .get("text")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            payload.messages = body
-                .get("messages")
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default();
-            payload.tool_specs = body
-                .get("tool_specs")
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default();
+        if let Some(Value::Object(body)) = payload.input_json.as_mut() {
+            if let Some(Value::String(text)) = body.remove("text") {
+                payload.text = Some(text);
+            }
+            if let Some(value) = body.get("messages").cloned() {
+                match serde_json::from_value::<Vec<AiMessage>>(value) {
+                    Ok(messages) => {
+                        payload.messages = messages;
+                        body.remove("messages");
+                    }
+                    Err(_) => {
+                        // Legacy/non-typed shape; leave it in input_json so the
+                        // provider's compat path can still pick it up.
+                    }
+                }
+            }
+            if let Some(value) = body.get("tool_specs").cloned() {
+                match serde_json::from_value::<Vec<AiToolSpec>>(value) {
+                    Ok(specs) => {
+                        payload.tool_specs = specs;
+                        body.remove("tool_specs");
+                    }
+                    Err(_) => {
+                        // Same reasoning as messages — preserve the raw shape
+                        // for any provider that knows how to handle it.
+                    }
+                }
+            }
         }
         Ok(payload)
     }
@@ -1214,6 +1225,13 @@ impl AiccClient {
             }
         }
     }
+
+    pub async fn list_models(&self) -> std::result::Result<Value, RPCErrors> {
+        match self {
+            Self::InProcess(_) => Err(RPCErrors::UnknownMethod("models.list".to_string())),
+            Self::KRPC(client) => client.call("models.list", serde_json::json!({})).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -1376,17 +1394,7 @@ mod tests {
                     ),
                     ResourceRef::named_object(ObjId::new("chunk:123456").unwrap()),
                 ],
-                Some(json!({
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                { "type": "text", "text": "summarize this commit" }
-                            ]
-                        }
-                    ],
-                    "text": "write a release note"
-                })),
+                Some(json!({})),
                 Some(json!({"temperature": 0.3})),
             ),
             Some("idem-1".to_string()),

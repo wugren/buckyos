@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::msg_tunnel::MsgTunnel;
 use anyhow::{bail, Context, Result as AnyResult};
 use async_trait::async_trait;
@@ -350,6 +352,11 @@ impl TgUiSessionTracker {
 
         let mut guard = self.sessions.lock().await;
         if let Some(session) = guard.get_mut(&session_id) {
+            if session.status_message_id.is_some()
+                && !Self::nonce_matches(nonce, session.status_nonce.as_deref())
+            {
+                return;
+            }
             session.status_message_id = None;
             session.completed_status_nonce = nonce.map(str::to_string);
             if let Some(status) = current_status {
@@ -4068,7 +4075,7 @@ impl MsgTunnel for TgTunnel {
                         chat_id.as_deref(),
                     )
                     .await;
-                if let Some(status_message_id) = previous_status_message_id {
+                if let Some(status_message_id) = previous_status_message_id.as_ref() {
                     if report.external_msg_id.as_deref() != Some(status_message_id.as_str()) {
                         if let Some(chat_id) = chat_id.as_ref() {
                             if let Err(error) = self
@@ -4088,6 +4095,8 @@ impl MsgTunnel for TgTunnel {
                             }
                         }
                     }
+                }
+                if previous_status_message_id.is_some() || msg_turn_nonce.is_some() {
                     self.ui_session_tracker
                         .mark_status_message_replaced(
                             ui_session_id.as_deref(),
@@ -4697,6 +4706,77 @@ mod tests {
             let session = guard.get(&session_id).unwrap();
             assert_eq!(session.status_message_id.as_deref(), Some("status-1"));
             assert_eq!(session.status_nonce.as_deref(), Some("old-turn"));
+        }
+
+        tunnel.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_reply_without_status_message_suppresses_late_terminal_status() {
+        let (center, _tmp) = new_msg_center().await;
+        let gateway = Arc::new(CountingTgGateway::default());
+        let mut cfg = TgTunnelConfig::new(DID::new("bns", "tg-fast-reply-test"));
+        cfg.supports_ingress = false;
+        let tunnel = TgTunnel::with_gateway(cfg, gateway.clone());
+        let owner = DID::new("bns", "alice");
+
+        tunnel
+            .bind_msg_center_handler(Arc::new(center.clone()))
+            .unwrap();
+        tunnel
+            .bind_bot_simple(
+                owner.clone(),
+                "@alice_bot".to_string(),
+                Some("ALICE_BOT_TOKEN".to_string()),
+                None,
+            )
+            .unwrap();
+        tunnel.start().await.unwrap();
+
+        let mut final_record = build_record(
+            owner,
+            vec![DID::new("bns", "group-room")],
+            MsgObjKind::GroupMsg,
+            Some("route-chat-1"),
+        );
+        let session_id = final_record.record.ui_session_id.clone().unwrap();
+        final_record
+            .msg
+            .as_mut()
+            .unwrap()
+            .meta
+            .insert(TG_TURN_NONCE_META_KEY.to_string(), json!("turn-1"));
+
+        let report = tunnel.send_record(final_record).await.unwrap();
+        assert!(report.ok);
+        {
+            let guard = tunnel.ui_session_tracker.sessions.lock().await;
+            let session = guard.get(&session_id).unwrap();
+            assert!(session.status_message_id.is_none());
+            assert_eq!(session.completed_status_nonce.as_deref(), Some("turn-1"));
+        }
+
+        center
+            .handle_update_ui_session_state(
+                session_id.clone(),
+                UI_SESSION_STATE_STATUS_LINE_KEY.to_string(),
+                json!({
+                    "value": "思考完成",
+                    "turn_nonce": "turn-1",
+                }),
+                RPCContext::default(),
+            )
+            .await
+            .unwrap();
+        TgTunnel::refresh_ui_sessions(tunnel.ui_session_tracker.as_ref(), gateway.as_ref()).await;
+        assert_eq!(gateway.status_line_count.load(Ordering::SeqCst), 0);
+        {
+            let guard = tunnel.ui_session_tracker.sessions.lock().await;
+            let session = guard.get(&session_id).unwrap();
+            assert!(session.status_message_id.is_none());
+            assert_eq!(session.status_nonce.as_deref(), Some("turn-1"));
+            assert_eq!(session.completed_status_nonce.as_deref(), Some("turn-1"));
+            assert_eq!(session.last_status_line, "思考完成");
         }
 
         tunnel.stop().await.unwrap();

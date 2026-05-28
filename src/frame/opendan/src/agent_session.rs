@@ -1,44 +1,68 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use buckyos_api::{
-    match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient,
-    UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
+    match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient, TaskStatus,
+    UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
+use ndn_lib::{MsgContent, MsgObjKind, MsgObject};
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::{timeout, Duration};
 
+use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput, OwnerScope};
 use agent_tool::todo_tools::read_todo_records;
-use agent_tool::{AgentToolManager, SessionRuntimeContext, TodoRecord};
+use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
+use agent_tool::{AgentMemory, AgentMemoryConfig, LoadOptions};
 use llm_context::{
+    behavior_loop::{
+        HistoryInputRecord, SendMessageRecord, StepRecord, StepResultHook, StepResultHookOutput,
+    },
     context_loop::LLMContext,
     interrupt::LLMContextInterruptHandle,
     observation::Observation,
     outcome::{ContextOutput, LLMContextOutcome, ResumeFill},
     request::{ContextOwnerRef, LLMContextRequest},
     state::{LLMContextSnapshot, LLMContextState},
+    step_record::XmlStepRenderer,
+    StepRenderer,
 };
 
-use crate::agent_config::{AgentConfig, LoopMode, SwitchMode};
+use crate::agent::AIAgent;
+use crate::agent_config::{
+    AgentConfig, BehaviorFilter, HookPointCfg, LoadBackgroundHintsPolicy, LoopMode,
+    PullEventPolicy, PullMsgPolicy, ReportDeliveryMode, SessionDriverCfg, SessionHookPoint,
+    SwitchMode,
+};
 use crate::ai_runtime::{build_session_deps, AgentRuntime, OneLineStatusSink, SessionDepsInput};
 use crate::behavior_cfg::BehaviorCfg;
-use crate::behavior_hooks::{self, CtxLimitOutcome, InterruptOutcome, ProviderFailedOutcome};
+use crate::behavior_hooks::{
+    self, CtxLimitOutcome, InterruptOutcome, LlmMessageCompressPolicy, ProviderFailedOutcome,
+};
 use crate::llm_context_helper::{
     apply_overrides_to_snapshot, run_fork_sub_context, ForkSubContextInput, RequestOverrides,
 };
-use crate::prompt_env::{self, AgentSessionEnv, ENVIRONMENT_BLOCK_TEMPLATE};
+use crate::local_workspace::LocalWorkspaceManager;
+use crate::prompt_env::{self, AgentSessionEnv, LlmContextEnv};
 use crate::round_history::{
     CompactionTarget, ContextMode, HistoryEvent, InterruptMode as HistoryInterruptMode,
     RoundStatus, RoundTrigger, SessionHistoryRecorder,
 };
 use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
-    EventSubscription, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame, SessionInput,
-    SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    BackgroundHint, BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode,
+    ImprovementBudget, ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus,
+    InternalContinuation, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
+    ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
 };
 use crate::task_dispatch::TaskDispatch;
+use crate::worksession_tools::render_workspace_inventory;
 
 /// Sentinel emitted by a behavior parser in
 /// `LLMBehaviorResult.next_behavior` to mean "current intent ran its course,
@@ -46,13 +70,50 @@ use crate::task_dispatch::TaskDispatch;
 /// message". Interpreted only at the session layer; the waist treats it as
 /// an opaque jump-target string.
 pub const NEXT_BEHAVIOR_WAIT_USER_MSG: &str = "WAIT_USER_MSG";
+pub const NEXT_BEHAVIOR_WAIT_FOR_MSG: &str = "WAIT_FOR_MSG";
 const MAX_PENDING_INPUTS: usize = 256;
+const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
+const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_IDLE_WORKER_RETIRE_MS: u64 = 3 * 60 * 1000;
+const BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS: u64 = 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorksessionReportPhase {
+    Checkpoint,
+    Final,
+}
+
+impl WorksessionReportPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorksessionReportPhase::Checkpoint => "checkpoint",
+            WorksessionReportPhase::Final => "final",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SessionReply {
     AssistantText { text: String },
     Error { message: String },
     Ended,
+}
+
+#[derive(Debug, Clone)]
+pub enum ManualCompressOutcome {
+    NoSnapshot,
+    NoChange {
+        messages: usize,
+        tokens: u32,
+        target_tokens: u32,
+    },
+    Applied {
+        before_messages: usize,
+        after_messages: usize,
+        before_tokens: u32,
+        after_tokens: u32,
+        target_tokens: u32,
+    },
 }
 
 pub struct InMemoryStatus {
@@ -177,6 +238,7 @@ pub struct AgentSession {
     /// list here whenever `subscribe_event` / `unsubscribe_event` mutates
     /// `event_subscriptions`, so the agent-wide reader rebuilds promptly.
     event_pump: Option<Arc<SessionEventPump>>,
+    parent_agent: Weak<AIAgent>,
 
     trace_seq: Arc<std::sync::atomic::AtomicU64>,
 
@@ -234,6 +296,289 @@ struct EventForTurn {
     message: String,
 }
 
+#[derive(Debug, Clone)]
+struct TurnMessage {
+    message: AiMessage,
+    runtime_auto: bool,
+}
+
+enum RenderedUserMessage {
+    NotConfigured,
+    Empty,
+    Text(String),
+}
+
+impl RenderedUserMessage {
+    fn into_text(self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::NotConfigured | Self::Empty => None,
+        }
+    }
+}
+
+struct OpenDanStepResultHook {
+    template: String,
+    behavior: BehaviorCfg,
+    agent_config: Arc<AgentConfig>,
+    agent_name: String,
+    driver: SessionDriverCfg,
+    meta: Arc<Mutex<SessionMeta>>,
+    session_id: String,
+    session_dir: PathBuf,
+    excluded_pending_keys: HashSet<String>,
+}
+
+#[async_trait]
+impl StepResultHook for OpenDanStepResultHook {
+    async fn on_behavior_step_ob(
+        &self,
+        snapshot: &LLMContextSnapshot,
+        step: &StepRecord,
+    ) -> std::result::Result<StepResultHookOutput, String> {
+        let template = self.template.trim();
+        if template.is_empty() {
+            return Ok(StepResultHookOutput::default());
+        }
+
+        let (_, default_user) = XmlStepRenderer::new().render(step);
+        let default_user_message = default_user.text_content();
+        let default_last_step_action_results_content =
+            serde_json::to_value(&step.action_results).unwrap_or(serde_json::Value::Null);
+        let selected_pending = self.selected_pending_inputs().await;
+        let selected_keys = selected_pending
+            .iter()
+            .map(PendingInput::dedup_key)
+            .collect::<Vec<_>>();
+        let pending_inputs = selected_pending
+            .iter()
+            .map(pending_input_hook_value)
+            .collect::<Vec<_>>();
+        let pending_input_text = render_pending_input_values(&pending_inputs);
+        let observed_at_ms = now_ms();
+        let msg_refs = selected_pending
+            .iter()
+            .filter_map(|input| prompt_env::msg_ref_from_pending(input, observed_at_ms))
+            .collect::<Vec<_>>();
+        let event_refs = self
+            .event_refs_from_selected(&selected_pending, observed_at_ms)
+            .await;
+        info!(
+            "opendan.session[{}]: build user message hook=on_behavior_step_ob behavior=`{}` actions={} results={} pending_inputs={} env_msgs={} env_events={} template_chars={}",
+            self.session_id,
+            self.behavior.meta.name,
+            step.actions.len(),
+            step.action_results.len(),
+            pending_inputs.len(),
+            msg_refs.len(),
+            event_refs.len(),
+            template.chars().count()
+        );
+        let mut env = build_agent_session_env(
+            &self.session_id,
+            &self.agent_config,
+            &self.agent_name,
+            &self.meta,
+            &self.session_dir,
+            &self.behavior,
+        )
+        .await;
+        env.llm_context.msgs = msg_refs;
+        env.llm_context.events = event_refs;
+        env.llm_context.last_step = snapshot
+            .state
+            .last_step
+            .as_ref()
+            .map(prompt_env::step_record_prompt_value);
+        env.llm_context.last_report = snapshot.state.last_report.clone();
+        env.llm_context.behavior_history = snapshot
+            .state
+            .steps
+            .iter()
+            .map(prompt_env::step_record_prompt_value)
+            .collect();
+        env.llm_context.agent_global_state = merge_global_state_hook_stats(
+            serde_json::json!({
+                "agent_name": self.agent_config.toml.identity.display_name,
+                "session_id": self.session_id,
+            }),
+            SessionHookPoint::OnBehaviorStepOb.as_key(),
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+        );
+        let extras = [
+            (
+                "step",
+                serde_json::to_value(step).unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "step_result",
+                serde_json::json!({
+                    "behavior": step.meta.behavior_name,
+                    "step_index": step.meta.step_index,
+                    "action_count": step.actions.len(),
+                    "result_count": step.action_results.len(),
+                    "default_user_message": default_user_message.clone(),
+                    "actions": step.actions,
+                    "action_results": step.action_results,
+                    "messages_sent": step.messages_sent,
+                }),
+            ),
+            (
+                "default_last_step_action_results_text",
+                serde_json::Value::String(default_user_message),
+            ),
+            (
+                "default_last_step_action_results_content",
+                default_last_step_action_results_content,
+            ),
+            (
+                "pending_inputs",
+                serde_json::Value::Array(pending_inputs.clone()),
+            ),
+            (
+                "pending_input_text",
+                serde_json::Value::String(pending_input_text),
+            ),
+        ];
+
+        let rendered = prompt_env::render_template(template, &env, &extras)
+            .await
+            .map_err(|err| err.to_string())?;
+        let rendered = rendered.trim();
+        if rendered.is_empty() {
+            self.discard_selected_pending(&selected_keys).await;
+            warn!(
+                "opendan.session[{}]: rendered empty user message hook=on_behavior_step_ob behavior=`{}`; skipping next inference",
+                self.session_id, self.behavior.meta.name
+            );
+            return Ok(StepResultHookOutput {
+                skip_next_inference: true,
+                ..Default::default()
+            });
+        }
+
+        self.discard_selected_pending(&selected_keys).await;
+        info!(
+            "opendan.session[{}]: rendered user message hook=on_behavior_step_ob behavior=`{}` chars={} preview=`{}`",
+            self.session_id,
+            self.behavior.meta.name,
+            rendered.chars().count(),
+            text_log_preview(rendered)
+        );
+        Ok(StepResultHookOutput {
+            user_message: Some(AiMessage::text(AiRole::User, rendered.to_string())),
+            history_inputs: Vec::new(),
+            skip_next_inference: false,
+        })
+    }
+}
+
+impl OpenDanStepResultHook {
+    async fn selected_pending_inputs(&self) -> Vec<PendingInput> {
+        let cfg = self.driver.hook(SessionHookPoint::OnBehaviorStepOb);
+        let meta = self.meta.lock().await;
+        let default_behavior = self
+            .agent_config
+            .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+        if !hook_filter_allows(
+            &cfg.filter,
+            &meta.current_behavior,
+            &default_behavior,
+            &meta.process_stack,
+        ) {
+            return Vec::new();
+        }
+        let pending = meta
+            .pending_inputs
+            .iter()
+            .filter(|input| !self.excluded_pending_keys.contains(&input.dedup_key()))
+            .cloned()
+            .collect::<Vec<_>>();
+        select_pending_for_hook_with_subscriptions(
+            cfg,
+            &pending,
+            &HashMap::new(),
+            &meta.event_subscriptions,
+        )
+    }
+
+    async fn event_refs_from_selected(
+        &self,
+        selected: &[PendingInput],
+        observed_at_ms: u64,
+    ) -> Vec<EventRef> {
+        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        selected
+            .iter()
+            .filter_map(|input| {
+                let PendingInput::Event { event_id, data } = input else {
+                    return None;
+                };
+                let reason = subscriptions
+                    .iter()
+                    .find(|sub| sub.matches(event_id))
+                    .and_then(|sub| sub.message_template.as_ref())
+                    .cloned();
+                Some(EventRef {
+                    event_id: event_id.clone(),
+                    data: data.clone(),
+                    reason,
+                    observed_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    async fn discard_selected_pending(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        {
+            let mut meta = self.meta.lock().await;
+            meta.pending_inputs
+                .retain(|input| !keys.contains(&input.dedup_key()));
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush after on_behavior_step_ob consume failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn flush_meta(&self) -> Result<()> {
+        let dir = self.session_dir.join(".meta");
+        tokio::fs::create_dir_all(&dir).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: mkdir {} failed: {err}",
+                self.session_id,
+                dir.display()
+            )
+        })?;
+        let meta = self.meta.lock().await.clone();
+        let bytes = serde_json::to_vec_pretty(&meta)
+            .map_err(|err| anyhow!("session[{}]: serialize meta failed: {err}", self.session_id))?;
+        let path = dir.join("session.json");
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, &bytes).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: write {} failed: {err}",
+                self.session_id,
+                tmp.display()
+            )
+        })?;
+        tokio::fs::rename(&tmp, &path).await.map_err(|err| {
+            anyhow!(
+                "session[{}]: rename to {} failed: {err}",
+                self.session_id,
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
 /// RAII handle slot — installs `LLMContextInterruptHandle` into a session's
 /// `current_interrupt_handle` for the lifetime of the guard. Dropping it
 /// (normal return, early return, panic during run) clears the slot so a
@@ -281,6 +626,7 @@ pub struct AgentSessionBuild {
     /// subscription patterns directly through the pump so additions take
     /// effect without going through the AIAgent layer first.
     pub event_pump: Option<Arc<SessionEventPump>>,
+    pub parent_agent: Weak<AIAgent>,
 }
 
 impl AgentSession {
@@ -292,7 +638,7 @@ impl AgentSession {
         // Restore path: keep persistent fields (pending_inputs, peer info,
         // event_subscriptions) but reset transient status to Idle so the
         // worker re-enters the main loop cleanly.
-        let meta = if let Some(mut existing) = b.existing_meta {
+        let mut meta = if let Some(mut existing) = b.existing_meta {
             existing.session_id = b.session_id.clone();
             existing.kind = b.kind;
             existing.current_behavior = b.current_behavior.clone();
@@ -315,6 +661,19 @@ impl AgentSession {
                 b.owner.clone(),
             )
         };
+        if matches!(b.kind, SessionKind::SelfImprove) && meta.improvement_budget.is_none() {
+            meta.improvement_budget = Some(ImprovementBudget {
+                unit: ImprovementBudgetUnit::Token,
+                remaining: 32_000,
+            });
+        }
+        if meta.ensure_default_event_subscriptions(now_ms()) {
+            info!(
+                "opendan.session[{}]: install default ui clock subscription event_id={} mode=background_only",
+                b.session_id,
+                crate::session_model::UI_CLOCK_TIMER_EVENT_ID
+            );
+        }
         let history = Arc::new(SessionHistoryRecorder::new(
             b.session_id.clone(),
             session_dir.clone(),
@@ -339,6 +698,7 @@ impl AgentSession {
             meta: Arc::new(Mutex::new(meta)),
             status: Arc::new(InMemoryStatus::new(ui_session_sync)),
             event_pump: b.event_pump,
+            parent_agent: b.parent_agent,
             trace_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fork_stack: Arc::new(std::sync::Mutex::new(Vec::new())),
             current_origin_msg: Arc::new(std::sync::Mutex::new(None)),
@@ -467,6 +827,149 @@ impl AgentSession {
         Ok(())
     }
 
+    async fn set_internal_continuation(&self, continuation: InternalContinuation) -> Result<()> {
+        {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation = Some(continuation);
+        }
+        self.flush_meta().await?;
+        Ok(())
+    }
+
+    async fn take_internal_continuation(&self) -> Option<InternalContinuation> {
+        let continuation = {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation.take()
+        };
+        if continuation.is_some() {
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush after taking internal continuation failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+        continuation
+    }
+
+    async fn restore_internal_continuation(&self, continuation: InternalContinuation) {
+        {
+            let mut meta = self.meta.lock().await;
+            meta.internal_continuation = Some(continuation);
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush after restoring internal continuation failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn prune_legacy_internal_pending_inputs(&self) {
+        let removed = {
+            let mut meta = self.meta.lock().await;
+            prune_legacy_internal_pending_inputs(&mut meta.pending_inputs)
+        };
+        if removed > 0 {
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush after pruning legacy internal pending inputs failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+    }
+
+    async fn run_internal_continuation(
+        &self,
+        continuation: InternalContinuation,
+    ) -> Result<NextAction> {
+        let messages = continuation.user_messages;
+        if messages.is_empty() {
+            warn!(
+                "opendan.session[{}]: skipped internal continuation `{}` with empty user message; skipping inference",
+                self.session_id, continuation.reason
+            );
+            return Ok(NextAction::Continue);
+        }
+        let seed = RoundSeed {
+            trigger: RoundTrigger::SystemEvent {
+                source: "session.internal_continuation".to_string(),
+                event_kind: continuation.reason,
+            },
+            input_keys: Vec::new(),
+            user_messages: messages.clone(),
+            system_events: Vec::new(),
+        };
+        self.set_current_origin_msg(messages.first().map(|message| message.text_content()));
+        self.run_one_round(messages, Vec::new(), Some(seed), false)
+            .await
+    }
+
+    pub async fn push_msg(&self, input: PendingInput) -> Result<()> {
+        if !matches!(input, PendingInput::Msg { .. }) {
+            return Err(anyhow!("push_msg expects PendingInput::Msg"));
+        }
+        self.enqueue_pending(input).await
+    }
+
+    pub async fn notify_event(&self, event_id: String, data: serde_json::Value) -> Result<bool> {
+        let (full_interested, background_interested) = {
+            let meta = self.meta.lock().await;
+            (
+                meta.event_subscriptions
+                    .iter()
+                    .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(&event_id)),
+                meta.event_subscriptions.iter().any(|sub| {
+                    sub.mode == EventSubscriptionMode::BackgroundOnly && sub.matches(&event_id)
+                }),
+            )
+        };
+        if full_interested {
+            info!(
+                "opendan.session[{}]: event {} matched full subscription; enqueue pending input",
+                self.session_id, event_id
+            );
+            self.enqueue_pending(PendingInput::Event { event_id, data })
+                .await?;
+            return Ok(true);
+        }
+
+        {
+            let mut meta = self.meta.lock().await;
+            if let Some(existing) = meta
+                .background_events
+                .iter_mut()
+                .find(|item| item.event_id == event_id)
+            {
+                info!(
+                    "opendan.session[{}]: event {} stored as background snapshot; subscription_match={} action=refresh",
+                    self.session_id, event_id, background_interested
+                );
+                existing.data = data;
+                existing.observed_at_ms = now_ms();
+            } else {
+                info!(
+                    "opendan.session[{}]: event {} stored as background snapshot; subscription_match={} action=create",
+                    self.session_id, event_id, background_interested
+                );
+                meta.background_events.push(BgEventSnapshot {
+                    event_id,
+                    data,
+                    reason: None,
+                    observed_at_ms: now_ms(),
+                });
+                const MAX_BG_EVENTS: usize = 32;
+                if meta.background_events.len() > MAX_BG_EVENTS {
+                    let drop_count = meta.background_events.len() - MAX_BG_EVENTS;
+                    meta.background_events.drain(0..drop_count);
+                }
+            }
+        }
+        self.flush_meta().await?;
+        Ok(false)
+    }
+
     /// Enqueue an interrupt barrier. The worker drains its queue strictly
     /// in order: items enqueued *before* this call are processed first
     /// (within the same logical turn), then the interrupt fires, then any
@@ -545,6 +1048,27 @@ impl AgentSession {
         }
     }
 
+    async fn finish_ended(&self) {
+        self.set_status(SessionStatus::Ended).await;
+        let _ = self.reply_tx.send(SessionReply::Ended).await;
+        if let Some(agent) = self.parent_agent.upgrade() {
+            agent.retire_ended_session(&self.session_id).await;
+        }
+    }
+
+    async fn handle_end_action(&self) -> bool {
+        match session_end_disposition(self.kind) {
+            SessionEndDisposition::Idle => {
+                self.set_status(SessionStatus::Idle).await;
+                true
+            }
+            SessionEndDisposition::Ended => {
+                self.finish_ended().await;
+                false
+            }
+        }
+    }
+
     /// Convenience: enqueue a locally-injected human message. The synthetic
     /// `record_id` distinguishes CLI / test injections from msg-center
     /// records (which use the upstream record id).
@@ -581,7 +1105,7 @@ impl AgentSession {
             while let Ok(signal) = inbox_rx.try_recv() {
                 if matches!(signal, SessionInput::Cancel) {
                     self.set_status(SessionStatus::Idle).await;
-                    if matches!(self.kind, SessionKind::Work) {
+                    if self.kind.is_work_family() {
                         info!(
                             "opendan.session[{}]: cancel received on work session, exiting worker",
                             self.session_id
@@ -591,10 +1115,58 @@ impl AgentSession {
                 }
             }
 
+            if let Some(continuation) = self.take_internal_continuation().await {
+                self.set_status(SessionStatus::Running).await;
+                let round_result = self.run_internal_continuation(continuation.clone()).await;
+                match round_result {
+                    Ok(action) => match action {
+                        NextAction::Continue => continue,
+                        NextAction::WaitForMsg => {
+                            self.set_status(SessionStatus::WaitingInput).await
+                        }
+                        NextAction::WaitForTool => {
+                            self.set_status(SessionStatus::WaitingTool).await
+                        }
+                        NextAction::End => {
+                            if self.handle_end_action().await {
+                                continue;
+                            }
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        self.restore_internal_continuation(continuation).await;
+                        warn!(
+                            "opendan.session[{}]: internal continuation failed (kept for retry): {err:#}",
+                            self.session_id
+                        );
+                        self.set_status(SessionStatus::Error).await;
+                        let _ = self
+                            .reply_tx
+                            .send(SessionReply::Error {
+                                message: format!("{err:#}"),
+                            })
+                            .await;
+                        match inbox_rx.recv().await {
+                            None => return,
+                            Some(SessionInput::Cancel) => {
+                                self.set_status(SessionStatus::Idle).await;
+                                if self.kind.is_work_family() {
+                                    return;
+                                }
+                            }
+                            Some(SessionInput::Wakeup) => {}
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Snapshot current pending queue. We DON'T remove items from
             // `meta.pending_inputs` here — that happens only after the turn
             // succeeds, so a crash mid-round leaves the
             // inputs durable and they'll be replayed next boot.
+            self.prune_legacy_internal_pending_inputs().await;
             let mut pending = self.meta.lock().await.pending_inputs.clone();
             if pending.is_empty() {
                 // Work session bootstrap: if a freshly-created Work session
@@ -603,7 +1175,7 @@ impl AgentSession {
                 // After the first successful turn this branch falls through
                 // to the normal recv()-blocking path.
                 let needs_bootstrap =
-                    matches!(self.kind, SessionKind::Work) && self.needs_bootstrap_turn().await;
+                    self.kind.is_work_family() && self.needs_bootstrap_turn().await;
                 if needs_bootstrap {
                     self.set_status(SessionStatus::Running).await;
                     let behavior = match self.load_current_behavior().await {
@@ -624,10 +1196,16 @@ impl AgentSession {
                         }
                     };
                     let bootstrap_message = self
-                        .render_on_switch_input_text("none", &behavior, None)
+                        .render_on_behavior_switch_input_text("none", &behavior, None, None)
                         .await
+                        .into_text()
                         .map(|text| AiMessage::text(AiRole::User, text));
                     let bootstrap_messages = bootstrap_message.into_iter().collect::<Vec<_>>();
+                    if bootstrap_messages.is_empty() {
+                        self.mark_bootstrap_done().await;
+                        self.set_status(SessionStatus::WaitingInput).await;
+                        continue;
+                    }
                     self.set_current_origin_msg(
                         bootstrap_messages
                             .first()
@@ -642,11 +1220,13 @@ impl AgentSession {
                         user_messages: bootstrap_messages.clone(),
                         system_events: Vec::new(),
                     };
-                    let round_result = self.run_one_round(bootstrap_messages, Some(seed)).await;
+                    let round_result = self
+                        .run_one_round(bootstrap_messages, Vec::new(), Some(seed), false)
+                        .await;
                     self.mark_bootstrap_done().await;
                     match round_result {
                         Ok(action) => match action {
-                            NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                            NextAction::Continue => continue,
                             NextAction::WaitForMsg => {
                                 self.set_status(SessionStatus::WaitingInput).await
                             }
@@ -654,8 +1234,9 @@ impl AgentSession {
                                 self.set_status(SessionStatus::WaitingTool).await
                             }
                             NextAction::End => {
-                                self.set_status(SessionStatus::Ended).await;
-                                let _ = self.reply_tx.send(SessionReply::Ended).await;
+                                if self.handle_end_action().await {
+                                    continue;
+                                }
                                 return;
                             }
                         },
@@ -675,6 +1256,42 @@ impl AgentSession {
                     }
                     continue;
                 }
+                if self.should_exit_when_idle().await {
+                    let idle_retire_ms = idle_worker_retire_ms(self.kind);
+                    match timeout(Duration::from_millis(idle_retire_ms), inbox_rx.recv()).await {
+                        Ok(None) => {
+                            info!(
+                                "opendan.session[{}]: inbox closed, exiting worker",
+                                self.session_id
+                            );
+                            return;
+                        }
+                        Ok(Some(SessionInput::Cancel)) => {
+                            self.set_status(SessionStatus::Idle).await;
+                            if self.kind.is_work_family() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Ok(Some(SessionInput::Wakeup)) => continue,
+                        Err(_) => {
+                            if let Err(err) = self.flush_meta().await {
+                                warn!(
+                                    "opendan.session[{}]: flush before idle worker exit failed: {err:#}",
+                                    self.session_id
+                                );
+                            }
+                            if let Some(agent) = self.parent_agent.upgrade() {
+                                agent.retire_idle_session(&self.session_id).await;
+                            }
+                            info!(
+                                "opendan.session[{}]: idle transient worker exiting",
+                                self.session_id
+                            );
+                            return;
+                        }
+                    }
+                }
                 match inbox_rx.recv().await {
                     None => {
                         info!(
@@ -685,7 +1302,7 @@ impl AgentSession {
                     }
                     Some(SessionInput::Cancel) => {
                         self.set_status(SessionStatus::Idle).await;
-                        if matches!(self.kind, SessionKind::Work) {
+                        if self.kind.is_work_family() {
                             return;
                         }
                         continue;
@@ -751,6 +1368,61 @@ impl AgentSession {
                 pending.truncate(pos);
             }
 
+            let pending_task_index = self.pending_task_index().await;
+            let driver = self.session_class_driver();
+            let selected_pending = self
+                .select_pending_for_hook(
+                    SessionHookPoint::OnWakeup,
+                    &driver,
+                    &pending,
+                    &pending_task_index,
+                )
+                .await;
+            let on_wakeup_cfg = driver.hook(SessionHookPoint::OnWakeup);
+            let selected_stats = pending_input_stats(&selected_pending);
+            info!(
+                "opendan.session[{}]: driver hook=on_wakeup pending_total={} selected_total={} selected_msg={} selected_event={} selected_interrupt={} pull_msg={:?} pull_event={:?}",
+                self.session_id,
+                pending.len(),
+                selected_pending.len(),
+                selected_stats.msg,
+                selected_stats.event,
+                selected_stats.interrupt,
+                on_wakeup_cfg.pull_msg,
+                on_wakeup_cfg.pull_event
+            );
+            if selected_pending.is_empty() {
+                self.set_status(SessionStatus::WaitingInput).await;
+                if self.should_exit_when_driver_blocked().await {
+                    if let Err(err) = self.flush_meta().await {
+                        warn!(
+                            "opendan.session[{}]: flush before driver-blocked worker exit failed: {err:#}",
+                            self.session_id
+                        );
+                    }
+                    if let Some(agent) = self.parent_agent.upgrade() {
+                        agent.retire_idle_session(&self.session_id).await;
+                    }
+                    info!(
+                        "opendan.session[{}]: transient worker exiting; pending input is not pulled by current driver hook",
+                        self.session_id
+                    );
+                    return;
+                }
+                match inbox_rx.recv().await {
+                    None => return,
+                    Some(SessionInput::Cancel) => {
+                        self.set_status(SessionStatus::Idle).await;
+                        if self.kind.is_work_family() {
+                            return;
+                        }
+                    }
+                    Some(SessionInput::Wakeup) => {}
+                }
+                continue;
+            }
+            pending = selected_pending;
+
             // Three buckets:
             //   - Msg / generic Event → fold into the next round as `round_inputs`
             //   - Event whose id matches a `pending_task_calls` pattern →
@@ -759,7 +1431,8 @@ impl AgentSession {
             //     result.
             // Latest peer info wins — the most recent Msg in this batch
             // dictates where outbound replies will be routed.
-            let mut turn_messages: Vec<AiMessage> = Vec::new();
+            let mut turn_messages: Vec<TurnMessage> = Vec::new();
+            let mut history_inputs: Vec<HistoryInputRecord> = Vec::new();
             let mut turn_events = Vec::new();
             let mut consumed_keys = Vec::new();
             let mut task_completions: Vec<(String, Observation, String, String)> = Vec::new();
@@ -776,10 +1449,11 @@ impl AgentSession {
             let mut event_count: u32 = 0;
             let mut first_msg_preview: Option<String> = None;
             let mut first_event_meta: Option<(String, String)> = None;
-            let pending_task_index = self.pending_task_index().await;
             for input in &pending {
                 match input {
                     PendingInput::Msg {
+                        record_id,
+                        from,
                         text,
                         from_did,
                         tunnel_did,
@@ -789,15 +1463,26 @@ impl AgentSession {
                         let message = pending_msg_ai_message(ai_message);
                         if ai_message_has_payload(&message) {
                             let preview_text = pending_msg_preview(text, &message);
-                            if first_msg_preview.is_none() {
-                                first_msg_preview = Some(trigger_preview(&preview_text));
+                            if is_history_input_pending(record_id) {
+                                history_inputs.push(HistoryInputRecord {
+                                    source: from.clone(),
+                                    text: message.text_content().trim().to_string(),
+                                    at_ms: now_ms(),
+                                });
+                            } else if !preview_text.trim().is_empty() {
+                                if !is_runtime_auto_user_pending(from) {
+                                    if first_msg_preview.is_none() {
+                                        first_msg_preview = Some(trigger_preview(&preview_text));
+                                    }
+                                    latest_origin_msg = Some(preview_text);
+                                    hist_user_messages.push(message.clone());
+                                    msg_count += 1;
+                                }
+                                turn_messages.push(TurnMessage {
+                                    message: message.clone(),
+                                    runtime_auto: is_runtime_auto_user_pending(from),
+                                });
                             }
-                            if !preview_text.trim().is_empty() {
-                                latest_origin_msg = Some(preview_text);
-                            }
-                            turn_messages.push(message.clone());
-                            hist_user_messages.push(message);
-                            msg_count += 1;
                         }
                         if let Some(did) = from_did.as_ref().filter(|s| !s.trim().is_empty()) {
                             latest_peer_did = Some(did.clone());
@@ -890,7 +1575,7 @@ impl AgentSession {
                             // and `run_one_round` handles them normally.
                             self.discard_consumed(&consumed_event_keys).await;
                             match action {
-                                NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                                NextAction::Continue => continue,
                                 NextAction::WaitForMsg => {
                                     self.set_status(SessionStatus::WaitingInput).await
                                 }
@@ -898,8 +1583,9 @@ impl AgentSession {
                                     self.set_status(SessionStatus::WaitingTool).await
                                 }
                                 NextAction::End => {
-                                    self.set_status(SessionStatus::Ended).await;
-                                    let _ = self.reply_tx.send(SessionReply::Ended).await;
+                                    if self.handle_end_action().await {
+                                        continue;
+                                    }
                                     return;
                                 }
                             }
@@ -922,7 +1608,7 @@ impl AgentSession {
                                 None => return,
                                 Some(SessionInput::Cancel) => {
                                     self.set_status(SessionStatus::Idle).await;
-                                    if matches!(self.kind, SessionKind::Work) {
+                                    if self.kind.is_work_family() {
                                         return;
                                     }
                                 }
@@ -942,7 +1628,7 @@ impl AgentSession {
                         None => return,
                         Some(SessionInput::Cancel) => {
                             self.set_status(SessionStatus::Idle).await;
-                            if matches!(self.kind, SessionKind::Work) {
+                            if self.kind.is_work_family() {
                                 return;
                             }
                         }
@@ -952,23 +1638,82 @@ impl AgentSession {
                 }
             }
 
-            let mut round_inputs = turn_messages;
-            if let Some(batch) = format_event_batch_for_turn(&turn_events) {
-                round_inputs.push(AiMessage::text(AiRole::User, batch));
-            }
+            let hook_env = self
+                .apply_hook(SessionHookPoint::OnWakeup, &driver, &pending)
+                .await;
+            let wakeup_template_text = match self
+                .render_on_wakeup_input_text(hook_env.clone())
+                .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    warn!(
+                        "opendan.session[{}]: render on_wakeup failed (pending kept for retry): {err:#}",
+                        self.session_id
+                    );
+                    self.set_status(SessionStatus::Error).await;
+                    let _ = self
+                        .reply_tx
+                        .send(SessionReply::Error {
+                            message: format!("render on_wakeup failed: {err:#}"),
+                        })
+                        .await;
+                    match inbox_rx.recv().await {
+                        None => return,
+                        Some(SessionInput::Cancel) => {
+                            self.set_status(SessionStatus::Idle).await;
+                            if self.kind.is_work_family() {
+                                return;
+                            }
+                        }
+                        Some(SessionInput::Wakeup) => {}
+                    }
+                    continue;
+                }
+            };
+            let round_inputs = match wakeup_template_text {
+                RenderedUserMessage::Text(text) => vec![AiMessage::text(AiRole::User, text)],
+                RenderedUserMessage::Empty => {
+                    self.discard_consumed(&consumed_keys).await;
+                    continue;
+                }
+                RenderedUserMessage::NotConfigured => {
+                    let mut round_inputs =
+                        prepare_turn_messages_for_run(turn_messages, self.kind.is_work_family());
+                    if let Some(batch) = format_event_batch_for_turn(&turn_events) {
+                        round_inputs.push(AiMessage::text(AiRole::User, batch));
+                    }
+                    round_inputs
+                }
+            };
+            info!(
+                "opendan.session[{}]: build user input hook=on_wakeup msgs={} events={} history_inputs={} round_user_messages={} first_msg=`{}` first_event={}",
+                self.session_id,
+                msg_count,
+                event_count,
+                history_inputs.len(),
+                round_inputs.len(),
+                first_msg_preview.as_deref().unwrap_or(""),
+                first_event_meta
+                    .as_ref()
+                    .map(|(id, kind)| format!("{id}:{kind}"))
+                    .unwrap_or_else(|| "none".to_string())
+            );
 
             // If the snapshot is currently mid-PendingTool and the upper
             // layer queued bare Msg/Event entries without an Interrupt
             // barrier, defer: starting a fresh turn here would discard
             // the in-flight tool round. Upper layers that want immediate
             // attention should `interrupt()` first, then `enqueue_pending`.
-            if !round_inputs.is_empty() && self.snapshot_has_pending_tool_calls().await {
+            if (!round_inputs.is_empty() || !history_inputs.is_empty())
+                && self.snapshot_has_pending_tool_calls().await
+            {
                 self.set_status(SessionStatus::WaitingTool).await;
                 match self.wait_with_tool_sweep(inbox_rx).await {
                     None => return,
                     Some(SessionInput::Cancel) => {
                         self.set_status(SessionStatus::Idle).await;
-                        if matches!(self.kind, SessionKind::Work) {
+                        if self.kind.is_work_family() {
                             return;
                         }
                     }
@@ -977,7 +1722,7 @@ impl AgentSession {
                 continue;
             }
 
-            if round_inputs.is_empty() {
+            if round_inputs.is_empty() && history_inputs.is_empty() {
                 self.discard_consumed(&consumed_keys).await;
                 continue;
             }
@@ -1012,14 +1757,21 @@ impl AgentSession {
                 user_messages: hist_user_messages,
                 system_events: hist_system_events,
             };
-            let round_result = self.run_one_round(round_inputs, Some(seed)).await;
+            let round_result = self
+                .run_one_round(
+                    round_inputs,
+                    history_inputs,
+                    Some(seed),
+                    msg_count > 0 || event_count > 0,
+                )
+                .await;
             match round_result {
                 Ok(action) => {
                     // Successful turn ⇒ remove the items we just fed to the
                     // LLM from the persistent queue.
                     self.discard_consumed(&consumed_keys).await;
                     match action {
-                        NextAction::Idle => self.set_status(SessionStatus::Idle).await,
+                        NextAction::Continue => continue,
                         NextAction::WaitForMsg => {
                             self.set_status(SessionStatus::WaitingInput).await
                         }
@@ -1027,8 +1779,9 @@ impl AgentSession {
                             self.set_status(SessionStatus::WaitingTool).await
                         }
                         NextAction::End => {
-                            self.set_status(SessionStatus::Ended).await;
-                            let _ = self.reply_tx.send(SessionReply::Ended).await;
+                            if self.handle_end_action().await {
+                                continue;
+                            }
                             return;
                         }
                     }
@@ -1055,7 +1808,7 @@ impl AgentSession {
                         None => return,
                         Some(SessionInput::Cancel) => {
                             self.set_status(SessionStatus::Idle).await;
-                            if matches!(self.kind, SessionKind::Work) {
+                            if self.kind.is_work_family() {
                                 return;
                             }
                         }
@@ -1092,6 +1845,16 @@ impl AgentSession {
     async fn needs_bootstrap_turn(&self) -> bool {
         let meta = self.meta.lock().await;
         !meta.bootstrap_done && !meta.objective.trim().is_empty()
+    }
+
+    async fn should_exit_when_idle(&self) -> bool {
+        let meta = self.meta.lock().await;
+        meta.pending_inputs.is_empty() && !matches!(meta.status, SessionStatus::WaitingTool)
+    }
+
+    async fn should_exit_when_driver_blocked(&self) -> bool {
+        let meta = self.meta.lock().await;
+        !matches!(meta.status, SessionStatus::WaitingTool)
     }
 
     /// Flip `bootstrap_done = true` and flush. Idempotent — calling twice
@@ -1205,7 +1968,7 @@ impl AgentSession {
             session_id: self.session_id.clone(),
         };
         let from_user_did = self.current_from_user_did().await;
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -1218,6 +1981,9 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        let completion_keys: Vec<String> =
+            completions.iter().map(|(_, _, _, k)| k.clone()).collect();
+        deps = self.attach_step_result_hook(&behavior, deps, &completion_keys);
         let mut ctx =
             LLMContext::resume(snapshot, fill, deps).map_err(|e| anyhow!("resume: {e}"))?;
         // Capture the post-resume baseline before the next inference so the
@@ -1446,7 +2212,7 @@ impl AgentSession {
             session_id: self.session_id.clone(),
         };
         let from_user_did = self.current_from_user_did().await;
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -1459,6 +2225,7 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        deps = self.attach_step_result_hook(&behavior, deps, &[]);
 
         let mut ctx = LLMContext::resume(snap_winddown, ResumeFill::ToolResults { results }, deps)
             .map_err(|e| anyhow!("interrupt graceful resume: {e}"))?;
@@ -1690,30 +2457,430 @@ impl AgentSession {
         self.agent_config
             .session_class(&class)
             .map(|c| c.loop_mode)
-            // Built-in defaults: UI ⇒ Agent loop, Work ⇒ Behavior loop.
-            // Matches the pre-config-rewrite hardcoded behavior so an
-            // `agent.toml` without `[session.<class>]` entries still
-            // boots into the expected loop shape.
-            .unwrap_or(match self.kind {
-                SessionKind::Ui => LoopMode::Agent,
-                SessionKind::Work => LoopMode::Behavior,
-            })
+            .unwrap_or_else(|| self.agent_config.default_loop_mode_for_kind(self.kind))
     }
 
     fn session_class_switch_mode(&self) -> SwitchMode {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
-            .map(|c| c.switch_mode)
+            .map(|c| c.driver.switch_mode)
             .unwrap_or(SwitchMode::Normal)
     }
 
-    fn session_class_inject_background_environment(&self) -> bool {
+    /// Configured `process_stack_limit` for this session class. `0` ⇒
+    /// unbounded (the documented default in `SessionClassCfg`).
+    fn session_class_process_stack_limit(&self) -> u32 {
         let class = self.agent_config.class_name_for_kind(self.kind);
         self.agent_config
             .session_class(&class)
-            .map(|c| c.inject_background_environment)
-            .unwrap_or(true)
+            .map(|c| c.process_stack_limit)
+            .unwrap_or(0)
+    }
+
+    /// Side-channel for the §10 #3 "refused fork/independent switch" path.
+    /// Writes both a `warn!` line (engineering visibility) and a worklog
+    /// record (operator-visible audit trail). Best-effort: any worklog
+    /// failure is logged but never propagates — refusing the switch is
+    /// already the right user-visible outcome.
+    async fn refuse_switch_for_stack_limit(
+        &self,
+        prev: &BehaviorCfg,
+        next_cfg: &BehaviorCfg,
+        switch_mode: SwitchMode,
+        current_depth: u32,
+        limit: u32,
+        final_snapshot: &LLMContextSnapshot,
+    ) {
+        let last_report = final_snapshot.state.last_report.clone().unwrap_or_default();
+        warn!(
+            "opendan.session[{}]: refusing {:?} switch `{}` -> `{}`: process_stack depth={} >= limit={} (config: session_class.process_stack_limit)",
+            self.session_id,
+            switch_mode,
+            prev.meta.name,
+            next_cfg.meta.name,
+            current_depth,
+            limit
+        );
+        let record = serde_json::json!({
+            "type": "agent.session.behavior_switch_refused",
+            "owner_session_id": self.session_id,
+            "status": "Refused",
+            "payload": {
+                "reason": "process_stack_limit_exceeded",
+                "from_behavior": prev.meta.name,
+                "to_behavior": next_cfg.meta.name,
+                "switch_mode": format!("{:?}", switch_mode),
+                "process_stack_depth": current_depth,
+                "process_stack_limit": limit,
+                "last_report": last_report,
+            }
+        });
+        if let Err(err) = self
+            .runtime
+            .worklog
+            .append_record_for_session(
+                &self.session_id,
+                &self.agent_name,
+                &prev.meta.name,
+                0,
+                record,
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: append behavior_switch_refused worklog failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    fn session_class_report_delivery(&self) -> ReportDeliveryMode {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.driver.report_delivery)
+            .unwrap_or_default()
+    }
+
+    fn session_class_driver(&self) -> SessionDriverCfg {
+        let class = self.agent_config.class_name_for_kind(self.kind);
+        self.agent_config
+            .session_class(&class)
+            .map(|c| c.driver.clone())
+            .unwrap_or_else(|| self.agent_config.default_driver_for_kind(self.kind))
+    }
+
+    async fn apply_hook(
+        &self,
+        point: SessionHookPoint,
+        driver: &SessionDriverCfg,
+        pending: &[PendingInput],
+    ) -> LlmContextEnv {
+        let cfg = driver.hook(point);
+        let observed_at_ms = now_ms();
+        let filter_allows = {
+            let meta = self.meta.lock().await;
+            let default_behavior = self
+                .agent_config
+                .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+            hook_filter_allows(
+                &cfg.filter,
+                &meta.current_behavior,
+                &default_behavior,
+                &meta.process_stack,
+            )
+        };
+        let (events, consumed_event_keys, msgs) = if filter_allows {
+            let (events, consumed_event_keys) =
+                self.pull_events_for_env(cfg, pending, observed_at_ms).await;
+            let (msgs, _) = self.pull_msgs_for_env(cfg, pending, observed_at_ms);
+            (events, consumed_event_keys, msgs)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let msg_count = msgs.len();
+        let event_count = consumed_event_keys.len();
+        let snapshot = self.try_load_snapshot_for_prompt();
+        let agent_global_state = if let Some(agent) = self.parent_agent.upgrade() {
+            agent.snapshot_global_state(Some(&self.session_id)).await
+        } else {
+            serde_json::json!({
+                "agent_name": self.agent_name,
+                "session_id": self.session_id,
+            })
+        };
+        let (last_step, last_report, behavior_history) = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot
+                        .state
+                        .last_step
+                        .as_ref()
+                        .map(prompt_env::step_record_prompt_value),
+                    snapshot.state.last_report.clone(),
+                    snapshot
+                        .state
+                        .steps
+                        .iter()
+                        .map(prompt_env::step_record_prompt_value)
+                        .collect(),
+                )
+            })
+            .unwrap_or((None, None, Vec::new()));
+        let bg_events = self.meta.lock().await.background_events.clone();
+        let background_hints =
+            if filter_allows && cfg.load_background_hits == LoadBackgroundHintsPolicy::All {
+                self.load_changed_background_hits().await
+            } else {
+                Vec::new()
+            };
+        let default_changed_background_hint_text =
+            render_changed_background_hint_text(&background_hints);
+        info!(
+            "opendan.session[{}]: apply driver hook={} pending_total={} env_msgs={} env_events={} bg_events={} background_hints={} filter={:?} filter_allows={} pull_msg={:?} pull_event={:?} load_background_hits={:?}",
+            self.session_id,
+            point.as_key(),
+            pending.len(),
+            msg_count,
+            event_count,
+            bg_events.len(),
+            background_hints.len(),
+            cfg.filter,
+            filter_allows,
+            cfg.pull_msg,
+            cfg.pull_event,
+            cfg.load_background_hits
+        );
+        LlmContextEnv {
+            msgs,
+            events,
+            bg_events,
+            background_hints,
+            default_changed_background_hint_text,
+            last_step,
+            last_report,
+            behavior_history,
+            agent_global_state: merge_global_state_hook_stats(
+                agent_global_state,
+                point.as_key(),
+                msg_count,
+                event_count,
+            ),
+        }
+    }
+
+    fn pull_msgs_for_env(
+        &self,
+        cfg: &HookPointCfg,
+        pending: &[PendingInput],
+        received_at_ms: u64,
+    ) -> (Vec<serde_json::Value>, Vec<String>) {
+        let limit = match cfg.pull_msg {
+            PullMsgPolicy::None => return (Vec::new(), Vec::new()),
+            PullMsgPolicy::One => Some(1usize),
+            PullMsgPolicy::All => None,
+        };
+        let mut values = Vec::new();
+        let mut keys = Vec::new();
+        for input in pending {
+            let Some(msg) = prompt_env::msg_ref_from_pending(input, received_at_ms) else {
+                continue;
+            };
+            values.push(msg);
+            keys.push(input.dedup_key());
+            if limit.is_some_and(|limit| values.len() >= limit) {
+                break;
+            }
+        }
+        (values, keys)
+    }
+
+    async fn select_pending_for_hook(
+        &self,
+        point: SessionHookPoint,
+        driver: &SessionDriverCfg,
+        pending: &[PendingInput],
+        pending_task_index: &std::collections::HashMap<String, PendingTaskCall>,
+    ) -> Vec<PendingInput> {
+        let cfg = driver.hook(point);
+        let meta = self.meta.lock().await;
+        let default_behavior = self
+            .agent_config
+            .default_behavior_for_class(&self.agent_config.class_name_for_kind(meta.kind));
+        if !hook_filter_allows(
+            &cfg.filter,
+            &meta.current_behavior,
+            &default_behavior,
+            &meta.process_stack,
+        ) {
+            return Vec::new();
+        }
+        let subscriptions = meta.event_subscriptions.clone();
+        select_pending_for_hook_with_subscriptions(cfg, pending, pending_task_index, &subscriptions)
+    }
+
+    async fn pull_events_for_env(
+        &self,
+        cfg: &HookPointCfg,
+        pending: &[PendingInput],
+        observed_at_ms: u64,
+    ) -> (Vec<EventRef>, Vec<String>) {
+        let subscriptions = self.meta.lock().await.event_subscriptions.clone();
+        let mut events = Vec::new();
+        let mut keys = Vec::new();
+        for input in pending {
+            let PendingInput::Event { event_id, data } = input else {
+                continue;
+            };
+            let matched = match &cfg.pull_event {
+                policy => event_matches_pull_policy(event_id, policy, &subscriptions),
+            };
+            if matched {
+                let reason = subscriptions
+                    .iter()
+                    .find(|sub| sub.matches(event_id))
+                    .and_then(|sub| sub.message_template.as_ref())
+                    .cloned();
+                events.push(EventRef {
+                    event_id: event_id.clone(),
+                    data: data.clone(),
+                    reason,
+                    observed_at_ms,
+                });
+                keys.push(input.dedup_key());
+            }
+        }
+        (events, keys)
+    }
+
+    pub(crate) async fn maybe_publish_worksession_report(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        phase: WorksessionReportPhase,
+        next_behavior: Option<&str>,
+        trace_id: &str,
+    ) -> Result<()> {
+        if !matches!(self.kind, SessionKind::Work) {
+            return Ok(());
+        }
+        let report = final_snapshot
+            .state
+            .last_report
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if report.is_empty() {
+            return Ok(());
+        }
+        let meta = self.meta.lock().await.clone();
+        let context_depth = meta.process_stack.len();
+        if !worksession_report_delivery_allows(
+            self.session_class_report_delivery(),
+            phase,
+            context_depth,
+        ) {
+            return Ok(());
+        }
+        let target_session_id = meta.owner.trim().to_string();
+        if target_session_id.is_empty() {
+            warn!(
+                "opendan.session[{}]: worksession report has no owner UI session",
+                self.session_id
+            );
+            return Ok(());
+        }
+        let report_hash = stable_report_hash(&report);
+        if meta
+            .last_report_delivery
+            .as_ref()
+            .is_some_and(|state| state.report_hash == report_hash && state.phase == phase.as_str())
+        {
+            return Ok(());
+        }
+        let report_id = format!(
+            "report:{}:{}:{}",
+            self.session_id,
+            phase.as_str(),
+            report_hash
+        );
+        let parent_process_entry = meta
+            .process_stack
+            .last()
+            .map(|frame| frame.entry.clone())
+            .filter(|entry| !entry.trim().is_empty());
+        let created_at_ms = now_ms();
+        let data = serde_json::json!({
+            "type": WORKSESSION_REPORT_EVENT_TYPE,
+            "report_id": report_id,
+            "source_session_id": self.session_id,
+            "source_kind": "worksession",
+            "target_session_id": target_session_id,
+            "title": meta.title,
+            "objective": meta.objective,
+            "workspace_id": meta.workspace_id,
+            "behavior": meta.current_behavior,
+            "context_depth": context_depth,
+            "process_entry": meta.process_entry,
+            "parent_process_entry": parent_process_entry,
+            "phase": phase.as_str(),
+            "report": report,
+            "next_behavior": next_behavior,
+            "is_final": matches!(phase, WorksessionReportPhase::Final),
+            "trace_id": trace_id,
+            "created_at_ms": created_at_ms,
+        });
+        self.write_worksession_report_file(&data).await;
+        let target = match self.parent_agent.upgrade() {
+            Some(agent) => agent.get_session(&target_session_id).await,
+            None => None,
+        };
+        let posted = if let Some(target) = target {
+            if !matches!(target.kind, SessionKind::Ui) {
+                warn!(
+                    "opendan.session[{}]: worksession report target {} is not a UI session",
+                    self.session_id, target_session_id
+                );
+                return Ok(());
+            }
+            target
+                .post_worksession_report_outbound(&data, Some(report_id.clone()))
+                .await?
+        } else {
+            self.post_worksession_report_outbound_to_persisted_ui(
+                &target_session_id,
+                &data,
+                Some(report_id.clone()),
+            )
+            .await?
+        };
+        if posted {
+            {
+                let mut meta = self.meta.lock().await;
+                if meta.last_report_delivery.as_ref().is_some_and(|state| {
+                    state.report_hash == report_hash && state.phase == phase.as_str()
+                }) {
+                    return Ok(());
+                }
+                meta.last_report_delivery = Some(ReportDeliveryState {
+                    report_hash,
+                    phase: phase.as_str().to_string(),
+                    report_id,
+                    delivered_at_ms: now_ms(),
+                });
+            }
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush report delivery state failed: {err:#}",
+                    self.session_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_worksession_report_file(&self, data: &serde_json::Value) {
+        let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
+        let content = format!(
+            "# WorkSession Report\n\n- phase: {}\n- source_session_id: {}\n- target_session_id: {}\n- behavior: {}\n- context_depth: {}\n- created_at_ms: {}\n\n{}",
+            data.get("phase").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("source_session_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("target_session_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("behavior").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("context_depth").and_then(|v| v.as_u64()).unwrap_or(0),
+            data.get("created_at_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            report
+        );
+        let path = self.session_dir.join("report.md");
+        if let Err(err) = tokio::fs::write(&path, content).await {
+            warn!(
+                "opendan.session[{}]: write {} failed: {err}",
+                self.session_id,
+                path.display()
+            );
+        }
     }
 
     /// Map a `BehaviorCfg` to the round-history mode tag (parser-presence is
@@ -1733,10 +2900,16 @@ impl AgentSession {
     async fn run_one_round(
         &self,
         turn_messages: Vec<AiMessage>,
+        history_inputs: Vec<HistoryInputRecord>,
         seed: Option<RoundSeed>,
+        _inject_background_environment: bool,
     ) -> Result<NextAction> {
         let behavior = self.load_current_behavior().await?;
         let mode = self.history_mode_for(&behavior);
+        let in_flight_input_keys = seed
+            .as_ref()
+            .map(|seed| seed.input_keys.clone())
+            .unwrap_or_default();
 
         // Open a round (or attach to one already open). For the PendingTool
         // resume path the worker passes `seed = None`; the caller is
@@ -1762,7 +2935,14 @@ impl AgentSession {
         let trace_id = self.next_trace_id();
         self.status.set_turn_nonce(Some(trace_id.clone()));
         let (ctx_owner, _request, deps) = self
-            .build_or_resume(&behavior, &turn_messages, &trace_id)
+            .build_or_resume(
+                &behavior,
+                &turn_messages,
+                history_inputs,
+                &trace_id,
+                &in_flight_input_keys,
+                false,
+            )
             .await?;
         let mut ctx = match ctx_owner {
             BuiltContext::Fresh(c) => c,
@@ -1784,6 +2964,14 @@ impl AgentSession {
         let llm_call = self
             .trace_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Commit-pop boundary: once build_or_resume has rendered the turn and
+        // produced a context that is about to enter `ctx.run()`, the input is
+        // no longer replayable. Keeping it queued after this point risks
+        // duplicating tool side effects after a crash or provider panic.
+        if !in_flight_input_keys.is_empty() {
+            self.discard_consumed(&in_flight_input_keys).await;
+        }
 
         // ContextLimitReached re-entry loop: compress the accumulated
         // history (opendan-side, message-level) and resume the same
@@ -1873,7 +3061,15 @@ impl AgentSession {
                     }
                     compress_rounds += 1;
                     let before_len = accumulated.len();
-                    let rewritten = compress_messages_for_context_limit(accumulated);
+                    let rewritten = self
+                        .compress_accumulated_for_context_limit(
+                            &accumulated,
+                            &snapshot,
+                            &deps,
+                            &behavior,
+                        )
+                        .await
+                        .unwrap_or_else(|| compress_messages_for_context_limit(accumulated));
                     let after_len = rewritten.len();
                     info!(
                         "opendan.session[{}]: ContextLimitReached ({:?}); compressed history {before_len} → {after_len} messages (round {compress_rounds}/{MAX_COMPRESS_ROUNDS})",
@@ -1895,9 +3091,9 @@ impl AgentSession {
                             kept_head: leading_system,
                             kept_tail,
                             summary_preview: format!(
-                            "context limit ({:?}): compressed {before_len} → {after_len} messages",
-                            which
-                        ),
+                                "context limit ({:?}): compressed {before_len} → {after_len} messages",
+                                which
+                            ),
                         })
                         .await;
                     // Persist the post-compression snapshot before re-running
@@ -1914,19 +3110,29 @@ impl AgentSession {
                     continue;
                 }
                 other => {
-                    let final_snapshot = ctx.snapshot();
+                    let raw_final_snapshot = ctx.snapshot();
                     self.history
                         .record_run_diff(
                             mode,
                             baseline_accumulated_len,
                             baseline_steps_len,
                             baseline_last_step_text,
-                            &final_snapshot,
+                            &raw_final_snapshot,
                             &other,
                             llm_call,
                         )
                         .await;
                     self.history.append_outcome(&other).await;
+                    let final_snapshot = if matches!(other, LLMContextOutcome::Done { .. }) {
+                        self.maybe_auto_compress_after_completed_pair(
+                            raw_final_snapshot,
+                            &deps,
+                            &behavior,
+                        )
+                        .await
+                    } else {
+                        raw_final_snapshot
+                    };
                     if let Some(status) = SessionHistoryRecorder::round_status_for(&other) {
                         self.history.finalize_round(status).await;
                     }
@@ -1943,18 +3149,331 @@ impl AgentSession {
         format!("{}-{}", self.session_id, n)
     }
 
-    /// Build the [`RequestOverrides`] that refreshes a resumed snapshot's
-    /// request side with the **current** behavior config. Mirrors
-    /// `apply_switch_normal` but with `reset_rounds = reset_errors = false`
-    /// — this is a soft refresh on every resume, not a behavior switch.
-    ///
-    /// Without this, edits to the behavior config (system prompt, model,
-    /// tool policy, budget, …) made between turns silently fail to land:
-    /// resume re-uses the snapshot's stored `request` and only a `switch` /
-    /// `discard` path would otherwise pick up the new config.
-    async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> Result<RequestOverrides> {
-        Ok(RequestOverrides {
-            system_messages: Some(self.render_system_messages(behavior).await?),
+    async fn maybe_auto_compress_after_completed_pair(
+        &self,
+        snapshot: LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        behavior: &BehaviorCfg,
+    ) -> LLMContextSnapshot {
+        let policy = match behavior_hooks::resolve_llm_message_compress(
+            behavior.on_llm_message_compress.as_ref(),
+        ) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => return snapshot,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: invalid on_llm_message_compress hook: {err}; skip auto compression",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        };
+
+        let Some(context_window_tokens) = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+        else {
+            warn!(
+                "opendan.session[{}]: skip llm_message_compress: context window tokens unavailable for model `{}`",
+                self.session_id, snapshot.request.model_policy.preferred
+            );
+            return snapshot;
+        };
+
+        let current_tokens = estimate_history_tokens(deps, &snapshot.state.accumulated);
+        let trigger_tokens = ratio_budget(context_window_tokens, policy.trigger_ratio);
+        let hard_limit_tokens = ratio_budget(context_window_tokens, policy.hard_limit_ratio);
+        let above_trigger = current_tokens >= trigger_tokens;
+        let above_hard_limit = current_tokens >= hard_limit_tokens;
+        if !above_trigger && !above_hard_limit {
+            return snapshot;
+        }
+
+        if policy.preserve_cache_stability && !above_hard_limit {
+            let turns_since = turns_since_last_llm_message_compress(&snapshot.state.accumulated);
+            if turns_since < policy.min_turns_between_compress {
+                info!(
+                    "opendan.session[{}]: skip llm_message_compress: {current_tokens}/{context_window_tokens} tokens but only {turns_since} turn(s) since last compression",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        }
+
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        self.compress_snapshot_accumulated(
+            snapshot,
+            deps,
+            target_token_budget,
+            "context_window_ratio",
+        )
+        .await
+    }
+
+    pub async fn compress_context_window_once(&self) -> Result<ManualCompressOutcome> {
+        let status = self.meta.lock().await.status;
+        if matches!(status, SessionStatus::Running | SessionStatus::WaitingTool) {
+            return Err(anyhow!(
+                "session status is {:?}; compress after the current run/tool wait finishes",
+                status
+            ));
+        }
+
+        let Some(mut snapshot) = self.try_load_snapshot() else {
+            return Ok(ManualCompressOutcome::NoSnapshot);
+        };
+        if !snapshot.state.pending_tool_calls.is_empty() {
+            return Err(anyhow!(
+                "snapshot has {} pending tool call(s); compress after tool results are resolved",
+                snapshot.state.pending_tool_calls.len()
+            ));
+        }
+
+        let behavior = self.load_current_behavior().await?;
+        let policy =
+            behavior_hooks::resolve_llm_message_compress(behavior.on_llm_message_compress.as_ref())
+                .map_err(|err| anyhow!("invalid on_llm_message_compress hook: {err}"))?
+                .unwrap_or_default();
+        let context_window_tokens = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+            .or(snapshot.request.budget.max_total_tokens)
+            .ok_or_else(|| {
+                anyhow!(
+                    "context window tokens unavailable for model `{}`",
+                    snapshot.request.model_policy.preferred
+                )
+            })?;
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            return Err(anyhow!("model preferred is empty"));
+        }
+
+        let trace_id = self.next_trace_id();
+        let from_user_did = self.current_from_user_did().await;
+        let deps = build_session_deps(
+            &self.runtime,
+            SessionDepsInput {
+                tools: self.tools.clone(),
+                ctx: SessionRuntimeContext {
+                    trace_id,
+                    agent_name: self.agent_name.clone(),
+                    behavior: behavior.meta.name.clone(),
+                    step_idx: snapshot.state.steps.len() as u32,
+                    wakeup_id: String::new(),
+                    session_id: self.session_id.clone(),
+                },
+                snapshot_path: self.state_snap_path.clone(),
+                approval_required: behavior.capabilities.approval_required.clone(),
+                one_line_status: Some(self.status.clone() as Arc<dyn OneLineStatusSink>),
+                i18n: self.agent_config.i18n.clone(),
+                parser_renderer: behavior.build_parser_and_renderer(self.session_class_loop_mode()),
+                from_user_did,
+            },
+        );
+
+        let before_messages = snapshot.state.accumulated.len();
+        let before_tokens = estimate_history_tokens(&deps, &snapshot.state.accumulated);
+        let extra_focus = llm_message_compress_extra_focus(&self.agent_name, &behavior);
+        let rewritten = llm_compress::compress(
+            &snapshot.state.accumulated,
+            &deps,
+            target_token_budget,
+            model_alias,
+            Some(extra_focus.as_str()),
+        )
+        .await
+        .map_err(|err| anyhow!("llm_message_compress failed: {err}"))?;
+        let after_messages = rewritten.len();
+        let after_tokens = estimate_history_tokens(&deps, &rewritten);
+
+        if after_messages == before_messages && after_tokens >= before_tokens {
+            return Ok(ManualCompressOutcome::NoChange {
+                messages: before_messages,
+                tokens: before_tokens,
+                target_tokens: target_token_budget,
+            });
+        }
+
+        info!(
+            "opendan.session[{}]: manual llm_message_compress messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens}, target={target_token_budget}",
+            self.session_id
+        );
+        self.history
+            .append_event(HistoryEvent::Compaction {
+                target: CompactionTarget::Accumulated,
+                dropped: before_messages.saturating_sub(after_messages) as u32,
+                kept_head: leading_system_messages(&rewritten) as u32,
+                kept_tail: after_messages.saturating_sub(leading_system_messages(&rewritten))
+                    as u32,
+                summary_preview: format!(
+                    "llm_message_compress(manual): messages {before_messages} -> {after_messages}, tokens {before_tokens} -> {after_tokens}"
+                ),
+            })
+            .await;
+        snapshot.state.accumulated = rewritten;
+        self.persist_snapshot(&snapshot).await;
+        Ok(ManualCompressOutcome::Applied {
+            before_messages,
+            after_messages,
+            before_tokens,
+            after_tokens,
+            target_tokens: target_token_budget,
+        })
+    }
+
+    async fn compress_accumulated_for_context_limit(
+        &self,
+        accumulated: &[AiMessage],
+        snapshot: &LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        behavior: &BehaviorCfg,
+    ) -> Option<Vec<AiMessage>> {
+        let policy = match behavior_hooks::resolve_llm_message_compress(
+            behavior.on_llm_message_compress.as_ref(),
+        ) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => LlmMessageCompressPolicy::default(),
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: invalid on_llm_message_compress hook during context-limit compression: {err}; use legacy compressor",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        let context_window_tokens = self
+            .resolve_context_window_tokens(&snapshot.request.model_policy.preferred, &policy)
+            .await
+            .or(snapshot.request.budget.max_total_tokens)?;
+        let target_token_budget = ratio_budget(context_window_tokens, policy.target_ratio);
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            warn!(
+                "opendan.session[{}]: cannot run llm_message_compress: model preferred is empty",
+                self.session_id
+            );
+            return None;
+        }
+        let extra_focus = llm_message_compress_extra_focus(&self.agent_name, behavior);
+        match llm_compress::compress(
+            accumulated,
+            deps,
+            target_token_budget,
+            model_alias,
+            Some(extra_focus.as_str()),
+        )
+        .await
+        {
+            Ok(rewritten) => Some(rewritten),
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: llm_message_compress failed during context-limit compression: {err}; use legacy compressor",
+                    self.session_id
+                );
+                None
+            }
+        }
+    }
+
+    async fn compress_snapshot_accumulated(
+        &self,
+        mut snapshot: LLMContextSnapshot,
+        deps: &llm_context::deps::LLMContextDeps,
+        target_token_budget: u32,
+        reason: &'static str,
+    ) -> LLMContextSnapshot {
+        let model_alias = snapshot.request.model_policy.preferred.trim();
+        if model_alias.is_empty() {
+            warn!(
+                "opendan.session[{}]: skip llm_message_compress: model preferred is empty",
+                self.session_id
+            );
+            return snapshot;
+        }
+        let before_len = snapshot.state.accumulated.len();
+        let before_tokens = estimate_history_tokens(deps, &snapshot.state.accumulated);
+        let behavior = self.load_current_behavior().await.ok();
+        let extra_focus = behavior
+            .as_ref()
+            .map(|behavior| llm_message_compress_extra_focus(&self.agent_name, behavior));
+        let rewritten = match llm_compress::compress(
+            &snapshot.state.accumulated,
+            deps,
+            target_token_budget,
+            model_alias,
+            extra_focus.as_deref(),
+        )
+        .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: llm_message_compress failed: {err}",
+                    self.session_id
+                );
+                return snapshot;
+            }
+        };
+        let after_len = rewritten.len();
+        let after_tokens = estimate_history_tokens(deps, &rewritten);
+        if after_len == before_len && after_tokens >= before_tokens {
+            info!(
+                "opendan.session[{}]: llm_message_compress made no change ({before_tokens} tokens, target {target_token_budget})",
+                self.session_id
+            );
+            return snapshot;
+        }
+
+        info!(
+            "opendan.session[{}]: llm_message_compress reason={reason} messages {before_len} -> {after_len}, tokens {before_tokens} -> {after_tokens}, target={target_token_budget}",
+            self.session_id
+        );
+        self.history
+            .append_event(HistoryEvent::Compaction {
+                target: CompactionTarget::Accumulated,
+                dropped: before_len.saturating_sub(after_len) as u32,
+                kept_head: leading_system_messages(&rewritten) as u32,
+                kept_tail: after_len.saturating_sub(leading_system_messages(&rewritten)) as u32,
+                summary_preview: format!(
+                    "llm_message_compress({reason}): messages {before_len} -> {after_len}, tokens {before_tokens} -> {after_tokens}"
+                ),
+            })
+            .await;
+        snapshot.state.accumulated = rewritten;
+        snapshot
+    }
+
+    async fn resolve_context_window_tokens(
+        &self,
+        model_alias: &str,
+        policy: &LlmMessageCompressPolicy,
+    ) -> Option<u32> {
+        if let Some(tokens) = policy.context_window_tokens {
+            return Some(tokens);
+        }
+        let directory = match self.runtime.aicc.list_models().await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: models.list failed while resolving context window: {err}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        context_window_tokens_from_model_directory(&directory, model_alias)
+    }
+
+    /// Build the [`RequestOverrides`] that refreshes non-message request
+    /// policy for a resumed snapshot. The message stream is inherited
+    /// strictly from the snapshot: `on_init` / system prompt rendering only
+    /// happens when a session context is created fresh.
+    fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> RequestOverrides {
+        RequestOverrides {
+            system_messages: None,
+            user_messages: None,
             tool_policy: Some(behavior.to_tool_policy()),
             objective: Some(behavior.meta.objective.clone()),
             behavior_name: Some(behavior.meta.name.clone()),
@@ -1968,14 +3487,17 @@ impl AgentSession {
             reset_errors: false,
             reset_behavior_hot_tail: false,
             forbid_next_behavior: false,
-        })
+        }
     }
 
     async fn build_or_resume(
         &self,
         behavior: &BehaviorCfg,
         turn_messages: &[AiMessage],
+        history_inputs: Vec<HistoryInputRecord>,
         trace_id: &str,
+        in_flight_input_keys: &[String],
+        _inject_background_environment: bool,
     ) -> Result<(
         BuiltContext,
         LLMContextRequest,
@@ -1994,7 +3516,7 @@ impl AgentSession {
         let approval_required = behavior.capabilities.approval_required.clone();
         let from_user_did = self.current_from_user_did().await;
 
-        let deps = build_session_deps(
+        let mut deps = build_session_deps(
             &self.runtime,
             SessionDepsInput {
                 tools: self.tools.clone(),
@@ -2007,43 +3529,41 @@ impl AgentSession {
                 from_user_did,
             },
         );
+        deps = self.attach_step_result_hook(behavior, deps, in_flight_input_keys);
 
-        // Compose the per-turn "environment-aware message" once so both the
-        // resume and fresh-build branches see it. The message is the
-        // opendan-side surface for §5 "环境感知 message" — bundles current
-        // workspace / behavior / activity hints so the LLM doesn't have to
-        // re-discover them every turn.
-        //
-        // Emit env **only when there is real human/event input driving this
-        // turn**. Mid-run resumes (no human text, snapshot present) must
-        // not inject a synthetic User message or they'd promote an idle
-        // wakeup into a fake conversational turn. Bootstrap turns (work
-        // session first run, no input, no snapshot) get the objective via
-        // System and don't need env either.
-        let turn_message = compose_turn_message(
-            turn_messages,
-            if self.session_class_inject_background_environment() {
-                self.compose_environment_message(behavior).await
-            } else {
-                None
-            },
-        );
+        let turn_message = compose_turn_message(turn_messages);
+        if let Some(message) = turn_message.as_ref() {
+            info!(
+                "opendan.session[{}]: composed user message trace={} behavior=`{}` source_messages={} blocks={} text_chars={} preview=`{}`",
+                self.session_id,
+                trace_id,
+                behavior.meta.name,
+                turn_messages.len(),
+                message.content.len(),
+                message_text_chars(message),
+                ai_message_log_preview(message)
+            );
+        } else if !turn_messages.is_empty() {
+            warn!(
+                "opendan.session[{}]: skipped empty user message trace={} behavior=`{}` source_messages={}",
+                self.session_id,
+                trace_id,
+                behavior.meta.name,
+                turn_messages.len()
+            );
+        }
 
         if let Some(snapshot) = self.try_load_snapshot() {
             if snapshot.state.pending_tool_calls.is_empty() {
-                // Refresh the snapshot's request side with the current
-                // behavior config before resuming. The cost (one
-                // leading-system swap + a handful of policy field copies)
-                // is negligible next to history tokens + inference, and it
-                // guarantees mid-session config edits actually land — without
-                // this, only a `switch` or a `discard` round would pick up
-                // the new system prompt / model / tool policy.
+                // Resume from the snapshot's persisted message stream.
+                // Refresh only non-message request policy here; `on_init`
+                // system prompt rendering belongs to fresh context creation.
                 let snapshot = apply_overrides_to_snapshot(
                     snapshot,
-                    self.current_behavior_overrides(behavior).await?,
+                    self.current_behavior_overrides(behavior),
                 );
 
-                if let Some(message) = turn_message.clone() {
+                if turn_message.is_some() || !history_inputs.is_empty() {
                     // Idle session + new user message: rebuild the snapshot
                     // with the new user turn appended while resetting
                     // per-run counters. In behavior mode the StepRecord
@@ -2052,7 +3572,8 @@ impl AgentSession {
                     // assistant intent and action results.
                     let snapshot = append_turn_message_to_snapshot(
                         snapshot,
-                        message,
+                        turn_message.clone(),
+                        history_inputs,
                         trace_id,
                         preserve_behavior_state,
                     );
@@ -2116,8 +3637,51 @@ impl AgentSession {
             error_policy: behavior.to_error_policy(),
             forbid_next_behavior: false,
         };
-        let fresh = LLMContext::new(request.clone(), deps.clone());
+        let fresh = if history_inputs.is_empty() {
+            LLMContext::new(request.clone(), deps.clone())
+        } else {
+            let mut state = LLMContextState::from_request(&request, now_ms());
+            state.history_inputs = history_inputs;
+            LLMContext::resume(
+                LLMContextSnapshot {
+                    request: request.clone(),
+                    state,
+                },
+                ResumeFill::ResumeFromMidRun,
+                deps.clone(),
+            )
+            .map_err(|e| anyhow!("resume fresh with history input: {e}"))?
+        };
         Ok((BuiltContext::Fresh(fresh), request, deps))
+    }
+
+    fn attach_step_result_hook(
+        &self,
+        behavior: &BehaviorCfg,
+        deps: llm_context::deps::LLMContextDeps,
+        in_flight_input_keys: &[String],
+    ) -> llm_context::deps::LLMContextDeps {
+        let Some(template) = behavior
+            .prompt
+            .on_behavior_step_ob
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return deps;
+        };
+        let hook = OpenDanStepResultHook {
+            template: template.to_string(),
+            behavior: behavior.clone(),
+            agent_config: self.agent_config.clone(),
+            agent_name: self.agent_name.clone(),
+            driver: self.session_class_driver(),
+            meta: self.meta.clone(),
+            session_id: self.session_id.clone(),
+            session_dir: self.session_dir.clone(),
+            excluded_pending_keys: in_flight_input_keys.iter().cloned().collect(),
+        };
+        deps.with_step_result_hook(Arc::new(hook))
     }
 
     fn try_load_snapshot(&self) -> Option<LLMContextSnapshot> {
@@ -2185,91 +3749,216 @@ impl AgentSession {
         })
     }
 
-    /// Compose the "environment-aware message" — a short, structured
-    /// summary of the session's current environment that we prefix onto
-    /// each turn's user input. Per §5 of `notepads/NewOpenDANRuntime.md`
-    /// the message should eventually include auto-recalled memory and an
-    /// event/message diff; the MVP version assembles the bits we can read
-    /// synchronously without grabbing the async meta lock:
-    ///
-    /// - Current behavior name (so the LLM knows which prompt context it's
-    ///   operating under after a `Normal`-mode switch).
-    /// - Workspace binding id (when present).
-    /// - One-line activity status (filled by tools through the
-    ///   `OneLineStatusSink`).
-    /// - Wall-clock timestamp so the LLM can reason about "now".
-    ///
-    /// Returns `None` when nothing useful can be rendered — caller then
-    /// falls back to just the raw human-text input (or `ResumeFromMidRun`).
-    /// `meta.try_lock` failures degrade silently (returns `None`); the
-    /// fact that a turn is currently driving an inference is rare to
-    /// happen concurrently with build_or_resume anyway.
     /// Build the Phase-1 [`AgentSessionEnv`] snapshot used by both the
-    /// behavior-template render path and the environment-block template. See
+    /// behavior-template render path and prompt environment variables. See
     /// `doc/opendan/Agent Enviroment.md` §15.1 for the variable contract.
     /// `input_text` is left empty in Phase 1 — `$input.*` is not consumed by
     /// the two currently-templated sections, and the user-input section is
     /// still composed by the legacy `compose_turn_message` path.
     async fn build_prompt_env(&self, behavior: &BehaviorCfg) -> AgentSessionEnv {
-        let (kind, title, objective, owner, workspace_id, one_line) = {
-            let meta = self.meta.lock().await;
-            (
-                meta.kind,
-                meta.title.clone(),
-                meta.objective.clone(),
-                meta.owner.clone(),
-                meta.workspace_id.clone(),
-                meta.one_line_status.clone(),
-            )
-        };
-        let session_objective = if objective.trim().is_empty() {
-            behavior.meta.objective.clone()
-        } else {
-            objective
-        };
-        let workspace_id = workspace_id.filter(|s| !s.is_empty());
-        let workspace_root = workspace_id
-            .as_deref()
-            .map(|ws| self.agent_config.layout.workspaces_dir.join(ws));
-        AgentSessionEnv {
-            session_id: self.session_id.clone(),
-            session_kind: AgentSessionEnv::kind_str(kind),
-            session_title: title.trim().to_string(),
-            session_objective,
-            session_owner: owner,
-            session_current_todo: load_current_todo(&self.session_dir),
-            session_current_todo_list: render_current_todo_list(&self.session_dir),
-            behavior_name: behavior.meta.name.clone(),
-            behavior_objective: behavior.meta.objective.clone(),
-            behavior_mode: "behavior",
-            behavior_template_dir: behavior
-                .source_path
-                .as_ref()
-                .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
-            workspace_id,
-            workspace_root,
-            agent_root: self.agent_config.layout.root.clone(),
-            session_root: self.session_dir.clone(),
-            input_text: String::new(),
-            input_has_user_text: false,
-            input_has_events: false,
-            recent_activity: one_line.trim().to_string(),
-            clock_unix_ms: now_ms(),
-        }
+        build_agent_session_env(
+            &self.session_id,
+            &self.agent_config,
+            &self.agent_name,
+            &self.meta,
+            &self.session_dir,
+            behavior,
+        )
+        .await
     }
 
-    async fn compose_environment_message(&self, behavior: &BehaviorCfg) -> Option<String> {
-        let env = self.build_prompt_env(behavior).await;
-        match prompt_env::render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[]).await {
-            Ok(text) => Some(text),
-            Err(err) => {
-                warn!(
-                    "opendan.session[{}]: render environment block failed: {err}; falling back to empty",
-                    self.session_id
-                );
-                None
+    async fn load_changed_background_hits(&self) -> Vec<BackgroundHint> {
+        let now = now_ms();
+        let (old_fingerprints, bg_events, owner) = {
+            let meta = self.meta.lock().await;
+            if background_hint_interval_active(
+                meta.background_hint_state
+                    .last_non_empty_background_hints_at_ms,
+                now,
+            ) {
+                return Vec::new();
+            }
+            (
+                meta.background_hint_state.hint_fingerprints.clone(),
+                meta.background_events.clone(),
+                meta.owner.clone(),
+            )
+        };
+
+        let topic_tags = load_session_topic_tags(&self.session_dir);
+        let mut candidates = Vec::new();
+        candidates.extend(build_background_event_hints(&bg_events));
+        candidates.extend(self.build_notepad_hints(&topic_tags, &owner).await);
+        candidates.extend(self.build_memory_hints(&topic_tags).await);
+
+        let mut next_fingerprints = BTreeMap::new();
+        let mut changed = Vec::new();
+        for hint in candidates {
+            let previous = old_fingerprints.get(&hint.path);
+            next_fingerprints.insert(hint.path.clone(), hint.fingerprint.clone());
+            if previous != Some(&hint.fingerprint) {
+                changed.push(hint);
             }
         }
+
+        {
+            let mut meta = self.meta.lock().await;
+            meta.background_hint_state.hint_fingerprints = next_fingerprints;
+            if !changed.is_empty() {
+                meta.background_hint_state
+                    .last_non_empty_background_hints_at_ms = now;
+            }
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush background hint state failed: {err:#}",
+                self.session_id
+            );
+        }
+
+        changed
+    }
+
+    async fn build_notepad_hints(&self, topic_tags: &[String], owner: &str) -> Vec<BackgroundHint> {
+        let owner = owner.trim();
+        if owner.is_empty() || !self.agent_config.layout.notepads_dir.exists() {
+            return Vec::new();
+        }
+
+        let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
+            self.agent_config.layout.notepads_dir.clone(),
+        )) {
+            Ok(notebook) => notebook,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: open notepads for background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+        let candidate_notebook_ids = load_subscribed_notepad_ids(&self.session_dir);
+        let scope = OwnerScope::new(owner.to_string()).with_agent(self.agent_name.clone());
+        let hints = match notebook.build_notebook_hints(BuildHintsInput {
+            scope,
+            session_id: self.session_id.clone(),
+            topic_tags: if topic_tags.is_empty() {
+                None
+            } else {
+                Some(topic_tags.to_vec())
+            },
+            candidate_notebook_ids,
+            max_hints: Some(3),
+        }) {
+            Ok(hints) => hints,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: build notepad background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+
+        hints
+            .hints
+            .into_iter()
+            .map(|hint| {
+                let data = serde_json::to_value(&hint).unwrap_or(serde_json::Value::Null);
+                let fingerprint = stable_json_fingerprint(&data);
+                BackgroundHint {
+                    path: format!("notepad/{}", hint.notebook_id),
+                    kind: "notepad".to_string(),
+                    text: hint.text,
+                    fingerprint,
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    async fn build_memory_hints(&self, topic_tags: &[String]) -> Vec<BackgroundHint> {
+        if topic_tags.is_empty() || !self.agent_config.layout.memory_dir.exists() {
+            return Vec::new();
+        }
+        let memory = match AgentMemory::open(AgentMemoryConfig::new(
+            self.agent_config.layout.memory_dir.clone(),
+        )) {
+            Ok(memory) => memory,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: open memory for background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+        let items = match memory.load(
+            topic_tags,
+            LoadOptions {
+                max_records: 5,
+                max_bytes: 8 * 1024,
+                body_truncate_bytes: 1024,
+                ..LoadOptions::default()
+            },
+        ) {
+            Ok(items) => items,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: load memory background hints failed: {err}",
+                    self.session_id
+                );
+                return Vec::new();
+            }
+        };
+
+        items
+            .into_iter()
+            .map(|item| {
+                let key = item.key;
+                let matched_items = item.matched;
+                let ts = item.ts;
+                let size = item.size;
+                let truncated = item.truncated;
+                let content = item.content;
+                let data = serde_json::json!({
+                    "key": key.clone(),
+                    "matched": matched_items,
+                    "ts": ts,
+                    "size": size,
+                    "truncated": truncated,
+                });
+                let fingerprint =
+                    stable_report_hash(&format!("{}:{}", stable_json_fingerprint(&data), content));
+                let matched = data
+                    .get("matched")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let key = data
+                    .get("key")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                BackgroundHint {
+                    path: format!("memory/{key}"),
+                    kind: "memory".to_string(),
+                    text: if matched.is_empty() {
+                        format!("Memory may be relevant: {key}")
+                    } else {
+                        format!("Memory may be relevant: {key} (matched: {matched})")
+                    },
+                    fingerprint,
+                    data,
+                }
+            })
+            .collect()
     }
 
     async fn render_system_messages(&self, behavior: &BehaviorCfg) -> Result<Vec<AiMessage>> {
@@ -2376,24 +4065,61 @@ impl AgentSession {
                 output,
                 response,
                 behavior_result,
+                trace,
                 ..
             } => {
                 self.post_outbound_message(&response.message).await;
+                if matches!(self.kind, SessionKind::SelfCheck) {
+                    self.dispatch_behavior_send_messages(&final_snapshot).await;
+                }
+                if matches!(self.kind, SessionKind::SelfImprove) {
+                    self.dispatch_self_improvement_tasks(&final_snapshot).await;
+                }
                 if let Some(text) = output_to_text(&output) {
                     let _ = self
                         .reply_tx
                         .send(SessionReply::AssistantText { text })
                         .await;
                 }
-                if let Some(next) = behavior_result.and_then(|r| r.next_behavior) {
+                let next_behavior = behavior_result
+                    .as_ref()
+                    .and_then(|r| r.next_behavior.as_deref())
+                    .map(str::to_string);
+                if let Some(next) = next_behavior.as_deref() {
                     let trimmed = next.trim();
                     if trimmed.eq_ignore_ascii_case("END") {
                         // Independent-mode call-stack-aware End: pop a
                         // parent frame if one is waiting; only an empty
                         // stack means the session itself is done.
-                        return self.handle_process_end(final_snapshot).await;
+                        let phase = if self.meta.lock().await.process_stack.is_empty() {
+                            WorksessionReportPhase::Final
+                        } else {
+                            WorksessionReportPhase::Checkpoint
+                        };
+                        if let Err(err) = self
+                            .maybe_publish_worksession_report(
+                                &final_snapshot,
+                                phase,
+                                Some(trimmed),
+                                &trace.trace_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "opendan.session[{}]: publish worksession report failed: {err:#}",
+                                self.session_id
+                            );
+                        }
+                        let action = self.handle_process_end(final_snapshot.clone()).await?;
+                        if matches!(action, NextAction::End) {
+                            self.feedback_task_completed(&final_snapshot, Some(trimmed))
+                                .await;
+                        }
+                        return Ok(action);
                     }
-                    if trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_USER_MSG) {
+                    if trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_USER_MSG)
+                        || trimmed.eq_ignore_ascii_case(NEXT_BEHAVIOR_WAIT_FOR_MSG)
+                    {
                         // Behavior state machine yields: current intent has
                         // run its course, no autonomous next step — park
                         // the session until the next user message arrives.
@@ -2406,24 +4132,69 @@ impl AgentSession {
                         // `SessionStatus::WaitingInput`, which is what
                         // forward_msg's inbox routing uses to find this
                         // session.
+                        if let Err(err) = self
+                            .maybe_publish_worksession_report(
+                                &final_snapshot,
+                                WorksessionReportPhase::Checkpoint,
+                                Some(trimmed),
+                                &trace.trace_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "opendan.session[{}]: publish worksession report failed: {err:#}",
+                                self.session_id
+                            );
+                        }
                         self.persist_snapshot(&final_snapshot).await;
+                        self.feedback_task_waiting_for_input(&final_snapshot, Some(trimmed))
+                            .await;
                         return Ok(NextAction::WaitForMsg);
                     }
                     // Switch — preserve history by handing the post-run
                     // snapshot to switch_behavior (which applies the new
                     // behavior's overrides and persists). Do **not** discard
                     // here; next turn resumes from the rebuilt snapshot.
-                    self.switch_behavior(trimmed, behavior, final_snapshot)
-                        .await?;
-                    return Ok(NextAction::Idle);
+                    if let Err(err) = self
+                        .maybe_publish_worksession_report(
+                            &final_snapshot,
+                            WorksessionReportPhase::Checkpoint,
+                            Some(trimmed),
+                            &trace.trace_id,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "opendan.session[{}]: publish worksession report failed: {err:#}",
+                            self.session_id
+                        );
+                    }
+                    return self
+                        .switch_behavior(trimmed, behavior, final_snapshot)
+                        .await;
                 }
                 // Natural Done (no next_behavior). Persist the completed
                 // snapshot so the next round starts from the previous round's
                 // accumulated state instead of rebuilding from round-history.
+                let phase = if self.meta.lock().await.process_stack.is_empty() {
+                    WorksessionReportPhase::Final
+                } else {
+                    WorksessionReportPhase::Checkpoint
+                };
+                if let Err(err) = self
+                    .maybe_publish_worksession_report(&final_snapshot, phase, None, &trace.trace_id)
+                    .await
+                {
+                    warn!(
+                        "opendan.session[{}]: publish worksession report failed: {err:#}",
+                        self.session_id
+                    );
+                }
                 self.persist_snapshot(&final_snapshot).await;
                 if matches!(self.kind, SessionKind::Ui) {
                     Ok(NextAction::WaitForMsg)
                 } else {
+                    self.feedback_task_completed(&final_snapshot, None).await;
                     Ok(NextAction::End)
                 }
             }
@@ -2539,7 +4310,13 @@ impl AgentSession {
                         message: format!("budget exhausted: {:?}", which),
                     })
                     .await;
+                self.feedback_task_failed(format!("budget exhausted: {:?}", which))
+                    .await;
                 self.discard_snapshot();
+                if matches!(self.kind, SessionKind::SelfImprove) {
+                    self.mark_improvement_budget_exhausted().await;
+                    return Ok(NextAction::End);
+                }
                 Ok(NextAction::WaitForMsg)
             }
             LLMContextOutcome::Error { error, .. } => {
@@ -2571,6 +4348,7 @@ impl AgentSession {
                                 message: error.to_string(),
                             })
                             .await;
+                        self.feedback_task_failed(error.to_string()).await;
                         self.discard_snapshot();
                         Ok(NextAction::WaitForMsg)
                     }
@@ -2592,6 +4370,8 @@ impl AgentSession {
                         message: format!("context limit reached: {:?}", which),
                     })
                     .await;
+                self.feedback_task_failed(format!("context limit reached: {:?}", which))
+                    .await;
                 Ok(NextAction::WaitForMsg)
             }
             LLMContextOutcome::Interrupted {
@@ -2609,8 +4389,347 @@ impl AgentSession {
                         message: format!("inference interrupted: {reason}"),
                     })
                     .await;
+                self.feedback_task_canceled(format!("inference interrupted: {reason}"))
+                    .await;
                 Ok(NextAction::WaitForMsg)
             }
+        }
+    }
+
+    async fn task_binding(&self) -> Option<crate::session_model::AgentTaskBinding> {
+        self.meta.lock().await.task_binding.clone()
+    }
+
+    async fn feedback_task_completed(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        next_behavior: Option<&str>,
+    ) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.complete_on_end {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let report = final_snapshot.state.last_report.clone().unwrap_or_default();
+        let patch = json!({
+            "agent_delegate": {
+                "execution": {
+                    "session_id": self.session_id,
+                    "workspace_id": self.workspace_id().await,
+                    "status": "completed",
+                },
+                "result": {
+                    "status": "completed",
+                    "report": report,
+                    "next_behavior": next_behavior,
+                }
+            }
+        });
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Completed),
+                Some(100.0),
+                Some("Agent session completed".to_string()),
+                Some(patch),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task completed failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_waiting_for_input(
+        &self,
+        final_snapshot: &LLMContextSnapshot,
+        next_behavior: Option<&str>,
+    ) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.create_human_input_on_wait {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(agent) = self.parent_agent.upgrade() else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let Ok(task) = client.get_task(binding.task_id).await else {
+            return;
+        };
+        if task.status.is_terminal() {
+            return;
+        }
+        let report = final_snapshot
+            .state
+            .last_report
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("The agent needs user input before it can continue.");
+        let question = if next_behavior.is_some() {
+            report.to_string()
+        } else {
+            "The agent is waiting for user input.".to_string()
+        };
+        if let Err(err) = agent
+            .create_human_input_task(&task, &question, "agent_wait_user_msg", Vec::new())
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: create human input task failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_failed(&self, message: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.fail_on_error {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Failed),
+                None,
+                Some(message.clone()),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "status": "failed",
+                        },
+                        "error": {
+                            "message": message,
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task failed failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn feedback_task_canceled(&self, reason: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !cfg.cancel_on_interrupt {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                Some(TaskStatus::Canceled),
+                None,
+                Some(reason.clone()),
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "status": "canceled",
+                            "reason": reason,
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: feedback task canceled failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn mark_improvement_budget_exhausted(&self) {
+        {
+            let mut meta = self.meta.lock().await;
+            let budget = meta.improvement_budget.get_or_insert(ImprovementBudget {
+                unit: ImprovementBudgetUnit::Token,
+                remaining: 0,
+            });
+            budget.remaining = 0;
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush improvement budget failed: {err:#}",
+                self.session_id
+            );
+        }
+    }
+
+    async fn dispatch_self_improvement_tasks(&self, snapshot: &LLMContextSnapshot) {
+        let Some(report) = snapshot
+            .state
+            .last_report
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let seq = self
+            .trace_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let task = ImprovementTask {
+            task_id: format!("improve-{}-{seq}", now_ms()),
+            summary: first_non_empty_line(report)
+                .unwrap_or("self improvement task")
+                .to_string(),
+            source_report: report.to_string(),
+            created_at_ms: now_ms(),
+            status: ImprovementTaskStatus::Dispatched,
+        };
+        {
+            let mut meta = self.meta.lock().await;
+            meta.pending_improvement_tasks.push(task.clone());
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush improvement task failed: {err:#}",
+                self.session_id
+            );
+        }
+
+        let path = self.session_dir.join("improvement_tasks.jsonl");
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                let mut line = match serde_json::to_string(&task) {
+                    Ok(line) => line,
+                    Err(err) => {
+                        warn!(
+                            "opendan.session[{}]: encode improvement task failed: {err}",
+                            self.session_id
+                        );
+                        return;
+                    }
+                };
+                line.push('\n');
+                if let Err(err) = file.write_all(line.as_bytes()).await {
+                    warn!(
+                        "opendan.session[{}]: write {} failed: {err}",
+                        self.session_id,
+                        path.display()
+                    );
+                } else {
+                    info!(
+                        "opendan.session[{}]: dispatched self improvement task {}",
+                        self.session_id, task.task_id
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "opendan.session[{}]: open {} failed: {err}",
+                self.session_id,
+                path.display()
+            ),
+        }
+    }
+
+    async fn dispatch_behavior_send_messages(&self, snapshot: &LLMContextSnapshot) {
+        let messages = snapshot
+            .state
+            .steps
+            .iter()
+            .flat_map(|step| step.messages_sent.iter())
+            .chain(
+                snapshot
+                    .state
+                    .last_step
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|step| step.messages_sent.iter()),
+            )
+            .collect::<Vec<_>>();
+        for message in messages {
+            self.post_send_message_record(message).await;
+        }
+    }
+
+    async fn post_send_message_record(&self, record: &SendMessageRecord) {
+        let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
+            return;
+        };
+        let target = record.target.trim();
+        let body = record.body.trim();
+        if target.is_empty() || body.is_empty() {
+            return;
+        }
+        let Ok(peer_did) = name_lib::DID::from_str(target) else {
+            warn!(
+                "opendan.session[{}]: sendmsg target `{}` is not a DID",
+                self.session_id, target
+            );
+            return;
+        };
+        let agent_did_raw = self.agent_config.toml.identity.agent_did.trim();
+        if agent_did_raw.is_empty() {
+            return;
+        }
+        let Ok(agent_did) = name_lib::DID::from_str(agent_did_raw) else {
+            return;
+        };
+        let msg = ndn_lib::MsgObject {
+            from: agent_did.clone(),
+            to: vec![peer_did],
+            kind: ndn_lib::MsgObjKind::Chat,
+            created_at_ms: now_ms(),
+            content: ndn_lib::MsgContent {
+                format: Some(ndn_lib::MsgContentFormat::TextPlain),
+                content: body.to_string(),
+                ..ndn_lib::MsgContent::default()
+            },
+            ..ndn_lib::MsgObject::default()
+        };
+        let send_ctx = buckyos_api::SendContext {
+            contact_mgr_owner: Some(agent_did),
+            ..Default::default()
+        };
+        match msg_center.post_send(msg, Some(send_ctx), None).await {
+            Ok(result) if result.ok => {}
+            Ok(result) => warn!(
+                "opendan.session[{}]: sendmsg rejected — reason={:?}",
+                self.session_id, result.reason
+            ),
+            Err(err) => warn!(
+                "opendan.session[{}]: sendmsg post_send failed: {err}",
+                self.session_id
+            ),
         }
     }
 
@@ -2649,7 +4768,7 @@ impl AgentSession {
         next: &str,
         prev: &BehaviorCfg,
         final_snapshot: LLMContextSnapshot,
-    ) -> Result<()> {
+    ) -> Result<NextAction> {
         let new_cfg = self
             .agent_config
             .load_behavior(next)
@@ -2657,8 +4776,39 @@ impl AgentSession {
         // §4.2 of the config-rewrite doc: switch_mode is a session-class
         // property — the LLM picks `<next_behavior>`, the runtime decides
         // whether to go Normal / Fork / Independent.
+        let switch_mode = self.session_class_switch_mode();
+        // §10 #3: enforce `process_stack_limit`. Normal switches don't grow
+        // the stack, so they're exempt. Fork / Independent would push a
+        // ProcessFrame — refuse if it would exceed the configured ceiling.
+        // Policy (per spec §10 #3 — "refuse fork + warn to worklog,
+        // escape valve for ops"): drop the switch, persist the post-run
+        // snapshot, and end the current process gracefully so the
+        // session lifecycle stays observable.
+        if matches!(switch_mode, SwitchMode::Fork | SwitchMode::Independent) {
+            let limit = self.session_class_process_stack_limit();
+            if limit > 0 {
+                let current_depth = self.meta.lock().await.process_stack.len() as u32;
+                if current_depth >= limit {
+                    self.refuse_switch_for_stack_limit(
+                        prev,
+                        &new_cfg,
+                        switch_mode,
+                        current_depth,
+                        limit,
+                        &final_snapshot,
+                    )
+                    .await;
+                    self.persist_snapshot(&final_snapshot).await;
+                    return Ok(match self.kind {
+                        SessionKind::Ui => NextAction::WaitForMsg,
+                        _ => NextAction::End,
+                    });
+                }
+            }
+        }
+        let from_context = prompt_env::context_snapshot_prompt_value(&final_snapshot);
         let from_context_report = final_snapshot.state.last_report.clone().unwrap_or_default();
-        match self.session_class_switch_mode() {
+        match switch_mode {
             SwitchMode::Normal => {
                 self.apply_switch_normal(&new_cfg, final_snapshot).await?;
                 self.meta.lock().await.current_behavior = new_cfg.meta.name.clone();
@@ -2681,38 +4831,84 @@ impl AgentSession {
                 self.session_id
             );
         }
-        self.enqueue_on_switch_input(prev, &new_cfg, Some(from_context_report.as_str()))
-            .await;
-        Ok(())
+        let messages: Vec<AiMessage> = self
+            .render_on_behavior_switch_input_text(
+                &prev.meta.name,
+                &new_cfg,
+                Some(from_context_report.as_str()),
+                Some(from_context),
+            )
+            .await
+            .into_text()
+            .map(|text| AiMessage::text(AiRole::User, text))
+            .into_iter()
+            .collect();
+        if messages.is_empty() {
+            return Ok(NextAction::Continue);
+        }
+        self.set_internal_continuation(InternalContinuation {
+            reason: format!("behavior_switch:{}->{}", prev.meta.name, new_cfg.meta.name),
+            user_messages: messages,
+        })
+        .await?;
+        Ok(NextAction::Continue)
     }
 
-    async fn render_on_switch_input_text(
+    async fn render_on_behavior_switch_input_text(
         &self,
         prev_name: &str,
         next: &BehaviorCfg,
         from_context_report: Option<&str>,
-    ) -> Option<String> {
-        let template = next.prompt.on_switch.as_deref().map(str::trim)?;
+        from_context: Option<serde_json::Value>,
+    ) -> RenderedUserMessage {
+        let Some(template) = next.prompt.on_behavior_switch.as_deref().map(str::trim) else {
+            return RenderedUserMessage::NotConfigured;
+        };
         if template.is_empty() {
-            return None;
+            return RenderedUserMessage::NotConfigured;
         }
-        let env = self.build_prompt_env(next).await;
+        let mut env = self.build_prompt_env(next).await;
+        let pending = self.meta.lock().await.pending_inputs.clone();
+        let hook_env = self
+            .apply_hook(
+                SessionHookPoint::OnBehaviorSwitch,
+                &self.session_class_driver(),
+                &pending,
+            )
+            .await;
+        apply_hook_env_to_prompt_env(&mut env, hook_env);
+        info!(
+            "opendan.session[{}]: build user message hook=on_behavior_switch from=`{}` to=`{}` pending_total={} env_msgs={} env_events={} template_chars={}",
+            self.session_id,
+            prev_name,
+            next.meta.name,
+            pending.len(),
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+            template.chars().count()
+        );
         let report = from_context_report
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let from_context = report
-            .map(|value| {
-                serde_json::json!({
-                    "report": value,
+        let from_context = from_context.unwrap_or_else(|| {
+            report
+                .map(|value| {
+                    serde_json::json!({
+                        "last_report": value,
+                        "report": value,
+                    })
                 })
-            })
-            .unwrap_or(serde_json::Value::Null);
+                .unwrap_or(serde_json::Value::Null)
+        });
+        let to_context = prompt_env::context_snapshot_prompt_value_from_env(&env);
         let extras = [
             (
                 "switch",
                 serde_json::json!({
                     "from": prev_name,
                     "to": next.meta.name.clone(),
+                    "from_context": from_context.clone(),
+                    "to_context": to_context.clone(),
                 }),
             ),
             (
@@ -2720,49 +4916,83 @@ impl AgentSession {
                 serde_json::Value::String(prev_name.to_string()),
             ),
             ("from_context", from_context),
+            ("to_context", to_context),
         ];
         match prompt_env::render_template(template, &env, &extras).await {
-            Ok(text) => Some(text.trim().to_string()),
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    warn!(
+                        "opendan.session[{}]: rendered empty user message hook=on_behavior_switch from=`{}` to=`{}`; skipping next inference",
+                        self.session_id, prev_name, next.meta.name
+                    );
+                    return RenderedUserMessage::Empty;
+                }
+                info!(
+                    "opendan.session[{}]: rendered user message hook=on_behavior_switch from=`{}` to=`{}` chars={} preview=`{}`",
+                    self.session_id,
+                    prev_name,
+                    next.meta.name,
+                    text.chars().count(),
+                    text_log_preview(&text)
+                );
+                RenderedUserMessage::Text(text)
+            }
             Err(err) => {
                 warn!(
-                    "opendan.session[{}]: render on_switch for behavior `{}` failed: {err}",
+                    "opendan.session[{}]: render on_behavior_switch for behavior `{}` failed: {err}",
                     self.session_id, next.meta.name
                 );
-                None
+                RenderedUserMessage::NotConfigured
             }
         }
-        .filter(|text| !text.is_empty())
     }
 
-    async fn enqueue_on_switch_input(
+    async fn render_on_wakeup_input_text(
         &self,
-        prev: &BehaviorCfg,
-        next: &BehaviorCfg,
-        from_context_report: Option<&str>,
-    ) {
-        let Some(text) = self
-            .render_on_switch_input_text(&prev.meta.name, next, from_context_report)
+        llm_context: LlmContextEnv,
+    ) -> Result<RenderedUserMessage> {
+        let behavior = self.load_current_behavior().await?;
+        let Some(template) = behavior.prompt.on_wakeup.as_deref().map(str::trim) else {
+            return Ok(RenderedUserMessage::NotConfigured);
+        };
+        if template.is_empty() {
+            return Ok(RenderedUserMessage::NotConfigured);
+        }
+        let mut env = self.build_prompt_env(&behavior).await;
+        apply_hook_env_to_prompt_env(&mut env, llm_context);
+        info!(
+            "opendan.session[{}]: build user message hook=on_wakeup behavior=`{}` env_msgs={} env_events={} template_chars={}",
+            self.session_id,
+            behavior.meta.name,
+            env.llm_context.msgs.len(),
+            env.llm_context.events.len(),
+            template.chars().count()
+        );
+        let rendered = prompt_env::render_template(template, &env, &[])
             .await
-        else {
-            return;
-        };
-        let seq = self
-            .trace_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let input = PendingInput::Msg {
-            record_id: format!("on-switch-{}-{}-{}", self.session_id, next.meta.name, seq),
-            from: "opendan:on_switch".to_string(),
-            from_did: None,
-            from_name: Some("on_switch".to_string()),
-            tunnel_did: None,
-            text: text.clone(),
-            ai_message: AiMessage::text(AiRole::User, text),
-        };
-        if let Err(err) = self.enqueue_pending(input).await {
-            warn!(
-                "opendan.session[{}]: enqueue on_switch input for behavior `{}` failed: {err:#}",
-                self.session_id, next.meta.name
+            .map_err(|err| {
+                anyhow!(
+                    "render prompt.on_wakeup for behavior `{}` failed: {err}",
+                    behavior.meta.name
+                )
+            })?;
+        let rendered = rendered.trim().to_string();
+        if !rendered.is_empty() {
+            info!(
+                "opendan.session[{}]: rendered user message hook=on_wakeup behavior=`{}` chars={} preview=`{}`",
+                self.session_id,
+                behavior.meta.name,
+                rendered.chars().count(),
+                text_log_preview(&rendered)
             );
+            Ok(RenderedUserMessage::Text(rendered))
+        } else {
+            warn!(
+                "opendan.session[{}]: rendered empty user message hook=on_wakeup behavior=`{}`; skipping next inference",
+                self.session_id, behavior.meta.name
+            );
+            Ok(RenderedUserMessage::Empty)
         }
     }
 
@@ -2783,6 +5013,7 @@ impl AgentSession {
         let new_system = self.render_system_messages(new_cfg).await?;
         let overrides = RequestOverrides {
             system_messages: Some(new_system),
+            user_messages: None,
             tool_policy: Some(new_cfg.to_tool_policy()),
             objective: Some(new_cfg.meta.objective.clone()),
             behavior_name: Some(new_cfg.meta.name.clone()),
@@ -2828,6 +5059,7 @@ impl AgentSession {
         }
         state.history_summaries = final_snapshot.state.history_summaries;
         state.next_step_index = final_snapshot.state.next_step_index;
+        state.next_action_id = final_snapshot.state.next_action_id;
 
         self.persist_snapshot(&LLMContextSnapshot { request, state })
             .await;
@@ -2913,9 +5145,8 @@ impl AgentSession {
     /// Drive the independent-mode call-stack pop on `END`. If a parent
     /// frame is waiting, persist this process's terminal state (so a future
     /// re-entry resumes its stream), restore the parent's snapshot to
-    /// `state.snap`, inject a marker `[independent process `<X>` ended]`
-    /// message into the parent's `pending_inputs` so the parent's next turn
-    /// has something to wake on, and return `NextAction::Idle`.
+    /// `state.snap`, and persist an internal continuation for the parent's next
+    /// turn. This hand-off is session state, not external pending input.
     ///
     /// Returns `NextAction::End` only when the call stack is empty — i.e.
     /// the top-level process itself ended.
@@ -2971,51 +5202,51 @@ impl AgentSession {
             self.discard_snapshot();
         }
 
-        let marker_text = if parent_frame.fork {
+        let on_behavior_switch_text = if parent_frame.fork {
             match self.agent_config.load_behavior(&parent_frame.current) {
                 Ok(parent_cfg) => self
-                    .render_on_switch_input_text(
+                    .render_on_behavior_switch_input_text(
                         child_entry.as_str(),
                         &parent_cfg,
                         Some(child_report.as_str()),
+                        None,
                     )
                     .await
-                    .unwrap_or_else(|| fork_child_end_marker(&child_entry, &child_report)),
+                    .into_text(),
                 Err(err) => {
                     warn!(
                         "opendan.session[{}]: load parent behavior `{}` after fork pop failed: {err:#}",
                         self.session_id, parent_frame.current
                     );
-                    fork_child_end_marker(&child_entry, &child_report)
+                    None
                 }
             }
         } else {
-            format!("[independent process `{}` ended]", child_entry)
+            None
         };
 
-        // Inject a marker so the parent's next turn wakes up with a user-side
-        // hand-off. Going through enqueue_pending both persists it and fires
-        // the Wakeup signal.
-        let marker = PendingInput::Msg {
-            record_id: format!(
-                "process-end:{}:{}",
-                child_entry,
-                uuid::Uuid::new_v4().simple()
-            ),
-            from: "system".to_string(),
-            from_did: None,
-            from_name: Some("system".to_string()),
-            tunnel_did: None,
-            text: marker_text.clone(),
-            ai_message: AiMessage::text(AiRole::User, marker_text),
+        let (reason, user_messages) = if let Some(text) = on_behavior_switch_text {
+            (
+                format!("process_return:{}->{}", child_entry, parent_frame.current),
+                vec![AiMessage::text(AiRole::User, text)],
+            )
+        } else {
+            let marker_text = if parent_frame.fork {
+                fork_child_end_marker(&child_entry, &child_report)
+            } else {
+                format!("[independent process `{}` ended]", child_entry)
+            };
+            (
+                format!("process_return:{}->{}", child_entry, parent_frame.current),
+                vec![AiMessage::text(AiRole::User, marker_text)],
+            )
         };
-        if let Err(err) = self.enqueue_pending(marker).await {
-            warn!(
-                "opendan.session[{}]: enqueue end-marker after pop failed: {err:#}",
-                self.session_id
-            );
-        }
-        Ok(NextAction::Idle)
+        self.set_internal_continuation(InternalContinuation {
+            reason,
+            user_messages,
+        })
+        .await?;
+        Ok(NextAction::Continue)
     }
 
     /// **Fork primitive** (Phase 4 of llm_context_helper.rs design).
@@ -3051,6 +5282,29 @@ impl AgentSession {
         &self,
         overrides: RequestOverrides,
         sub_behavior_name: &str,
+    ) -> Result<ContextOutput> {
+        self.fork_and_run_with_loop_mode(
+            overrides,
+            sub_behavior_name,
+            self.session_class_loop_mode(),
+        )
+        .await
+    }
+
+    pub async fn fork_and_run_agent_loop(
+        &self,
+        overrides: RequestOverrides,
+        sub_behavior_name: &str,
+    ) -> Result<ContextOutput> {
+        self.fork_and_run_with_loop_mode(overrides, sub_behavior_name, LoopMode::Agent)
+            .await
+    }
+
+    async fn fork_and_run_with_loop_mode(
+        &self,
+        overrides: RequestOverrides,
+        sub_behavior_name: &str,
+        loop_mode: LoopMode,
     ) -> Result<ContextOutput> {
         let parent_snap = self.try_load_snapshot().ok_or_else(|| {
             anyhow!(
@@ -3103,7 +5357,7 @@ impl AgentSession {
             parent_snap,
             overrides,
             sub_cfg: &sub_cfg,
-            loop_mode: self.session_class_loop_mode(),
+            loop_mode,
             trace_id: &trace_id,
             depth,
             from_user_did,
@@ -3164,6 +5418,7 @@ impl AgentSession {
         {
             let mut g = self.meta.lock().await;
             g.status = status;
+            g.status_changed_at_ms = now_ms();
             g.one_line_status = one_line_status.clone();
         }
         let typing = matches!(status, SessionStatus::Running | SessionStatus::WaitingTool);
@@ -3171,12 +5426,66 @@ impl AgentSession {
             .update_ui_state(UI_SESSION_STATE_TYPING_KEY, serde_json::json!(typing));
         self.status.update_ui_state(
             UI_SESSION_STATE_STATUS_LINE_KEY,
-            self.status.status_line_value(one_line_status),
+            self.status.status_line_value(one_line_status.clone()),
         );
         if let Err(err) = self.flush_meta().await {
             warn!(
                 "opendan.session[{}]: flush after status set failed: {err:#}",
                 self.session_id
+            );
+        }
+        self.mirror_status_to_task(status, one_line_status).await;
+    }
+
+    async fn mirror_status_to_task(&self, status: SessionStatus, one_line_status: String) {
+        let cfg = self.session_class_driver().task_feedback;
+        if !cfg.enabled || !self.kind.is_work_family() {
+            return;
+        }
+        let Some(binding) = self.task_binding().await else {
+            return;
+        };
+        let Some(client) = self.runtime.task_mgr.as_ref().cloned() else {
+            return;
+        };
+        let Ok(task) = client.get_task(binding.task_id).await else {
+            return;
+        };
+        if task.status.is_terminal() || task.status == TaskStatus::Paused {
+            return;
+        }
+        let task_status = task_status_for_session_status(status);
+        let progress = if matches!(task_status, Some(TaskStatus::Completed)) {
+            Some(100.0)
+        } else {
+            None
+        };
+        let message = task_message_for_session_status(status, &one_line_status);
+        let status_text = session_status_text(status);
+        if let Err(err) = client
+            .update_task(
+                binding.task_id,
+                task_status,
+                progress,
+                message,
+                Some(json!({
+                    "agent_delegate": {
+                        "execution": {
+                            "session_id": self.session_id,
+                            "workspace_id": self.workspace_id().await,
+                            "session_status": status_text,
+                            "status": status_text,
+                            "one_line_status": one_line_status,
+                            "updated_at_ms": now_ms(),
+                        }
+                    }
+                })),
+            )
+            .await
+        {
+            warn!(
+                "opendan.session[{}]: mirror status {:?} to task {} failed: {err:#}",
+                self.session_id, status, binding.task_id
             );
         }
     }
@@ -3274,6 +5583,7 @@ impl AgentSession {
                 meta.event_subscriptions.push(EventSubscription {
                     pattern: trimmed.to_string(),
                     subscribed_at_ms: now,
+                    mode: EventSubscriptionMode::Full,
                     message_template: template,
                 });
                 changed = true;
@@ -3491,6 +5801,7 @@ impl AgentSession {
         let send_ctx = buckyos_api::SendContext {
             contact_mgr_owner: Some(agent_did),
             preferred_tunnel: tunnel,
+            extra: tg_route_extra_for_session(&self.session_id),
             ..Default::default()
         };
 
@@ -3506,10 +5817,149 @@ impl AgentSession {
             ),
         }
     }
+
+    async fn post_worksession_report_outbound(
+        &self,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        if !matches!(self.kind, SessionKind::Ui) {
+            return Ok(false);
+        }
+        let target_meta = self.meta.lock().await.clone();
+        self.post_worksession_report_outbound_to_ui_meta(
+            &self.session_id,
+            &target_meta,
+            data,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn post_worksession_report_outbound_to_persisted_ui(
+        &self,
+        target_session_id: &str,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        let meta_path = self
+            .agent_config
+            .layout
+            .session_dir(target_session_id)
+            .join(".meta")
+            .join("session.json");
+        let bytes = match tokio::fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report target UI session {} not found: read {} failed: {err}",
+                    self.session_id,
+                    target_session_id,
+                    meta_path.display()
+                );
+                return Ok(false);
+            }
+        };
+        let target_meta: SessionMeta = match serde_json::from_slice(&bytes) {
+            Ok(meta) => meta,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report target UI session {} invalid: parse {} failed: {err}",
+                    self.session_id,
+                    target_session_id,
+                    meta_path.display()
+                );
+                return Ok(false);
+            }
+        };
+        self.post_worksession_report_outbound_to_ui_meta(
+            target_session_id,
+            &target_meta,
+            data,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn post_worksession_report_outbound_to_ui_meta(
+        &self,
+        target_session_id: &str,
+        target_meta: &SessionMeta,
+        data: &serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<bool> {
+        if !matches!(target_meta.kind, SessionKind::Ui) {
+            warn!(
+                "opendan.session[{}]: worksession report target {} is not a UI session",
+                self.session_id, target_session_id
+            );
+            return Ok(false);
+        }
+        let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let peer_did_raw = target_meta.peer_did.clone();
+        let Some(peer_did_raw) = peer_did_raw.as_deref().filter(|s| !s.trim().is_empty()) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — UI session has no peer DID",
+                target_session_id
+            );
+            return Ok(false);
+        };
+        let Ok(peer_did) = name_lib::DID::from_str(peer_did_raw) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — invalid peer DID `{}`",
+                target_session_id, peer_did_raw
+            );
+            return Ok(false);
+        };
+        let agent_did_raw = self.agent_config.toml.identity.agent_did.trim();
+        if agent_did_raw.is_empty() {
+            return Ok(false);
+        }
+        let Ok(agent_did) = name_lib::DID::from_str(agent_did_raw) else {
+            warn!(
+                "opendan.session[{}]: cannot post worksession report — invalid agent DID `{}`",
+                target_session_id, agent_did_raw
+            );
+            return Ok(false);
+        };
+        if agent_did == peer_did {
+            return Ok(false);
+        }
+        let tunnel = target_meta
+            .peer_tunnel_did
+            .as_deref()
+            .and_then(|raw| name_lib::DID::from_str(raw).ok());
+        let msg = self
+            .build_worksession_report_msg(&agent_did, &peer_did, target_session_id, data)
+            .await;
+        let send_ctx = buckyos_api::SendContext {
+            contact_mgr_owner: Some(agent_did),
+            preferred_tunnel: tunnel,
+            context_id: Some(target_session_id.to_string()),
+            extra: Some(with_tg_route_chat_id(data.clone(), target_session_id)),
+            ..Default::default()
+        };
+        match msg_center
+            .post_send(msg, Some(send_ctx), idempotency_key)
+            .await
+        {
+            Ok(result) if result.ok => Ok(true),
+            Ok(result) => {
+                warn!(
+                    "opendan.session[{}]: worksession report outbound rejected — reason={:?}",
+                    target_session_id, result.reason
+                );
+                Ok(false)
+            }
+            Err(err) => Err(anyhow!("worksession report post_send failed: {err}")),
+        }
+    }
 }
 
 enum NextAction {
-    Idle,
+    Continue,
     WaitForMsg,
     /// Session yielded on async tool dispatch — the worker is parked until
     /// the matching task-completion events arrive in `pending_inputs`.
@@ -3522,9 +5972,355 @@ enum BuiltContext {
     Resumed(LLMContext),
 }
 
+async fn build_agent_session_env(
+    session_id: &str,
+    agent_config: &AgentConfig,
+    agent_name: &str,
+    meta: &Arc<Mutex<SessionMeta>>,
+    session_dir: &Path,
+    behavior: &BehaviorCfg,
+) -> AgentSessionEnv {
+    let (kind, title, objective, owner, workspace_id, one_line, bg_events, task_binding) = {
+        let meta = meta.lock().await;
+        (
+            meta.kind,
+            meta.title.clone(),
+            meta.objective.clone(),
+            meta.owner.clone(),
+            meta.workspace_id.clone(),
+            meta.one_line_status.clone(),
+            meta.background_events.clone(),
+            meta.task_binding.clone(),
+        )
+    };
+    let session_objective = if objective.trim().is_empty() {
+        behavior.meta.objective.clone()
+    } else {
+        objective
+    };
+    let workspace_id = workspace_id.filter(|s| !s.is_empty());
+    let workspace_root = workspace_id
+        .as_deref()
+        .map(|ws| agent_config.layout.workspaces_dir.join(ws));
+    let (notebook_list_text, notebook_last_items_text) =
+        build_notebook_prompt_texts(agent_config, owner.trim(), agent_name);
+    let runtime_workspace_list_text = build_runtime_workspace_list_text(agent_config).await;
+    AgentSessionEnv {
+        session_id: session_id.to_string(),
+        session_kind: AgentSessionEnv::kind_str(kind),
+        session_title: title.trim().to_string(),
+        session_objective,
+        session_owner: owner,
+        session_current_todo: load_current_todo(session_dir),
+        session_current_todo_list: render_current_todo_list(session_dir),
+        session_background_hints: Vec::new(),
+        session_default_changed_background_hint_text: String::new(),
+        behavior_name: behavior.meta.name.clone(),
+        behavior_objective: behavior.meta.objective.clone(),
+        behavior_mode: "behavior",
+        behavior_template_dir: behavior
+            .source_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
+        workspace_id,
+        workspace_root,
+        agent_root: agent_config.layout.root.clone(),
+        session_root: session_dir.to_path_buf(),
+        input_text: String::new(),
+        input_has_user_text: false,
+        input_has_events: false,
+        recent_activity: one_line.trim().to_string(),
+        clock_unix_ms: now_ms(),
+        runtime_workspace_list_text,
+        notebook_list_text,
+        notebook_last_items_text,
+        llm_context: LlmContextEnv {
+            bg_events,
+            ..Default::default()
+        },
+        task: task_binding.map(Into::into),
+    }
+}
+
+async fn build_runtime_workspace_list_text(agent_config: &AgentConfig) -> String {
+    let manager = LocalWorkspaceManager::new(agent_config.layout.workspaces_dir.clone());
+    match manager.list().await {
+        Ok(mut workspaces) => {
+            workspaces.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+            render_workspace_inventory(&workspaces)
+        }
+        Err(err) => {
+            warn!("opendan.session: build workspace list prompt text failed: {err}");
+            String::new()
+        }
+    }
+}
+
+fn build_notebook_prompt_texts(
+    agent_config: &AgentConfig,
+    owner: &str,
+    agent_name: &str,
+) -> (String, String) {
+    if owner.is_empty() || !agent_config.layout.notepads_dir.exists() {
+        return (
+            "Available notebooks: 0 total.\n".to_string(),
+            "Recent notebook items: none.\n".to_string(),
+        );
+    }
+
+    let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
+        agent_config.layout.notepads_dir.clone(),
+    )) {
+        Ok(notebook) => notebook,
+        Err(err) => {
+            warn!("opendan.session: open notepads for prompt env failed: {err}");
+            return (String::new(), String::new());
+        }
+    };
+    let scope = OwnerScope::new(owner.to_string()).with_agent(agent_name.to_string());
+    let list_text = match notebook.build_notebook_list_text(scope.clone()) {
+        Ok(text) => text,
+        Err(err) => {
+            warn!("opendan.session: build notebook list prompt text failed: {err}");
+            String::new()
+        }
+    };
+    let last_items_text = match notebook.build_recent_items_text(scope, 8) {
+        Ok(text) => text,
+        Err(err) => {
+            warn!("opendan.session: build notebook recent items prompt text failed: {err}");
+            String::new()
+        }
+    };
+    (list_text, last_items_text)
+}
+
+fn apply_hook_env_to_prompt_env(env: &mut AgentSessionEnv, hook_env: LlmContextEnv) {
+    env.session_background_hints = hook_env.background_hints.clone();
+    env.session_default_changed_background_hint_text =
+        hook_env.default_changed_background_hint_text.clone();
+    env.llm_context = hook_env;
+}
+
+fn background_hint_interval_active(last_non_empty_at_ms: u64, now_ms: u64) -> bool {
+    last_non_empty_at_ms > 0
+        && now_ms.saturating_sub(last_non_empty_at_ms) < BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS
+}
+
+fn build_background_event_hints(events: &[BgEventSnapshot]) -> Vec<BackgroundHint> {
+    let mut events = events.to_vec();
+    events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    events
+        .into_iter()
+        .map(|event| {
+            let data = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+            let fingerprint = stable_json_fingerprint(&data);
+            let reason = background_event_reason(&event);
+            let event_data =
+                serde_json::to_string(&event.data).unwrap_or_else(|_| String::from("null"));
+            BackgroundHint {
+                path: format!("event/{}", event.event_id),
+                kind: "event".to_string(),
+                text: format!("{} updated : {} ({})", reason, event_data, event.event_id),
+                fingerprint,
+                data,
+            }
+        })
+        .collect()
+}
+
+fn background_event_reason(event: &BgEventSnapshot) -> String {
+    if let Some(reason) = event
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return reason.to_string();
+    }
+
+    for key in ["reason", "purpose", "type"] {
+        if let Some(reason) = event
+            .data
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return reason.to_string();
+        }
+    }
+
+    "event".to_string()
+}
+
+fn render_changed_background_hint_text(hints: &[BackgroundHint]) -> String {
+    hints
+        .iter()
+        .map(|hint| {
+            let text = hint.text.trim();
+            if text.is_empty() {
+                hint.path.trim()
+            } else {
+                text
+            }
+        })
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("- {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn load_session_topic_tags(session_dir: &Path) -> Vec<String> {
+    let tag_set_path = session_dir.join(".meta").join("tag_set.json");
+    if let Ok(value) = read_json_file(&tag_set_path) {
+        let tags = value
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !tags.is_empty() {
+            return tags;
+        }
+    }
+
+    let topic_path = session_dir.join(".meta").join("topic.md");
+    let Ok(text) = std::fs::read_to_string(topic_path) else {
+        return Vec::new();
+    };
+    parse_topic_doc_tags(&text)
+}
+
+fn parse_topic_doc_tags(text: &str) -> Vec<String> {
+    if !text.starts_with("---\n") {
+        return Vec::new();
+    }
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    let Some((frontmatter, _body)) = rest.split_once("\n---") else {
+        return Vec::new();
+    };
+    for line in frontmatter.lines() {
+        let Some(raw) = line.trim().strip_prefix("tags:") else {
+            continue;
+        };
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(raw.trim()) else {
+            return Vec::new();
+        };
+        return tags
+            .into_iter()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn load_subscribed_notepad_ids(session_dir: &Path) -> Option<Vec<String>> {
+    let path = session_dir.join(".meta").join("subscriptions.json");
+    let value = read_json_file(&path).ok()?;
+    let subscriptions = value.get("subscriptions")?.as_array()?;
+    let mut ids = Vec::new();
+    for subscription in subscriptions {
+        let kind = subscription
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if kind != "notepad" && kind != "notebook" {
+            continue;
+        }
+        let Some(id) = subscription
+            .get("id")
+            .or_else(|| subscription.get("notebook_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        ids.push(id.to_string());
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+fn read_json_file(path: &Path) -> std::io::Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path)?;
+    serde_json::from_str(&text)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+fn stable_json_fingerprint(value: &serde_json::Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    stable_report_hash(&text)
+}
+
+fn merge_global_state_hook_stats(
+    mut state: serde_json::Value,
+    hook_point: &str,
+    pulled_msg_count: usize,
+    pulled_event_count: usize,
+) -> serde_json::Value {
+    let stats = serde_json::json!({
+        "hook_point": hook_point,
+        "pulled_msg_count": pulled_msg_count,
+        "pulled_event_count": pulled_event_count,
+    });
+    match &mut state {
+        serde_json::Value::Object(map) => {
+            map.insert("driver".to_string(), stats);
+            state
+        }
+        _ => serde_json::json!({
+            "value": state,
+            "driver": stats,
+        }),
+    }
+}
+
+#[derive(Default)]
+struct PendingInputStats {
+    msg: usize,
+    event: usize,
+    interrupt: usize,
+}
+
+fn pending_input_stats(inputs: &[PendingInput]) -> PendingInputStats {
+    let mut stats = PendingInputStats::default();
+    for input in inputs {
+        match input {
+            PendingInput::Msg { .. } => stats.msg += 1,
+            PendingInput::Event { .. } => stats.event += 1,
+            PendingInput::Interrupt { .. } => stats.interrupt += 1,
+        }
+    }
+    stats
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
 fn append_turn_message_to_snapshot(
     mut snapshot: LLMContextSnapshot,
-    message: AiMessage,
+    message: Option<AiMessage>,
+    history_inputs: Vec<HistoryInputRecord>,
     trace_id: &str,
     preserve_behavior_state: bool,
 ) -> LLMContextSnapshot {
@@ -3533,29 +6329,79 @@ fn append_turn_message_to_snapshot(
     let previous_state = snapshot.state;
     let state = if preserve_behavior_state {
         let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
-        state.accumulated.push(message);
-        state.steps = previous_state.steps;
-        state.history_summaries = previous_state.history_summaries;
-        state.last_step = previous_state.last_step;
-        if state.last_step.is_none()
-            && state
-                .steps
+        let mut steps = previous_state.steps;
+        let mut last_step = previous_state.last_step;
+        if last_step.is_none()
+            && steps
                 .last()
                 .is_some_and(|step| step.meta.behavior_name == snapshot.request.behavior_name)
         {
-            state.last_step = state.steps.pop();
+            last_step = steps.pop();
         }
+        // Behavior-switch pair (Agent Context Messages.md §状态机切换): when
+        // the resolved hot tail ended with `<next_behavior>`, the incoming
+        // user message IS that step's on_behavior_switch payload, not a
+        // free-floating next-turn input. Attach it as `next_user_message`
+        // so the rendered shape is `[assistant:next_behavior=X user:on_switch]`
+        // instead of `[assistant:next_behavior=X user:empty][user:on_switch]`
+        // (two consecutive user messages — the bug).
+        if let Some(message) = message {
+            let attach_to_switch_step = last_step
+                .as_ref()
+                .is_some_and(|s| s.next_behavior.is_some() && s.next_user_message.is_none());
+            if attach_to_switch_step {
+                if let Some(last) = last_step.as_mut() {
+                    last.next_user_message = Some(message);
+                }
+            } else {
+                state.accumulated.push(message);
+            }
+        }
+        state.steps = steps;
+        state.history_summaries = previous_state.history_summaries;
+        state.history_inputs = previous_state.history_inputs;
+        state.history_inputs.extend(history_inputs);
+        state.last_step = last_step;
         state.last_report = previous_state.last_report;
         state.next_step_index = previous_state.next_step_index;
+        state.next_action_id = previous_state.next_action_id;
         state
     } else {
         let mut input = previous_state.accumulated;
-        input.push(message);
+        if let Some(message) = message {
+            input.push(message);
+        }
         snapshot.request.input = input;
-        LLMContextState::from_request(&snapshot.request, now_ms())
+        let mut state = LLMContextState::from_request(&snapshot.request, now_ms());
+        state.history_inputs = previous_state.history_inputs;
+        state.history_inputs.extend(history_inputs);
+        state
     };
     snapshot.state = state;
     snapshot
+}
+
+fn is_runtime_auto_user_pending(from: &str) -> bool {
+    from == "opendan:on_behavior_switch"
+}
+
+fn prune_legacy_internal_pending_inputs(pending: &mut Vec<PendingInput>) -> usize {
+    let before = pending.len();
+    pending.retain(|input| {
+        let is_legacy_internal = matches!(
+            input,
+            PendingInput::Msg { from, .. } if is_runtime_auto_user_pending(from)
+        ) || matches!(
+            input,
+            PendingInput::Msg { record_id, .. } if is_history_input_pending(record_id)
+        );
+        !is_legacy_internal
+    });
+    before.saturating_sub(pending.len())
+}
+
+fn is_history_input_pending(record_id: &str) -> bool {
+    record_id.starts_with("process-end:")
 }
 
 fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {
@@ -3566,11 +6412,316 @@ fn fork_child_end_marker(child_entry: &str, child_report: &str) -> String {
     format!("[fork process `{child_entry}` ended]\n\n## Child Report:\n{report}")
 }
 
+fn worksession_report_delivery_allows(
+    mode: ReportDeliveryMode,
+    phase: WorksessionReportPhase,
+    context_depth: usize,
+) -> bool {
+    match mode {
+        ReportDeliveryMode::FinalOnly => {
+            context_depth == 0 && matches!(phase, WorksessionReportPhase::Final)
+        }
+        ReportDeliveryMode::TopLevel => context_depth == 0,
+        ReportDeliveryMode::All => true,
+    }
+}
+
+fn stable_report_hash(report: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in report.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEndDisposition {
+    Idle,
+    Ended,
+}
+
+fn session_end_disposition(kind: SessionKind) -> SessionEndDisposition {
+    match kind {
+        SessionKind::SelfCheck => SessionEndDisposition::Idle,
+        _ => SessionEndDisposition::Ended,
+    }
+}
+
+fn idle_worker_retire_ms(kind: SessionKind) -> u64 {
+    if matches!(kind, SessionKind::Ui) {
+        UI_IDLE_WORKER_RETIRE_MS
+    } else {
+        DEFAULT_IDLE_WORKER_RETIRE_MS
+    }
+}
+
+impl AgentSession {
+    async fn build_worksession_report_msg(
+        &self,
+        agent_did: &name_lib::DID,
+        peer_did: &name_lib::DID,
+        target_session_id: &str,
+        data: &serde_json::Value,
+    ) -> MsgObject {
+        let content_title = worksession_report_content_title(data);
+        let mut msg =
+            build_worksession_report_base_msg(agent_did, peer_did, target_session_id, data);
+        let report = normalize_report_attachment_tags(&json_str(data, "report"));
+        let workspace_id = json_str(data, "workspace_id");
+        let workspace_dir = if workspace_id.is_empty() {
+            None
+        } else {
+            Some(self.agent_config.layout.workspaces_dir.join(workspace_id))
+        };
+        let validator = crate::attachment_policy::WorkspaceAttachmentValidator::with_policy(
+            workspace_dir.clone(),
+            self.agent_name.clone(),
+            self.agent_config.toml.runtime.filesystem_policy,
+        );
+        let resolver = crate::attachment_resolver::NamedStoreLocalLinkResolver::new(
+            workspace_dir,
+            self.agent_name.clone(),
+        );
+        let egress_options = llm_context::MsgEgressOptions {
+            preserve_attachment_tag_in_egress: self
+                .agent_config
+                .toml
+                .runtime
+                .preserve_attachment_tag_in_egress,
+        };
+        match llm_context::ai_message_to_msg_object_with_base_validated_async(
+            &AiMessage::text(AiRole::Assistant, report),
+            msg.clone(),
+            &validator,
+            egress_options,
+            &resolver,
+        )
+        .await
+        {
+            Ok(mut converted) => {
+                converted.content.title = Some(content_title);
+                converted
+            }
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: worksession report conversion failed: {err}",
+                    self.session_id
+                );
+                msg.content.content = normalize_report_attachment_tags(&json_str(data, "report"));
+                msg.content.title = Some(content_title);
+                msg
+            }
+        }
+    }
+}
+
+fn build_worksession_report_base_msg(
+    agent_did: &name_lib::DID,
+    peer_did: &name_lib::DID,
+    target_session_id: &str,
+    data: &serde_json::Value,
+) -> MsgObject {
+    let title = json_str(data, "title");
+    let source_session_id = json_str(data, "source_session_id");
+    let mut msg = MsgObject {
+        from: agent_did.clone(),
+        to: vec![peer_did.clone()],
+        kind: MsgObjKind::Chat,
+        created_at_ms: data
+            .get("created_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(now_ms),
+        content: MsgContent::default(),
+        ..MsgObject::default()
+    };
+    msg.thread.topic = Some(target_session_id.to_string());
+    msg.thread.correlation_id = Some(source_session_id.clone());
+    msg.meta.insert(
+        "llm_role".to_string(),
+        serde_json::Value::String(WORKSESSION_REPORT_EVENT_TYPE.to_string()),
+    );
+    msg.meta.insert(
+        "message_type".to_string(),
+        serde_json::Value::String(WORKSESSION_REPORT_EVENT_TYPE.to_string()),
+    );
+    msg.meta.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(target_session_id.to_string()),
+    );
+    msg.meta.insert(
+        "owner_session_id".to_string(),
+        serde_json::Value::String(target_session_id.to_string()),
+    );
+    msg.meta.insert(
+        "source_session_id".to_string(),
+        serde_json::Value::String(source_session_id.clone()),
+    );
+    msg.meta.insert(
+        "source_kind".to_string(),
+        serde_json::Value::String("worksession".to_string()),
+    );
+    msg.meta.insert(
+        "source".to_string(),
+        serde_json::json!({
+            "kind": "worksession",
+            "session_id": source_session_id,
+            "title": title,
+            "objective": data.get("objective").cloned().unwrap_or(serde_json::Value::Null),
+            "workspace_id": data.get("workspace_id").cloned().unwrap_or(serde_json::Value::Null),
+            "behavior": data.get("behavior").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    for key in [
+        "report_id",
+        "phase",
+        "is_final",
+        "context_depth",
+        "process_entry",
+        "parent_process_entry",
+        "trace_id",
+    ] {
+        if let Some(value) = data.get(key) {
+            msg.meta.insert(key.to_string(), value.clone());
+        }
+    }
+    msg
+}
+
+fn worksession_report_content_title(data: &serde_json::Value) -> String {
+    let title = json_str(data, "title");
+    let source_session_id = json_str(data, "source_session_id");
+    if title.is_empty() {
+        format!("WorkSession report: {source_session_id}")
+    } else {
+        format!("WorkSession report: {title}")
+    }
+}
+
+fn normalize_report_attachment_tags(report: &str) -> String {
+    report
+        .replace("</attachement>", "</attachment>")
+        .replace("<attachement", "<attachment")
+        .lines()
+        .map(normalize_report_attachment_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_report_attachment_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let Some(body) = trimmed.strip_prefix("<attachment>") else {
+        return line.to_string();
+    };
+    let Some(body) = body.strip_suffix("<attachment>") else {
+        return line.to_string();
+    };
+    if body.contains("</attachment>") {
+        return line.to_string();
+    }
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    format!("{indent}<attachment>{}</attachment>", body.trim())
+}
+
+fn tg_route_extra_for_session(session_id: &str) -> Option<serde_json::Value> {
+    telegram_chat_id_from_ui_session_id(session_id)
+        .map(|chat_id| serde_json::json!({ "route": { "chat_id": chat_id } }))
+}
+
+fn with_tg_route_chat_id(mut extra: serde_json::Value, session_id: &str) -> serde_json::Value {
+    let Some(chat_id) = telegram_chat_id_from_ui_session_id(session_id) else {
+        return extra;
+    };
+    let Some(obj) = extra.as_object_mut() else {
+        return serde_json::json!({
+            "payload": extra,
+            "route": { "chat_id": chat_id },
+        });
+    };
+
+    match obj.get_mut("route").and_then(|route| route.as_object_mut()) {
+        Some(route) => {
+            route
+                .entry("chat_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(chat_id));
+        }
+        None => {
+            obj.insert(
+                "route".to_string(),
+                serde_json::json!({ "chat_id": chat_id }),
+            );
+        }
+    }
+    extra
+}
+
+fn telegram_chat_id_from_ui_session_id(session_id: &str) -> Option<String> {
+    let mut parts = session_id.splitn(3, ':');
+    let platform = parts.next()?.trim();
+    if platform != UI_SESSION_PLATFORM_TELEGRAM {
+        return None;
+    }
+    parts.next()?;
+    let chat_id = parts.next()?.trim();
+    if chat_id.is_empty() {
+        None
+    } else {
+        Some(chat_id.to_string())
+    }
+}
+
+fn json_str(data: &serde_json::Value, key: &str) -> String {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn task_status_for_session_status(status: SessionStatus) -> Option<TaskStatus> {
+    match status {
+        SessionStatus::Running | SessionStatus::WaitingTool => Some(TaskStatus::Running),
+        SessionStatus::WaitingInput => Some(TaskStatus::WaitingForApproval),
+        SessionStatus::Ended => Some(TaskStatus::Completed),
+        SessionStatus::Error => Some(TaskStatus::Failed),
+        SessionStatus::Idle => None,
+    }
+}
+
+fn task_message_for_session_status(status: SessionStatus, one_line_status: &str) -> Option<String> {
+    let fallback = match status {
+        SessionStatus::Idle => "Agent session idle",
+        SessionStatus::Running => "Agent session running",
+        SessionStatus::WaitingInput => "Agent session waiting for input",
+        SessionStatus::WaitingTool => "Agent session waiting for tool",
+        SessionStatus::Ended => "Agent session completed",
+        SessionStatus::Error => "Agent session failed",
+    };
+    let message = one_line_status.trim();
+    Some(if message.is_empty() {
+        fallback.to_string()
+    } else {
+        message.to_string()
+    })
+}
+
+fn session_status_text(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Running => "running",
+        SessionStatus::WaitingInput => "waiting_input",
+        SessionStatus::WaitingTool => "waiting_tool",
+        SessionStatus::Ended => "ended",
+        SessionStatus::Error => "error",
+    }
 }
 
 /// Build an `Observation` from a task_mgr kevent payload — returns `None`
@@ -3591,6 +6742,7 @@ fn observation_from_task_event(call_id: &str, data: &serde_json::Value) -> Optio
                 content,
                 bytes,
                 truncated: false,
+                tool_result: None,
             })
         }
         "Failed" => {
@@ -3607,6 +6759,7 @@ fn observation_from_task_event(call_id: &str, data: &serde_json::Value) -> Optio
             Some(Observation::Error {
                 call_id: call_id.to_string(),
                 message,
+                tool_result: None,
             })
         }
         "Canceled" => {
@@ -3644,6 +6797,81 @@ fn should_replace_pending_event(existing: &PendingInput, incoming: &PendingInput
         return false;
     };
     event_status_rank(incoming_data) >= event_status_rank(existing_data)
+}
+
+fn event_matches_pull_policy(
+    event_id: &str,
+    policy: &PullEventPolicy,
+    subscriptions: &[EventSubscription],
+) -> bool {
+    match policy {
+        PullEventPolicy::None => false,
+        PullEventPolicy::All => true,
+        PullEventPolicy::Filter(name) => {
+            let filter = name
+                .strip_suffix(".*")
+                .or_else(|| name.strip_suffix("/**"))
+                .unwrap_or(name);
+            event_id == filter
+                || event_id.starts_with(&format!("{filter}."))
+                || event_id.starts_with(&format!("{filter}/"))
+                || subscriptions
+                    .iter()
+                    .any(|sub| sub.mode == EventSubscriptionMode::Full && sub.matches(event_id))
+        }
+    }
+}
+
+fn select_pending_for_hook_with_subscriptions(
+    cfg: &HookPointCfg,
+    pending: &[PendingInput],
+    pending_task_index: &std::collections::HashMap<String, PendingTaskCall>,
+    subscriptions: &[EventSubscription],
+) -> Vec<PendingInput> {
+    let mut out = Vec::new();
+    let msg_limit = match cfg.pull_msg {
+        PullMsgPolicy::None => Some(0usize),
+        PullMsgPolicy::One => Some(1usize),
+        PullMsgPolicy::All => None,
+    };
+    let mut msg_count = 0usize;
+    for input in pending {
+        match input {
+            PendingInput::Msg { .. } => {
+                if msg_limit.is_some_and(|limit| msg_count >= limit) {
+                    continue;
+                }
+                msg_count += 1;
+                out.push(input.clone());
+            }
+            PendingInput::Event { event_id, .. } => {
+                if pending_task_index.contains_key(event_id)
+                    || event_matches_pull_policy(event_id, &cfg.pull_event, subscriptions)
+                {
+                    out.push(input.clone());
+                }
+            }
+            PendingInput::Interrupt { .. } => {}
+        }
+    }
+    out
+}
+
+fn hook_filter_allows(
+    filter: &BehaviorFilter,
+    current_behavior: &str,
+    default_behavior: &str,
+    process_stack: &[ProcessFrame],
+) -> bool {
+    match filter {
+        BehaviorFilter::None => false,
+        BehaviorFilter::All => true,
+        BehaviorFilter::Top => process_stack.is_empty(),
+        BehaviorFilter::DefaultOnly => {
+            process_stack.is_empty() && current_behavior == default_behavior
+        }
+        BehaviorFilter::Behavior(name) => current_behavior == name,
+    }
 }
 
 fn event_status_rank(data: &serde_json::Value) -> u8 {
@@ -3955,6 +7183,23 @@ fn trigger_preview(text: &str) -> String {
     out
 }
 
+fn text_log_preview(text: &str) -> String {
+    trigger_preview(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn message_text_chars(message: &AiMessage) -> usize {
+    message.text_content().chars().count()
+}
+
+fn ai_message_log_preview(message: &AiMessage) -> String {
+    let text = message.text_content();
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        return text_log_preview(trimmed);
+    }
+    pending_msg_preview("", message)
+}
+
 /// Derive a coarse `event_kind` label from a kevent id. Today's pump produces
 /// hierarchical paths like `/task_mgr/123` — the first segment is the most
 /// useful classifier (`task_mgr`); fall back to the whole id otherwise.
@@ -3966,6 +7211,139 @@ fn trigger_event_kind(event_id: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| event_id.to_string())
+}
+
+fn ratio_budget(context_window_tokens: u32, ratio: f32) -> u32 {
+    ((context_window_tokens as f64) * (ratio as f64))
+        .ceil()
+        .clamp(1.0, u32::MAX as f64) as u32
+}
+
+fn estimate_history_tokens(deps: &llm_context::deps::LLMContextDeps, msgs: &[AiMessage]) -> u32 {
+    msgs.iter().fold(0u32, |total, msg| {
+        total
+            .saturating_add(deps.tokenizer.count_tokens(msg.role.as_str()))
+            .saturating_add(deps.tokenizer.count_tokens(&msg.render_for_debug()))
+    })
+}
+
+fn llm_message_compress_extra_focus(agent_name: &str, behavior: &BehaviorCfg) -> String {
+    format!(
+        "Agent identity: {agent_name}\nBehavior: {}\nObjective: {}",
+        behavior.meta.name.trim(),
+        behavior.meta.objective.trim()
+    )
+}
+
+fn leading_system_messages(msgs: &[AiMessage]) -> usize {
+    msgs.iter()
+        .take_while(|msg| matches!(msg.role, AiRole::System | AiRole::Developer))
+        .count()
+}
+
+fn turns_since_last_llm_message_compress(msgs: &[AiMessage]) -> u32 {
+    let start = msgs
+        .iter()
+        .rposition(is_llm_message_compress_marker)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    msgs[start..]
+        .iter()
+        .filter(|msg| matches!(msg.role, AiRole::User) && !is_llm_message_compress_marker(msg))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn is_llm_message_compress_marker(msg: &AiMessage) -> bool {
+    let text = msg.text_content();
+    text.contains("[LLM_MESSAGE_COMPRESS_META_V1]")
+        || text.contains("[LLM_MESSAGE_COMPRESS_SUMMARY_V1]")
+        || text.contains("[Conversation summary]")
+}
+
+fn context_window_tokens_from_model_directory(
+    directory: &serde_json::Value,
+    alias: &str,
+) -> Option<u32> {
+    let aliases = model_directory_alias_targets(directory, alias);
+    let mut exact = Vec::new();
+    let mut logical = Vec::new();
+    let providers = directory.get("providers")?.as_array()?;
+    for provider in providers {
+        let Some(models) = provider.get("models").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for model in models {
+            let Some(tokens) = model
+                .pointer("/capabilities/max_context_tokens")
+                .and_then(|value| value.as_u64())
+            else {
+                continue;
+            };
+            if tokens == 0 {
+                continue;
+            }
+            let exact_model = model
+                .get("exact_model")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let provider_model_id = model
+                .get("provider_model_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if aliases
+                .iter()
+                .any(|item| item == exact_model || item == provider_model_id)
+            {
+                exact.push(tokens);
+                continue;
+            }
+            let has_logical_mount = model
+                .get("logical_mounts")
+                .and_then(|value| value.as_array())
+                .map(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount
+                            .as_str()
+                            .map(|mount| aliases.iter().any(|item| item == mount))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if has_logical_mount {
+                logical.push(tokens);
+            }
+        }
+    }
+    exact
+        .into_iter()
+        .chain(logical)
+        .min()
+        .map(|tokens| tokens.min(u32::MAX as u64) as u32)
+}
+
+fn model_directory_alias_targets(directory: &serde_json::Value, alias: &str) -> Vec<String> {
+    let mut out = vec![alias.to_string()];
+    let mut cursor = 0usize;
+    while cursor < out.len() && out.len() < 64 {
+        let current = out[cursor].clone();
+        cursor += 1;
+        if let Some(items) = directory
+            .get("directory")
+            .and_then(|value| value.get(&current))
+            .and_then(|value| value.as_object())
+        {
+            for target in items
+                .values()
+                .filter_map(|item| item.get("target").and_then(|value| value.as_str()))
+            {
+                if !out.iter().any(|item| item == target) {
+                    out.push(target.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Cap on the size of the tail preserved when compressing `accumulated` on
@@ -3991,9 +7369,9 @@ const COMPRESS_KEEP_TAIL: usize = 12;
 /// case (tail starts with `User`) clean and the edge case from emitting
 /// two `Assistant` messages in a row.
 ///
-/// Note: this is an opendan-level compressor (message dimension), distinct
-/// from the optional `HistoryCompressor` inside the Behavior Loop (step
-/// dimension). They can coexist.
+/// Note: this is an opendan-level compressor (message dimension). The
+/// behavior loop itself only appends and renders persisted step history; it
+/// does not run a separate step compressor.
 pub fn compress_messages_for_context_limit(accumulated: Vec<AiMessage>) -> Vec<AiMessage> {
     let leading_system = accumulated
         .iter()
@@ -4045,6 +7423,76 @@ fn pending_msg_ai_message(message: &AiMessage) -> AiMessage {
     let mut message = message.clone();
     message.role = AiRole::User;
     message
+}
+
+fn pending_input_hook_value(input: &PendingInput) -> serde_json::Value {
+    match input {
+        PendingInput::Msg {
+            record_id,
+            from,
+            from_did,
+            from_name,
+            tunnel_did,
+            text,
+            ai_message,
+        } => serde_json::json!({
+            "kind": "msg",
+            "key": input.dedup_key(),
+            "record_id": record_id,
+            "from": from,
+            "from_did": from_did,
+            "from_name": from_name,
+            "tunnel_did": tunnel_did,
+            "text": text,
+            "message_text": ai_message.text_content(),
+        }),
+        PendingInput::Event { event_id, data } => serde_json::json!({
+            "kind": "event",
+            "key": input.dedup_key(),
+            "event_id": event_id,
+            "data": data,
+        }),
+        PendingInput::Interrupt { mode, id } => serde_json::json!({
+            "kind": "interrupt",
+            "key": input.dedup_key(),
+            "mode": mode,
+            "id": id,
+        }),
+    }
+}
+
+fn render_pending_input_values(values: &[serde_json::Value]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .filter_map(|value| {
+            let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "msg" => {
+                    let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| value.get("message_text").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    Some(format!("- msg from {from}: {}", text.trim()))
+                }
+                "event" => {
+                    let event_id = value.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(format!("- event {event_id}: {}", value["data"]))
+                }
+                "interrupt" => {
+                    let mode = value.get("mode").map(|v| v.to_string()).unwrap_or_default();
+                    Some(format!("- interrupt {mode}"))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn ai_message_has_payload(message: &AiMessage) -> bool {
@@ -4166,17 +7614,11 @@ fn agent_mention_token(agent_name: &str) -> String {
     }
 }
 
-fn compose_turn_message(messages: &[AiMessage], env: Option<String>) -> Option<AiMessage> {
+fn compose_turn_message(messages: &[AiMessage]) -> Option<AiMessage> {
     if messages.is_empty() {
         return None;
     }
     let mut blocks = Vec::new();
-    if let Some(env) = env.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        append_turn_content(
-            &mut blocks,
-            AiContent::text(background_environment_block(&env)),
-        );
-    }
     for message in messages {
         for block in &message.content {
             append_turn_content(&mut blocks, block.clone());
@@ -4189,11 +7631,108 @@ fn compose_turn_message(messages: &[AiMessage], env: Option<String>) -> Option<A
     }
 }
 
-fn background_environment_block(env: &str) -> String {
-    format!(
-        "<background_environment>\n{}\n</background_environment>",
-        env.trim()
-    )
+fn prepare_turn_messages_for_run(
+    messages: Vec<TurnMessage>,
+    embed_user_supplement: bool,
+) -> Vec<AiMessage> {
+    if !embed_user_supplement {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    }
+
+    let has_runtime_auto = messages.iter().any(|entry| entry.runtime_auto);
+    let user_messages = messages
+        .iter()
+        .filter(|entry| !entry.runtime_auto)
+        .map(|entry| &entry.message)
+        .collect::<Vec<_>>();
+    if !has_runtime_auto
+        || user_messages.is_empty()
+        || !user_messages
+            .iter()
+            .all(|message| is_plain_text_user_message(message))
+    {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    }
+
+    let Some(supplement) = render_user_supplement_section(&user_messages) else {
+        return messages.into_iter().map(|entry| entry.message).collect();
+    };
+
+    let mut injected = false;
+    messages
+        .into_iter()
+        .filter_map(|entry| {
+            if entry.runtime_auto {
+                if injected {
+                    Some(entry.message)
+                } else {
+                    injected = true;
+                    Some(inject_user_supplement_into_message(
+                        entry.message,
+                        &supplement,
+                    ))
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_plain_text_user_message(message: &AiMessage) -> bool {
+    message.content.iter().all(|block| match block {
+        AiContent::Text { .. } => true,
+        AiContent::Thinking { .. } | AiContent::ProviderState { .. } => true,
+        AiContent::Image { .. }
+        | AiContent::Document { .. }
+        | AiContent::ToolUse { .. }
+        | AiContent::ToolResult { .. } => false,
+    })
+}
+
+fn render_user_supplement_section(messages: &[&AiMessage]) -> Option<String> {
+    let text = messages
+        .iter()
+        .map(|message| message.text_content())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(format!("## 刚刚用户补充的信息\n\n{text}"))
+    }
+}
+
+fn inject_user_supplement_into_message(mut message: AiMessage, supplement: &str) -> AiMessage {
+    for block in &mut message.content {
+        let AiContent::Text { text } = block else {
+            continue;
+        };
+        *text = inject_user_supplement_into_text(text, supplement);
+        return message;
+    }
+    message.content.insert(0, AiContent::text(supplement));
+    message
+}
+
+fn inject_user_supplement_into_text(text: &str, supplement: &str) -> String {
+    const MARKERS: [&str; 2] = ["Continue from PROCESS_RULES.", "Continue TASK_ANCHOR."];
+    for marker in MARKERS {
+        if let Some(pos) = text.find(marker) {
+            let before = text[..pos].trim_end();
+            let after = &text[pos..];
+            return format!("{before}\n\n{supplement}\n\n{after}");
+        }
+    }
+
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        supplement.to_string()
+    } else {
+        format!("{trimmed}\n\n{supplement}")
+    }
 }
 
 fn append_turn_content(blocks: &mut Vec<AiContent>, block: AiContent) {

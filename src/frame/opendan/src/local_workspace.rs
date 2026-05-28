@@ -122,10 +122,9 @@ impl LocalWorkspaceManager {
     }
 
     /// Create a new workspace directory + record, or return the existing
-    /// record if the id is already present. The caller chooses the id —
-    /// `try_create_worksession` will pass session-meaningful names; the
-    /// MVP path passes `session_id` so files land where the legacy code
-    /// expects.
+    /// record if the id is already present. The caller chooses the id;
+    /// worksession creation should pass a human-meaningful directory name
+    /// and only add a suffix when needed to avoid collisions.
     pub async fn create_or_open(
         &self,
         workspace_id: &str,

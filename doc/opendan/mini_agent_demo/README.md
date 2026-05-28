@@ -56,6 +56,7 @@ mini_agent_demo/
 | 引入 Work session(自主任务) | `[session.work]` 加一段,配 `loop_mode = "behavior"` + `kind = "work"` + 选一个 `session_id_strategy` |
 | 加一个新 behavior(planner / executor / summarizer …) | 在 `behaviors/` 加一个 `.toml`,用 `[meta]` `[prompt]` `[capabilities]` 写好;LLM 用 `<next_behavior>NAME</next_behavior>` 自己切过去 |
 | 上下文满了想压缩后继续而非中止 | 目标 behavior 加 `[on_context_limit_reached]\nmode = "compress_then_continue"` |
+| 想在接近 context window 时提前自动压缩 | 目标 behavior 加 `[on_llm_message_compress]\nmode = "context_window_ratio"\ntrigger_ratio = 0.80\ntarget_ratio = 0.50` |
 | Provider 失败时降级到备用 behavior | `[on_provider_failed]\nmode = "fallback_behavior"\ntarget = "safe_mode"` |
 | 让人审某个工具调用 | `[capabilities].approval_required = ["exec_bash"]`(沿用 v0 占位语义) |
 
@@ -63,7 +64,7 @@ mini_agent_demo/
 
 - 在 `agent.toml` 写 `when = "..."` 之类的表达式 ⇒ 不支持
 - 在 `behaviors/*.toml` 给 `session_id` 写模板插值 ⇒ 不支持(strategy 是 4 选 1 的枚举)
-- 让 LLM 决定 `switch_mode = "fork"` 还是 `"normal"` ⇒ LLM 只挑 `<next_behavior>`,模式归 session 类
+- 让 LLM 决定 `driver.switch_mode = "fork"` 还是 `"normal"` ⇒ LLM 只挑 `<next_behavior>`,模式归 session driver
 
 复杂状态机请整体跳到 Workflow LLMContext DSL,不要在这份 schema 上叠 `when` / 脚本钩子。
 

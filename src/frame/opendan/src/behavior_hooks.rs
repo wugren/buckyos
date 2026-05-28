@@ -29,6 +29,29 @@ pub enum CtxLimitOutcome {
     CompressThenContinue,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmMessageCompressPolicy {
+    pub trigger_ratio: f32,
+    pub target_ratio: f32,
+    pub hard_limit_ratio: f32,
+    pub min_turns_between_compress: u32,
+    pub preserve_cache_stability: bool,
+    pub context_window_tokens: Option<u32>,
+}
+
+impl Default for LlmMessageCompressPolicy {
+    fn default() -> Self {
+        Self {
+            trigger_ratio: 0.80,
+            target_ratio: 0.50,
+            hard_limit_ratio: 0.95,
+            min_turns_between_compress: 2,
+            preserve_cache_stability: true,
+            context_window_tokens: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderFailedOutcome {
     Default,
@@ -56,6 +79,83 @@ pub fn resolve_ctx_limit(hook: Option<&HookPoint>) -> Result<CtxLimitOutcome, Ho
     match mode {
         "compress_then_continue" => Ok(CtxLimitOutcome::CompressThenContinue),
         _ => unreachable!("ensure_mode whitelist already verified"),
+    }
+}
+
+pub fn resolve_llm_message_compress(
+    hook: Option<&HookPoint>,
+) -> Result<Option<LlmMessageCompressPolicy>, HookPointError> {
+    const SITE: &str = "on_llm_message_compress";
+    let Some(hook) = hook else {
+        return Ok(None);
+    };
+    let mode = hook.ensure_mode(SITE, &["context_window_ratio"])?;
+    match mode {
+        "context_window_ratio" => {
+            let mut policy = LlmMessageCompressPolicy::default();
+            if let Some(value) = hook.optional_f64(SITE, "trigger_ratio")? {
+                policy.trigger_ratio = checked_ratio(hook, SITE, "trigger_ratio", value)?;
+            }
+            if let Some(value) = hook.optional_f64(SITE, "target_ratio")? {
+                policy.target_ratio = checked_ratio(hook, SITE, "target_ratio", value)?;
+            }
+            if let Some(value) = hook.optional_f64(SITE, "hard_limit_ratio")? {
+                policy.hard_limit_ratio = checked_ratio(hook, SITE, "hard_limit_ratio", value)?;
+            }
+            if policy.target_ratio >= policy.trigger_ratio {
+                return Err(HookPointError::InvalidParam {
+                    site: SITE,
+                    mode: hook.mode.clone(),
+                    key: "target_ratio",
+                    reason: "must be lower than trigger_ratio".to_string(),
+                });
+            }
+            if policy.hard_limit_ratio < policy.trigger_ratio {
+                return Err(HookPointError::InvalidParam {
+                    site: SITE,
+                    mode: hook.mode.clone(),
+                    key: "hard_limit_ratio",
+                    reason: "must be greater than or equal to trigger_ratio".to_string(),
+                });
+            }
+            if let Some(value) = hook.optional_u64(SITE, "min_turns_between_compress")? {
+                policy.min_turns_between_compress = value.min(u32::MAX as u64) as u32;
+            }
+            if let Some(value) = hook.optional_bool(SITE, "preserve_cache_stability")? {
+                policy.preserve_cache_stability = value;
+            }
+            if let Some(value) = hook.optional_u64(SITE, "context_window_tokens")? {
+                if value == 0 {
+                    return Err(HookPointError::InvalidParam {
+                        site: SITE,
+                        mode: hook.mode.clone(),
+                        key: "context_window_tokens",
+                        reason: "must be greater than 0".to_string(),
+                    });
+                }
+                policy.context_window_tokens = Some(value.min(u32::MAX as u64) as u32);
+            }
+            Ok(Some(policy))
+        }
+        _ => unreachable!("ensure_mode whitelist already verified"),
+    }
+}
+
+fn checked_ratio(
+    hook: &HookPoint,
+    site: &'static str,
+    key: &'static str,
+    value: f64,
+) -> Result<f32, HookPointError> {
+    if value > 0.0 && value <= 1.0 {
+        Ok(value as f32)
+    } else {
+        Err(HookPointError::InvalidParam {
+            site,
+            mode: hook.mode.clone(),
+            key,
+            reason: "must be in (0.0, 1.0]".to_string(),
+        })
     }
 }
 
@@ -128,6 +228,43 @@ mod tests {
     fn ctx_limit_rejects_unknown() {
         let h = HookPoint::fixed("retry_with_smaller_model");
         assert!(resolve_ctx_limit(Some(&h)).is_err());
+    }
+
+    #[test]
+    fn llm_message_compress_absent_disables_auto_trigger() {
+        assert_eq!(resolve_llm_message_compress(None).unwrap(), None);
+    }
+
+    #[test]
+    fn llm_message_compress_accepts_ratio_policy() {
+        let toml_src = r#"
+            mode = "context_window_ratio"
+            trigger_ratio = 0.82
+            target_ratio = 0.61
+            hard_limit_ratio = 0.96
+            min_turns_between_compress = 3
+            preserve_cache_stability = false
+            context_window_tokens = 128000
+        "#;
+        let h: HookPoint = toml::from_str(toml_src).unwrap();
+        let policy = resolve_llm_message_compress(Some(&h)).unwrap().unwrap();
+        assert_eq!(policy.trigger_ratio, 0.82);
+        assert_eq!(policy.target_ratio, 0.61);
+        assert_eq!(policy.hard_limit_ratio, 0.96);
+        assert_eq!(policy.min_turns_between_compress, 3);
+        assert!(!policy.preserve_cache_stability);
+        assert_eq!(policy.context_window_tokens, Some(128000));
+    }
+
+    #[test]
+    fn llm_message_compress_rejects_target_above_trigger() {
+        let toml_src = r#"
+            mode = "context_window_ratio"
+            trigger_ratio = 0.80
+            target_ratio = 0.90
+        "#;
+        let h: HookPoint = toml::from_str(toml_src).unwrap();
+        assert!(resolve_llm_message_compress(Some(&h)).is_err());
     }
 
     #[test]

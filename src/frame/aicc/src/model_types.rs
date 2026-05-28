@@ -804,6 +804,7 @@ impl Default for RoutePolicy {
 }
 
 impl RoutePolicy {
+    #[allow(dead_code)]
     pub fn from_config(config: &PolicyConfig) -> Self {
         let mut policy = RoutePolicy::default();
         if let Some(value) = config.profile.as_ref() {

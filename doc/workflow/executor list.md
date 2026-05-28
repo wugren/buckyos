@@ -427,7 +427,7 @@ FunctionObject + params = ThunkObject
 | FunctionObject / ThunkObject | `src/kernel/buckyos-api/src/thunk_object.rs` |
 | Apply + params → ThunkObject 构造 | `src/kernel/workflow/src/orchestrator.rs::build_thunk` |
 | Scheduler thunk runner | `src/kernel/scheduler/src/thunk_runner.rs` |
-| Node 执行器 | `src/kernel/node_daemon/src/node_exector.rs` |
+| Node 执行器 | `src/kernel/node_daemon/src/node_Executor.rs` |
 
 ### 实现状态
 
@@ -475,7 +475,7 @@ exec(hash("deploy.sh"), node_state("node3", 3701))
 |------|------|
 | FunctionType `OPTask` | `src/kernel/buckyos-api/src/thunk_object.rs` |
 | runner hint | `src/kernel/scheduler/src/thunk_runner.rs::build_scheduling_hint` |
-| Node 端执行计划 | `src/kernel/node_daemon/src/node_exector.rs::build_execution_plan` |
+| Node 端执行计划 | `src/kernel/node_daemon/src/node_Executor.rs::build_execution_plan` |
 
 ### 实现状态
 

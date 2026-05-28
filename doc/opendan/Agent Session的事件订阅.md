@@ -1,6 +1,15 @@
 # OpenDAN AgentSession 的事件订阅设计
 
 > 整理自语音记录。本文讨论 Agent Session 在"非自然推理结束"——即需要等待外部状态变化才能继续推进——这一场景下的几种实现模式，以及它们各自的语义边界。
+>
+> 相关文档：
+> - [Agent Session §3.3 SelfCheck Session](./Agent%20Session.md) —— 模式二在 timer-driven 提醒
+>   场景下的具体落地形式；
+> - [Agent Session §8 Driver 配置](./Agent%20Session.md) —— hook point × filter × pull policy
+>   把三种模式翻译成 session class 的一等配置项，`pull_event = "timer.*"` 等 filter 是模式二的
+>   命名空间载体；
+> - [Agent Environment §3.4 / §5](./Agent%20Enviroment.md) —— `input.events` / `input.bg_events`
+>   分别对应模式二（显式订阅事件入 user message）与模式三（半订阅事件作为环境块）。
 
 ## 1. 问题场景
 

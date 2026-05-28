@@ -1455,8 +1455,6 @@ pub async fn create_test_env_configs() {
 
 #[cfg(test)]
 mod tests {
-    use serde::de;
-
     use super::*;
 
     /// Create DevEnvBuilder uniformly for tests, root directory distinguished by test name
@@ -1601,7 +1599,7 @@ mod tests {
         println!("zone_boot_config_decoded: {:?}", zone_boot_config_decoded);
 
         // Construct expected ZoneBootConfig, consistent with logic in create_zone_boot_config_jwt
-        let expected_zone_boot_config = ZoneBootConfig {
+        let _expected_zone_boot_config = ZoneBootConfig {
             id: None,
             oods: vec![ood],
             sn: sn_host,

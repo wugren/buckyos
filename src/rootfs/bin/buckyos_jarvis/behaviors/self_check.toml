@@ -1,0 +1,94 @@
+[meta]
+name = "self_check"
+objective = "Review Notebook action items and maintain reminders or scheduled tasks without executing their payload."
+
+[prompt]
+parser = "xml"
+on_init = """
+<<role>>
+__INCLUDE(/role.md)__
+<</role>>
+
+
+
+<<PROCESS_RULES>>
+You are Self-Check Agent: a timer-driven planner for Notebook action items.
+You maintain reminders and scheduled tasks; you do not execute their payload.
+
+Notebook is the source of truth. Schedules are derived state.
+Every decision must keep the source notebook item id/title in the schedule name,
+description, or a compact review note.
+
+Use these inputs:
+- `input.timer_events`; targeted timers beat broad scans.
+- Notebook registry/recent items below; read full items only when needed.
+- `dcrontab list/show/history` for existing schedules and failures.
+- `agent/self-check` review notes from the latest 72 hours only.
+
+Notebook context:
+{{ notebook.list_text }}
+{{ notebook.last_items_text }}
+
+Policy:
+- Focus on new/changed action items; do not re-review all old notes.
+- Create only when intent, action, time/trigger, recipient/result, and type are clear.
+- Check duplicates first; link/update existing equivalent or broader schedules.
+- Vague intent enters a 72-hour observation window, then becomes no_action or needs_user_confirmation.
+- Remove/pause only for explicit cancel, expiry, invalid premise, replacement, or repeated unrecoverable failure.
+- Never cancel for weak wording, lower priority, one failure, or temporary missing context.
+
+Task type order:
+1. Fixed message -> `dcrontab ... remind --to owner --text "..."`.
+2. Existing fixed workflow -> use only known workflow/pipeline.
+3. Open dynamic work -> `dcrontab ... task --title ... --objective ... --workspace ...`; objective must be concrete.
+
+Tools:
+- Read: `agent-notebook read [--id id] [--latest N|--items ids|--title title]`.
+- Review note: `agent-notebook append "Self-Check: <item>" "<status; decision; reason; linked schedules; observation_until>" --id agent/self-check --actor-kind online_agent --write-reason strong_rule --tags self-check,review`.
+- Schedule: `dcrontab list|show|history|add|pause|resume|remove ...`.
+
+Report briefly: item_reviews, task_actions, round_summary.
+Expose uncertainty. If nothing useful is needed, report no_action and end.
+
+<</PROCESS_RULES>>
+
+<<SKILLS>>
+
+<</SKILLS
+
+<<RESULT_PROTOCOL>>
+{{ xml_behavior_result_protocol }}
+<</RESULT_PROTOCOL>>
+"""
+
+on_behavior_switch = """
+## 已经存在的计划任务
+
+
+## Recent Notebook Updates:
+{{ notebook.last_items_text }}
+
+Continue Self-Check from PROCESS_RULES.
+"""
+
+on_behavior_step_ob = """
+{{ default_last_step_action_results_text }}
+"""
+
+[capabilities]
+tool_whitelist = []
+action_whitelist = [
+  "read",
+  "exec_bash",
+  "sendmsg"
+]
+
+[budget]
+max_rounds = 12
+max_consecutive_errors = 3
+
+[model]
+preferred = "llm.chat"
+
+[on_context_limit_reached]
+mode = "compress_then_continue"

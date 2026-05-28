@@ -15,13 +15,47 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use buckyos_api::{AiContent, AiMessage, ResourceRef};
+use chrono::{Local, TimeZone};
 use llm_context::{
-    EngineConfig, PromptRenderEngine, RenderError, RenderVars, ValueLoader,
-    XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT,
+    behavior_loop::StepRecord, EngineConfig, PromptRenderEngine, RenderError, RenderVars,
+    ValueLoader, XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT,
 };
 use serde_json::{json, Value as Json};
 
-use crate::session_model::SessionKind;
+use crate::session_model::{
+    AgentTaskBinding, BackgroundHint, BgEventSnapshot, EventRef, PendingInput, SessionKind,
+};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LlmContextEnv {
+    pub msgs: Vec<Json>,
+    pub events: Vec<EventRef>,
+    pub bg_events: Vec<BgEventSnapshot>,
+    pub background_hints: Vec<BackgroundHint>,
+    pub default_changed_background_hint_text: String,
+    pub last_step: Option<Json>,
+    pub last_report: Option<String>,
+    pub behavior_history: Vec<Json>,
+    pub agent_global_state: Json,
+}
+
+impl Default for LlmContextEnv {
+    fn default() -> Self {
+        Self {
+            msgs: Vec::new(),
+            events: Vec::new(),
+            bg_events: Vec::new(),
+            background_hints: Vec::new(),
+            default_changed_background_hint_text: String::new(),
+            last_step: None,
+            last_report: None,
+            behavior_history: Vec::new(),
+            agent_global_state: Json::Null,
+        }
+    }
+}
 
 /// Phase-1 snapshot of the variables the loader / `RenderVars` can serve.
 /// Built once per turn at the egress boundary so the value set is stable
@@ -29,8 +63,7 @@ use crate::session_model::SessionKind;
 ///
 /// String fields that drive presence checks (`session_title`,
 /// `recent_activity`) are stored already-trimmed so the matching
-/// `has_*` booleans line up with the historical `compose_environment_message`
-/// rules byte-for-byte.
+/// `has_*` booleans are stable across behavior-template renders.
 #[derive(Debug, Clone)]
 pub struct AgentSessionEnv {
     pub session_id: String,
@@ -40,6 +73,8 @@ pub struct AgentSessionEnv {
     pub session_owner: String,
     pub session_current_todo: Json,
     pub session_current_todo_list: String,
+    pub session_background_hints: Vec<BackgroundHint>,
+    pub session_default_changed_background_hint_text: String,
 
     pub behavior_name: String,
     pub behavior_objective: String,
@@ -58,15 +93,46 @@ pub struct AgentSessionEnv {
 
     pub recent_activity: String,
     pub clock_unix_ms: u64,
+    pub runtime_workspace_list_text: String,
+    pub notebook_list_text: String,
+    pub notebook_last_items_text: String,
+    pub llm_context: LlmContextEnv,
+    pub task: Option<TaskEnv>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskEnv {
+    pub task_id: i64,
+    pub root_task_id: i64,
+    pub root_id: String,
+    pub task_type: String,
+    pub runner: String,
+    pub task_name: String,
+    pub user_id: String,
+    pub app_id: String,
+    pub parent_id: Option<i64>,
+}
+
+impl From<AgentTaskBinding> for TaskEnv {
+    fn from(binding: AgentTaskBinding) -> Self {
+        Self {
+            task_id: binding.task_id,
+            root_task_id: binding.root_task_id,
+            root_id: binding.root_id,
+            task_type: binding.task_type,
+            runner: binding.runner,
+            task_name: binding.task_name,
+            user_id: binding.user_id,
+            app_id: binding.app_id,
+            parent_id: binding.parent_id,
+        }
+    }
 }
 
 impl AgentSessionEnv {
     /// Normalize a raw `SessionKind` to the stable string used in templates.
     pub fn kind_str(kind: SessionKind) -> &'static str {
-        match kind {
-            SessionKind::Ui => "ui",
-            SessionKind::Work => "work",
-        }
+        kind.as_str()
     }
 
     fn has_title(&self) -> bool {
@@ -75,6 +141,10 @@ impl AgentSessionEnv {
 
     fn has_current_todo(&self) -> bool {
         !self.session_current_todo.is_null()
+    }
+
+    fn background_hint_changed(&self) -> bool {
+        !self.session_background_hints.is_empty()
     }
 
     fn has_workspace_id(&self) -> bool {
@@ -107,7 +177,31 @@ pub fn build_render_vars(env: &AgentSessionEnv) -> RenderVars {
         .with_var("workspace", workspace_object(env))
         .with_var("paths", paths_object(env))
         .with_var("input", input_object(env))
+        .with_var("current_context", current_context_object(env))
+        .with_var("task", task_object(env))
+        .with_var("task_executor", task_executor_object(env))
         .with_var("runtime", runtime_object(env))
+        .with_var("notebook", notebook_object(env))
+        .with_var("llm_context", llm_context_object(env))
+        .with_var("msgs", msgs_array(env))
+        .with_var("events", events_array(env))
+        .with_var("bg_events", bg_events_array(env))
+        .with_var(
+            "last_step",
+            env.llm_context.last_step.clone().unwrap_or(Json::Null),
+        )
+        .with_var(
+            "behavior_history",
+            Json::Array(env.llm_context.behavior_history.clone()),
+        )
+        .with_var(
+            "step_history",
+            Json::Array(env.llm_context.behavior_history.clone()),
+        )
+        .with_var(
+            "agent_global_state",
+            env.llm_context.agent_global_state.clone(),
+        )
         .with_var(
             "result_protocol",
             Json::String(XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string()),
@@ -168,8 +262,19 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "session.title" => Some(Json::String(env.session_title.clone())),
         "session.objective" => Some(Json::String(env.session_objective.clone())),
         "session.owner" => Some(Json::String(env.session_owner.clone())),
+        "session.current_behavior" => Some(Json::String(env.behavior_name.clone())),
+        "session.task_id" => Some(task_number(env, |task| task.task_id)),
+        "session.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
         "session.current_todo" => Some(env.session_current_todo.clone()),
         "session.current_todo_list" => Some(Json::String(env.session_current_todo_list.clone())),
+        "session.background_hint_changed" => Some(Json::Bool(env.background_hint_changed())),
+        "session.default_changed_background_hint_text" => Some(Json::String(
+            env.session_default_changed_background_hint_text.clone(),
+        )),
+        "session.default_changed_backgrand_hint_text" => Some(Json::String(
+            env.session_default_changed_background_hint_text.clone(),
+        )),
+        "session.background_hints" => Some(background_hints_array(env)),
         "session.has_title" => Some(Json::Bool(env.has_title())),
         "session.has_current_todo" => Some(Json::Bool(env.has_current_todo())),
 
@@ -194,14 +299,93 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "paths.workspace_root" => Some(Json::String(env.workspace_root_display())),
 
         "input" => Some(input_object(env)),
-        "input.text" => Some(Json::String(env.input_text.clone())),
-        "input.has_user_text" => Some(Json::Bool(env.input_has_user_text)),
-        "input.has_events" => Some(Json::Bool(env.input_has_events)),
+        "input.text" => Some(Json::String(input_text(env))),
+        "input.msg" => Some(first_or_null(&env.llm_context.msgs)),
+        "input.msgs" | "msgs" => Some(msgs_array(env)),
+        "input.event" => first_event_or_null(&env.llm_context.events),
+        "input.events" | "llm_context.events" | "events" => Some(events_array(env)),
+        "input.bg_events" | "llm_context.bg_events" | "bg_events" => Some(bg_events_array(env)),
+        "input.timer_events" => Some(filtered_events_array(env, is_timer_event)),
+        "input.reminder_events" => Some(filtered_events_array(env, |event| {
+            event.event_id == "timer.reminder_check"
+        })),
+        "input.hard_barrier_events" => Some(filtered_events_array(env, |event| {
+            event.event_id == "timer.hard_barrier"
+        })),
+        "input.scheduled_task_events" => Some(filtered_events_array(env, |event| {
+            event.event_id == "timer.scheduled_task_check"
+        })),
+        "input.worksession_reports" => Some(filtered_events_array(env, |event| {
+            event.event_id == "worksession_report"
+        })),
+        "input.has_user_text" => Some(Json::Bool(has_user_text(env))),
+        "input.has_msgs" => Some(Json::Bool(!env.llm_context.msgs.is_empty())),
+        "input.has_events" => Some(Json::Bool(!env.llm_context.events.is_empty())),
+        "input.has_bg_events" => Some(Json::Bool(!env.llm_context.bg_events.is_empty())),
+        _ if key.starts_with("input.") => {
+            let path = key.trim_start_matches("input.");
+            resolve_json_path(&input_object(env), path)
+        }
 
         "runtime" => Some(runtime_object(env)),
         "runtime.clock_unix_ms" => Some(Json::from(env.clock_unix_ms)),
+        "runtime.clock_text" => Some(Json::String(clock_text_from_unix_ms(env.clock_unix_ms))),
         "runtime.recent_activity" => Some(Json::String(env.recent_activity.clone())),
         "runtime.has_activity" => Some(Json::Bool(env.has_recent_activity())),
+        "runtime.workspace_list_text" => {
+            Some(Json::String(env.runtime_workspace_list_text.clone()))
+        }
+
+        "task" => Some(task_object(env)),
+        "task.id" | "task.task_id" => Some(task_number(env, |task| task.task_id)),
+        "task.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
+        "task.root_id" => Some(task_string(env, |task| task.root_id.as_str())),
+        "task.type" | "task.task_type" => Some(task_string(env, |task| task.task_type.as_str())),
+        "task.runner" => Some(task_string(env, |task| task.runner.as_str())),
+        "task.name" | "task.task_name" => Some(task_string(env, |task| task.task_name.as_str())),
+        "task.user_id" => Some(task_string(env, |task| task.user_id.as_str())),
+        "task.app_id" => Some(task_string(env, |task| task.app_id.as_str())),
+        "task.parent_id" => Some(match env.task.as_ref().and_then(|task| task.parent_id) {
+            Some(id) => Json::from(id),
+            None => Json::Null,
+        }),
+
+        "task_executor" => Some(task_executor_object(env)),
+        "task_executor.has_task" => Some(Json::Bool(env.task.is_some())),
+        "task_executor.task_id" => Some(task_number(env, |task| task.task_id)),
+        "task_executor.root_task_id" => Some(task_number(env, |task| task.root_task_id)),
+
+        "notebook" => Some(notebook_object(env)),
+        "notebook.list_text" => Some(Json::String(env.notebook_list_text.clone())),
+        "notebook.last_items_text" => Some(Json::String(env.notebook_last_items_text.clone())),
+
+        "current_context" => Some(current_context_object(env)),
+        "current_context.behavior_name" => Some(Json::String(env.behavior_name.clone())),
+        "current_context.last_step" | "last_step" => {
+            Some(env.llm_context.last_step.clone().unwrap_or(Json::Null))
+        }
+        "current_context.last_report" => Some(match &env.llm_context.last_report {
+            Some(report) => Json::String(report.clone()),
+            None => Json::Null,
+        }),
+        "current_context.step_history"
+        | "step_history"
+        | "llm_context.behavior_history"
+        | "behavior_history" => Some(Json::Array(env.llm_context.behavior_history.clone())),
+        _ if key.starts_with("current_context.") => {
+            let path = key.trim_start_matches("current_context.");
+            resolve_json_path(&current_context_object(env), path)
+        }
+
+        "llm_context" => Some(llm_context_object(env)),
+        "llm_context.last_step" => Some(env.llm_context.last_step.clone().unwrap_or(Json::Null)),
+        "llm_context.last_report" => Some(match &env.llm_context.last_report {
+            Some(report) => Json::String(report.clone()),
+            None => Json::Null,
+        }),
+        "llm_context.agent_global_state" | "agent_global_state" => {
+            Some(env.llm_context.agent_global_state.clone())
+        }
 
         "result_protocol" | "xml_behavior_result_protocol" => Some(Json::String(
             XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string(),
@@ -218,11 +402,62 @@ fn session_object(env: &AgentSessionEnv) -> Json {
         "title": env.session_title,
         "objective": env.session_objective,
         "owner": env.session_owner,
+        "current_behavior": env.behavior_name,
+        "task_id": env.task.as_ref().map(|task| task.task_id),
+        "root_task_id": env.task.as_ref().map(|task| task.root_task_id),
         "current_todo": env.session_current_todo.clone(),
         "current_todo_list": env.session_current_todo_list,
+        "background_hint_changed": env.background_hint_changed(),
+        "default_changed_background_hint_text": env.session_default_changed_background_hint_text.clone(),
+        "default_changed_backgrand_hint_text": env.session_default_changed_background_hint_text.clone(),
+        "background_hints": background_hints_array(env),
         "has_title": env.has_title(),
         "has_current_todo": env.has_current_todo(),
     })
+}
+
+fn task_object(env: &AgentSessionEnv) -> Json {
+    match &env.task {
+        Some(task) => json!({
+            "id": task.task_id,
+            "task_id": task.task_id,
+            "root_task_id": task.root_task_id,
+            "root_id": task.root_id,
+            "type": task.task_type,
+            "task_type": task.task_type,
+            "runner": task.runner,
+            "name": task.task_name,
+            "task_name": task.task_name,
+            "user_id": task.user_id,
+            "app_id": task.app_id,
+            "parent_id": task.parent_id,
+        }),
+        None => Json::Null,
+    }
+}
+
+fn task_executor_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "has_task": env.task.is_some(),
+        "task": task_object(env),
+        "task_id": env.task.as_ref().map(|task| task.task_id),
+        "root_task_id": env.task.as_ref().map(|task| task.root_task_id),
+    })
+}
+
+fn task_number(env: &AgentSessionEnv, f: impl Fn(&TaskEnv) -> i64) -> Json {
+    env.task
+        .as_ref()
+        .map(f)
+        .map(Json::from)
+        .unwrap_or(Json::Null)
+}
+
+fn task_string<'a>(env: &'a AgentSessionEnv, f: impl Fn(&'a TaskEnv) -> &'a str) -> Json {
+    env.task
+        .as_ref()
+        .map(|task| Json::String(f(task).to_string()))
+        .unwrap_or(Json::Null)
 }
 
 fn resolve_json_path(value: &Json, path: &str) -> Option<Json> {
@@ -267,17 +502,328 @@ fn paths_object(env: &AgentSessionEnv) -> Json {
 
 fn input_object(env: &AgentSessionEnv) -> Json {
     json!({
-        "text": env.input_text,
-        "has_user_text": env.input_has_user_text,
-        "has_events": env.input_has_events,
+        "text": input_text(env),
+        "msg": first_or_null(&env.llm_context.msgs),
+        "msgs": msgs_array(env),
+        "event": first_event_or_null(&env.llm_context.events).unwrap_or(Json::Null),
+        "events": events_array(env),
+        "bg_events": bg_events_array(env),
+        "timer_events": filtered_events_array(env, is_timer_event),
+        "reminder_events": filtered_events_array(env, |event| {
+            event.event_id == "timer.reminder_check"
+        }),
+        "hard_barrier_events": filtered_events_array(env, |event| {
+            event.event_id == "timer.hard_barrier"
+        }),
+        "scheduled_task_events": filtered_events_array(env, |event| {
+            event.event_id == "timer.scheduled_task_check"
+        }),
+        "worksession_reports": filtered_events_array(env, |event| {
+            event.event_id == "worksession_report"
+        }),
+        "has_user_text": has_user_text(env),
+        "has_msgs": !env.llm_context.msgs.is_empty(),
+        "has_events": !env.llm_context.events.is_empty(),
+        "has_bg_events": !env.llm_context.bg_events.is_empty(),
     })
 }
 
 fn runtime_object(env: &AgentSessionEnv) -> Json {
     json!({
         "clock_unix_ms": env.clock_unix_ms,
+        "clock_text": clock_text_from_unix_ms(env.clock_unix_ms),
         "recent_activity": env.recent_activity,
         "has_activity": env.has_recent_activity(),
+        "workspace_list_text": env.runtime_workspace_list_text,
+    })
+}
+
+fn notebook_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "list_text": env.notebook_list_text,
+        "last_items_text": env.notebook_last_items_text,
+    })
+}
+
+fn clock_text_from_unix_ms(clock_unix_ms: u64) -> String {
+    let Ok(ms) = i64::try_from(clock_unix_ms) else {
+        return String::new();
+    };
+
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S %Z").to_string())
+        .unwrap_or_default()
+}
+
+fn llm_context_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "msgs": msgs_array(env),
+        "events": events_array(env),
+        "bg_events": bg_events_array(env),
+        "last_step": env.llm_context.last_step.clone().unwrap_or(Json::Null),
+        "last_report": env.llm_context.last_report.clone(),
+        "behavior_history": env.llm_context.behavior_history.clone(),
+        "step_history": env.llm_context.behavior_history.clone(),
+        "current_context": current_context_object(env),
+        "agent_global_state": env.llm_context.agent_global_state.clone(),
+    })
+}
+
+fn current_context_object(env: &AgentSessionEnv) -> Json {
+    json!({
+        "behavior_name": env.behavior_name,
+        "last_step": env.llm_context.last_step.clone().unwrap_or(Json::Null),
+        "last_report": env.llm_context.last_report.clone(),
+        "step_history": env.llm_context.behavior_history.clone(),
+    })
+}
+
+fn msgs_array(env: &AgentSessionEnv) -> Json {
+    Json::Array(env.llm_context.msgs.clone())
+}
+
+fn events_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.llm_context.events).unwrap_or(Json::Array(Vec::new()))
+}
+
+fn bg_events_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.llm_context.bg_events).unwrap_or(Json::Array(Vec::new()))
+}
+
+fn background_hints_array(env: &AgentSessionEnv) -> Json {
+    serde_json::to_value(&env.session_background_hints).unwrap_or(Json::Array(Vec::new()))
+}
+
+fn first_or_null(values: &[Json]) -> Json {
+    values.first().cloned().unwrap_or(Json::Null)
+}
+
+fn first_event_or_null(events: &[EventRef]) -> Option<Json> {
+    events
+        .first()
+        .and_then(|event| serde_json::to_value(event).ok())
+        .or(Some(Json::Null))
+}
+
+fn is_timer_event(event: &EventRef) -> bool {
+    event.event_id == "timer"
+        || event.event_id.starts_with("timer.")
+        || event.event_id.starts_with("timer/")
+}
+
+fn filtered_events_array(env: &AgentSessionEnv, predicate: impl Fn(&EventRef) -> bool) -> Json {
+    Json::Array(
+        env.llm_context
+            .events
+            .iter()
+            .filter(|event| predicate(event))
+            .filter_map(|event| serde_json::to_value(event).ok())
+            .collect(),
+    )
+}
+
+fn input_text(env: &AgentSessionEnv) -> String {
+    if env.llm_context.msgs.is_empty() {
+        return env.input_text.clone();
+    }
+    env.llm_context
+        .msgs
+        .iter()
+        .filter_map(|msg| msg.get("text").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn has_user_text(env: &AgentSessionEnv) -> bool {
+    env.input_has_user_text || !input_text(env).trim().is_empty()
+}
+
+pub fn step_record_prompt_value(step: &StepRecord) -> Json {
+    json!({
+        "step_index": step.meta.step_index,
+        "behavior_name": step.meta.behavior_name,
+        "observation": step.observation,
+        "thinking": step.thought,
+        "actions": step.actions,
+        "action_results": step.action_results,
+        "messages_sent": step.messages_sent,
+        "report": step.self_report,
+        "next_behavior": step.next_behavior,
+    })
+}
+
+pub fn context_snapshot_prompt_value(snapshot: &llm_context::state::LLMContextSnapshot) -> Json {
+    let step_history: Vec<Json> = snapshot
+        .state
+        .steps
+        .iter()
+        .map(step_record_prompt_value)
+        .collect();
+    json!({
+        "behavior_name": snapshot.request.behavior_name,
+        "last_step": snapshot
+            .state
+            .last_step
+            .as_ref()
+            .map(step_record_prompt_value)
+            .unwrap_or(Json::Null),
+        "last_report": snapshot.state.last_report,
+        "step_history": step_history,
+    })
+}
+
+pub fn context_snapshot_prompt_value_from_env(env: &AgentSessionEnv) -> Json {
+    current_context_object(env)
+}
+
+pub fn msg_ref_from_pending(input: &PendingInput, received_at_ms: u64) -> Option<Json> {
+    let PendingInput::Msg {
+        record_id,
+        from,
+        from_did,
+        tunnel_did,
+        text,
+        ai_message,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    let (content, attachments, default_text) = render_msg_content(ai_message);
+    Some(json!({
+        "record_id": record_id,
+        "from": from,
+        "from_did": from_did,
+        "tunnel_did": tunnel_did,
+        "created_at_ms": Json::Null,
+        "received_at_ms": received_at_ms,
+        "raw_text": if text.trim().is_empty() {
+            Json::Null
+        } else {
+            Json::String(text.clone())
+        },
+        "text": default_text,
+        "content": content,
+        "attachments": attachments,
+    }))
+}
+
+fn render_msg_content(message: &AiMessage) -> (Vec<Json>, Vec<Json>, String) {
+    let mut content = Vec::new();
+    let mut attachments = Vec::new();
+    let mut text_parts = Vec::new();
+    for block in &message.content {
+        match block {
+            AiContent::Text { text } => {
+                content.push(json!({
+                    "type": "text",
+                    "text": text,
+                    "attachment": Json::Null,
+                    "machine": Json::Null,
+                }));
+                if !text.trim().is_empty() {
+                    text_parts.push(text.clone());
+                }
+            }
+            AiContent::Image { source } => {
+                let attachment = attachment_ref("image", source, None);
+                text_parts.push(
+                    attachment
+                        .get("text_marker")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("[image]")
+                        .to_string(),
+                );
+                content.push(json!({
+                    "type": "image",
+                    "text": Json::Null,
+                    "attachment": attachment.clone(),
+                    "machine": Json::Null,
+                }));
+                attachments.push(attachment);
+            }
+            AiContent::Document { source, title } => {
+                let attachment = attachment_ref("document", source, title.as_deref());
+                text_parts.push(
+                    attachment
+                        .get("text_marker")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("[document]")
+                        .to_string(),
+                );
+                content.push(json!({
+                    "type": "document",
+                    "text": Json::Null,
+                    "attachment": attachment.clone(),
+                    "machine": Json::Null,
+                }));
+                attachments.push(attachment);
+            }
+            AiContent::ToolUse { .. }
+            | AiContent::ToolResult { .. }
+            | AiContent::Thinking { .. }
+            | AiContent::ProviderState { .. } => {
+                content.push(json!({
+                    "type": "machine",
+                    "text": Json::Null,
+                    "attachment": Json::Null,
+                    "machine": serde_json::to_value(block).unwrap_or(Json::Null),
+                }));
+            }
+        }
+    }
+    (content, attachments, text_parts.join("\n"))
+}
+
+fn attachment_ref(kind: &str, source: &ResourceRef, title: Option<&str>) -> Json {
+    let (source_json, mime, fallback_title) = match source {
+        ResourceRef::NamedObject { obj_id } => (
+            json!({
+                "type": "named_object",
+                "obj_id": obj_id.to_string(),
+                "url": Json::Null,
+            }),
+            None,
+            Some(obj_id.to_string()),
+        ),
+        ResourceRef::Url { url, mime_hint } => (
+            json!({
+                "type": "url",
+                "obj_id": Json::Null,
+                "url": url,
+            }),
+            mime_hint.clone(),
+            url.rsplit('/').next().map(str::to_string),
+        ),
+        ResourceRef::Base64 { mime, .. } => (
+            json!({
+                "type": "base64",
+                "obj_id": Json::Null,
+                "url": Json::Null,
+            }),
+            Some(mime.clone()),
+            None,
+        ),
+    };
+    let label = title
+        .map(str::to_string)
+        .or(fallback_title)
+        .filter(|value| !value.trim().is_empty());
+    let marker = match &label {
+        Some(label) => format!("[{kind}: {label}]"),
+        None => format!("[{kind}]"),
+    };
+    json!({
+        "kind": kind,
+        "source": source_json,
+        "mime": mime,
+        "title": label,
+        "label": label,
+        "text_marker": marker,
     })
 }
 
@@ -305,28 +851,6 @@ pub async fn render_template(
     Ok(result.rendered)
 }
 
-/// Phase-1 environment-block template. Mirrors the historical
-/// `compose_environment_message` output line-for-line:
-///
-/// ```text
-/// behavior: `<name>`
-/// session: `<id>`[ ("<title>")]
-/// [workspace: `<id>`]
-/// [recent activity: <activity>]
-/// clock: unix_ms=<ms>
-/// ```
-///
-/// The `{% if %}` guards key off the explicit `has_*` booleans seeded into
-/// the aggregate objects, so empty-string distinction is exact.
-pub const ENVIRONMENT_BLOCK_TEMPLATE: &str = "\
-behavior: `{{ behavior.name }}`
-session: `{{ session.id }}`{% if session.has_title %} (\"{{ session.title }}\"){% endif %}\
-{% if workspace.has_id %}
-workspace: `{{ workspace.id }}`{% endif %}\
-{% if runtime.has_activity %}
-recent activity: {{ runtime.recent_activity }}{% endif %}
-clock: unix_ms={{ runtime.clock_unix_ms }}";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +870,8 @@ mod tests {
                 "skills": ["docs"],
             }),
             session_current_todo_list: "T01 pending current - do thing".into(),
+            session_background_hints: Vec::new(),
+            session_default_changed_background_hint_text: String::new(),
             behavior_name: "chat_route".into(),
             behavior_objective: "route".into(),
             behavior_mode: "behavior",
@@ -359,6 +885,42 @@ mod tests {
             input_has_events: false,
             recent_activity: "running tool".into(),
             clock_unix_ms: 123,
+            runtime_workspace_list_text: "- `ws-a` (ready) — Alpha\n".into(),
+            notebook_list_text: "Available notebooks: 1 total.\n- user/preferences: preferences, 2 records, last modified 2026-05-24T10:00:00Z\n".into(),
+            notebook_last_items_text: "Recent notebook items: latest 1.\n- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)\n".into(),
+            llm_context: LlmContextEnv {
+                msgs: vec![json!({
+                    "record_id": "msg-1",
+                    "from": "alice",
+                    "from_did": Json::Null,
+                    "tunnel_did": Json::Null,
+                    "created_at_ms": Json::Null,
+                    "received_at_ms": 120,
+                    "raw_text": "hi",
+                    "text": "hi",
+                    "content": [{"type": "text", "text": "hi", "attachment": Json::Null, "machine": Json::Null}],
+                    "attachments": [],
+                })],
+                events: vec![EventRef {
+                    event_id: "timer.reminder_check".into(),
+                    data: json!({"target_id": "r1"}),
+                    reason: Some("reminder".into()),
+                    observed_at_ms: 121,
+                }],
+                bg_events: vec![BgEventSnapshot {
+                    event_id: "presence.changed".into(),
+                    data: json!({"online": true}),
+                    reason: None,
+                    observed_at_ms: 122,
+                }],
+                background_hints: Vec::new(),
+                default_changed_background_hint_text: String::new(),
+                last_step: Some(json!({"step_index": 7, "behavior_name": "chat_route"})),
+                last_report: Some("latest report".into()),
+                behavior_history: vec![json!({"step_index": 6, "behavior_name": "chat_route"})],
+                agent_global_state: json!({"mood": "steady"}),
+            },
+            task: None,
         }
     }
 
@@ -371,6 +933,8 @@ mod tests {
             session_owner: String::new(),
             session_current_todo: Json::Null,
             session_current_todo_list: String::new(),
+            session_background_hints: Vec::new(),
+            session_default_changed_background_hint_text: String::new(),
             behavior_name: "chat_route".into(),
             behavior_objective: String::new(),
             behavior_mode: "behavior",
@@ -384,12 +948,41 @@ mod tests {
             input_has_events: false,
             recent_activity: String::new(),
             clock_unix_ms: 999,
+            runtime_workspace_list_text: String::new(),
+            notebook_list_text: String::new(),
+            notebook_last_items_text: String::new(),
+            llm_context: LlmContextEnv::default(),
+            task: None,
         }
+    }
+
+    #[test]
+    fn clock_text_includes_year_seconds_and_timezone() {
+        let timestamp_ms = 1_779_729_908_000;
+        let expected = Local
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string();
+
+        assert_eq!(clock_text_from_unix_ms(timestamp_ms as u64), expected);
     }
 
     #[tokio::test]
     async fn loader_resolves_phase1_keys() {
-        let env = sample_env();
+        let mut env = sample_env();
+        env.task = Some(TaskEnv {
+            task_id: 42,
+            root_task_id: 40,
+            root_id: "40".to_string(),
+            task_type: "agent.delegate".to_string(),
+            runner: "jarvis".to_string(),
+            task_name: "delegate".to_string(),
+            user_id: "user".to_string(),
+            app_id: "opendan".to_string(),
+            parent_id: None,
+        });
         let loader = AgentSessionValueLoader::new(env.clone());
         assert_eq!(
             loader.load("$session.id").await.unwrap(),
@@ -417,6 +1010,11 @@ mod tests {
             loader.load("$session.current_todo.content").await.unwrap(),
             Some(Json::String("do thing details".into()))
         );
+        assert_eq!(loader.load("$task.id").await.unwrap(), Some(Json::from(42)));
+        assert_eq!(
+            loader.load("$task_executor.has_task").await.unwrap(),
+            Some(Json::Bool(true))
+        );
         assert_eq!(
             loader.load("$session.has_current_todo").await.unwrap(),
             Some(Json::Bool(true))
@@ -430,10 +1028,47 @@ mod tests {
             Some(Json::Bool(true))
         );
         assert_eq!(
+            loader.load("$runtime.clock_text").await.unwrap(),
+            Some(Json::String(clock_text_from_unix_ms(env.clock_unix_ms)))
+        );
+        assert_eq!(
+            loader.load("$runtime.workspace_list_text").await.unwrap(),
+            Some(Json::String(env.runtime_workspace_list_text.clone()))
+        );
+        assert_eq!(
+            loader.load("$notebook.list_text").await.unwrap(),
+            Some(Json::String(env.notebook_list_text.clone()))
+        );
+        assert_eq!(
+            loader.load("$notebook.last_items_text").await.unwrap(),
+            Some(Json::String(env.notebook_last_items_text.clone()))
+        );
+        assert_eq!(
             loader.load("$result_protocol").await.unwrap(),
             Some(Json::String(
                 XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT.to_string()
             ))
+        );
+        assert_eq!(
+            loader.load("$llm_context.events").await.unwrap(),
+            Some(json!([{
+                "event_id": "timer.reminder_check",
+                "data": {"target_id": "r1"},
+                "reason": "reminder",
+                "observed_at_ms": 121
+            }]))
+        );
+        assert_eq!(
+            loader.load("$input.msg.text").await.unwrap(),
+            Some(Json::String("hi".into()))
+        );
+        assert_eq!(
+            loader.load("$current_context.last_report").await.unwrap(),
+            Some(Json::String("latest report".into()))
+        );
+        assert_eq!(
+            loader.load("$agent_global_state").await.unwrap(),
+            Some(json!({"mood": "steady"}))
         );
         assert_eq!(loader.load("$unknown.path").await.unwrap(), None);
     }
@@ -476,50 +1111,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_block_matches_full_layout() {
-        let env = sample_env();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-1` (\"hello\")
-workspace: `ws1`
-recent activity: running tool
-clock: unix_ms=123";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
-    async fn environment_block_minimal_layout() {
-        let env = minimal_env();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-2`
-clock: unix_ms=999";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
-    async fn environment_block_partial_title_only() {
-        let mut env = sample_env();
-        env.workspace_id = None;
-        env.workspace_root = None;
-        env.recent_activity = String::new();
-        let out = render_template(ENVIRONMENT_BLOCK_TEMPLATE, &env, &[])
-            .await
-            .unwrap();
-        let expected = "\
-behavior: `chat_route`
-session: `s-1` (\"hello\")
-clock: unix_ms=123";
-        assert_eq!(out, expected);
-    }
-
-    #[tokio::test]
     async fn extra_vars_seed_overlay() {
         let env = sample_env();
         let extras = vec![
@@ -532,7 +1123,7 @@ clock: unix_ms=123";
     }
 
     #[tokio::test]
-    async fn extra_vars_support_on_switch_from_context_report() {
+    async fn extra_vars_support_on_behavior_switch_from_context_report() {
         let env = sample_env();
         let extras = vec![(
             "from_context",
@@ -553,6 +1144,311 @@ clock: unix_ms=123";
         let template = "agent={{ behavior.name }}\nsession={{ session.id }}\n---\n{{ role_md }}";
         let out = render_template(template, &env, &extras).await.unwrap();
         assert_eq!(out, "agent=chat_route\nsession=s-1\n---\nROLE");
+    }
+
+    #[tokio::test]
+    async fn contract_renders_main_variables_and_control_flow() {
+        let mut env = sample_env();
+        let msg = PendingInput::Msg {
+            record_id: "msg-image".into(),
+            from: "alice".into(),
+            from_did: Some("did:example:alice".into()),
+            from_name: Some("Alice".into()),
+            tunnel_did: Some("did:example:tunnel".into()),
+            text: "look".into(),
+            ai_message: AiMessage::new(
+                buckyos_api::AiRole::User,
+                vec![
+                    AiContent::text("look"),
+                    AiContent::Image {
+                        source: ResourceRef::url(
+                            "https://example.test/screenshot.png".into(),
+                            Some("image/png".into()),
+                        ),
+                    },
+                ],
+            ),
+        };
+        env.input_text = String::new();
+        env.input_has_user_text = false;
+        env.input_has_events = false;
+        env.llm_context = LlmContextEnv {
+            msgs: vec![msg_ref_from_pending(&msg, 42).unwrap()],
+            events: vec![
+                EventRef {
+                    event_id: "timer.reminder_check".into(),
+                    data: json!({
+                        "trigger_type": "precise_trigger",
+                        "target_type": "reminder",
+                        "target_id": "r1",
+                        "expected_trigger_time": "2026-05-24T10:00:00-07:00",
+                        "reason": "drink water",
+                    }),
+                    reason: Some("reminder subscription".into()),
+                    observed_at_ms: 101,
+                },
+                EventRef {
+                    event_id: "timer.hard_barrier".into(),
+                    data: json!({
+                        "trigger_type": "hard_barrier",
+                        "target_type": "other",
+                        "target_id": "all",
+                        "expected_trigger_time": "2026-05-24T11:00:00-07:00",
+                        "reason": "daily scan",
+                    }),
+                    reason: Some("barrier subscription".into()),
+                    observed_at_ms: 102,
+                },
+                EventRef {
+                    event_id: "timer.scheduled_task_check".into(),
+                    data: json!({
+                        "trigger_type": "precise_trigger",
+                        "target_type": "scheduled_task",
+                        "target_id": "task-1",
+                        "expected_trigger_time": "2026-05-24T12:00:00-07:00",
+                        "reason": "run task",
+                    }),
+                    reason: Some("task subscription".into()),
+                    observed_at_ms: 103,
+                },
+                EventRef {
+                    event_id: "worksession_report".into(),
+                    data: json!({
+                        "report_id": "report-1",
+                        "source_session_id": "work-1",
+                        "target_session_id": "s-1",
+                        "title": "Build",
+                        "objective": "Ship",
+                        "workspace_id": "ws1",
+                        "phase": "final",
+                        "report": "done",
+                        "is_final": true,
+                    }),
+                    reason: Some("work report".into()),
+                    observed_at_ms: 104,
+                },
+            ],
+            bg_events: vec![BgEventSnapshot {
+                event_id: "presence.changed".into(),
+                data: json!({"online": true}),
+                reason: Some("presence subscription".into()),
+                observed_at_ms: 105,
+            }],
+            background_hints: Vec::new(),
+            default_changed_background_hint_text: String::new(),
+            last_step: Some(json!({
+                "step_index": 8,
+                "behavior_name": "chat_route",
+                "observation": "observed",
+                "thinking": "thought",
+                "report": "step report",
+                "next_behavior": "do",
+            })),
+            last_report: Some("latest report".into()),
+            behavior_history: vec![
+                json!({
+                    "step_index": 6,
+                    "behavior_name": "plan",
+                    "report": "plan report",
+                    "next_behavior": "do",
+                }),
+                json!({
+                    "step_index": 7,
+                    "behavior_name": "do",
+                    "observation": "done",
+                    "report": "do report",
+                    "next_behavior": "",
+                }),
+            ],
+            agent_global_state: json!({
+                "mood": "steady",
+                "driver": {
+                    "hook_point": "on_behavior_switch",
+                    "pulled_msg_count": 1,
+                    "pulled_event_count": 4,
+                },
+            }),
+        };
+        env.session_background_hints = vec![BackgroundHint {
+            path: "memory/user/preference/style".into(),
+            kind: "memory".into(),
+            text: "Memory may be relevant: /user/preference/style".into(),
+            fingerprint: "fp-memory".into(),
+            data: json!({"key": "/user/preference/style"}),
+        }];
+        env.session_default_changed_background_hint_text =
+            "- Memory may be relevant: /user/preference/style".into();
+
+        let extras = vec![
+            (
+                "switch",
+                json!({
+                    "from": "plan",
+                    "to": "do",
+                    "from_context": {
+                        "behavior_name": "plan",
+                        "last_report": "parent report",
+                    },
+                    "to_context": {
+                        "behavior_name": "do",
+                        "last_report": "child report",
+                    },
+                }),
+            ),
+            ("from_behavior", Json::String("plan".into())),
+            (
+                "from_context",
+                json!({
+                    "behavior_name": "plan",
+                    "last_report": "parent report",
+                }),
+            ),
+            (
+                "to_context",
+                json!({
+                    "behavior_name": "do",
+                    "last_report": "child report",
+                }),
+            ),
+        ];
+        let template = r#"
+session={{ session.id }}|{{ session.kind }}|{{ session.title }}|{{ session.objective }}|{{ session.owner }}|{{ session.current_behavior }}|{{ session.current_todo.todo_id }}|{{ session.current_todo_list }}
+behavior={{ behavior.name }}|{{ behavior.objective }}|{{ behavior.mode }}
+workspace={{ workspace.id }}|{{ workspace.root }}|{{ workspace.has_id }}
+paths={{ paths.agent_root }}|{{ paths.session_root }}|{{ paths.workspace_root }}
+runtime={{ runtime.clock_unix_ms }}|{{ runtime.clock_text }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
+runtime_workspace={{ runtime.workspace_list_text }}
+notebook={{ notebook.list_text }}|{{ notebook.last_items_text }}
+{% if session.has_title %}if_session_title={{ session.title }}{% endif %}
+{% if session.background_hint_changed %}if_background_hint={{ session.default_changed_background_hint_text }}
+{% endif %}
+{% for hint in session.background_hints %}hint={{ hint.path }}|{{ hint.kind }}|{{ hint.text }}
+{% endfor %}
+{% if input.has_user_text %}if_input_text={{ input.text }}{% endif %}
+{% if input.has_msgs %}if_msgs=yes{% endif %}
+{% if input.has_events %}if_events=yes{% endif %}
+{% if input.has_bg_events %}if_bg=yes{% endif %}
+input_msg={{ input.msg.record_id }}|{{ input.msg.from }}|{{ input.msg.from_did }}|{{ input.msg.tunnel_did }}|{{ input.msg.received_at_ms }}|{{ input.msg.raw_text }}|{{ input.msg.text }}|{{ input.msg.content.0.text }}|{{ input.msg.content.1.attachment.text_marker }}
+{% for msg in input.msgs %}msg={{ msg.record_id }}|{{ msg.attachments.0.kind }}|{{ msg.attachments.0.source.type }}|{{ msg.attachments.0.source.url }}|{{ msg.attachments.0.mime }}|{{ msg.attachments.0.title }}|{{ msg.attachments.0.text_marker }}
+{% endfor %}
+input_event={{ input.event.event_id }}|{{ input.event.reason }}|{{ input.event.observed_at_ms }}|{{ input.event.data.target_id }}
+{% for event in input.events %}event={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}
+{% endfor %}
+{% for event in input.bg_events %}bg={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}|{{ event.data.online }}
+{% endfor %}
+{% for event in input.timer_events %}timer={{ event.event_id }}|{{ event.data.trigger_type }}
+{% endfor %}
+{% for event in input.reminder_events %}reminder={{ event.data.target_id }}|{{ event.data.reason }}
+{% endfor %}
+{% for event in input.hard_barrier_events %}hard={{ event.data.target_id }}|{{ event.data.reason }}
+{% endfor %}
+{% for event in input.scheduled_task_events %}scheduled={{ event.data.target_id }}|{{ event.data.reason }}
+{% endfor %}
+{% for event in input.worksession_reports %}workreport={{ event.data.report_id }}|{{ event.data.source_session_id }}|{{ event.data.target_session_id }}|{{ event.data.title }}|{{ event.data.objective }}|{{ event.data.workspace_id }}|{{ event.data.phase }}|{{ event.data.report }}|{{ event.data.is_final }}
+{% endfor %}
+current={{ current_context.behavior_name }}|{{ current_context.last_step.step_index }}|{{ current_context.last_step.report }}|{{ current_context.last_report }}
+{% for step in current_context.step_history %}step={{ step.step_index }}|{{ step.behavior_name }}|{{ step.report }}|{{ step.next_behavior }}
+{% endfor %}
+legacy={{ last_step.step_index }}|{{ llm_context.last_step.step_index }}|{{ llm_context.last_report }}|{{ llm_context.agent_global_state.mood }}|{{ agent_global_state.mood }}
+{% for step in behavior_history %}legacy_step={{ step.step_index }}|{{ step.behavior_name }}
+{% endfor %}
+{% for step in step_history %}alias_step={{ step.step_index }}|{{ step.behavior_name }}
+{% endfor %}
+{% for event in events %}legacy_event={{ event.event_id }}
+{% endfor %}
+{% for event in bg_events %}legacy_bg={{ event.event_id }}
+{% endfor %}
+switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_context.last_report }}|{{ switch.to_context.behavior_name }}|{{ from_context.last_report }}|{{ to_context.last_report }}
+{% if result_protocol %}result_protocol=yes{% endif %}
+{% if xml_behavior_result_protocol %}xml_protocol=yes{% endif %}
+"#;
+        let out = render_template(template, &env, &extras).await.unwrap();
+        let expected_runtime = format!(
+            "runtime=123|{}|running tool|true",
+            clock_text_from_unix_ms(env.clock_unix_ms)
+        );
+
+        for expected in [
+            "session=s-1|ui|hello|do thing|alice|chat_route|T01|T01 pending current - do thing",
+            "behavior=chat_route|route|behavior",
+            "workspace=ws1|/tmp/ws1|true",
+            "paths=/tmp/agent|/tmp/agent/sessions/s-1|/tmp/ws1",
+            expected_runtime.as_str(),
+            "runtime_workspace=- `ws-a` (ready) — Alpha",
+            "notebook=Available notebooks: 1 total.",
+            "- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)",
+            "if_session_title=hello",
+            "if_background_hint=- Memory may be relevant: /user/preference/style",
+            "hint=memory/user/preference/style|memory|Memory may be relevant: /user/preference/style",
+            "if_input_text=look\n[image: screenshot.png]",
+            "if_msgs=yes",
+            "if_events=yes",
+            "if_bg=yes",
+            "input_msg=msg-image|alice|did:example:alice|did:example:tunnel|42|look|look\n[image: screenshot.png]|look|[image: screenshot.png]",
+            "msg=msg-image|image|url|https://example.test/screenshot.png|image/png|screenshot.png|[image: screenshot.png]",
+            "input_event=timer.reminder_check|reminder subscription|101|r1",
+            "event=timer.hard_barrier|barrier subscription|102",
+            "bg=presence.changed|presence subscription|105|true",
+            "timer=timer.scheduled_task_check|precise_trigger",
+            "reminder=r1|drink water",
+            "hard=all|daily scan",
+            "scheduled=task-1|run task",
+            "workreport=report-1|work-1|s-1|Build|Ship|ws1|final|done|true",
+            "current=chat_route|8|step report|latest report",
+            "step=6|plan|plan report|do",
+            "step=7|do|do report|",
+            "legacy=8|8|latest report|steady|steady",
+            "legacy_step=6|plan",
+            "alias_step=7|do",
+            "legacy_event=worksession_report",
+            "legacy_bg=presence.changed",
+            "switch=plan|do|plan|parent report|do|parent report|child report",
+            "result_protocol=yes",
+            "xml_protocol=yes",
+        ] {
+            assert!(
+                out.contains(expected),
+                "rendered contract output missing `{expected}`\n--- output ---\n{out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn msg_ref_renders_structured_attachments() {
+        let input = PendingInput::Msg {
+            record_id: "msg-image".into(),
+            from: "alice".into(),
+            from_did: Some("did:example:alice".into()),
+            from_name: None,
+            tunnel_did: Some("did:example:tunnel".into()),
+            text: "look".into(),
+            ai_message: AiMessage::new(
+                buckyos_api::AiRole::User,
+                vec![
+                    AiContent::text("look"),
+                    AiContent::Image {
+                        source: ResourceRef::url(
+                            "https://example.test/screenshot.png".into(),
+                            Some("image/png".into()),
+                        ),
+                    },
+                ],
+            ),
+        };
+        let msg = msg_ref_from_pending(&input, 42).unwrap();
+        assert_eq!(
+            msg["text"],
+            Json::String("look\n[image: screenshot.png]".into())
+        );
+        assert_eq!(msg["attachments"][0]["kind"], Json::String("image".into()));
+        assert_eq!(
+            msg["attachments"][0]["source"]["type"],
+            Json::String("url".into())
+        );
+        assert_eq!(
+            msg["content"][1]["attachment"]["text_marker"],
+            Json::String("[image: screenshot.png]".into())
+        );
     }
 
     #[tokio::test]

@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use buckyos_api::{
     get_buckyos_api_runtime, init_buckyos_api_runtime, load_app_identity_from_env,
-    set_buckyos_api_runtime, BuckyOSRuntimeType, KEventClient, OPENDAN_SERVICE_NAME,
+    set_buckyos_api_runtime, BuckyOSRuntimeType, CreateTaskOptions, KEventClient, TaskStatus,
+    OPENDAN_SERVICE_NAME,
 };
 use buckyos_kit::{get_buckyos_root_dir, init_logging};
 use log::{error, info, warn};
@@ -24,6 +25,7 @@ use tokio::fs;
 
 use opendan::agent::{AIAgent, CreateWorkSessionParams};
 use opendan::agent_config::AgentTomlFile;
+use opendan::agent_task_executor::TASK_TYPE_AGENT_DELEGATE;
 use opendan::ai_runtime::AgentRuntime;
 use opendan::session_model::{SessionStatus, SessionSummary};
 use opendan::worklog::{WorklogService, WorklogToolConfig};
@@ -49,6 +51,7 @@ struct StartupArgs {
     agent_root: Option<PathBuf>,
     agent_bin: Option<PathBuf>,
     worksession_test: Option<PathBuf>,
+    worksession_task_test: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -66,6 +69,7 @@ struct RootfsSyncEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct WorkSessionQuickTestSpec {
+    task_id: Option<i64>,
     title: String,
     objective: String,
     workspace_id: Option<String>,
@@ -73,17 +77,20 @@ struct WorkSessionQuickTestSpec {
     created_by_session_id: String,
     #[serde(alias = "reason_message")]
     reason_messages: Vec<String>,
+    auto_start: bool,
 }
 
 impl Default for WorkSessionQuickTestSpec {
     fn default() -> Self {
         Self {
+            task_id: None,
             title: String::new(),
             objective: String::new(),
             workspace_id: None,
             behavior: None,
             created_by_session_id: "worksession-test".to_string(),
             reason_messages: Vec::new(),
+            auto_start: true,
         }
     }
 }
@@ -97,6 +104,10 @@ impl WorkSessionQuickTestSpec {
             behavior: self.behavior,
             created_by_session_id: self.created_by_session_id,
             reason_messages: self.reason_messages,
+            task_binding: None,
+            task_id: self.task_id,
+            auto_start: self.auto_start,
+            bind_task: true,
         }
     }
 }
@@ -146,6 +157,16 @@ where
                         .ok_or_else(|| anyhow!("missing value for {arg}"))?,
                 ));
             }
+            "--worksession-task-test"
+            | "--work-session-task-test"
+            | "worksession-task-test"
+            | "work-session-task-test" => {
+                parsed.worksession_task_test = Some(PathBuf::from(
+                    args.next()
+                        .map(|value| value.as_ref().to_string())
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                ));
+            }
             other if other.starts_with("--appid=") => {
                 parsed.appid = Some(other["--appid=".len()..].to_string());
             }
@@ -177,6 +198,14 @@ where
             other if other.starts_with("--work-session-test=") => {
                 parsed.worksession_test =
                     Some(PathBuf::from(&other["--work-session-test=".len()..]));
+            }
+            other if other.starts_with("--worksession-task-test=") => {
+                parsed.worksession_task_test =
+                    Some(PathBuf::from(&other["--worksession-task-test=".len()..]));
+            }
+            other if other.starts_with("--work-session-task-test=") => {
+                parsed.worksession_task_test =
+                    Some(PathBuf::from(&other["--work-session-task-test=".len()..]));
             }
             other if !other.starts_with('-') && parsed.appid.is_none() => {
                 parsed.appid = Some(other.to_string());
@@ -641,6 +670,105 @@ async fn run_worksession_quick_test(agent: Arc<AIAgent>, json_path: PathBuf) -> 
     result
 }
 
+async fn run_worksession_task_quick_test(agent: Arc<AIAgent>, json_path: PathBuf) -> Result<()> {
+    let result = async {
+        let raw = fs::read_to_string(&json_path)
+            .await
+            .with_context(|| format!("read worksession task test json {}", json_path.display()))?;
+        let spec = serde_json::from_str::<WorkSessionQuickTestSpec>(&raw)
+            .with_context(|| format!("parse worksession task test json {}", json_path.display()))?;
+        let task_mgr = agent
+            .runtime
+            .task_mgr
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("task manager unavailable"))?;
+        let api_runtime = get_buckyos_api_runtime()
+            .map_err(|err| anyhow!("load buckyos runtime failed: {err}"))?;
+        let user_id = api_runtime
+            .get_owner_user_id()
+            .or_else(|| api_runtime.user_id.clone())
+            .unwrap_or_else(|| agent.agent_id());
+        let app_id = api_runtime.get_app_id();
+        let task_name = if spec.title.trim().is_empty() {
+            "worksession task test".to_string()
+        } else {
+            spec.title.trim().to_string()
+        };
+        let objective = spec.objective.trim().to_string();
+        if objective.is_empty() {
+            return Err(anyhow!("worksession task test objective must not be empty"));
+        }
+        let runner = agent.task_executor_runner_id()?;
+        let mut workspace_hints = Vec::new();
+        if let Some(workspace_id) = spec
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            workspace_hints.push(serde_json::json!({ "workspace_id": workspace_id }));
+        }
+        let task = task_mgr
+            .create_task(
+                &task_name,
+                TASK_TYPE_AGENT_DELEGATE,
+                Some(serde_json::json!({
+                    "agent_delegate": {
+                        "version": 1,
+                        "source": "worksession-task-test",
+                        "title": spec.title,
+                        "purpose": objective,
+                        "requester_agent_id": agent.agent_id(),
+                        "input": {
+                            "text": objective
+                        },
+                        "workspace_hints": workspace_hints,
+                        "reason_messages": spec.reason_messages,
+                        "execution": {
+                            "runner": runner.clone(),
+                            "behavior": spec.behavior,
+                            "status": "assigned"
+                        }
+                    }
+                })),
+                &user_id,
+                &app_id,
+                Some(CreateTaskOptions {
+                    runner: Some(runner),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|err| anyhow!("create worksession task test task failed: {err}"))?;
+        info!(
+            "opendan.worksession_task_test: created task_id={} runner={} user_id={} app_id={}",
+            task.id, task.runner, task.user_id, task.app_id
+        );
+        let final_task = wait_task_to_finish(agent.clone(), task.id).await?;
+        info!(
+            "opendan.worksession_task_test: finished task_id={} status={:?}",
+            final_task.id, final_task.status
+        );
+        match final_task.status {
+            TaskStatus::Completed => Ok(()),
+            other => Err(anyhow!(
+                "worksession task test task {} ended with status {:?}: {}",
+                final_task.id,
+                other,
+                final_task.message.unwrap_or_default()
+            )),
+        }
+    }
+    .await;
+
+    if let Err(err) = &result {
+        error!("opendan.worksession_task_test: failed: {err:#}");
+    }
+    agent.shutdown().await;
+    result
+}
+
 async fn wait_worksession_to_finish(
     agent: Arc<AIAgent>,
     session_id: &str,
@@ -666,6 +794,33 @@ async fn wait_worksession_to_finish(
             }
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
+    }
+}
+
+async fn wait_task_to_finish(agent: Arc<AIAgent>, task_id: i64) -> Result<buckyos_api::Task> {
+    let task_mgr = agent
+        .runtime
+        .task_mgr
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("task manager unavailable"))?;
+    let mut last_status = None;
+    loop {
+        let task = task_mgr
+            .get_task(task_id)
+            .await
+            .map_err(|err| anyhow!("load task {task_id}: {err}"))?;
+        if last_status != Some(task.status) {
+            info!(
+                "opendan.worksession_task_test: task_id={} status={:?} progress={}",
+                task.id, task.status, task.progress
+            );
+            last_status = Some(task.status);
+        }
+        if task.status.is_terminal() {
+            return Ok(task);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -701,6 +856,10 @@ async fn run() -> Result<()> {
         .worksession_test
         .clone()
         .map(|path| tokio::spawn(run_worksession_quick_test(agent.clone(), path)));
+    let worksession_task_test_handle = startup
+        .worksession_task_test
+        .clone()
+        .map(|path| tokio::spawn(run_worksession_task_quick_test(agent.clone(), path)));
     let agent_for_signal = agent.clone();
     tokio::spawn(async move {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -716,6 +875,17 @@ async fn run() -> Result<()> {
         match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
             Ok(joined) => {
                 joined.map_err(|err| anyhow!("worksession test task join failed: {err}"))??;
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+    if let Some(mut handle) = worksession_task_test_handle {
+        match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
+            Ok(joined) => {
+                joined.map_err(|err| anyhow!("worksession task test join failed: {err}"))??;
             }
             Err(_) => {
                 handle.abort();
@@ -780,6 +950,34 @@ mod tests {
         assert_eq!(
             parsed.worksession_test.unwrap(),
             std::path::PathBuf::from("/tmp/ws.json")
+        );
+    }
+
+    #[test]
+    fn parses_worksession_task_test_flag() {
+        let parsed = parse_startup_args_from_iter([
+            "--appid=jarvis",
+            "--worksession-task-test",
+            "/tmp/ws-task.json",
+        ])
+        .expect("parse args");
+        assert_eq!(
+            parsed.worksession_task_test.unwrap(),
+            std::path::PathBuf::from("/tmp/ws-task.json")
+        );
+    }
+
+    #[test]
+    fn parses_worksession_task_test_separator_alias() {
+        let parsed = parse_startup_args_from_iter([
+            "--appid=jarvis",
+            "worksession-task-test",
+            "/tmp/ws-task.json",
+        ])
+        .expect("parse args");
+        assert_eq!(
+            parsed.worksession_task_test.unwrap(),
+            std::path::PathBuf::from("/tmp/ws-task.json")
         );
     }
 

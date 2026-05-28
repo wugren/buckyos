@@ -24,7 +24,7 @@ use buckyos_api::{
     AICC_SERVICE_SERVICE_NAME,
 };
 use log::{debug, error, info, warn};
-use ndn_lib::{ChunkHasher, ChunkId, FileObject, NamedObject, ObjId};
+use ndn_lib::{ChunkHasher, FileObject, NamedObject, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
@@ -454,6 +454,8 @@ impl MemoryTaskEventSink {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn events(&self) -> Vec<TaskEvent> {
         self.events
             .lock()
@@ -774,6 +776,7 @@ impl AIComputeCenter {
         if let Some(task_options) = request.task_options.as_ref() {
             create_task_opts.parent_id = task_options.parent_id;
         }
+        create_task_opts.root_id = resolve_task_root_id(request, invoke_ctx);
 
         let taskmgr = self.taskmgr.as_ref().cloned().ok_or_else(|| {
             warn!(
@@ -962,66 +965,6 @@ pub trait ResourceResolver: Send + Sync {
 #[derive(Default)]
 pub struct PassthroughResourceResolver;
 
-async fn resolve_named_object_resource(
-    resource: &mut ResourceRef,
-) -> std::result::Result<(), RPCErrors> {
-    let obj_id = match resource {
-        ResourceRef::NamedObject { obj_id } => obj_id.clone(),
-        _ => return Ok(()),
-    };
-
-    let runtime = get_buckyos_api_runtime().map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("get buckyos runtime failed: {}", error),
-        )
-    })?;
-    let named_store = runtime.get_named_store().await.map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("get named_store failed: {}", error),
-        )
-    })?;
-    let object_json = named_store.get_object(&obj_id).await.map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("load named_object {} failed: {}", obj_id, error),
-        )
-    })?;
-    let file_obj: FileObject = serde_json::from_str(object_json.as_str()).map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("parse named_object {} as file failed: {}", obj_id, error),
-        )
-    })?;
-    let chunk_id = ChunkId::new(file_obj.content.as_str()).map_err(|error| {
-        reason_error(
-            "resource_resolve_failed",
-            format!("parse named_object {} chunk id failed: {}", obj_id, error),
-        )
-    })?;
-    let bytes = named_store
-        .get_chunk_data(&chunk_id)
-        .await
-        .map_err(|error| {
-            reason_error(
-                "resource_resolve_failed",
-                format!("read named_object {} chunk failed: {}", obj_id, error),
-            )
-        })?;
-    let mime = file_obj
-        .meta
-        .get("mime_type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    *resource = ResourceRef::Base64 {
-        mime,
-        data_base64: general_purpose::STANDARD.encode(bytes),
-    };
-    Ok(())
-}
-
 #[async_trait]
 impl ResourceResolver for PassthroughResourceResolver {
     async fn resolve(
@@ -1029,32 +972,7 @@ impl ResourceResolver for PassthroughResourceResolver {
         _ctx: &InvokeCtx,
         req: &AiMethodRequest,
     ) -> std::result::Result<ResolvedRequest, RPCErrors> {
-        let mut resolved = req.clone();
-        for resource in &mut resolved.payload.resources {
-            resolve_named_object_resource(resource).await?;
-        }
-        for message in &mut resolved.payload.messages {
-            for block in &mut message.content {
-                match block {
-                    AiContent::Image { source } | AiContent::Document { source, .. } => {
-                        resolve_named_object_resource(source).await?;
-                    }
-                    AiContent::ToolResult { content, .. } => {
-                        for item in content {
-                            match item {
-                                buckyos_api::AiToolResultContent::Image { source }
-                                | buckyos_api::AiToolResultContent::Document { source, .. } => {
-                                    resolve_named_object_resource(source).await?;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(ResolvedRequest::new(resolved))
+        Ok(ResolvedRequest::new(req.clone()))
     }
 }
 
@@ -2148,7 +2066,6 @@ struct TaskBinding {
 
 pub struct AIComputeCenter {
     registry: Registry,
-    router: Router,
     route_cfg: Arc<RwLock<RouteConfig>>,
     sn_ai_provider_billing: SnAIProviderBillingLedger,
     model_catalog: ModelCatalog,
@@ -2220,7 +2137,6 @@ impl AIComputeCenter {
 
         Self {
             registry,
-            router: Router,
             route_cfg: Arc::new(RwLock::new(RouteConfig::default())),
             sn_ai_provider_billing: SnAIProviderBillingLedger::default(),
             model_catalog,
@@ -3654,6 +3570,12 @@ fn extract_rootid_from_complete_request(request: &AiMethodRequest) -> Option<Str
     })
 }
 
+fn resolve_task_root_id(request: &AiMethodRequest, invoke_ctx: &InvokeCtx) -> Option<String> {
+    extract_rootid_from_complete_request(request)
+        .or_else(|| extract_session_id_from_complete_request(request))
+        .or_else(|| Some(resolve_default_rootid(invoke_ctx)))
+}
+
 fn resolve_default_rootid(invoke_ctx: &InvokeCtx) -> String {
     let app_seed = invoke_ctx
         .caller_app_id
@@ -3671,12 +3593,8 @@ fn build_initial_aicc_task_data(
     invoke_ctx: &InvokeCtx,
 ) -> serde_json::Value {
     let session_id = extract_session_id_from_complete_request(request);
-    let rootid = extract_rootid_from_complete_request(request)
-        .or_else(|| session_id.clone())
-        .unwrap_or_else(|| resolve_default_rootid(invoke_ctx));
 
     json!({
-        "rootid": rootid.clone(),
         "session_id": session_id.clone(),
         "owner_session_id": session_id.clone(),
         "aicc": {
@@ -3687,7 +3605,6 @@ fn build_initial_aicc_task_data(
             "updated_at_ms": now_ms(),
             "tenant_id": invoke_ctx.tenant_id,
             "event_ref": event_ref,
-            "rootid": rootid,
             "session_id": session_id,
             "request": request,
             "provider_input": serde_json::Value::Null,
@@ -4284,10 +4201,12 @@ mod tests {
                 id: *guard as i64,
                 user_id: user_id.to_string(),
                 app_id: app_id.to_string(),
+                session_id: opts.session_id.unwrap_or_default(),
                 parent_id: opts.parent_id,
-                root_id: String::new(),
+                root_id: opts.root_id.unwrap_or_else(|| (*guard).to_string()),
                 name: name.to_string(),
                 task_type: task_type.to_string(),
+                runner: opts.runner.unwrap_or_default(),
                 status: TaskStatus::Pending,
                 progress: 0.0,
                 message: None,
@@ -4336,6 +4255,7 @@ mod tests {
         async fn handle_list_tasks_by_time_range(
             &self,
             _app_id: Option<&str>,
+            _session_id: Option<&str>,
             _task_type: Option<&str>,
             _source_user_id: Option<&str>,
             _source_app_id: Option<&str>,
@@ -4455,6 +4375,7 @@ mod tests {
 
     #[derive(Debug)]
     struct MockProvider {
+        #[allow(dead_code)]
         instance: ProviderInstance,
         inventory: ProviderInventory,
         cost: CostEstimateOutput,
@@ -4897,10 +4818,9 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("succeeded")
         );
-        assert_eq!(
-            task.data.get("rootid").and_then(|value| value.as_str()),
-            Some("aicc-default")
-        );
+        assert_eq!(task.root_id, "aicc-default");
+        assert!(task.data.get("rootid").is_none());
+        assert!(task.data.pointer("/aicc/rootid").is_none());
     }
 
     #[tokio::test]
@@ -5078,7 +4998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_persists_rootid_and_session_id_from_request_options() {
+    async fn complete_persists_root_id_and_session_id_from_request_options() {
         let registry = Registry::default();
         let catalog = ModelCatalog::default();
         catalog.set_mapping(
@@ -5123,20 +5043,13 @@ mod tests {
                     == Some(response.task_id.as_str())
             })
             .expect("aicc task should exist");
-        assert_eq!(
-            task.data.get("rootid").and_then(|value| value.as_str()),
-            Some("session-xyz")
-        );
+        assert_eq!(task.root_id, "session-xyz");
         assert_eq!(
             task.data.get("session_id").and_then(|value| value.as_str()),
             Some("session-xyz")
         );
-        assert_eq!(
-            task.data
-                .pointer("/aicc/rootid")
-                .and_then(|value| value.as_str()),
-            Some("session-xyz")
-        );
+        assert!(task.data.get("rootid").is_none());
+        assert!(task.data.pointer("/aicc/rootid").is_none());
     }
 
     #[tokio::test]

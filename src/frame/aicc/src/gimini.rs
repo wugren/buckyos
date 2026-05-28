@@ -83,10 +83,13 @@ pub struct GoogleGiminiInstanceConfig {
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
+    #[allow(dead_code)]
     pub default_model: Option<String>,
     pub image_models: Vec<String>,
+    #[allow(dead_code)]
     pub default_image_model: Option<String>,
     pub features: Vec<Feature>,
+    #[allow(dead_code)]
     pub alias_map: HashMap<String, String>,
 }
 
@@ -579,6 +582,8 @@ impl GoogleGiminiProvider {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
@@ -1967,7 +1972,7 @@ impl GoogleGiminiProvider {
 
     async fn start_image2image(
         &self,
-        ctx: &crate::aicc::InvokeCtx,
+        _ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
         req: &AiMethodRequest,
     ) -> Result<ProviderStartResult, ProviderError> {
@@ -2029,7 +2034,7 @@ impl GoogleGiminiProvider {
 
     async fn start_embedding(
         &self,
-        ctx: &crate::aicc::InvokeCtx,
+        _ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
         req: &AiMethodRequest,
         multimodal: bool,
@@ -2113,7 +2118,7 @@ impl GoogleGiminiProvider {
 
     async fn start_vision(
         &self,
-        ctx: &crate::aicc::InvokeCtx,
+        _ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
         method: &str,
         req: &AiMethodRequest,
@@ -2198,7 +2203,7 @@ impl GoogleGiminiProvider {
 
     async fn start_audio_media(
         &self,
-        ctx: &crate::aicc::InvokeCtx,
+        _ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
         method: &str,
         req: &AiMethodRequest,
@@ -2473,6 +2478,8 @@ fn provider_model_from_exact(exact_model: &str) -> &str {
         .unwrap_or(exact_model)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn json_text_len(value: &Value) -> usize {
     match value {
         Value::String(text) => text.len(),
@@ -2489,6 +2496,7 @@ struct GiminiSettings {
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
     #[serde(default)]
+    #[allow(dead_code)]
     alias_map: HashMap<String, String>,
     #[serde(default)]
     instances: Vec<SettingsGoogleGiminiInstanceConfig>,
@@ -2888,6 +2896,7 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
     Ok(instances)
 }
 
+#[cfg(test)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -2972,6 +2981,7 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,

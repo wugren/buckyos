@@ -58,6 +58,40 @@ impl TypedTool for SubscribeEventTool {
         CallingConventions::LLM
     }
 
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        let mut line = format!("subscribe_event {}", args.pattern.trim());
+        if args
+            .message_template
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            line.push_str(" message_template=<set>");
+        }
+        Some(line)
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        if output.subscribed {
+            format!("subscribed to {}", output.pattern)
+        } else {
+            format!("subscription already active: {}", output.pattern)
+        }
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "subscribe_event {} => {}",
+            output.pattern,
+            if output.subscribed {
+                "success"
+            } else {
+                "already active"
+            }
+        ))
+    }
+
     async fn execute(
         &self,
         _ctx: &ToolCtx<'_>,
@@ -133,6 +167,30 @@ impl TypedTool for UnsubscribeEventTool {
 
     fn calling(&self) -> CallingConventions {
         CallingConventions::LLM
+    }
+
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        Some(format!("unsubscribe_event {}", args.pattern.trim()))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        if output.unsubscribed {
+            format!("unsubscribed from {}", output.pattern)
+        } else {
+            format!("subscription not found: {}", output.pattern)
+        }
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "unsubscribe_event {} => {}",
+            output.pattern,
+            if output.unsubscribed {
+                "success"
+            } else {
+                "not found"
+            }
+        ))
     }
 
     async fn execute(

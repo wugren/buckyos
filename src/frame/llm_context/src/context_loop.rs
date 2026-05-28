@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use buckyos_api::{AiContent, AiMessage, AiResponse, AiRole, AiToolResultContent, AiUsage};
 use serde_json::Value;
 
-use crate::behavior_loop::{CompressBudget, LLMBehaviorResult, StepMeta, StepRecord};
+use crate::behavior_loop::{LLMBehaviorResult, StepMeta, StepRecord};
 use crate::deps::{resolve_tool_specs, LLMContextDeps, LlmInferenceRequest, WorkEvent};
 use crate::error::LLMComputeError;
 use crate::interrupt::{
@@ -654,13 +654,12 @@ impl LLMContext {
                     });
                 }
                 // The observation message has already been appended to
-                // accumulated by the caller (tool path); for non-tool
-                // recoverable errors we push a system message describing
-                // the error so the next inference can see it.
+                // accumulated by the caller (tool path); non-tool errors use
+                // a user observation so the next inference can see it.
                 if !matches!(&err, LLMComputeError::ToolFailed { .. }) {
                     self.state
                         .accumulated
-                        .push(AiMessage::text(AiRole::System, format!("error: {err}")));
+                        .push(AiMessage::text(AiRole::User, format!("error: {err}")));
                 }
                 None
             }
@@ -672,7 +671,7 @@ impl LLMContext {
     //
     // The traditional `run_inner` above is reused as a *subroutine* — one
     // step iteration of `run_behavior` starts a fresh traditional LLMContext
-    // (with parser/renderer/compressor stripped), runs it to Done, hands the
+    // (with parser/renderer stripped), runs it to Done, hands the
     // raw response to the configured parser, and sediments the result as a
     // `StepRecord`. `run_inner` itself is untouched.
     // ===================================================================
@@ -941,17 +940,21 @@ impl LLMContext {
             //    consecutive-error counter.
             if let Some(err) = error_to_bump {
                 self.finish_step(&mut new_step);
+                if self.apply_step_result_hook(&mut new_step).await {
+                    return self.finish_done_behavior(new_step, response).await;
+                }
                 self.sediment(new_step);
                 if let Some(outcome) = self.bump_consecutive_errors(err).await {
                     return outcome;
                 }
-                self.maybe_compress().await;
                 continue;
             }
 
             self.finish_step(&mut new_step);
+            if self.apply_step_result_hook(&mut new_step).await {
+                return self.finish_done_behavior(new_step, response).await;
+            }
             self.sediment(new_step);
-            self.maybe_compress().await;
         }
     }
 
@@ -1050,6 +1053,7 @@ impl LLMContext {
             self.state.steps.clone(),
             current_behavior,
             self.state.history_summaries.clone(),
+            self.state.history_inputs.clone(),
         ));
         if let Some(ref last) = self.state.last_step {
             let (assistant_msg, user_msg) = renderer.render(last);
@@ -1081,6 +1085,7 @@ impl LLMContext {
     }
 
     fn clear_behavior_turn_tail(&mut self) {
+        self.state.history_inputs.clear();
         let prefix_len = self.request.input.len();
         if self.state.accumulated.len() <= prefix_len {
             return;
@@ -1107,6 +1112,10 @@ impl LLMContext {
     fn prepare_step(&mut self, mut step: StepRecord, started_at_ms: u64) -> StepRecord {
         let step_index = self.state.next_step_index;
         self.state.next_step_index = self.state.next_step_index.saturating_add(1);
+        for action in &mut step.actions {
+            self.state.next_action_id = self.state.next_action_id.saturating_add(1);
+            action.call_id = self.state.next_action_id.to_string();
+        }
         step.meta = StepMeta {
             behavior_name: self.request.behavior_name.clone(),
             step_index,
@@ -1121,42 +1130,34 @@ impl LLMContext {
         step.meta.ended_at_ms = Some(now_ms());
     }
 
-    /// Run the optional history compressor. Compression failures are
-    /// non-fatal — we log via worklog and continue with the uncompressed
-    /// history.
-    async fn maybe_compress(&mut self) {
-        let Some(compressor) = self.deps.history_compressor.clone() else {
-            return;
-        };
-        let steps_before = self.state.steps.len();
-        if steps_before == 0 {
-            return;
+    async fn apply_step_result_hook(&mut self, step: &mut StepRecord) -> bool {
+        if step.action_results.is_empty() && step.messages_sent.is_empty() {
+            return false;
         }
-        let budget = CompressBudget {
-            target_steps: None,
-            target_tokens: self.request.budget.max_total_tokens,
+        let Some(hook) = self.deps.step_result_hook.clone() else {
+            return false;
         };
-        // Clone so a compressor failure leaves the live history intact.
-        let snapshot = self.state.steps.clone();
-        match compressor.compress(snapshot, budget).await {
-            Ok(compressed) => {
-                let steps_after = compressed.steps.len();
-                self.state.steps = compressed.steps;
-                self.state.history_summaries.extend(compressed.summaries);
-                self.deps
-                    .worklog
-                    .emit(WorkEvent::ContextRewritten {
-                        trace_id: self.request.trace.clone(),
-                        from_messages: steps_before,
-                        to_messages: steps_after,
-                    })
-                    .await;
+        let snapshot = self.snapshot();
+        match hook.on_behavior_step_ob(&snapshot, step).await {
+            Ok(output) => {
+                if output.skip_next_inference {
+                    return true;
+                }
+                if let Some(message) = output.user_message {
+                    step.next_user_message = Some(normalize_user_message(message));
+                }
+                self.state.history_inputs.extend(output.history_inputs);
             }
-            Err(_) => {
-                // Compressor refused — keep the uncompressed history. Caller
-                // observes the same `steps` it had before the attempt.
+            Err(err) => {
+                log::warn!(
+                    "behavior_loop: on_behavior_step_ob hook failed for behavior `{}` step {}: {}",
+                    step.meta.behavior_name,
+                    step.meta.step_index,
+                    err
+                );
             }
         }
+        false
     }
 
     /// Outer-loop counterpart to `handle_error`'s FeedAsObservation cap.
@@ -1205,6 +1206,13 @@ impl LLMContext {
     }
 }
 
+fn normalize_user_message(message: AiMessage) -> AiMessage {
+    if matches!(message.role, AiRole::User) {
+        return message;
+    }
+    AiMessage::text(AiRole::User, message.text_content())
+}
+
 /// Map a raw `LLMComputeError` to the default `ErrorClass`.
 fn classify(err: LLMComputeError) -> ErrorClass {
     match err {
@@ -1247,7 +1255,7 @@ fn tool_observation_message(call_id: &str, observation: &Observation) -> AiMessa
             (text, false)
         }
         Observation::Error { message, .. } => (message.clone(), true),
-        Observation::Pending { call_id: cid } => (format!("pending:{cid}"), true),
+        Observation::Pending { call_id: cid, .. } => (format!("pending:{cid}"), true),
         Observation::Cancelled { reason, .. } => {
             // `is_error=false` — the call did not fail, it was interrupted.
             // The text marker lets a content-aware renderer / the LLM tell

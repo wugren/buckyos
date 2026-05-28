@@ -8,7 +8,7 @@
 use buckyos_api::{AiMessage, AiUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::behavior_loop::{HistorySummaryRecord, StepRecord};
+use crate::behavior_loop::{HistoryInputRecord, HistorySummaryRecord, StepRecord};
 use crate::observation::PendingToolCall;
 use crate::request::LLMContextRequest;
 
@@ -47,13 +47,17 @@ pub struct LLMContextState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub llm_task_ids: Vec<String>,
 
-    /// Behavior mode: sedimented step history (compression-eligible).
-    /// Always empty in traditional mode.
+    /// Behavior mode: sedimented step history. During one LLMContext run this
+    /// history is append-only; any compression or rewrite happens above the
+    /// waist before a new stable snapshot is resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepRecord>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_summaries: Vec<HistorySummaryRecord>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_inputs: Vec<HistoryInputRecord>,
 
     /// Behavior mode: the freshest step still being processed — rendered
     /// verbatim into the next inference. `None` until the first iteration
@@ -71,6 +75,9 @@ pub struct LLMContextState {
 
     #[serde(default)]
     pub next_step_index: u32,
+
+    #[serde(default)]
+    pub next_action_id: u32,
 }
 
 impl LLMContextState {
@@ -90,9 +97,11 @@ impl LLMContextState {
             llm_task_ids: Vec::new(),
             steps: Vec::new(),
             history_summaries: Vec::new(),
+            history_inputs: Vec::new(),
             last_step: None,
             last_report: None,
             next_step_index: 0,
+            next_action_id: 0,
         }
     }
 }

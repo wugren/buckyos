@@ -48,6 +48,13 @@ pub enum HookPointError {
         mode: String,
         key: &'static str,
     },
+    #[error("hook `{site}` mode=`{mode}`: invalid param `{key}`: {reason}")]
+    InvalidParam {
+        site: &'static str,
+        mode: String,
+        key: &'static str,
+        reason: String,
+    },
 }
 
 impl HookPoint {
@@ -102,6 +109,64 @@ impl HookPoint {
     /// Read an optional string param. `None` when missing or not a string.
     pub fn optional_string(&self, key: &str) -> Option<&str> {
         self.params.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn optional_f64(
+        &self,
+        site: &'static str,
+        key: &'static str,
+    ) -> Result<Option<f64>, HookPointError> {
+        let Some(value) = self.params.get(key) else {
+            return Ok(None);
+        };
+        match value {
+            toml::Value::Float(v) => Ok(Some(*v)),
+            toml::Value::Integer(v) => Ok(Some(*v as f64)),
+            _ => Err(HookPointError::InvalidParam {
+                site,
+                mode: self.mode.clone(),
+                key,
+                reason: "expected number".to_string(),
+            }),
+        }
+    }
+
+    pub fn optional_u64(
+        &self,
+        site: &'static str,
+        key: &'static str,
+    ) -> Result<Option<u64>, HookPointError> {
+        let Some(value) = self.params.get(key) else {
+            return Ok(None);
+        };
+        match value {
+            toml::Value::Integer(v) if *v >= 0 => Ok(Some(*v as u64)),
+            _ => Err(HookPointError::InvalidParam {
+                site,
+                mode: self.mode.clone(),
+                key,
+                reason: "expected non-negative integer".to_string(),
+            }),
+        }
+    }
+
+    pub fn optional_bool(
+        &self,
+        site: &'static str,
+        key: &'static str,
+    ) -> Result<Option<bool>, HookPointError> {
+        let Some(value) = self.params.get(key) else {
+            return Ok(None);
+        };
+        match value {
+            toml::Value::Boolean(v) => Ok(Some(*v)),
+            _ => Err(HookPointError::InvalidParam {
+                site,
+                mode: self.mode.clone(),
+                key,
+                reason: "expected boolean".to_string(),
+            }),
+        }
     }
 }
 

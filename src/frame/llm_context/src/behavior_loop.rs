@@ -10,6 +10,7 @@ use buckyos_api::{AiMessage, AiResponse, AiToolCall};
 use serde::{Deserialize, Serialize};
 
 use crate::observation::Observation;
+use crate::state::LLMContextSnapshot;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +48,14 @@ pub struct HistorySummaryRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behavior_names: Vec<String>,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HistoryInputRecord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub text: String,
+    pub at_ms: u64,
 }
 
 /// One Behavior step. Carries both the LLM-emitted intent (`assistant_text`
@@ -103,6 +112,11 @@ pub struct StepRecord {
     /// steps with no actions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub action_results: Vec<Observation>,
+    /// Optional user message to render after this step's assistant message.
+    /// When unset, the configured [`StepRenderer`] renders the default
+    /// action-result observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_user_message: Option<AiMessage>,
 }
 
 /// One `<sendmsg target=...>` emit. v2 stub: recorded on
@@ -136,6 +150,7 @@ impl StepRecord {
             self_report,
             messages_sent: messages_to_send,
             action_results: Vec::new(),
+            next_user_message: None,
         }
     }
 
@@ -167,7 +182,9 @@ impl StepRecord {
             action_results: vec![Observation::Error {
                 call_id: String::new(),
                 message,
+                tool_result: None,
             }],
+            next_user_message: None,
         }
     }
 }
@@ -270,10 +287,20 @@ pub trait StepRenderer: Send + Sync {
         steps: Vec<StepRecord>,
         current_behavior: &str,
         summaries: Vec<HistorySummaryRecord>,
+        inputs: Vec<HistoryInputRecord>,
     ) -> Vec<AiMessage> {
         let mut out = Vec::with_capacity(steps.len() * 2 + summaries.len());
         for summary in &summaries {
             out.push(self.render_summary(summary));
+        }
+        for input in inputs {
+            out.push(AiMessage::text(
+                buckyos_api::AiRole::User,
+                format!(
+                    "history input:\nsource: {}\nat_ms: {}\n{}",
+                    input.source, input.at_ms, input.text
+                ),
+            ));
         }
         for step in &steps {
             if !current_behavior.is_empty() && step.meta.behavior_name != current_behavior {
@@ -288,43 +315,22 @@ pub trait StepRenderer: Send + Sync {
     }
 }
 
-/// Budget hint passed into the compressor. Implementations may ignore it.
 #[derive(Debug, Clone, Default)]
-pub struct CompressBudget {
-    /// Soft target for the number of steps to keep after compression.
-    pub target_steps: Option<usize>,
-    /// Soft target for the total token estimate of the rendered history.
-    pub target_tokens: Option<u32>,
-}
-
-/// Compressor error — opaque to the waist; surfaced as `LLMComputeError::Internal`
-/// when bubble-up is needed (current design just skips compression on error).
-#[derive(Debug, Clone)]
-pub struct CompressError(pub String);
-
-impl std::fmt::Display for CompressError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "history compress failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for CompressError {}
-
-/// Optional history compressor. Same role as `ResumeFill::RewrittenHistory`
-/// but triggered from inside the outer loop rather than by an external
-/// scheduler.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HistoryCompressionOutput {
-    pub steps: Vec<StepRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub summaries: Vec<HistorySummaryRecord>,
+pub struct StepResultHookOutput {
+    /// Override the user message rendered immediately after this step on the
+    /// next behavior inference. `None` keeps the renderer default.
+    pub user_message: Option<AiMessage>,
+    /// Extra history inputs to append before the next behavior inference.
+    pub history_inputs: Vec<HistoryInputRecord>,
+    /// Stop the behavior loop instead of starting the next inference.
+    pub skip_next_inference: bool,
 }
 
 #[async_trait]
-pub trait HistoryCompressor: Send + Sync {
-    async fn compress(
+pub trait StepResultHook: Send + Sync {
+    async fn on_behavior_step_ob(
         &self,
-        steps: Vec<StepRecord>,
-        budget: CompressBudget,
-    ) -> Result<HistoryCompressionOutput, CompressError>;
+        snapshot: &LLMContextSnapshot,
+        step: &StepRecord,
+    ) -> Result<StepResultHookOutput, String>;
 }
