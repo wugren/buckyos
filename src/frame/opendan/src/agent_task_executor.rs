@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use buckyos_api::{
-    get_buckyos_api_runtime, AiMessage, AiRole, CreateTaskOptions, Task, TaskFilter, TaskStatus,
+    get_buckyos_api_runtime, parse_typed_task_data, AgentDelegateProgress, AgentDelegateTaskData,
+    AiMessage, AiRole, CreateTaskOptions, HumanInputTaskData, HumanInputTaskRequest, Task,
+    TaskFilter, TaskStatus, TypedTaskData,
 };
 use log::{error, info, warn};
 use serde_json::{json, Value};
@@ -201,8 +203,8 @@ impl AIAgent {
             }
         }
 
-        let data = task.data.clone();
-        if let Some(session_id) = execution_session_id(&data) {
+        let delegate_data = agent_delegate_task_data(&task)?;
+        if let Some(session_id) = execution_session_id(&delegate_data) {
             let session = self.clone().ensure_session(&session_id).await?;
             session.wake().await;
             return Ok(());
@@ -214,7 +216,7 @@ impl AIAgent {
         {
             return Ok(());
         }
-        if let Some(session_id) = route_session_id(&data) {
+        if let Some(session_id) = route_session_id(&delegate_data) {
             if !self.config.toml.runtime.task_route.enabled {
                 self.clone()
                     .fail_task_route_disabled(task, Some(session_id))
@@ -226,8 +228,10 @@ impl AIAgent {
             return Ok(());
         }
 
-        if task_data_supports_direct_worksession(&task.data) {
-            self.clone().create_worksession_by_task_id(task).await?;
+        if task_data_supports_direct_worksession(&delegate_data) {
+            self.clone()
+                .create_worksession_by_task_id(task, delegate_data)
+                .await?;
             return Ok(());
         }
 
@@ -261,18 +265,19 @@ impl AIAgent {
                         "Existing bound agent session already ended before task recovery"
                             .to_string(),
                     ),
-                    Some(json!({
-                        "agent_delegate": {
-                            "execution": {
+                    Some(agent_delegate_update_value(task, |data| {
+                        set_agent_delegate_execution(
+                            data,
+                            json!({
                                 "session_id": bound.session_id,
                                 "workspace_id": bound.workspace_id,
                                 "behavior": bound.behavior,
                                 "runner": runner,
                                 "status": "ended",
                                 "recovered_at_ms": now_ms()
-                            }
-                        }
-                    })),
+                            }),
+                        );
+                    })?),
                 )
                 .await?;
             return Ok(true);
@@ -284,18 +289,19 @@ impl AIAgent {
                 Some(TaskStatus::Running),
                 Some(task.progress.max(10.0)),
                 Some("Recovered existing agent session binding".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "execution": {
+                Some(agent_delegate_update_value(task, |data| {
+                    set_agent_delegate_execution(
+                        data,
+                        json!({
                             "session_id": bound.session_id,
                             "workspace_id": bound.workspace_id,
                             "behavior": bound.behavior,
                             "runner": runner,
                             "status": "running",
                             "recovered_at_ms": now_ms()
-                        }
-                    }
-                })),
+                        }),
+                    );
+                })?),
             )
             .await?;
 
@@ -304,7 +310,11 @@ impl AIAgent {
         Ok(true)
     }
 
-    async fn create_worksession_by_task_id(self: Arc<Self>, task: Task) -> Result<()> {
+    async fn create_worksession_by_task_id(
+        self: Arc<Self>,
+        task: Task,
+        data: AgentDelegateTaskData,
+    ) -> Result<()> {
         let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
             return Err(anyhow!("task manager unavailable"));
         };
@@ -314,14 +324,12 @@ impl AIAgent {
                 Some(TaskStatus::Running),
                 Some(5.0),
                 Some("Creating agent session from task data".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "route": {
-                            "status": "direct",
-                            "strategy": "create_worksession_by_taskid"
-                        }
-                    }
-                })),
+                Some(agent_delegate_update_value(&task, |data| {
+                    data.route = Some(json!({
+                        "status": "direct",
+                        "strategy": "create_worksession_by_taskid"
+                    }));
+                })?),
             )
             .await?;
 
@@ -329,13 +337,19 @@ impl AIAgent {
             .create_work_session(CreateWorkSessionParams {
                 title: String::new(),
                 objective: String::new(),
-                workspace_id: direct_task_workspace_id(&task.data),
-                behavior: task
-                    .data
-                    .pointer("/agent_delegate/execution/behavior")
+                workspace_id: direct_task_workspace_id(&data),
+                behavior: data
+                    .progress
+                    .as_ref()
+                    .and_then(|progress| progress.execution.as_ref())
+                    .and_then(|execution| execution.get("behavior"))
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                created_by_session_id: delegate_string(&task.data, "owner_session_id")
+                created_by_session_id: data
+                    .request
+                    .owner_session_id
+                    .as_deref()
+                    .map(str::to_string)
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| format!("task-{}", task.id)),
                 reason_messages: vec![format!(
@@ -369,7 +383,12 @@ impl AIAgent {
                 )
                 .await?
         } else {
-            let created_by_session_id = delegate_string(&task.data, "owner_session_id")
+            let data = agent_delegate_task_data(&task)?;
+            let created_by_session_id = data
+                .request
+                .owner_session_id
+                .as_deref()
+                .map(str::to_string)
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| format!("task-{}", task.id));
             let mut meta = SessionMeta::new(
@@ -411,16 +430,14 @@ impl AIAgent {
                 Some(TaskStatus::Running),
                 Some(task.progress.max(1.0)),
                 Some("Routing agent task via task_route".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "route": {
-                            "status": "routed",
-                            "strategy": "task_route_behavior",
-                            "session_id": session_id,
-                            "routed_at_ms": now_ms()
-                        }
-                    }
-                })),
+                Some(agent_delegate_update_value(&task, |data| {
+                    data.route = Some(json!({
+                        "status": "routed",
+                        "strategy": "task_route_behavior",
+                        "session_id": session_id,
+                        "routed_at_ms": now_ms()
+                    }));
+                })?),
             )
             .await;
         session.wake().await;
@@ -444,17 +461,15 @@ impl AIAgent {
                 Some(TaskStatus::Failed),
                 Some(task.progress),
                 Some(reason.to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "route": {
-                            "status": "failed",
-                            "strategy": "task_route_disabled",
-                            "session_id": route_session_id,
-                            "reason": reason,
-                            "failed_at_ms": now_ms()
-                        }
-                    }
-                })),
+                Some(agent_delegate_update_value(&task, |data| {
+                    data.route = Some(json!({
+                        "status": "failed",
+                        "strategy": "task_route_disabled",
+                        "session_id": route_session_id,
+                        "reason": reason,
+                        "failed_at_ms": now_ms()
+                    }));
+                })?),
             )
             .await?;
         Ok(())
@@ -470,27 +485,29 @@ impl AIAgent {
         if task.runner != runner {
             return Ok(());
         }
-        if task_control_already_reflected(&task.data, status) {
+        let delegate_data = agent_delegate_task_data(&task)?;
+        if task_control_already_reflected(&delegate_data, status) {
             return Ok(());
         }
         let Some(task_mgr) = self.runtime.task_mgr.as_ref().cloned() else {
             return Err(anyhow!("task manager unavailable"));
         };
-        let Some(session_id) = execution_session_id(&task.data) else {
+        let Some(session_id) = execution_session_id(&delegate_data) else {
             task_mgr
                 .update_task(
                     task.id,
                     Some(task.status),
                     Some(task.progress),
                     Some(format!("Agent task {status} before session start")),
-                    Some(json!({
-                        "agent_delegate": {
-                            "execution": {
+                    Some(agent_delegate_update_value(&task, |data| {
+                        set_agent_delegate_execution(
+                            data,
+                            json!({
                                 "status": status,
                                 "control_observed_at_ms": now_ms(),
-                            }
-                        }
-                    })),
+                            }),
+                        );
+                    })?),
                 )
                 .await?;
             return Ok(());
@@ -509,18 +526,19 @@ impl AIAgent {
                 Some(task.status),
                 Some(task.progress),
                 Some(format!("Agent session {status} by task manager")),
-                Some(json!({
-                    "agent_delegate": {
-                        "execution": {
+                Some(agent_delegate_update_value(&task, |data| {
+                    set_agent_delegate_execution(
+                        data,
+                        json!({
                             "session_id": session_id,
                             "status": status,
                             "control": {
                                 "status": status,
                                 "observed_at_ms": now_ms(),
                             }
-                        }
-                    }
-                })),
+                        }),
+                    );
+                })?),
             )
             .await?;
         Ok(())
@@ -538,23 +556,27 @@ impl AIAgent {
         let Some(child) = completed else {
             return Ok(false);
         };
-        let response_text = human_input_response_text(&child.data)
+        let child_data = human_input_task_data(child)?;
+        let response_text = human_input_response_text(&child_data)
             .unwrap_or_else(|| "Human input task was completed.".to_string());
-        let Some(session_id) = execution_session_id(&task.data) else {
+        let Some(session_id) = execution_session_id(&agent_delegate_task_data(task)?) else {
+            let response = child_data
+                .result
+                .as_ref()
+                .and_then(|result| result.response.clone())
+                .unwrap_or(Value::Null);
             task_mgr
                 .update_task(
                     task.id,
                     Some(TaskStatus::Pending),
                     Some(task.progress),
                     Some("Human input received; routing task".to_string()),
-                    Some(json!({
-                        "agent_delegate": {
-                            "human_input": {
-                                "task_id": child.id,
-                                "response": child.data.pointer("/human_input/response").cloned().unwrap_or(Value::Null),
-                            }
-                        }
-                    })),
+                    Some(agent_delegate_update_value(task, |data| {
+                        data.human_input = Some(json!({
+                            "task_id": child.id,
+                            "response": response,
+                        }));
+                    })?),
                 )
                 .await?;
             return Ok(true);
@@ -578,14 +600,16 @@ impl AIAgent {
                 Some(TaskStatus::Running),
                 Some(task.progress.max(10.0)),
                 Some("Human input received; resuming agent session".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "human_input": {
-                            "task_id": child.id,
-                            "response": child.data.pointer("/human_input/response").cloned().unwrap_or(Value::Null),
-                        }
-                    }
-                })),
+                Some(agent_delegate_update_value(task, |data| {
+                    data.human_input = Some(json!({
+                        "task_id": child.id,
+                        "response": child_data
+                            .result
+                            .as_ref()
+                            .and_then(|result| result.response.clone())
+                            .unwrap_or(Value::Null),
+                    }));
+                })?),
             )
             .await?;
         Ok(true)
@@ -621,24 +645,20 @@ impl AIAgent {
             .create_task(
                 &format!("human-input/{}", parent.id),
                 TASK_TYPE_HUMAN_INPUT,
-                Some(json!({
-                    "human_input": {
-                        "version": 1,
-                        "kind": kind,
-                        "question": question,
-                        "required_by": {
+                Some(serde_json::to_value(HumanInputTaskData {
+                    request: HumanInputTaskRequest {
+                        version: 1,
+                        kind: kind.to_string(),
+                        question: Some(question.to_string()),
+                        required_by: Some(json!({
                             "task_id": parent.id,
                             "executor": self.task_executor_runner_id()?,
-                        },
-                        "candidates": candidates,
-                        "response_schema": {
-                            "type": "object"
-                        },
-                        "response": Value::Null,
-                        "answered_by": Value::Null,
-                        "answered_at": Value::Null,
-                    }
-                })),
+                        })),
+                        candidates,
+                        response_schema: Some(json!({ "type": "object" })),
+                    },
+                    result: None,
+                })?),
                 &parent.user_id,
                 &parent.app_id,
                 Some(CreateTaskOptions {
@@ -666,15 +686,13 @@ impl AIAgent {
                 Some(TaskStatus::WaitingForApproval),
                 Some(parent.progress),
                 Some("Waiting for human input".to_string()),
-                Some(json!({
-                    "agent_delegate": {
-                        "blocker": {
-                            "task_id": child.id,
-                            "task_type": TASK_TYPE_HUMAN_INPUT,
-                            "kind": kind,
-                        }
-                    }
-                })),
+                Some(agent_delegate_update_value(parent, |data| {
+                    data.blocker = Some(json!({
+                        "task_id": child.id,
+                        "task_type": TASK_TYPE_HUMAN_INPUT,
+                        "kind": kind,
+                    }));
+                })?),
             )
             .await?;
         Ok(child)
@@ -694,37 +712,80 @@ fn workspace_id_from_hint(value: &Value) -> Option<String> {
         .or_else(|| value.get("id").and_then(Value::as_str).map(str::to_string))
 }
 
-fn delegate_string(data: &Value, key: &str) -> Option<String> {
-    data.pointer(&format!("/agent_delegate/{key}"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+fn agent_delegate_task_data(task: &Task) -> Result<AgentDelegateTaskData> {
+    match parse_typed_task_data(task.task_type.as_str(), task.data.clone()) {
+        Ok(TypedTaskData::AgentDelegate(data)) => Ok(data),
+        Ok(other) => Err(anyhow!(
+            "expected agent.delegate task data, got {:?}",
+            other.task_data_type()
+        )),
+        Err(err) => Err(anyhow!("invalid agent.delegate task data: {}", err)),
+    }
 }
 
-fn execution_session_id(data: &Value) -> Option<String> {
-    data.pointer("/agent_delegate/execution/session_id")
+fn human_input_task_data(task: &Task) -> Result<HumanInputTaskData> {
+    match parse_typed_task_data(task.task_type.as_str(), task.data.clone()) {
+        Ok(TypedTaskData::HumanInput(data)) => Ok(data),
+        Ok(other) => Err(anyhow!(
+            "expected human.input task data, got {:?}",
+            other.task_data_type()
+        )),
+        Err(err) => Err(anyhow!("invalid human.input task data: {}", err)),
+    }
+}
+
+fn agent_delegate_data_value(data: AgentDelegateTaskData) -> Result<Value> {
+    serde_json::to_value(data).map_err(|err| anyhow!("serialize agent.delegate task data: {}", err))
+}
+
+fn agent_delegate_update_value(
+    task: &Task,
+    mutate: impl FnOnce(&mut AgentDelegateTaskData),
+) -> Result<Value> {
+    let mut data = agent_delegate_task_data(task)?;
+    mutate(&mut data);
+    agent_delegate_data_value(data)
+}
+
+fn set_agent_delegate_execution(data: &mut AgentDelegateTaskData, execution: Value) {
+    let progress = data
+        .progress
+        .get_or_insert_with(AgentDelegateProgress::default);
+    progress.execution = Some(execution);
+    progress.updated_at_ms = Some(now_ms() as i64);
+}
+
+fn execution_session_id(data: &AgentDelegateTaskData) -> Option<String> {
+    data.progress
+        .as_ref()
+        .and_then(|progress| progress.execution.as_ref())
+        .and_then(|execution| execution.get("session_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
-fn route_session_id(data: &Value) -> Option<String> {
-    data.pointer("/agent_delegate/route/session_id")
+fn route_session_id(data: &AgentDelegateTaskData) -> Option<String> {
+    data.route
+        .as_ref()
+        .and_then(|route| route.get("session_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
-fn task_data_supports_direct_worksession(data: &Value) -> bool {
-    let Some(delegate) = data.get("agent_delegate").and_then(Value::as_object) else {
-        return false;
-    };
-    let objective = delegate
-        .get("purpose")
-        .and_then(Value::as_str)
+fn task_data_supports_direct_worksession(data: &AgentDelegateTaskData) -> bool {
+    let objective = data
+        .request
+        .purpose
+        .as_deref()
         .or_else(|| {
-            data.pointer("/agent_delegate/input/text")
+            data.request
+                .input
+                .as_ref()
+                .and_then(|input| input.get("text"))
                 .and_then(Value::as_str)
         })
         .map(str::trim)
@@ -732,44 +793,51 @@ fn task_data_supports_direct_worksession(data: &Value) -> bool {
     if objective.is_none() {
         return false;
     }
-    let hints = data
-        .pointer("/agent_delegate/workspace_hints")
-        .and_then(Value::as_array);
-    if hints.map(|values| values.len()).unwrap_or(0) > 1 {
+    if data.request.workspace_hints.len() > 1 {
         return false;
     }
     true
 }
 
-fn direct_task_workspace_id(data: &Value) -> Option<String> {
-    data.pointer("/agent_delegate/route/workspace_id")
+fn direct_task_workspace_id(data: &AgentDelegateTaskData) -> Option<String> {
+    data.route
+        .as_ref()
+        .and_then(|route| route.get("workspace_id"))
         .and_then(Value::as_str)
         .or_else(|| {
-            data.pointer("/agent_delegate/execution/workspace_id")
+            data.progress
+                .as_ref()
+                .and_then(|progress| progress.execution.as_ref())
+                .and_then(|execution| execution.get("workspace_id"))
                 .and_then(Value::as_str)
         })
         .or_else(|| {
-            data.pointer("/agent_delegate/workspace_id")
+            data.request
+                .input
+                .as_ref()
+                .and_then(|input| input.get("workspace_id"))
                 .and_then(Value::as_str)
         })
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            data.pointer("/agent_delegate/workspace_hints")
-                .and_then(Value::as_array)
-                .and_then(|hints| {
-                    if hints.len() == 1 {
-                        hints.first().and_then(workspace_id_from_hint)
-                    } else {
-                        None
-                    }
-                })
+            if data.request.workspace_hints.len() == 1 {
+                data.request
+                    .workspace_hints
+                    .first()
+                    .and_then(workspace_id_from_hint)
+            } else {
+                None
+            }
         })
 }
 
-fn task_control_already_reflected(data: &Value, status: &str) -> bool {
-    data.pointer("/agent_delegate/execution/status")
+fn task_control_already_reflected(data: &AgentDelegateTaskData, status: &str) -> bool {
+    data.progress
+        .as_ref()
+        .and_then(|progress| progress.execution.as_ref())
+        .and_then(|execution| execution.get("status"))
         .and_then(Value::as_str)
         .map(|value| value == status)
         .unwrap_or(false)
@@ -782,8 +850,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn human_input_response_text(data: &Value) -> Option<String> {
-    let response = data.pointer("/human_input/response")?;
+fn human_input_response_text(data: &HumanInputTaskData) -> Option<String> {
+    let response = data.result.as_ref()?.response.as_ref()?;
     response
         .as_str()
         .map(str::to_string)
@@ -915,11 +983,9 @@ mod tests {
                 "workspace_hints": [{"workspace_id": "buckyos"}]
             }
         }));
-        assert!(task_data_supports_direct_worksession(&task.data));
-        assert_eq!(
-            direct_task_workspace_id(&task.data).as_deref(),
-            Some("buckyos")
-        );
+        let data = agent_delegate_task_data(&task).expect("agent.delegate task data");
+        assert!(task_data_supports_direct_worksession(&data));
+        assert_eq!(direct_task_workspace_id(&data).as_deref(), Some("buckyos"));
     }
 
     #[test]
@@ -930,7 +996,8 @@ mod tests {
                 "workspace_hints": ["a", "b"]
             }
         }));
-        assert!(!task_data_supports_direct_worksession(&task.data));
+        let data = agent_delegate_task_data(&task).expect("agent.delegate task data");
+        assert!(!task_data_supports_direct_worksession(&data));
     }
 
     #[test]
@@ -938,7 +1005,7 @@ mod tests {
         let task = task(json!({
             "input": "free-form task"
         }));
-        assert!(!task_data_supports_direct_worksession(&task.data));
+        assert!(agent_delegate_task_data(&task).is_err());
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use buckyos_api::{CreateTaskOptions, TaskFilter, TaskManagerClient, TaskStatus};
+use buckyos_api::{
+    parse_typed_task_data, CreateTaskOptions, TaskFilter, TaskManagerClient, TaskStatus,
+    TypedTaskData, WorkflowScheduleTaskData, WorkflowScheduleTaskRequest,
+    WorkflowScheduleTaskResult,
+};
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -560,31 +564,42 @@ impl ScheduleTaskMirrorClient {
         Ok(tasks
             .iter()
             .find(|task| {
-                task.data
-                    .pointer("/workflow/run_id")
-                    .and_then(Value::as_str)
-                    == Some(run_id)
+                matches!(
+                    parse_typed_task_data(task.task_type.as_str(), task.data.clone()),
+                    Ok(TypedTaskData::WorkflowRun(data)) if data.request.run_id == run_id
+                )
             })
             .map(|task| task.id))
     }
 }
 
 fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {
-    json!({
-        "schedule": {
-            "schedule_id": schedule.schedule_id,
-            "name": schedule.name,
-            "status": schedule.status,
-            "schedule": schedule.schedule,
-            "target": schedule.target,
-            "next_fire_at": schedule.state.next_fire_at,
-            "last_fire_at": schedule.state.last_fire_at,
-            "last_task_id": schedule.state.last_task_id,
-            "last_run_id": schedule.state.last_run_id,
-            "consecutive_failures": schedule.state.consecutive_failures,
-            "last_error": schedule.state.last_error,
-        }
+    serde_json::to_value(WorkflowScheduleTaskData {
+        request: WorkflowScheduleTaskRequest {
+            schedule_id: schedule.schedule_id.clone(),
+            name: Some(schedule.name.clone()),
+            status: Some(schedule_status_value(schedule.status)),
+            schedule: serde_json::to_value(&schedule.schedule).ok(),
+            target: serde_json::to_value(&schedule.target).ok(),
+        },
+        progress: None,
+        result: Some(WorkflowScheduleTaskResult {
+            next_fire_at: schedule.state.next_fire_at,
+            last_fire_at: schedule.state.last_fire_at,
+            last_task_id: schedule.state.last_task_id,
+            last_run_id: schedule.state.last_run_id.clone(),
+            consecutive_failures: schedule.state.consecutive_failures as u64,
+            last_error: schedule.state.last_error.clone().map(Value::String),
+        }),
     })
+    .unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn schedule_status_value(status: ScheduleStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| format!("{:?}", status))
 }
 
 fn map_schedule_status(status: ScheduleStatus) -> TaskStatus {

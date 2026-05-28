@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, BuckyOSRuntimeType, Task, TaskManagerClient,
-    TaskStatus,
+    get_buckyos_api_runtime, init_buckyos_api_runtime, parse_typed_task_data, BuckyOSRuntimeType,
+    Task, TaskDataType, TaskManagerClient, TaskStatus, ToolExecBashTaskData, TypedTaskData,
 };
 use kRPC::kRPC;
 use serde::{Deserialize, Serialize};
@@ -3402,7 +3402,8 @@ fn build_check_task_result(tool_name: &str, task: Task) -> AgentToolResult {
     let top_status = task_protocol_status(&task);
     let summary = task_summary(&task, top_status);
     let pending_reason = task_pending_reason(&task);
-    let is_exec_bash_task = task.data.get("kind").and_then(Json::as_str) == Some("tool.exec_bash");
+    let exec_bash_task = tool_exec_bash_task_data(&task);
+    let is_exec_bash_task = exec_bash_task.is_some();
     let mut detail = if is_exec_bash_task {
         json!({})
     } else {
@@ -3415,33 +3416,22 @@ fn build_check_task_result(tool_name: &str, task: Task) -> AgentToolResult {
     }
 
     let cmd_line = if is_exec_bash_task {
-        task.data
-            .get("command")
-            .and_then(Json::as_str)
-            .map(|value| value.to_string())
+        exec_bash_task
+            .as_ref()
+            .and_then(|data| data.command.clone())
     } else {
         Some(format!("{tool_name} {}", task.id))
     };
-    let output = task
-        .data
-        .get("output")
-        .and_then(Json::as_str)
-        .map(|value| value.to_string());
-    let return_code = task
-        .data
-        .get("return_code")
-        .or_else(|| task.data.get("exit_code"))
-        .and_then(Json::as_i64)
-        .and_then(|value| i32::try_from(value).ok());
-    let estimated_wait = task
-        .data
-        .get("estimated_wait")
-        .and_then(Json::as_str)
-        .map(|value| value.to_string());
-    let check_after = task
-        .data
-        .get("check_after")
-        .and_then(Json::as_u64)
+    let output = exec_bash_task.as_ref().and_then(|data| data.output.clone());
+    let return_code = exec_bash_task
+        .as_ref()
+        .and_then(|data| data.return_code.or(data.exit_code));
+    let estimated_wait = exec_bash_task
+        .as_ref()
+        .and_then(|data| data.estimated_wait.clone());
+    let check_after = exec_bash_task
+        .as_ref()
+        .and_then(|data| data.check_after)
         .or_else(|| (top_status == AgentToolStatus::Pending).then_some(5));
 
     let mut result = AgentToolResult::from_details(detail)
@@ -3564,7 +3554,10 @@ fn normalized_task_detail(task: &Task) -> Json {
 
 fn task_protocol_status(task: &Task) -> AgentToolStatus {
     match task.status {
-        TaskStatus::Completed => match task.data.get("status").and_then(Json::as_str) {
+        TaskStatus::Completed => match tool_exec_bash_task_data(task)
+            .and_then(|data| data.status)
+            .as_deref()
+        {
             Some("error") => AgentToolStatus::Error,
             _ => AgentToolStatus::Success,
         },
@@ -3577,9 +3570,9 @@ fn task_protocol_status(task: &Task) -> AgentToolStatus {
 }
 
 fn task_summary(task: &Task, protocol_status: AgentToolStatus) -> String {
-    task.data
-        .get("summary")
-        .and_then(Json::as_str)
+    let exec_summary = tool_exec_bash_task_data(task).and_then(|data| data.summary);
+    exec_summary
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
@@ -3599,9 +3592,9 @@ fn task_summary(task: &Task, protocol_status: AgentToolStatus) -> String {
 }
 
 fn task_pending_reason(task: &Task) -> Option<AgentToolPendingReason> {
-    task.data
-        .get("pending_reason")
-        .and_then(Json::as_str)
+    let pending_reason = tool_exec_bash_task_data(task).and_then(|data| data.pending_reason);
+    pending_reason
+        .as_deref()
         .and_then(|value| match value {
             "user_approval" => Some(AgentToolPendingReason::UserApproval),
             "wait_for_install" | "external_callback" => {
@@ -3620,15 +3613,11 @@ fn task_pending_reason(task: &Task) -> Option<AgentToolPendingReason> {
 }
 
 async fn interrupt_task_if_supported(task: &Task) -> Option<String> {
-    if task.data.get("kind").and_then(Json::as_str) != Some("tool.exec_bash") {
+    let tmux_target = tool_exec_bash_task_data(task)?.tmux_target?;
+    let tmux_target = tmux_target.trim();
+    if tmux_target.is_empty() {
         return None;
     }
-    let tmux_target = task
-        .data
-        .get("tmux_target")
-        .and_then(Json::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
 
     let output = match Command::new("tmux")
         .args(["send-keys", "-t", tmux_target, "C-c"])
@@ -3648,6 +3637,15 @@ async fn interrupt_task_if_supported(task: &Task) -> Option<String> {
     } else {
         format!("tmux interrupt `{tmux_target}` failed: {stderr}")
     })
+}
+
+fn tool_exec_bash_task_data(task: &Task) -> Option<ToolExecBashTaskData> {
+    match parse_typed_task_data(TaskDataType::ToolExecBash.as_str(), task.data.clone()).ok()? {
+        TypedTaskData::ToolExecBash(data) if data.kind == TaskDataType::ToolExecBash.as_str() => {
+            Some(data)
+        }
+        _ => None,
+    }
 }
 
 fn canonicalize_or_normalize(path: PathBuf, base_dir: Option<&Path>) -> PathBuf {

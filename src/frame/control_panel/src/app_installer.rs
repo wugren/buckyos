@@ -1,8 +1,10 @@
 use buckyos_api::{
-    get_buckyos_api_runtime, AppDoc, AppServiceSpec, AppType, CreateTaskOptions, RepoClient,
-    RepoProof, RepoProofFilter, ServiceInstanceReportInfo, ServiceInstanceState, ServiceState,
-    SubPkgDesc, SystemConfigClient, SystemConfigError, TaskManagerClient, TaskStatus,
-    REPO_PROOF_TYPE_DOWNLOAD, REPO_PROOF_TYPE_REFERRAL, REPO_STATUS_COLLECTED, REPO_STATUS_PINNED,
+    get_buckyos_api_runtime, AppDoc, AppInstallTaskData, AppInstallTaskRequest, AppServiceSpec,
+    AppStartTaskData, AppStartTaskRequest, AppType, AppUninstallTaskData, AppUninstallTaskRequest,
+    AppUpdateTaskData, AppUpdateTaskRequest, CreateTaskOptions, RepoClient, RepoProof,
+    RepoProofFilter, ServiceInstanceReportInfo, ServiceInstanceState, ServiceState, SubPkgDesc,
+    SystemConfigClient, SystemConfigError, TaskManagerClient, TaskStatus, REPO_PROOF_TYPE_DOWNLOAD,
+    REPO_PROOF_TYPE_REFERRAL, REPO_STATUS_COLLECTED, REPO_STATUS_PINNED,
 };
 use buckyos_kit::buckyos_get_unix_timestamp;
 use flate2::write::GzEncoder;
@@ -16,7 +18,7 @@ use ndn_lib::{
 };
 use ndn_toolkit::{cacl_file_object, CheckMode};
 use package_lib::{PackageId, PackageMeta};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use std::fs::File as StdFile;
 use std::io;
@@ -40,10 +42,10 @@ use uuid::Uuid;
 // 3. schedule() 四阶段: Step1 resort_nodes -> Step2 schedule_spec_change(New->选点+InstanceReplica, Deleted->RemoveInstance) -> Step4 calc_service_infos
 // 4. 输出: InstanceReplica -> nodes/{node}/config.apps, RemoveInstance -> 删 node config, UpdateServiceInfo -> services/{spec}/info
 // 5. node-daemon 读 nodes/{node}/config 收敛实例; 实例上报 services/{spec}/instances/{node}; gateway 读 service_info 做路由
-const INSTALL_TASK_TYPE: &str = "app_install";
-const UNINSTALL_TASK_TYPE: &str = "app_uninstall";
-const START_TASK_TYPE: &str = "app_start";
-const UPDATE_TASK_TYPE: &str = "app_update";
+const INSTALL_TASK_TYPE: &str = "app.install";
+const UNINSTALL_TASK_TYPE: &str = "app.uninstall";
+const START_TASK_TYPE: &str = "app.start";
+const UPDATE_TASK_TYPE: &str = "app.update";
 const WAIT_INTERVAL_MS: u64 = 1_000;
 const WAIT_TIMEOUT_SECS: u64 = 45;
 const PROOF_EXPIRE_SECS: u64 = 365 * 24 * 60 * 60;
@@ -81,6 +83,11 @@ struct PreparedSubPkg {
 struct PreparedPublishPlan {
     app_bundle: Option<PreparedPayload>,
     sub_pkgs: Vec<PreparedSubPkg>,
+}
+
+fn task_data_value<T: Serialize>(data: T) -> Result<Value, RPCErrors> {
+    serde_json::to_value(data)
+        .map_err(|error| RPCErrors::ReasonError(format!("Serialize task data failed: {error}")))
 }
 
 #[derive(Clone)]
@@ -1229,12 +1236,15 @@ impl AppInstaller {
             .create_task(
                 format!("Install app {}", spec.app_id()),
                 INSTALL_TASK_TYPE,
-                json!({
-                    "app_id": spec.app_id(),
-                    "user_id": spec.user_id,
-                    "version": spec.app_doc.version,
-                    "content_id": content_id,
-                }),
+                task_data_value(AppInstallTaskData {
+                    request: AppInstallTaskRequest {
+                        app_id: spec.app_id().to_string(),
+                        user_id: spec.user_id.clone(),
+                        version: spec.app_doc.version.clone(),
+                        content_id: content_id.clone(),
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 spec.app_id(),
             )
@@ -1281,11 +1291,14 @@ impl AppInstaller {
             .create_task(
                 format!("Uninstall app {app_id}"),
                 UNINSTALL_TASK_TYPE,
-                json!({
-                    "app_id": app_id,
-                    "user_id": spec.user_id,
-                    "remove_data": is_remove_data,
-                }),
+                task_data_value(AppUninstallTaskData {
+                    request: AppUninstallTaskRequest {
+                        app_id: app_id.to_string(),
+                        user_id: spec.user_id.clone(),
+                        remove_data: is_remove_data,
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 app_id,
             )
@@ -1369,10 +1382,13 @@ impl AppInstaller {
             .create_task(
                 format!("Start app {app_id}"),
                 START_TASK_TYPE,
-                json!({
-                    "app_id": app_id,
-                    "user_id": spec.user_id,
-                }),
+                task_data_value(AppStartTaskData {
+                    request: AppStartTaskRequest {
+                        app_id: app_id.to_string(),
+                        user_id: spec.user_id.clone(),
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 app_id,
             )
@@ -1413,13 +1429,16 @@ impl AppInstaller {
             .create_task(
                 format!("Update app {}", spec.app_id()),
                 UPDATE_TASK_TYPE,
-                json!({
-                    "app_id": spec.app_id(),
-                    "user_id": spec.user_id,
-                    "from_version": current_spec.app_doc.version,
-                    "to_version": spec.app_doc.version,
-                    "content_id": content_id,
-                }),
+                task_data_value(AppUpdateTaskData {
+                    request: AppUpdateTaskRequest {
+                        app_id: spec.app_id().to_string(),
+                        user_id: spec.user_id.clone(),
+                        from_version: current_spec.app_doc.version.clone(),
+                        to_version: spec.app_doc.version.clone(),
+                        content_id,
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 spec.app_id(),
             )

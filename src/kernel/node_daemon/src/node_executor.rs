@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use buckyos_api::{
-    get_session_token_env_key, FunctionObject, FunctionType, Task, TaskFilter, TaskManagerClient,
-    TaskStatus, ThunkExecutionResult, ThunkExecutionStatus, ThunkObject, TASK_MANAGER_SERVICE_PORT,
+    get_session_token_env_key, parse_typed_task_data, FunctionObject, FunctionType,
+    NodeExecutorTaskState, Task, TaskFilter, TaskManagerClient, TaskStatus, ThunkExecutionResult,
+    ThunkExecutionStatus, ThunkObject, ThunkTaskData, TypedTaskData, TASK_MANAGER_SERVICE_PORT,
 };
 use buckyos_kit::get_buckyos_service_data_dir;
 use log::{info, warn};
@@ -234,22 +235,18 @@ impl NodeExecutor {
         execution: &RunningThunkExecution,
         payload: &NodeExecutorTaskPayload,
     ) -> Result<()> {
-        let next_data = merge_task_data(
-            &task.data,
-            json!({
-                "node_id": self.config.node_id,
-                "runner": payload.runner,
-                "thunk_obj_id": execution.thunk_obj_id,
-                "executor": {
-                    "status": "running",
-                    "task_id": task.id,
-                    "work_dir": execution.work_dir,
-                    "result_path": execution.result_path,
-                }
-            }),
-        );
+        let mut next_data = parse_thunk_task_data(task)?;
+        next_data.request.node_id = Some(self.config.node_id.clone());
+        next_data.request.runner = payload.runner.clone();
+        next_data.request.thunk_obj_id = Some(execution.thunk_obj_id.clone());
+        next_data.executor = Some(NodeExecutorTaskState {
+            status: Some("running".to_string()),
+            task_id: Some(task.id),
+            work_dir: Some(execution.work_dir.to_string_lossy().to_string()),
+            result_path: Some(execution.result_path.to_string_lossy().to_string()),
+        });
         self.task_manager
-            .update_task_data(task.id, next_data)
+            .update_task_data(task.id, thunk_task_data_value(&next_data)?)
             .await?;
         self.task_manager
             .update_task_status(task.id, TaskStatus::Running)
@@ -403,19 +400,23 @@ impl NodeExecutor {
         result: &ThunkExecutionResult,
     ) -> Result<()> {
         let task = self.task_manager.get_task(task_id).await?;
-        let next_data = merge_task_data(
-            &task.data,
-            json!({
-                "thunk_obj_id": result.thunk_obj_id,
-                "executor": {
-                    "status": "finished",
-                    "task_id": task_id,
-                },
-                "executor_result": result,
-            }),
-        );
+        let mut next_data = parse_thunk_task_data(&task)?;
+        next_data.request.thunk_obj_id = Some(result.thunk_obj_id.to_string());
+        next_data.executor = Some(NodeExecutorTaskState {
+            status: Some("finished".to_string()),
+            task_id: Some(task_id),
+            work_dir: next_data
+                .executor
+                .as_ref()
+                .and_then(|executor| executor.work_dir.clone()),
+            result_path: next_data
+                .executor
+                .as_ref()
+                .and_then(|executor| executor.result_path.clone()),
+        });
+        next_data.result = Some(result.clone());
         self.task_manager
-            .update_task_data(task_id, next_data)
+            .update_task_data(task_id, thunk_task_data_value(&next_data)?)
             .await?;
         Ok(())
     }
@@ -423,20 +424,27 @@ impl NodeExecutor {
 
 impl NodeExecutorTaskPayload {
     fn from_task(task: &Task) -> Result<Self> {
-        let data = &task.data;
-        let thunk = extract_required_value::<ThunkObject>(data, "thunk")
-            .context("task.data.thunk is required")?;
-        let function_object = extract_required_value::<FunctionObject>(data, "function_object")
-            .context("task.data.function_object is required")?;
-        let runner = extract_string(data, "runner")
-            .or_else(|| data.pointer("/dispatch/runner").and_then(Value::as_str))
-            .map(ToString::to_string);
-        let thunk_obj_id = extract_string(data, "thunk_obj_id")
-            .or_else(|| {
-                data.pointer("/dispatch/details/thunk_obj_id")
-                    .and_then(Value::as_str)
-            })
-            .map(ToString::to_string);
+        let data = parse_thunk_task_data(task)?;
+        let thunk = data
+            .request
+            .thunk
+            .ok_or_else(|| anyhow::anyhow!("task.data.request.thunk is required"))?;
+        let function_object = data
+            .request
+            .function_object
+            .ok_or_else(|| anyhow::anyhow!("task.data.request.function_object is required"))?;
+        let runner = data.request.runner.or_else(|| {
+            data.request
+                .dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.runner.clone())
+        });
+        let thunk_obj_id = data.request.thunk_obj_id.or_else(|| {
+            data.request
+                .dispatch
+                .and_then(|dispatch| dispatch.details)
+                .and_then(|details| details.thunk_obj_id)
+        });
 
         Ok(Self {
             runner,
@@ -549,19 +557,23 @@ fn build_terminal_result(
     })
 }
 
-fn merge_task_data(current: &Value, patch: Value) -> Value {
-    let mut merged = if current.is_object() {
-        current.clone()
-    } else {
-        json!({})
-    };
-    let merged_obj = merged.as_object_mut().expect("object ensured");
-    if let Some(patch_obj) = patch.as_object() {
-        for (key, value) in patch_obj {
-            merged_obj.insert(key.clone(), value.clone());
+fn parse_thunk_task_data(task: &Task) -> Result<ThunkTaskData> {
+    match parse_typed_task_data(task.task_type.as_str(), task.data.clone())
+        .with_context(|| format!("parse task {} thunk data failed", task.id))?
+    {
+        TypedTaskData::SchedulerDispatchThunk(data) | TypedTaskData::WorkflowThunk(data) => {
+            Ok(data)
         }
+        other => bail!(
+            "task {} data type {} is not thunk-compatible",
+            task.id,
+            other.task_data_type()
+        ),
     }
-    merged
+}
+
+fn thunk_task_data_value(data: &ThunkTaskData) -> Result<Value> {
+    serde_json::to_value(data).context("serialize thunk task data failed")
 }
 
 fn script_interpreter(language: &str) -> &'static str {
@@ -579,21 +591,6 @@ fn script_extension(language: &str) -> &'static str {
         "javascript" | "js" | "node" => "js",
         _ => "sh",
     }
-}
-
-fn extract_string<'a>(data: &'a Value, key: &str) -> Option<&'a str> {
-    data.get(key).and_then(Value::as_str)
-}
-
-fn extract_required_value<T>(data: &Value, key: &str) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let value = data
-        .get(key)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("task.data.{} is missing", key))?;
-    serde_json::from_value(value).with_context(|| format!("parse task.data.{} failed", key))
 }
 
 fn sanitize_component(raw: &str) -> String {

@@ -201,16 +201,12 @@ async fn proto_sec_04_idempotency_key_preserved() {
         .expect("list tasks");
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(response.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(response.task_id.as_str()))
         .expect("task should exist");
+    let request = typed_aicc_request(&task).expect("typed aicc request");
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/idempotency_key")
+        request
+            .pointer("/idempotency_key")
             .and_then(|v| v.as_str()),
         Some(idem.as_str())
     , "assert_eq failed in proto_sec_04_idempotency_key_preserved: expected left == right; check this scenario's routing/status/error-code branch.");
@@ -486,22 +482,18 @@ async fn proto_res_01_named_object_passthrough_preserved() {
         .unwrap();
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(resp.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(resp.task_id.as_str()))
         .unwrap();
+    let request = typed_aicc_request(&task).unwrap();
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/0/kind")
+        request
+            .pointer("/payload/resources/0/kind")
             .and_then(|v| v.as_str()),
         Some("named_object")
     );
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/0/obj_id")
+        request
+            .pointer("/payload/resources/0/obj_id")
             .and_then(|v| v.as_str()),
         Some("chunk:123456")
     );
@@ -693,22 +685,18 @@ async fn proto_res_08_named_object_and_url_mixed_order_stable() {
         .unwrap();
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(resp.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(resp.task_id.as_str()))
         .unwrap();
+    let request = typed_aicc_request(&task).unwrap();
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/0/kind")
+        request
+            .pointer("/payload/resources/0/kind")
             .and_then(|v| v.as_str()),
         Some("named_object")
     );
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/1/kind")
+        request
+            .pointer("/payload/resources/1/kind")
             .and_then(|v| v.as_str()),
         Some("url")
     );
@@ -735,16 +723,12 @@ async fn proto_res_09_mime_hint_consistency_after_translation() {
         .unwrap();
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(resp.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(resp.task_id.as_str()))
         .unwrap();
+    let request = typed_aicc_request(&task).unwrap();
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/0/mime_hint")
+        request
+            .pointer("/payload/resources/0/mime_hint")
             .and_then(|v| v.as_str()),
         Some("image/png")
     );

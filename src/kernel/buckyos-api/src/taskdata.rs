@@ -234,6 +234,7 @@ pub const TASK_DATA_TYPE_APP_START: &str = "app.start";
 pub const TASK_DATA_TYPE_APP_UPDATE: &str = "app.update";
 pub const TASK_DATA_TYPE_SERVICE_RPC: &str = "workflow.execute_rpc";
 pub const TASK_DATA_TYPE_WORKFLOW_RUN_TARGET: &str = "workflow.run";
+pub const TASK_DATA_TYPE_TOOL_EXEC_BASH: &str = "tool.exec_bash";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TaskDataType {
@@ -255,6 +256,7 @@ pub enum TaskDataType {
     AppUpdate,
     ServiceRpc,
     WorkflowRunTarget,
+    ToolExecBash,
 }
 
 impl TaskDataType {
@@ -278,6 +280,7 @@ impl TaskDataType {
             Self::AppUpdate => TASK_DATA_TYPE_APP_UPDATE,
             Self::ServiceRpc => TASK_DATA_TYPE_SERVICE_RPC,
             Self::WorkflowRunTarget => TASK_DATA_TYPE_WORKFLOW_RUN_TARGET,
+            Self::ToolExecBash => TASK_DATA_TYPE_TOOL_EXEC_BASH,
         }
     }
 }
@@ -311,6 +314,7 @@ impl FromStr for TaskDataType {
             TASK_DATA_TYPE_APP_UPDATE => Ok(Self::AppUpdate),
             TASK_DATA_TYPE_SERVICE_RPC => Ok(Self::ServiceRpc),
             TASK_DATA_TYPE_WORKFLOW_RUN_TARGET => Ok(Self::WorkflowRunTarget),
+            TASK_DATA_TYPE_TOOL_EXEC_BASH => Ok(Self::ToolExecBash),
             _ => Err(TaskDataParseError::UnknownTaskDataType(value.to_string())),
         }
     }
@@ -417,6 +421,8 @@ pub enum TypedTaskData {
     ServiceRpc(ServiceRpcTaskData),
     #[serde(rename = "workflow.run")]
     WorkflowRunTarget(WorkflowRunTargetTaskData),
+    #[serde(rename = "tool.exec_bash")]
+    ToolExecBash(ToolExecBashTaskData),
 }
 
 impl TypedTaskData {
@@ -483,6 +489,7 @@ impl TypedTaskData {
             TaskDataType::WorkflowRunTarget => parse_data(task_data_type, data.clone())
                 .map(Self::WorkflowRunTarget)
                 .or_else(|_| parse_workflow_run_target_legacy(data).map(Self::WorkflowRunTarget)),
+            TaskDataType::ToolExecBash => parse_data(task_data_type, data).map(Self::ToolExecBash),
         }
     }
 
@@ -506,6 +513,7 @@ impl TypedTaskData {
             Self::AppUpdate(_) => TaskDataType::AppUpdate,
             Self::ServiceRpc(_) => TaskDataType::ServiceRpc,
             Self::WorkflowRunTarget(_) => TaskDataType::WorkflowRunTarget,
+            Self::ToolExecBash(_) => TaskDataType::ToolExecBash,
         }
     }
 }
@@ -529,6 +537,98 @@ pub struct DownloadTaskData {
     pub result: Option<DownloadTaskResult>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl DownloadTaskData {
+    pub fn new(
+        download_url: impl Into<String>,
+        objid: Option<String>,
+        options: Option<DownloadTaskOptions>,
+    ) -> Self {
+        let download_url = download_url.into();
+        Self {
+            request: DownloadTaskRequest {
+                download_url: Some(download_url.clone()),
+                urls: vec![download_url],
+                objid,
+                resolved_objid: None,
+                options,
+            },
+            progress: Some(TaskDataProgress::with_bytes(0, None)),
+            result: Some(DownloadTaskResult {
+                state: Some("pending".to_string()),
+                ..Default::default()
+            }),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    pub fn primary_url(&self) -> Option<&str> {
+        self.request
+            .download_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.request
+                    .urls
+                    .iter()
+                    .map(|value| value.trim())
+                    .find(|value| !value.is_empty())
+            })
+    }
+
+    pub fn urls(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        if let Some(download_url) = self
+            .request
+            .download_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            urls.push(download_url.to_string());
+        }
+
+        for url in &self.request.urls {
+            let url = url.trim();
+            if !url.is_empty() && !urls.iter().any(|existing| existing == url) {
+                urls.push(url.to_string());
+            }
+        }
+        urls
+    }
+
+    pub fn add_url(&mut self, download_url: impl Into<String>) -> bool {
+        let download_url = download_url.into();
+        if self.urls().iter().any(|url| url == &download_url) {
+            return false;
+        }
+        self.request.urls.push(download_url);
+        true
+    }
+
+    pub fn objid(&self) -> Option<&str> {
+        self.request
+            .objid
+            .as_deref()
+            .or(self.request.resolved_objid.as_deref())
+    }
+
+    pub fn set_state(&mut self, state: impl Into<String>, mode: Option<String>) {
+        let result = self.result.get_or_insert_with(Default::default);
+        result.state = Some(state.into());
+        if let Some(mode) = mode {
+            result.mode = Some(mode);
+        }
+    }
+
+    pub fn set_byte_progress(&mut self, downloaded_bytes: u64, total_bytes: Option<u64>) {
+        self.progress = Some(TaskDataProgress::with_bytes(downloaded_bytes, total_bytes));
+        let result = self.result.get_or_insert_with(Default::default);
+        result.downloaded_bytes = Some(downloaded_bytes);
+        result.total_bytes = total_bytes;
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -571,6 +671,22 @@ pub struct DownloadTaskResult {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stored_objects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_pkg_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_pkg_completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_sub_pkg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
 }
@@ -1073,6 +1189,34 @@ pub struct WorkflowRunTargetTaskRequest {
     pub trigger: Option<ScheduleTriggerContext>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolExecBashTaskData {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_wait: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_target: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct LegacyDownloadTaskData {
     #[serde(default)]
@@ -1122,6 +1266,14 @@ fn parse_download_legacy(data: Value) -> Result<DownloadTaskData, TaskDataParseE
         state: download.state,
         mode: download.mode,
         local_path: download.local_path,
+        downloaded_bytes: download.downloaded_bytes,
+        total_bytes: download.total_bytes,
+        chunk_count: None,
+        stored_objects: Vec::new(),
+        completed_at: None,
+        sub_pkg_total: None,
+        sub_pkg_completed: None,
+        current_sub_pkg: None,
         output: download.result,
     });
     Ok(DownloadTaskData {

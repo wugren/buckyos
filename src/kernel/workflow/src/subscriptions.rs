@@ -33,7 +33,8 @@
 //! [`apply_task_data`]: crate::WorkflowOrchestrator::apply_task_data
 
 use buckyos_api::{
-    EventReader, KEventClient, NodeRunState, RunStatus, Task, TaskFilter, TaskManagerClient,
+    parse_typed_task_data, EventReader, KEventClient, NodeRunState, RunStatus, Task, TaskFilter,
+    TaskManagerClient, TypedTaskData, WorkflowStepTaskData,
 };
 use log::{debug, info, warn};
 use serde_json::Value;
@@ -233,9 +234,9 @@ impl RunSubscriptionManager {
         // task_manager 的 inline 阈值很小（~1300 字节，见
         // task_manager/server.rs），整段 task_data 一过阈值就只剩
         // `data_omitted=true`。这里按 task_id 回拉一次拿全量 data。
-        let fetched_data: Value;
-        let data: &Value = match payload.get("data") {
-            Some(d) if !d.is_null() => d,
+        let fetched_data: WorkflowStepTaskData;
+        let data = match payload.get("data") {
+            Some(d) if !d.is_null() => parse_workflow_step_task_data(d.clone())?,
             _ => {
                 if !payload
                     .get("data_omitted")
@@ -266,8 +267,8 @@ impl RunSubscriptionManager {
                         .and_then(Value::as_u64)
                         .unwrap_or(0)
                 );
-                fetched_data = task.data;
-                &fetched_data
+                fetched_data = workflow_step_task_data(&task)?;
+                fetched_data
             }
         };
 
@@ -278,7 +279,7 @@ impl RunSubscriptionManager {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "event missing root_id".to_string())?;
 
-        if let Err(err) = self.apply_run_data(run_id, data).await {
+        if let Err(err) = self.apply_run_data(run_id, &data).await {
             debug!(
                 "workflow.subscriptions: apply_run_data failed run_id={} err={}",
                 run_id, err
@@ -290,7 +291,11 @@ impl RunSubscriptionManager {
     /// 把一段 task_data 喂给 orchestrator.apply_task_data 并 tick 后继节点。
     /// 事件路径和 sweep 路径共用同一个入口，保证两边幂等性一致——已经应用过
     /// 的 human_action 再被回放只会拿到 `NodeNotWaitingHuman` / 空 events。
-    async fn apply_run_data(&self, run_id: &str, data: &Value) -> Result<(), String> {
+    async fn apply_run_data(
+        &self,
+        run_id: &str,
+        data: &WorkflowStepTaskData,
+    ) -> Result<(), String> {
         let handle = self
             .runs
             .get(run_id)
@@ -400,17 +405,18 @@ impl RunSubscriptionManager {
             let Some(node_id) = step_task_node_id(&task) else {
                 continue;
             };
-            if !waiting_nodes.contains(node_id) {
+            if !waiting_nodes.contains(&node_id) {
                 continue;
             }
-            if task.data.get("human_action").is_none() {
+            let data = workflow_step_task_data(&task)?;
+            if data.human_action.is_none() {
                 continue;
             }
             debug!(
                 "workflow.subscriptions.sweep: replay run_id={} node={} task_id={}",
                 run_id, node_id, task.id
             );
-            if let Err(err) = self.apply_run_data(run_id, &task.data).await {
+            if let Err(err) = self.apply_run_data(run_id, &data).await {
                 debug!(
                     "workflow.subscriptions.sweep: apply run_id={} node={} task_id={} err={}",
                     run_id, node_id, task.id, err
@@ -421,10 +427,24 @@ impl RunSubscriptionManager {
     }
 }
 
-fn step_task_node_id(task: &Task) -> Option<&str> {
-    task.data
-        .get("workflow")
-        .and_then(|w| w.get("node_id"))
-        .and_then(Value::as_str)
+fn workflow_step_task_data(task: &Task) -> Result<WorkflowStepTaskData, String> {
+    parse_workflow_step_task_data(task.data.clone())
+}
+
+fn parse_workflow_step_task_data(data: Value) -> Result<WorkflowStepTaskData, String> {
+    match parse_typed_task_data(STEP_TASK_TYPE, data) {
+        Ok(TypedTaskData::WorkflowStep(data)) => Ok(data),
+        Ok(other) => Err(format!(
+            "expected workflow/step task data, got {:?}",
+            other.task_data_type()
+        )),
+        Err(err) => Err(format!("invalid workflow/step task data: {}", err)),
+    }
+}
+
+fn step_task_node_id(task: &Task) -> Option<String> {
+    workflow_step_task_data(task)
+        .ok()
+        .map(|data| data.request.node_id)
         .filter(|s| !s.is_empty())
 }

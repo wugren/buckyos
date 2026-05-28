@@ -52,12 +52,7 @@ async fn task_01_immediate_persists_completed() {
         .expect("list tasks");
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(response.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(response.task_id.as_str()))
         .expect("task should exist");
     assert_eq!(
         task.status,
@@ -155,12 +150,7 @@ async fn task_03_queued_persists_pending_and_position() {
         .expect("list tasks");
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(response.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(response.task_id.as_str()))
         .expect("task should exist");
     assert_eq!(
         task.status,
@@ -168,9 +158,16 @@ async fn task_03_queued_persists_pending_and_position() {
         "assert_eq failed in task_03_queued_persists_pending_and_position: expected left == right; check this scenario's routing/status/error-code branch."
     );
     assert_eq!(
-        task.data
-            .pointer("/aicc/events/0/kind")
-            .and_then(|v| v.as_str()),
+        typed_aicc_task_data(&task)
+            .and_then(|data| data.progress)
+            .and_then(|progress| progress.events.first().cloned())
+            .and_then(|event| {
+                event
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            })
+            .as_deref(),
         Some("queued"),
         "assert_eq failed in task_03_queued_persists_pending_and_position: expected left == right; check this scenario's routing/status/error-code branch."
     );

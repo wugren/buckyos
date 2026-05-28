@@ -24,7 +24,7 @@ use buckyos_api::{
     ai_methods, features, get_buckyos_api_runtime, value_to_object_map, AiMethodRequest,
     AiMethodStatus, AiPayload, AiResponse, AiToolCall, AiToolSpec, AiccClient, Capability,
     KEventClient, ModelSpec, MsgCenterClient, Requirements, RespFormat, TaskFilter,
-    TaskManagerClient, TaskStatus, AICC_SERVICE_SERVICE_NAME,
+    TaskManagerClient, TaskStatus, TypedTaskData, AICC_SERVICE_SERVICE_NAME,
 };
 use log::warn;
 use serde_json::{json, Value};
@@ -218,16 +218,24 @@ async fn resolve_async_aicc_result(external_task_id: &str) -> Result<AiResponse,
         )));
     }
 
-    let output = task.data.pointer("/aicc/output").cloned().ok_or_else(|| {
-        LLMComputeError::Provider(format!(
-            "aicc task {} terminated without /aicc/output payload",
-            id
-        ))
-    })?;
-    // Envelope-tolerant: aicc.rs writes either `AiResponse` directly
-    // or `{summary: AiResponse, ...}` depending on the event payload
-    // shape. Strip the wrapper when present. (Drop once the task.data schema
-    // is unified — see follow-up task.)
+    let task_data = match buckyos_api::parse_typed_task_data(task.task_type.as_str(), task.data) {
+        Ok(TypedTaskData::AiccCompute(data)) => data,
+        _ => {
+            return Err(LLMComputeError::Provider(format!(
+                "aicc task {} terminated without typed aicc.compute payload",
+                id
+            )))
+        }
+    };
+    let output = task_data
+        .result
+        .and_then(|result| result.output)
+        .ok_or_else(|| {
+            LLMComputeError::Provider(format!(
+                "aicc task {} terminated without aicc output payload",
+                id
+            ))
+        })?;
     let summary_value = output.get("summary").cloned().unwrap_or(output);
     serde_json::from_value::<AiResponse>(summary_value).map_err(|err| {
         LLMComputeError::Provider(format!(
@@ -263,12 +271,11 @@ async fn resolve_aicc_task_id(
         .map_err(|err| LLMComputeError::Provider(err.to_string()))?;
 
     for task in tasks {
-        let matched = task
-            .data
-            .pointer("/aicc/external_task_id")
-            .and_then(|value| value.as_str())
-            .map(|value| value == external_task_id)
-            .unwrap_or(false);
+        let matched = matches!(
+            buckyos_api::parse_typed_task_data(task.task_type.as_str(), task.data),
+            Ok(TypedTaskData::AiccCompute(data))
+                if data.request.external_task_id.as_deref() == Some(external_task_id)
+        );
         if matched {
             return Ok(task.id);
         }

@@ -14,6 +14,7 @@ use base64::Engine as _;
 use buckyos_api::{
     AiMethodRequest, AiPayload, Capability, CreateTaskOptions, ModelSpec, Requirements,
     ResourceRef, Task, TaskFilter, TaskManagerClient, TaskManagerHandler, TaskStatus,
+    TypedTaskData,
 };
 use kRPC::{RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
@@ -42,6 +43,21 @@ pub fn base_request() -> AiMethodRequest {
         ),
         Some("idem-test".to_string()),
     )
+}
+
+pub fn typed_aicc_task_data(task: &Task) -> Option<buckyos_api::AiccComputeTaskData> {
+    match buckyos_api::parse_typed_task_data(task.task_type.as_str(), task.data.clone()).ok()? {
+        TypedTaskData::AiccCompute(data) => Some(data),
+        _ => None,
+    }
+}
+
+pub fn typed_aicc_request(task: &Task) -> Option<Value> {
+    typed_aicc_task_data(task).and_then(|data| data.request.request)
+}
+
+pub fn typed_aicc_external_task_id(task: &Task) -> Option<String> {
+    typed_aicc_task_data(task).and_then(|data| data.request.external_task_id)
 }
 
 #[allow(dead_code)]

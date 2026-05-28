@@ -19,9 +19,9 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, AiContent, AiMethodRequest, AiMethodResponse,
-    AiMethodStatus, AiResponse, AiccHandler, AiccUsageEvent, CancelResponse, Capability,
-    CreateTaskOptions, Feature, ResourceRef, TaskManagerClient, TaskStatus,
-    AICC_SERVICE_SERVICE_NAME,
+    AiMethodStatus, AiResponse, AiccComputeProgress, AiccComputeTaskData, AiccComputeTaskRequest,
+    AiccHandler, AiccUsageEvent, CancelResponse, Capability, CreateTaskOptions, Feature,
+    ResourceRef, TaskManagerClient, TaskStatus, TypedTaskData, AICC_SERVICE_SERVICE_NAME,
 };
 use log::{debug, error, info, warn};
 use ndn_lib::{ChunkHasher, FileObject, NamedObject, ObjId};
@@ -3593,27 +3593,26 @@ fn build_initial_aicc_task_data(
     invoke_ctx: &InvokeCtx,
 ) -> serde_json::Value {
     let session_id = extract_session_id_from_complete_request(request);
-
-    json!({
-        "session_id": session_id.clone(),
-        "owner_session_id": session_id.clone(),
-        "aicc": {
-            "version": 1,
-            "external_task_id": external_task_id,
-            "status": "pending",
-            "created_at_ms": now_ms(),
-            "updated_at_ms": now_ms(),
-            "tenant_id": invoke_ctx.tenant_id,
-            "event_ref": event_ref,
-            "session_id": session_id,
-            "request": request,
-            "provider_input": serde_json::Value::Null,
-            "route": {},
-            "output": serde_json::Value::Null,
-            "provider_output": serde_json::Value::Null,
-            "error": serde_json::Value::Null,
-            "events": []
-        }
+    aicc_task_data_value(AiccComputeTaskData {
+        request: AiccComputeTaskRequest {
+            version: 1,
+            external_task_id: Some(external_task_id.to_string()),
+            tenant_id: Some(invoke_ctx.tenant_id.clone()),
+            event_ref: event_ref.map(ToString::to_string),
+            session_id: session_id.clone(),
+            owner_session_id: session_id,
+            request: Some(serde_json::to_value(request).unwrap_or(Value::Null)),
+            provider_input: None,
+            route: Some(json!({})),
+            created_at_ms: Some(now_ms_i64()),
+        },
+        progress: Some(AiccComputeProgress {
+            status: Some("pending".to_string()),
+            updated_at_ms: Some(now_ms_i64()),
+            events: Vec::new(),
+        }),
+        result: None,
+        error: None,
     })
 }
 
@@ -3622,42 +3621,20 @@ fn merge_route_decision_into_task_data(
     decision: &RouteDecision,
     initial_status: &str,
 ) {
-    if !data.is_object() {
-        *data = json!({});
-    }
-    let root = data.as_object_mut().expect("task data should be object");
-    if !root.contains_key("aicc") || !root["aicc"].is_object() {
-        root.insert("aicc".to_string(), json!({}));
-    }
-    let aicc = root
-        .get_mut("aicc")
-        .and_then(|value| value.as_object_mut())
-        .expect("aicc task payload should be object");
-    aicc.insert(
-        "route".to_string(),
-        json!({
+    let mut task_data = parse_aicc_task_data(data);
+    task_data.request.route = Some(json!({
             "primary_instance_id": decision.primary_instance_id,
             "fallback_instance_ids": decision.fallback_instance_ids,
             "provider_model": decision.provider_model,
-        }),
-    );
-    aicc.insert("status".to_string(), json!(initial_status));
-    aicc.insert("updated_at_ms".to_string(), json!(now_ms()));
+    }));
+    let progress = task_data.progress.get_or_insert_with(Default::default);
+    progress.status = Some(initial_status.to_string());
+    progress.updated_at_ms = Some(now_ms_i64());
+    *data = aicc_task_data_value(task_data);
 }
 
 fn merge_task_data_with_event(data: &mut serde_json::Value, event: &TaskEvent) {
-    if !data.is_object() {
-        *data = json!({});
-    }
-    let root = data.as_object_mut().expect("task data should be object");
-    if !root.contains_key("aicc") || !root["aicc"].is_object() {
-        root.insert("aicc".to_string(), json!({}));
-    }
-    let aicc = root
-        .get_mut("aicc")
-        .and_then(|value| value.as_object_mut())
-        .expect("aicc task payload should be object");
-
+    let mut task_data = parse_aicc_task_data(data);
     let status = match event.kind {
         TaskEventKind::Queued => "queued",
         TaskEventKind::Started => "running",
@@ -3665,21 +3642,18 @@ fn merge_task_data_with_event(data: &mut serde_json::Value, event: &TaskEvent) {
         TaskEventKind::Error => "failed",
         TaskEventKind::CancelRequested => "canceled",
     };
-    aicc.insert("status".to_string(), json!(status));
-    aicc.insert("updated_at_ms".to_string(), json!(now_ms()));
+    let progress = task_data.progress.get_or_insert_with(Default::default);
+    progress.status = Some(status.to_string());
+    progress.updated_at_ms = Some(now_ms_i64());
 
     let event_json = serde_json::to_value(event).unwrap_or_else(|_| json!({}));
-    let events = aicc
-        .entry("events".to_string())
-        .or_insert_with(|| json!([]));
-    if !events.is_array() {
-        *events = json!([]);
-    }
-    let events_arr = events.as_array_mut().expect("events should be an array");
-    events_arr.push(event_json);
-    if events_arr.len() > AICC_TASK_EVENT_RETENTION {
-        let to_drop = events_arr.len().saturating_sub(AICC_TASK_EVENT_RETENTION);
-        events_arr.drain(0..to_drop);
+    progress.events.push(event_json);
+    if progress.events.len() > AICC_TASK_EVENT_RETENTION {
+        let to_drop = progress
+            .events
+            .len()
+            .saturating_sub(AICC_TASK_EVENT_RETENTION);
+        progress.events.drain(0..to_drop);
     }
 
     match event.kind {
@@ -3692,20 +3666,22 @@ fn merge_task_data_with_event(data: &mut serde_json::Value, event: &TaskEvent) {
                 if let Some(extra) = summary.get("extra") {
                     if let Some(provider_io) = extra.get("provider_io") {
                         if let Some(input) = provider_io.get("input") {
-                            aicc.insert("provider_input".to_string(), input.clone());
+                            task_data.request.provider_input = Some(input.clone());
                         }
                         if let Some(output) = provider_io.get("output") {
-                            aicc.insert("provider_output".to_string(), output.clone());
+                            task_data
+                                .result
+                                .get_or_insert_with(Default::default)
+                                .provider_output = Some(output.clone());
                         }
                     }
                 }
-                aicc.insert("output".to_string(), summary);
+                task_data.result.get_or_insert_with(Default::default).output = Some(summary);
             }
-            aicc.insert("error".to_string(), serde_json::Value::Null);
+            task_data.error = None;
         }
         TaskEventKind::Error => {
-            aicc.insert(
-                "error".to_string(),
+            task_data.error = Some(
                 event
                     .data
                     .clone()
@@ -3713,8 +3689,7 @@ fn merge_task_data_with_event(data: &mut serde_json::Value, event: &TaskEvent) {
             );
         }
         TaskEventKind::CancelRequested => {
-            aicc.insert(
-                "error".to_string(),
+            task_data.error = Some(
                 event
                     .data
                     .clone()
@@ -3723,6 +3698,27 @@ fn merge_task_data_with_event(data: &mut serde_json::Value, event: &TaskEvent) {
         }
         TaskEventKind::Started | TaskEventKind::Queued => {}
     }
+    *data = aicc_task_data_value(task_data);
+}
+
+fn parse_aicc_task_data(data: &Value) -> AiccComputeTaskData {
+    match buckyos_api::parse_typed_task_data(AICC_TASK_TYPE, data.clone()) {
+        Ok(TypedTaskData::AiccCompute(data)) => data,
+        _ => AiccComputeTaskData {
+            request: AiccComputeTaskRequest::default(),
+            progress: Some(AiccComputeProgress::default()),
+            result: None,
+            error: None,
+        },
+    }
+}
+
+fn aicc_task_data_value(data: AiccComputeTaskData) -> Value {
+    serde_json::to_value(data).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn now_ms_i64() -> i64 {
+    now_ms().min(i64::MAX as u128) as i64
 }
 
 fn capability_name(capability: &Capability) -> &'static str {
@@ -4166,7 +4162,7 @@ mod tests {
     use super::*;
     use buckyos_api::{
         AiPayload, AiTaskOptions, CreateTaskOptions, ModelSpec, Requirements, Task, TaskFilter,
-        TaskManagerClient, TaskManagerHandler, TaskStatus,
+        TaskManagerClient, TaskManagerHandler, TaskStatus, TypedTaskData,
     };
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
@@ -4177,6 +4173,33 @@ mod tests {
     struct MockTaskMgrHandler {
         counter: Mutex<u64>,
         tasks: Arc<Mutex<HashMap<i64, Task>>>,
+    }
+
+    fn aicc_task_data(task: &Task) -> Option<AiccComputeTaskData> {
+        match buckyos_api::parse_typed_task_data(task.task_type.as_str(), task.data.clone()).ok()? {
+            TypedTaskData::AiccCompute(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn aicc_external_task_id(task: &Task) -> Option<String> {
+        aicc_task_data(task).and_then(|data| data.request.external_task_id)
+    }
+
+    fn aicc_status(task: &Task) -> Option<String> {
+        aicc_task_data(task).and_then(|data| data.progress.and_then(|progress| progress.status))
+    }
+
+    fn aicc_event_kind(task: &Task, index: usize) -> Option<String> {
+        aicc_task_data(task)
+            .and_then(|data| data.progress)
+            .and_then(|progress| progress.events.get(index).cloned())
+            .and_then(|event| {
+                event
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
     }
 
     #[async_trait]
@@ -4804,20 +4827,10 @@ mod tests {
             .expect("list tasks");
         let task = tasks
             .into_iter()
-            .find(|item| {
-                item.data
-                    .pointer("/aicc/external_task_id")
-                    .and_then(|value| value.as_str())
-                    == Some(response.task_id.as_str())
-            })
+            .find(|item| aicc_external_task_id(item).as_deref() == Some(response.task_id.as_str()))
             .expect("immediate provider completion should persist aicc task");
         assert_eq!(task.status, TaskStatus::Completed);
-        assert_eq!(
-            task.data
-                .pointer("/aicc/status")
-                .and_then(|value| value.as_str()),
-            Some("succeeded")
-        );
+        assert_eq!(aicc_status(&task).as_deref(), Some("succeeded"));
         assert_eq!(task.root_id, "aicc-default");
         assert!(task.data.get("rootid").is_none());
         assert!(task.data.pointer("/aicc/rootid").is_none());
@@ -4871,19 +4884,16 @@ mod tests {
             .expect("list tasks");
         let task = tasks
             .into_iter()
-            .find(|item| {
-                item.data
-                    .pointer("/aicc/external_task_id")
-                    .and_then(|value| value.as_str())
-                    == Some(response.task_id.as_str())
-            })
+            .find(|item| aicc_external_task_id(item).as_deref() == Some(response.task_id.as_str()))
             .expect("running response should persist task");
         assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(
             task.message.as_deref(),
             Some("request sent, waiting for provider response")
         );
-        assert!(task.data.pointer("/aicc/request").is_some());
+        assert!(aicc_task_data(&task)
+            .and_then(|data| data.request.request)
+            .is_some());
     }
 
     #[tokio::test]
@@ -4918,28 +4928,13 @@ mod tests {
             .expect("list tasks");
         let task = tasks
             .into_iter()
-            .find(|item| {
-                item.data
-                    .pointer("/aicc/external_task_id")
-                    .and_then(|value| value.as_str())
-                    == Some(response.task_id.as_str())
-            })
+            .find(|item| aicc_external_task_id(item).as_deref() == Some(response.task_id.as_str()))
             .expect("queued response should persist task");
 
         assert_eq!(task.status, TaskStatus::Pending);
         assert_eq!(task.message.as_deref(), Some(QUEUE_STATUS_QUEUED));
-        assert_eq!(
-            task.data
-                .pointer("/aicc/status")
-                .and_then(|value| value.as_str()),
-            Some("queued")
-        );
-        assert_eq!(
-            task.data
-                .pointer("/aicc/events/0/kind")
-                .and_then(|value| value.as_str()),
-            Some("queued")
-        );
+        assert_eq!(aicc_status(&task).as_deref(), Some("queued"));
+        assert_eq!(aicc_event_kind(&task, 0).as_deref(), Some("queued"));
     }
 
     #[tokio::test]
@@ -4987,12 +4982,7 @@ mod tests {
             .expect("list tasks");
         let task = tasks
             .into_iter()
-            .find(|item| {
-                item.data
-                    .pointer("/aicc/external_task_id")
-                    .and_then(|value| value.as_str())
-                    == Some(response.task_id.as_str())
-            })
+            .find(|item| aicc_external_task_id(item).as_deref() == Some(response.task_id.as_str()))
             .expect("aicc task should exist");
         assert_eq!(task.parent_id, Some(parent_task.id));
     }
@@ -5036,16 +5026,13 @@ mod tests {
             .expect("list tasks");
         let task = tasks
             .into_iter()
-            .find(|item| {
-                item.data
-                    .pointer("/aicc/external_task_id")
-                    .and_then(|value| value.as_str())
-                    == Some(response.task_id.as_str())
-            })
+            .find(|item| aicc_external_task_id(item).as_deref() == Some(response.task_id.as_str()))
             .expect("aicc task should exist");
         assert_eq!(task.root_id, "session-xyz");
         assert_eq!(
-            task.data.get("session_id").and_then(|value| value.as_str()),
+            aicc_task_data(&task)
+                .and_then(|data| data.request.session_id)
+                .as_deref(),
             Some("session-xyz")
         );
         assert!(task.data.get("rootid").is_none());

@@ -10,7 +10,9 @@ use crate::runtime::{
 };
 use crate::task_tracker::{MapShardTaskView, StepTaskView, ThunkTaskView, WorkflowTaskTracker};
 use crate::types::{AwaitKind, ExecutorRef, Expr, JoinStrategy, RetryPolicy, ValueTemplate};
-use buckyos_api::{ThunkExecutionResult, ThunkExecutionStatus, ThunkObject};
+use buckyos_api::{
+    TaskHumanAction, ThunkExecutionResult, ThunkExecutionStatus, ThunkObject, WorkflowStepTaskData,
+};
 use chrono::Utc;
 use ndn_lib::ObjId;
 use serde_json::{json, Value};
@@ -1949,63 +1951,57 @@ where
         &self,
         workflow: &CompiledWorkflow,
         run: &mut WorkflowRun,
-        task_data: &Value,
+        task_data: &WorkflowStepTaskData,
     ) -> WorkflowResult<Vec<EventEnvelope>> {
-        let workflow_meta = task_data.get("workflow").ok_or_else(|| {
-            WorkflowError::Serialization("task_data missing `workflow` descriptor".to_string())
-        })?;
-        let node_id = workflow_meta
-            .get("node_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                WorkflowError::Serialization("task_data.workflow.node_id missing".to_string())
-            })?
-            .to_string();
-        if let Some(declared_run) = workflow_meta.get("run_id").and_then(Value::as_str) {
-            if declared_run != run.run_id {
-                return Err(WorkflowError::Serialization(format!(
-                    "task_data.workflow.run_id `{}` does not match run `{}`",
-                    declared_run, run.run_id
-                )));
-            }
+        let node_id = task_data.request.node_id.trim();
+        if node_id.is_empty() {
+            return Err(WorkflowError::Serialization(
+                "task_data.request.node_id missing".to_string(),
+            ));
+        }
+        if !task_data.request.run_id.is_empty() && task_data.request.run_id != run.run_id {
+            return Err(WorkflowError::Serialization(format!(
+                "task_data.request.run_id `{}` does not match run `{}`",
+                task_data.request.run_id, run.run_id
+            )));
         }
 
-        let action = match task_data.get("human_action") {
+        let action = match task_data.human_action.as_ref() {
             Some(value) => value,
             None => return Ok(Vec::new()),
         };
-        let kind = action
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                WorkflowError::Serialization("task_data.human_action.kind missing".to_string())
-            })?
-            .to_string();
-        let actor = action
-            .get("actor")
-            .and_then(Value::as_str)
-            .unwrap_or("human")
-            .to_string();
-        let payload = action.get("payload").cloned();
+        let TaskHumanAction {
+            kind,
+            payload,
+            actor,
+            ..
+        } = action;
+        let kind = kind.trim();
+        if kind.is_empty() {
+            return Err(WorkflowError::Serialization(
+                "task_data.human_action.kind missing".to_string(),
+            ));
+        }
+        let actor = actor.as_deref().unwrap_or("human").to_string();
 
         if kind == "submit_output" {
             let output = payload.clone().unwrap_or(Value::Null);
             return match self
-                .submit_step_output(workflow, run, &node_id, &actor, output)
+                .submit_step_output(workflow, run, node_id, &actor, output)
                 .await
             {
                 Ok(events) => Ok(events),
                 Err(err) => {
                     let _ = self
                         .tracker
-                        .report_step_validation_error(run, &node_id, &err.to_string())
+                        .report_step_validation_error(run, node_id, &err.to_string())
                         .await;
                     Err(err)
                 }
             };
         }
 
-        let action_kind = match kind.as_str() {
+        let action_kind = match kind {
             "approve" => HumanActionKind::Approve,
             "modify" => HumanActionKind::Modify,
             "reject" => HumanActionKind::Reject,
@@ -2017,10 +2013,10 @@ where
                 let msg = format!("unknown human_action kind `{}`", other);
                 let _ = self
                     .tracker
-                    .report_step_validation_error(run, &node_id, &msg)
+                    .report_step_validation_error(run, node_id, &msg)
                     .await;
                 return Err(WorkflowError::InvalidHumanAction {
-                    node_id,
+                    node_id: node_id.to_string(),
                     action: other.to_string(),
                 });
             }
@@ -2031,9 +2027,9 @@ where
                 workflow,
                 run,
                 HumanAction {
-                    node_id: node_id.clone(),
+                    node_id: node_id.to_string(),
                     action: action_kind,
-                    payload,
+                    payload: payload.clone(),
                     actor,
                 },
             )
@@ -2043,7 +2039,7 @@ where
             Err(err) => {
                 let _ = self
                     .tracker
-                    .report_step_validation_error(run, &node_id, &err.to_string())
+                    .report_step_validation_error(run, node_id, &err.to_string())
                     .await;
                 Err(err)
             }
@@ -2399,9 +2395,33 @@ mod tests {
     };
     use crate::object_store::InMemoryObjectStore;
     use crate::task_tracker::NoopTaskTracker;
-    use buckyos_api::{ThunkExecutionResult, ThunkExecutionStatus};
+    use buckyos_api::{ThunkExecutionResult, ThunkExecutionStatus, WorkflowStepTaskRequest};
     use ndn_lib::ObjId;
     use serde_json::json;
+
+    fn human_action_task_data(
+        run_id: &str,
+        node_id: &str,
+        kind: &str,
+        actor: Option<&str>,
+    ) -> WorkflowStepTaskData {
+        WorkflowStepTaskData {
+            request: WorkflowStepTaskRequest {
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                ..Default::default()
+            },
+            progress: None,
+            result: None,
+            human_action: Some(TaskHumanAction {
+                kind: kind.to_string(),
+                payload: None,
+                actor: actor.map(str::to_string),
+                submitted_at: None,
+            }),
+            last_error: None,
+        }
+    }
 
     fn sample_workflow() -> WorkflowDefinition {
         WorkflowDefinition {
@@ -3352,16 +3372,7 @@ mod tests {
         );
 
         // 模拟 TaskMgr UI 的 TaskData 写入：用户点了 "approve"
-        let task_data = json!({
-            "workflow": {
-                "run_id": run.run_id,
-                "node_id": "review",
-            },
-            "human_action": {
-                "kind": "approve",
-                "actor": "user-A",
-            }
-        });
+        let task_data = human_action_task_data(&run.run_id, "review", "approve", Some("user-A"));
         let events = orchestrator
             .apply_task_data(&compiled, &mut run, &task_data)
             .await
@@ -3386,16 +3397,7 @@ mod tests {
         let (mut run, _) = orchestrator.create_run(&compiled).await.unwrap();
 
         // plan 节点根本还没进入 WaitingHuman，approve 应当报错并写回 last_error
-        let task_data = json!({
-            "workflow": {
-                "run_id": run.run_id,
-                "node_id": "plan",
-            },
-            "human_action": {
-                "kind": "approve",
-                "actor": "user-A",
-            }
-        });
+        let task_data = human_action_task_data(&run.run_id, "plan", "approve", Some("user-A"));
         let result = orchestrator
             .apply_task_data(&compiled, &mut run, &task_data)
             .await;
@@ -3413,15 +3415,7 @@ mod tests {
         let orchestrator = WorkflowOrchestrator::new(dispatcher, object_store, tracker.clone());
         let (mut run, _) = orchestrator.create_run(&compiled).await.unwrap();
 
-        let task_data = json!({
-            "workflow": {
-                "run_id": "run-other",
-                "node_id": "plan",
-            },
-            "human_action": {
-                "kind": "approve",
-            }
-        });
+        let task_data = human_action_task_data("run-other", "plan", "approve", None);
         let result = orchestrator
             .apply_task_data(&compiled, &mut run, &task_data)
             .await;

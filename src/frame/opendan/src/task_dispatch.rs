@@ -40,7 +40,9 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use buckyos_api::{CreateTaskOptions, Task, TaskManagerClient, TaskStatus};
+use buckyos_api::{
+    CreateTaskOptions, OpenDanAsyncToolTaskData, Task, TaskManagerClient, TaskStatus,
+};
 use log::warn;
 use serde_json::Value;
 
@@ -110,7 +112,10 @@ impl TaskDispatch {
             .create_task(
                 &task_name,
                 TASK_TYPE_OPENDAN_TOOL,
-                Some(payload),
+                Some(serde_json::to_value(OpenDanAsyncToolTaskData {
+                    request: payload,
+                    result: None,
+                })?),
                 &self.user_id,
                 &self.app_id,
                 Some(opts),

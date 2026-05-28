@@ -450,18 +450,14 @@ impl DownloadTaskStore for TaskManagerService {
         status: Option<TaskStatus>,
         progress: Option<f32>,
         message: Option<String>,
-        data_patch: Option<Value>,
+        data: Option<DownloadTaskData>,
         source_method: &'static str,
     ) -> std::result::Result<Task, String> {
-        self.update_task_and_publish(
-            task_id,
-            status,
-            progress,
-            message,
-            data_patch,
-            source_method,
-        )
-        .await
+        let data = data
+            .map(|data| serde_json::to_value(data).map_err(|err| err.to_string()))
+            .transpose()?;
+        self.update_task_and_publish(task_id, status, progress, message, data, source_method)
+            .await
     }
 
     async fn mark_failed(
@@ -921,15 +917,6 @@ impl TaskManagerHandler for TaskManagerService {
 
         self.db
             .update_task_progress(id, progress, completed_items as i32, total_items as i32)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-
-        let data_patch = json!({
-            "completed_items": completed_items,
-            "total_items": total_items
-        });
-        self.db
-            .update_task(id, None, Some(progress), None, Some(data_patch))
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
 
@@ -1557,8 +1544,7 @@ mod tests {
 
             if let RPCResult::Success(result) = get_resp.result {
                 assert_eq!(result["task"]["progress"], 50.0);
-                assert_eq!(result["task"]["data"]["completed_items"], 5);
-                assert_eq!(result["task"]["data"]["total_items"], 10);
+                assert!(result["task"]["data"].as_object().unwrap().is_empty());
             } else {
                 panic!("Failed to get task after progress update");
             }

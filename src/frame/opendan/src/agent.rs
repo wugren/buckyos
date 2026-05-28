@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use buckyos_api::{
-    get_buckyos_api_runtime, AiMessage, AiRole, CreateTaskOptions, Task, TimerOptions,
+    get_buckyos_api_runtime, parse_typed_task_data, AgentDelegateProgress, AgentDelegateTaskData,
+    AgentDelegateTaskRequest, AiMessage, AiRole, CreateTaskOptions, Task, TimerOptions,
+    TypedTaskData,
 };
 use chrono::{Local, Utc};
 use log::{info, warn};
@@ -1745,27 +1747,37 @@ impl AIAgent {
             .create_task(
                 &task_name,
                 TASK_TYPE_AGENT_DELEGATE,
-                Some(serde_json::json!({
-                    "agent_delegate": {
-                        "version": 1,
-                        "purpose": objective,
-                        "title": title,
-                        "requester_agent_id": self.agent_id(),
-                        "owner_session_id": created_by_session_id,
-                        "input": {
+                Some(serde_json::to_value(AgentDelegateTaskData {
+                    request: AgentDelegateTaskRequest {
+                        version: 1,
+                        purpose: Some(objective.to_string()),
+                        title: Some(title.to_string()),
+                        requester_agent_id: Some(self.agent_id()),
+                        owner_session_id: Some(created_by_session_id.to_string()),
+                        input: Some(serde_json::json!({
                             "text": objective
-                        },
-                        "workspace_hints": [{
+                        })),
+                        workspace_hints: vec![serde_json::json!({
                             "workspace_id": workspace_id
-                        }],
-                        "execution": {
+                        })],
+                        ..Default::default()
+                    },
+                    progress: Some(AgentDelegateProgress {
+                        execution: Some(serde_json::json!({
                             "session_id": session_id,
                             "workspace_id": workspace_id,
                             "runner": runner.clone(),
                             "status": "creating"
-                        }
-                    }
-                })),
+                        })),
+                        one_line_status: None,
+                        updated_at_ms: Some(Utc::now().timestamp_millis()),
+                    }),
+                    result: None,
+                    route: None,
+                    blocker: None,
+                    human_input: None,
+                    error: None,
+                })?),
                 &user_id,
                 &app_id,
                 Some(CreateTaskOptions {
@@ -1813,24 +1825,57 @@ impl AIAgent {
             }
         };
         let execution_status = if auto_started { "running" } else { "idle" };
+        let data = match task_mgr.get_task(binding.task_id).await {
+            Ok(task) => {
+                let mut data = match agent_delegate_task_data(&task) {
+                    Some(data) => data,
+                    None => {
+                        warn!(
+                            "opendan.agent[{}]: worksession task {} has invalid agent.delegate data",
+                            self.agent_name, binding.task_id
+                        );
+                        return;
+                    }
+                };
+                data.progress
+                    .get_or_insert_with(AgentDelegateProgress::default)
+                    .execution = Some(serde_json::json!({
+                    "session_id": session_id,
+                    "workspace_id": workspace_id,
+                    "workspace_status": workspace_status,
+                    "behavior": behavior,
+                    "runner": runner,
+                    "status": execution_status
+                }));
+                if let Some(progress) = data.progress.as_mut() {
+                    progress.updated_at_ms = Some(Utc::now().timestamp_millis());
+                }
+                match serde_json::to_value(data) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            "opendan.agent[{}]: serialize worksession task {} data failed: {err:#}",
+                            self.agent_name, binding.task_id
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "opendan.agent[{}]: load worksession task {} for update failed: {err:#}",
+                    self.agent_name, binding.task_id
+                );
+                return;
+            }
+        };
         if let Err(err) = task_mgr
             .update_task(
                 binding.task_id,
                 status,
                 progress,
                 Some(message.to_string()),
-                Some(serde_json::json!({
-                    "agent_delegate": {
-                        "execution": {
-                            "session_id": session_id,
-                            "workspace_id": workspace_id,
-                            "workspace_status": workspace_status,
-                            "behavior": behavior,
-                            "runner": runner,
-                            "status": execution_status
-                        }
-                    }
-                })),
+                Some(data),
             )
             .await
         {
@@ -2016,56 +2061,69 @@ struct WorkSessionTaskDefaults {
 }
 
 fn work_session_defaults_from_task(task: &Task) -> WorkSessionTaskDefaults {
-    let data = &task.data;
+    let data = agent_delegate_task_data(task);
     let title = data
-        .pointer("/agent_delegate/title")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| data.get("title").and_then(serde_json::Value::as_str))
+        .as_ref()
+        .and_then(|data| data.request.title.as_deref())
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| task.name.clone());
     let objective = data
-        .pointer("/agent_delegate/purpose")
-        .and_then(serde_json::Value::as_str)
+        .as_ref()
+        .and_then(|data| data.request.purpose.as_deref())
         .or_else(|| {
-            data.pointer("/agent_delegate/input/text")
+            data.as_ref()
+                .and_then(|data| data.request.input.as_ref())
+                .and_then(|input| input.get("text"))
                 .and_then(serde_json::Value::as_str)
         })
-        .or_else(|| data.get("objective").and_then(serde_json::Value::as_str))
-        .or_else(|| data.get("purpose").and_then(serde_json::Value::as_str))
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| task.name.clone());
     let workspace_id = data
-        .pointer("/agent_delegate/route/workspace_id")
+        .as_ref()
+        .and_then(|data| data.route.as_ref())
+        .and_then(|route| route.get("workspace_id"))
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
-            data.pointer("/agent_delegate/execution/workspace_id")
+            data.as_ref()
+                .and_then(|data| data.progress.as_ref())
+                .and_then(|progress| progress.execution.as_ref())
+                .and_then(|execution| execution.get("workspace_id"))
                 .and_then(serde_json::Value::as_str)
         })
         .or_else(|| {
-            data.pointer("/agent_delegate/workspace_id")
+            data.as_ref()
+                .and_then(|data| data.request.input.as_ref())
+                .and_then(|input| input.get("workspace_id"))
                 .and_then(serde_json::Value::as_str)
         })
-        .or_else(|| data.get("workspace_id").and_then(serde_json::Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            data.pointer("/agent_delegate/workspace_hints")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|hints| {
-                    if hints.len() == 1 {
-                        hints.first().and_then(workspace_id_from_task_hint)
-                    } else {
-                        None
-                    }
-                })
+            data.as_ref().and_then(|data| {
+                if data.request.workspace_hints.len() == 1 {
+                    data.request
+                        .workspace_hints
+                        .first()
+                        .and_then(workspace_id_from_task_hint)
+                } else {
+                    None
+                }
+            })
         });
     WorkSessionTaskDefaults {
         title,
         objective,
         workspace_id,
+    }
+}
+
+fn agent_delegate_task_data(task: &Task) -> Option<AgentDelegateTaskData> {
+    match parse_typed_task_data(task.task_type.as_str(), task.data.clone()).ok()? {
+        TypedTaskData::AgentDelegate(data) => Some(data),
+        _ => None,
     }
 }
 
@@ -3222,18 +3280,23 @@ runner_id = "agent"
         drop(meta);
 
         let updated = task_mgr.task(task.id);
+        let updated_data = agent_delegate_task_data(&updated).expect("agent.delegate task data");
         assert_eq!(updated.status, TaskStatus::Pending);
         assert_eq!(
-            updated
-                .data
-                .pointer("/agent_delegate/execution/session_id")
+            updated_data
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.execution.as_ref())
+                .and_then(|execution| execution.get("session_id"))
                 .and_then(serde_json::Value::as_str),
             Some(outcome.session_id.as_str())
         );
         assert_eq!(
-            updated
-                .data
-                .pointer("/agent_delegate/execution/status")
+            updated_data
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.execution.as_ref())
+                .and_then(|execution| execution.get("status"))
                 .and_then(serde_json::Value::as_str),
             Some("idle")
         );
@@ -3267,15 +3330,13 @@ runner_id = "agent"
         assert_eq!(task.task_type, TASK_TYPE_AGENT_DELEGATE);
         assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(task.session_id, outcome.session_id);
+        let data = agent_delegate_task_data(&task).expect("agent.delegate task data");
+        assert_eq!(data.request.purpose.as_deref(), Some("Do generated work"));
         assert_eq!(
-            task.data
-                .pointer("/agent_delegate/purpose")
-                .and_then(serde_json::Value::as_str),
-            Some("Do generated work")
-        );
-        assert_eq!(
-            task.data
-                .pointer("/agent_delegate/execution/session_id")
+            data.progress
+                .as_ref()
+                .and_then(|progress| progress.execution.as_ref())
+                .and_then(|execution| execution.get("session_id"))
                 .and_then(serde_json::Value::as_str),
             Some(outcome.session_id.as_str())
         );

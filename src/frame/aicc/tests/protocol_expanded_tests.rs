@@ -474,16 +474,12 @@ async fn proto_mix_04_resource_order_stable() {
         .await
         .unwrap()
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(resp.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(resp.task_id.as_str()))
         .unwrap();
+    let request = typed_aicc_request(&task).unwrap();
     assert_eq!(
-        task.data
-            .pointer("/aicc/request/payload/resources/0/kind")
+        request
+            .pointer("/payload/resources/0/kind")
             .and_then(|v| v.as_str()),
         Some("url")
     );

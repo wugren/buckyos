@@ -13,8 +13,14 @@
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::runtime::{NodeRunState, RunStatus, WorkflowRun};
 use async_trait::async_trait;
-use buckyos_api::{CreateTaskOptions, TaskManagerClient, TaskStatus};
-use serde_json::{json, Value};
+use buckyos_api::{
+    CreateTaskOptions, TaskDataErrorInfo, TaskDataProgress, TaskManagerClient, TaskStatus,
+    ThunkTaskData, ThunkTaskRequest, WorkflowMapShardTaskData, WorkflowMapShardTaskRequest,
+    WorkflowRunTaskData, WorkflowRunTaskRequest, WorkflowRunTaskResult, WorkflowStepTaskData,
+    WorkflowStepTaskRequest,
+};
+use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -296,14 +302,7 @@ impl TaskManagerTaskTracker {
             .create_task(
                 task_name.as_str(),
                 "workflow/run",
-                Some(json!({
-                    "workflow": {
-                        "run_id": run.run_id,
-                        "workflow_id": run.workflow_id,
-                        "workflow_name": run.workflow_name,
-                        "plan_version": run.plan_version,
-                    },
-                })),
+                Some(run_task_data(run)),
                 self.user_id.as_str(),
                 self.app_id.as_str(),
                 Some(opts),
@@ -434,15 +433,7 @@ impl TaskManagerTaskTracker {
             .create_task(
                 &format!("thunk:{} [{}]", thunk.thunk_obj_id, run.run_id),
                 "workflow/thunk",
-                Some(json!({
-                    "workflow": {
-                        "run_id": run.run_id,
-                        "node_id": thunk.node_id,
-                        "thunk_obj_id": thunk.thunk_obj_id,
-                        "attempt": thunk.attempt,
-                        "shard_index": thunk.shard_index,
-                    }
-                })),
+                Some(thunk_task_data(run, thunk)),
                 self.user_id.as_str(),
                 self.app_id.as_str(),
                 Some(CreateTaskOptions {
@@ -468,17 +459,7 @@ impl WorkflowTaskTracker for TaskManagerTaskTracker {
                 Some(map_run_status(run.status)),
                 Some(run.progress_percent()),
                 Some(run.status.to_string()),
-                Some(json!({
-                    "workflow": {
-                        "run_id": run.run_id,
-                        "workflow_id": run.workflow_id,
-                        "workflow_name": run.workflow_name,
-                        "plan_version": run.plan_version,
-                        "status": run.status,
-                        "summary": run.node_state_counts(),
-                        "updated_at": run.updated_at,
-                    }
-                })),
+                Some(run_task_data(run)),
             )
             .await
             .map_err(|err| WorkflowError::TaskTracker(err.to_string()))
@@ -551,11 +532,20 @@ impl WorkflowTaskTracker for TaskManagerTaskTracker {
         self.client
             .update_task_data(
                 task_id,
-                json!({
-                    "last_error": {
-                        "message": message,
-                        "ts": chrono::Utc::now().timestamp(),
-                    }
+                task_data_value(WorkflowStepTaskData {
+                    request: WorkflowStepTaskRequest {
+                        run_id: run.run_id.clone(),
+                        node_id: node_id.to_string(),
+                        ..Default::default()
+                    },
+                    progress: None,
+                    result: None,
+                    human_action: None,
+                    last_error: Some(TaskDataErrorInfo {
+                        message: Some(message.to_string()),
+                        ts: Some(chrono::Utc::now().timestamp()),
+                        ..Default::default()
+                    }),
                 }),
             )
             .await
@@ -579,107 +569,135 @@ fn run_task_options(run: &WorkflowRun) -> CreateTaskOptions {
     }
 }
 
+fn task_data_value<T: Serialize>(data: T) -> Value {
+    serde_json::to_value(data).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn run_task_data(run: &WorkflowRun) -> Value {
+    let summary = run
+        .node_state_counts()
+        .into_iter()
+        .map(|(key, value)| (key, value as u64))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let total = summary.values().copied().sum::<u64>();
+    let completed = summary.get("Completed").copied().unwrap_or_default();
+    task_data_value(WorkflowRunTaskData {
+        request: WorkflowRunTaskRequest {
+            run_id: run.run_id.clone(),
+            workflow_id: run.workflow_id.clone(),
+            workflow_name: run.workflow_name.clone(),
+            plan_version: run.plan_version,
+        },
+        progress: (total > 0).then(|| TaskDataProgress::with_items(completed, Some(total))),
+        result: Some(WorkflowRunTaskResult {
+            status: run.status.to_string(),
+            summary,
+            updated_at: Some(run.updated_at),
+        }),
+        human_action: None,
+        last_error: None,
+    })
+}
+
 fn initial_step_task_data(run: &WorkflowRun, step: &StepTaskView) -> Value {
-    json!({
-        "workflow": workflow_descriptor(run, step),
+    task_data_value(WorkflowStepTaskData {
+        request: workflow_step_request(run, step),
+        progress: None,
+        result: None,
+        human_action: None,
+        last_error: None,
     })
 }
 
 fn step_task_data(run: &WorkflowRun, step: &StepTaskView) -> Value {
-    let mut data = json!({
-        "workflow": workflow_descriptor(run, step),
-    });
-    if let Some(output) = step.output.as_ref() {
-        data.as_object_mut()
-            .unwrap()
-            .insert("output".to_string(), output.clone());
-    }
-    if let Some(err) = step.error.as_ref() {
-        data.as_object_mut().unwrap().insert(
-            "last_error".to_string(),
-            json!({
-                "message": err,
-                "ts": chrono::Utc::now().timestamp(),
-            }),
-        );
-    } else {
-        data.as_object_mut()
-            .unwrap()
-            .insert("last_error".to_string(), Value::Null);
-    }
-    data
+    task_data_value(WorkflowStepTaskData {
+        request: workflow_step_request(run, step),
+        progress: None,
+        result: step.output.clone(),
+        human_action: None,
+        last_error: step.error.as_ref().map(|err| TaskDataErrorInfo {
+            message: Some(err.clone()),
+            ts: Some(chrono::Utc::now().timestamp()),
+            ..Default::default()
+        }),
+    })
 }
 
-fn workflow_descriptor(run: &WorkflowRun, step: &StepTaskView) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("run_id".to_string(), Value::String(run.run_id.clone()));
-    obj.insert("node_id".to_string(), Value::String(step.node_id.clone()));
-    obj.insert("attempt".to_string(), Value::Number(step.attempt.into()));
-    if let Some(executor) = step.executor.as_ref() {
-        obj.insert("executor".to_string(), Value::String(executor.clone()));
+fn workflow_step_request(run: &WorkflowRun, step: &StepTaskView) -> WorkflowStepTaskRequest {
+    WorkflowStepTaskRequest {
+        run_id: run.run_id.clone(),
+        node_id: step.node_id.clone(),
+        attempt: step.attempt,
+        executor: step.executor.clone(),
+        prompt: step.prompt.clone(),
+        output_schema: step.output_schema.clone(),
+        subject: step.subject.clone(),
+        subject_obj_id: step.subject_obj_id.clone(),
+        stakeholders: step.stakeholders.clone(),
+        waiting_human_since: step.waiting_human_since,
     }
-    if let Some(prompt) = step.prompt.as_ref() {
-        obj.insert("prompt".to_string(), Value::String(prompt.clone()));
-    }
-    if let Some(schema) = step.output_schema.as_ref() {
-        obj.insert("output_schema".to_string(), schema.clone());
-    }
-    if let Some(subject) = step.subject.as_ref() {
-        obj.insert("subject".to_string(), subject.clone());
-    }
-    if let Some(subject_obj_id) = step.subject_obj_id.as_ref() {
-        obj.insert(
-            "subject_obj_id".to_string(),
-            Value::String(subject_obj_id.clone()),
-        );
-    }
-    if !step.stakeholders.is_empty() {
-        obj.insert(
-            "stakeholders".to_string(),
-            Value::Array(
-                step.stakeholders
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(ts) = step.waiting_human_since {
-        obj.insert("waiting_human_since".to_string(), Value::Number(ts.into()));
-    }
-    Value::Object(obj)
 }
 
 fn initial_map_shard_task_data(run: &WorkflowRun, shard: &MapShardTaskView) -> Value {
-    json!({
-        "workflow": {
-            "run_id": run.run_id,
-            "node_id": shard.for_each_id,
-            "shard_index": shard.shard_index,
-            "attempt": shard.attempt,
-            "item": shard.item,
-        }
+    task_data_value(WorkflowMapShardTaskData {
+        request: workflow_map_shard_request(run, shard),
+        progress: None,
+        result: None,
+        last_error: None,
     })
 }
 
 fn map_shard_task_data(run: &WorkflowRun, shard: &MapShardTaskView) -> Value {
-    let mut data = initial_map_shard_task_data(run, shard);
-    if let Some(output) = shard.output.as_ref() {
-        data.as_object_mut()
-            .unwrap()
-            .insert("output".to_string(), output.clone());
+    task_data_value(WorkflowMapShardTaskData {
+        request: workflow_map_shard_request(run, shard),
+        progress: None,
+        result: shard.output.clone(),
+        last_error: shard.error.as_ref().map(|err| TaskDataErrorInfo {
+            message: Some(err.clone()),
+            ts: Some(chrono::Utc::now().timestamp()),
+            ..Default::default()
+        }),
+    })
+}
+
+fn workflow_map_shard_request(
+    run: &WorkflowRun,
+    shard: &MapShardTaskView,
+) -> WorkflowMapShardTaskRequest {
+    WorkflowMapShardTaskRequest {
+        run_id: run.run_id.clone(),
+        node_id: shard.for_each_id.clone(),
+        shard_index: shard.shard_index,
+        attempt: shard.attempt,
+        item: Some(shard.item.clone()),
     }
-    if let Some(err) = shard.error.as_ref() {
-        data.as_object_mut().unwrap().insert(
-            "last_error".to_string(),
-            json!({
-                "message": err,
-                "ts": chrono::Utc::now().timestamp(),
-            }),
-        );
+}
+
+fn thunk_task_data(run: &WorkflowRun, thunk: &ThunkTaskView) -> Value {
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert(
+        "workflow_run_id".to_string(),
+        Value::String(run.run_id.clone()),
+    );
+    extra.insert(
+        "workflow_attempt".to_string(),
+        Value::Number(thunk.attempt.into()),
+    );
+    if let Some(shard_index) = thunk.shard_index {
+        extra.insert("workflow_shard_index".to_string(), Value::from(shard_index));
     }
-    data
+    task_data_value(ThunkTaskData {
+        request: ThunkTaskRequest {
+            node_id: Some(thunk.node_id.clone()),
+            thunk_obj_id: Some(thunk.thunk_obj_id.clone()),
+            extra,
+            ..Default::default()
+        },
+        progress: None,
+        result: None,
+        executor: None,
+        extra: Default::default(),
+    })
 }
 
 fn map_run_status(status: RunStatus) -> TaskStatus {

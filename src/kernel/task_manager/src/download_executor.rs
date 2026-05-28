@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use buckyos_api::{get_buckyos_api_runtime, AppDoc, Task, TaskStatus, TASK_MANAGER_SERVICE_NAME};
+use buckyos_api::{
+    get_buckyos_api_runtime, parse_typed_task_data, AppDoc, DownloadTaskData, DownloadTaskOptions,
+    Task, TaskDataCounter, TaskDataType, TaskStatus, TypedTaskData, TASK_MANAGER_SERVICE_NAME,
+};
 use buckyos_kit::get_buckyos_service_data_dir;
 use lazy_static::lazy_static;
 use log::{error, info, warn};
@@ -9,7 +12,7 @@ use ndn_lib::{
     OBJ_TYPE_PKG,
 };
 use ndn_toolkit::cyfs_ndn_client::{CyfsNdnClient, CyfsPullResult};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
@@ -39,7 +42,7 @@ pub trait DownloadTaskStore: Send + Sync + 'static {
         status: Option<TaskStatus>,
         progress: Option<f32>,
         message: Option<String>,
-        data_patch: Option<Value>,
+        data: Option<DownloadTaskData>,
         source_method: &'static str,
     ) -> std::result::Result<Task, String>;
 
@@ -56,7 +59,7 @@ pub struct DownloadTaskSpec {
     pub task_id: i64,
     pub download_url: String,
     pub objid: Option<ObjId>,
-    pub download_options: Value,
+    pub download_options: DownloadTaskOptions,
 }
 
 struct ProgressState {
@@ -174,16 +177,21 @@ impl DownloadExecutorCore {
                 "download task canceled before start: task_id={} url={}",
                 spec.task_id, spec.download_url
             );
-            let _ = store
-                .update_task(
-                    spec.task_id,
-                    Some(TaskStatus::Canceled),
-                    None,
-                    Some("Download canceled".to_string()),
-                    Some(json!({ "download": { "state": "canceled" } })),
-                    "download_executor_canceled",
-                )
-                .await;
+            let _ = update_download_task_data(
+                store.clone(),
+                spec.task_id,
+                Some(TaskStatus::Canceled),
+                None,
+                Some("Download canceled".to_string()),
+                "download_executor_canceled",
+                |data| {
+                    data.set_state(
+                        "canceled",
+                        Some(download_mode(spec.objid.as_ref()).to_string()),
+                    )
+                },
+            )
+            .await;
             return Ok(());
         }
 
@@ -209,22 +217,22 @@ impl DownloadExecutorCore {
             }
         }
 
-        store
-            .update_task(
-                spec.task_id,
-                Some(TaskStatus::Running),
-                Some(0.0),
-                Some("Download started".to_string()),
-                Some(json!({
-                    "download": {
-                        "state": "running",
-                        "mode": download_mode(spec.objid.as_ref()),
-                        "downloaded_bytes": 0u64,
-                    }
-                })),
-                "download_executor_start",
-            )
-            .await?;
+        update_download_task_data(
+            store.clone(),
+            spec.task_id,
+            Some(TaskStatus::Running),
+            Some(0.0),
+            Some("Download started".to_string()),
+            "download_executor_start",
+            |data| {
+                data.set_state(
+                    "running",
+                    Some(download_mode(spec.objid.as_ref()).to_string()),
+                );
+                data.set_byte_progress(0, None);
+            },
+        )
+        .await?;
         info!(
             "download task started: task_id={} mode={} objid={:?} url={}",
             spec.task_id,
@@ -288,18 +296,18 @@ impl DownloadExecutorCore {
                 .map_err(|err| err.to_string())?
         };
 
-        let completed_patch =
-            build_completed_patch(&spec, &result, local_output_path.as_ref().cloned());
-        store
-            .update_task(
-                spec.task_id,
-                Some(TaskStatus::Completed),
-                Some(100.0),
-                Some("Download completed".to_string()),
-                Some(completed_patch),
-                "download_executor_complete",
-            )
-            .await?;
+        update_download_task_data(
+            store.clone(),
+            spec.task_id,
+            Some(TaskStatus::Completed),
+            Some(100.0),
+            Some("Download completed".to_string()),
+            "download_executor_complete",
+            |data| {
+                apply_completed_result(data, &spec, &result, local_output_path.as_ref().cloned())
+            },
+        )
+        .await?;
 
         info!(
             "download task completed: task_id={} objid={:?} url={}",
@@ -340,6 +348,48 @@ pub fn infer_objid_from_url(download_url: &str) -> Option<ObjId> {
         .map(|(objid, _)| objid)
 }
 
+fn parse_download_task_data(task: &Task) -> Option<DownloadTaskData> {
+    match parse_typed_task_data(TaskDataType::Download.as_str(), task.data.clone()).ok()? {
+        TypedTaskData::Download(data) => Some(data),
+        _ => None,
+    }
+}
+
+fn download_task_data_to_value(data: &DownloadTaskData) -> Value {
+    serde_json::to_value(data).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn parse_download_options(options: Option<Value>) -> Option<DownloadTaskOptions> {
+    options
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+async fn update_download_task_data(
+    store: Arc<dyn DownloadTaskStore>,
+    task_id: i64,
+    status: Option<TaskStatus>,
+    progress: Option<f32>,
+    message: Option<String>,
+    source_method: &'static str,
+    update: impl FnOnce(&mut DownloadTaskData),
+) -> std::result::Result<Task, String> {
+    let task = store.load_task(task_id).await?;
+    let mut data = parse_download_task_data(&task)
+        .ok_or_else(|| format!("task {} data is not download task data", task_id))?;
+    update(&mut data);
+    store
+        .update_task(
+            task_id,
+            status,
+            progress,
+            message,
+            Some(data),
+            source_method,
+        )
+        .await
+}
+
 pub fn build_download_task_name(download_url: &str, objid: Option<&ObjId>) -> String {
     if let Some(objid) = objid {
         return format!("download:objid:{}", objid);
@@ -355,25 +405,13 @@ pub fn build_download_task_data(
     objid: Option<&ObjId>,
     download_options: Option<Value>,
 ) -> Value {
-    let mut data = json!({
-        "download_url": download_url,
-        "urls": [download_url],
-        "download": {
-            "state": "pending",
-            "mode": download_mode(objid),
-            "downloaded_bytes": 0u64,
-        }
-    });
-
-    if let Some(objid) = objid {
-        data["objid"] = json!(objid.to_string());
-    }
-    if let Some(download_options) = download_options {
-        if !download_options.is_null() {
-            data["download_options"] = download_options;
-        }
-    }
-    data
+    let mut data = DownloadTaskData::new(
+        download_url.to_string(),
+        objid.map(|objid| objid.to_string()),
+        parse_download_options(download_options),
+    );
+    data.set_state("pending", Some(download_mode(objid).to_string()));
+    download_task_data_to_value(&data)
 }
 
 pub fn merge_download_source_patch(
@@ -382,139 +420,100 @@ pub fn merge_download_source_patch(
     objid: Option<&ObjId>,
     download_options: Option<&Value>,
 ) -> Option<Value> {
-    let mut patch = serde_json::Map::new();
-    let mut urls = extract_download_urls(task_data);
+    let mut data =
+        match parse_typed_task_data(TaskDataType::Download.as_str(), task_data.clone()).ok()? {
+            TypedTaskData::Download(data) => data,
+            _ => return None,
+        };
     let mut changed = false;
 
-    if !urls.iter().any(|url| url == download_url) {
-        urls.push(download_url.to_string());
+    changed |= data.add_url(download_url.to_string());
+    if data
+        .request
+        .download_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        data.request.download_url = Some(download_url.to_string());
         changed = true;
     }
 
-    if changed {
-        patch.insert("urls".to_string(), json!(urls));
-    }
-
-    if task_data
-        .get("download_url")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        patch.insert("download_url".to_string(), json!(download_url));
-    }
-
-    if extract_task_objid(task_data).is_none() {
+    if data.objid().is_none() {
         if let Some(objid) = objid {
-            patch.insert("objid".to_string(), json!(objid.to_string()));
+            data.request.objid = Some(objid.to_string());
+            changed = true;
         }
     }
 
-    if task_data.get("download_options").is_none() {
+    if data.request.options.is_none() {
         if let Some(download_options) = download_options {
-            if !download_options.is_null() {
-                patch.insert("download_options".to_string(), download_options.clone());
+            if let Some(options) = parse_download_options(Some(download_options.clone())) {
+                data.request.options = Some(options);
+                changed = true;
             }
         }
     }
 
-    if task_data.pointer("/download/mode").is_none() {
-        let mode_objid = objid.cloned().or_else(|| extract_task_objid(task_data));
-        patch.insert(
-            "download".to_string(),
-            json!({
-                "mode": download_mode(mode_objid.as_ref())
-            }),
+    if data
+        .result
+        .as_ref()
+        .and_then(|result| result.mode.as_ref())
+        .is_none()
+    {
+        let mode_objid = objid
+            .cloned()
+            .or_else(|| data.objid().and_then(|value| ObjId::new(value).ok()));
+        data.set_state(
+            data.result
+                .as_ref()
+                .and_then(|result| result.state.clone())
+                .unwrap_or_else(|| "pending".to_string()),
+            Some(download_mode(mode_objid.as_ref()).to_string()),
         );
+        changed = true;
     }
 
-    if patch.is_empty() {
-        None
+    if changed {
+        Some(download_task_data_to_value(&data))
     } else {
-        Some(Value::Object(patch))
+        None
     }
 }
 
 pub fn task_has_objid(task: &Task, objid: &ObjId) -> bool {
-    extract_task_objid(&task.data).as_ref() == Some(objid)
+    parse_download_task_data(task)
+        .and_then(|data| data.objid().and_then(|value| ObjId::new(value).ok()))
+        .as_ref()
+        == Some(objid)
 }
 
 pub fn task_has_download_url(task: &Task, download_url: &str) -> bool {
-    extract_download_urls(&task.data)
+    parse_download_task_data(task)
+        .map(|data| data.urls())
+        .unwrap_or_default()
         .into_iter()
         .any(|url| url == download_url)
 }
 
 pub fn spec_from_task(task: &Task) -> Option<DownloadTaskSpec> {
-    let download_url = task
-        .data
-        .get("download_url")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        .or_else(|| extract_download_urls(&task.data).into_iter().next())?;
+    let data = parse_download_task_data(task)?;
+    let download_url = data.primary_url()?.to_string();
 
     Some(DownloadTaskSpec {
         task_id: task.id,
-        objid: extract_task_objid(&task.data)
+        objid: data
+            .objid()
+            .and_then(|value| ObjId::new(value).ok())
             .or_else(|| infer_objid_from_url(download_url.as_str())),
         download_url,
-        download_options: task
-            .data
-            .get("download_options")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
+        download_options: data.request.options.unwrap_or_default(),
     })
 }
 
 pub fn should_enqueue_download_task(task: &Task) -> bool {
     matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-}
-
-fn extract_download_urls(task_data: &Value) -> Vec<String> {
-    let mut urls = Vec::new();
-
-    if let Some(download_url) = task_data
-        .get("download_url")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        urls.push(download_url.to_string());
-    }
-
-    if let Some(items) = task_data.get("urls").and_then(|value| value.as_array()) {
-        for item in items {
-            if let Some(url) = item
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                if !urls.iter().any(|existing| existing == url) {
-                    urls.push(url.to_string());
-                }
-            }
-        }
-    }
-
-    urls
-}
-
-fn extract_task_objid(task_data: &Value) -> Option<ObjId> {
-    for pointer in ["/objid", "/resolved_objid"] {
-        if let Some(objid) = task_data
-            .pointer(pointer)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| ObjId::new(value).ok())
-        {
-            return Some(objid);
-        }
-    }
-    None
 }
 
 fn download_mode(objid: Option<&ObjId>) -> &'static str {
@@ -528,7 +527,7 @@ fn download_mode(objid: Option<&ObjId>) -> &'static str {
 fn build_ndn_client(
     session_token: &str,
     named_store: Option<NamedDataMgr>,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<CyfsNdnClient, String> {
     let mut builder = CyfsNdnClient::builder();
 
@@ -539,8 +538,8 @@ fn build_ndn_client(
         builder = builder.default_store_mgr(named_store);
     }
     if let Some(default_remote_url) = download_options
-        .get("default_remote_url")
-        .and_then(|value| value.as_str())
+        .default_remote_url
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -549,39 +548,31 @@ fn build_ndn_client(
     if let Some(timeout_ms) = resolve_timeout_ms(download_options) {
         builder = builder.timeout(std::time::Duration::from_millis(timeout_ms));
     }
-    if download_options
-        .get("obj_id_in_host")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-    {
+    if download_options.obj_id_in_host.unwrap_or(false) {
         builder = builder.obj_id_in_host(true);
     }
 
     builder.build().map_err(|err| err.to_string())
 }
 
-fn resolve_timeout_ms(download_options: &Value) -> Option<u64> {
-    if let Some(timeout_ms) = download_options
-        .get("timeout_ms")
-        .and_then(|value| value.as_u64())
-    {
+fn resolve_timeout_ms(download_options: &DownloadTaskOptions) -> Option<u64> {
+    if let Some(timeout_ms) = download_options.timeout_ms {
         return Some(timeout_ms);
     }
 
     download_options
-        .get("timeout_secs")
-        .and_then(|value| value.as_u64())
+        .timeout_secs
         .map(|timeout_secs| timeout_secs.saturating_mul(1000))
 }
 
 fn resolve_local_output_path(
     task_id: i64,
     download_url: &str,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<PathBuf, String> {
     if let Some(local_path) = download_options
-        .get("local_path")
-        .and_then(|value| value.as_str())
+        .local_path
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -592,8 +583,8 @@ fn resolve_local_output_path(
         .join("downloads")
         .join(task_id.to_string());
     let filename = download_options
-        .get("filename")
-        .and_then(|value| value.as_str())
+        .filename
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(sanitize_filename)
@@ -685,24 +676,17 @@ fn build_progress_callback(
                     ((downloaded_bytes as f64 / total as f64) * 100.0).min(99.0) as f32
                 }
             });
-            let mut download_patch = json!({
-                "downloaded_bytes": downloaded_bytes,
-            });
-            if let Some(total_bytes) = total_bytes {
-                download_patch["total_bytes"] = json!(total_bytes);
-            }
-
-            store
-                .update_task(
-                    task_id,
-                    None,
-                    progress,
-                    Some(progress_message(downloaded_bytes, total_bytes)),
-                    Some(json!({ "download": download_patch })),
-                    "download_executor_progress",
-                )
-                .await
-                .map_err(NdnError::Internal)?;
+            update_download_task_data(
+                store.clone(),
+                task_id,
+                None,
+                progress,
+                Some(progress_message(downloaded_bytes, total_bytes)),
+                "download_executor_progress",
+                |data| data.set_byte_progress(downloaded_bytes, total_bytes),
+            )
+            .await
+            .map_err(NdnError::Internal)?;
             Ok(ProgressCallbackResult::Continue)
         })
     })))
@@ -750,7 +734,7 @@ async fn pull_named_store_download(
     download_url: &str,
     objid: &ObjId,
     store_mgr: &NamedDataMgr,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
     progress_callback: Option<Arc<Mutex<ndn_lib::NdnProgressCallback>>>,
 ) -> std::result::Result<CyfsPullResult, String> {
     if objid.is_chunk() || objid.is_chunk_list() || objid.is_file_object() {
@@ -892,7 +876,7 @@ async fn pull_wrapped_file_object_to_named_store(
     verified: VerifiedJsonObject,
     file_obj: FileObject,
     store_mgr: &NamedDataMgr,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
     progress_callback: Option<Arc<Mutex<ndn_lib::NdnProgressCallback>>>,
 ) -> std::result::Result<CyfsPullResult, String> {
     let content_objid = ObjId::new(file_obj.content.trim()).map_err(|err| {
@@ -939,7 +923,7 @@ async fn pull_sub_pkg_to_named_store(
     download_url: &str,
     objid: &ObjId,
     store_mgr: &NamedDataMgr,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<CyfsPullResult, String> {
     if objid.is_chunk() || objid.is_chunk_list() || objid.is_file_object() {
         info!(
@@ -1016,7 +1000,7 @@ async fn pull_app_doc_to_named_store(
     verified: VerifiedJsonObject,
     app_doc: AppDoc,
     store_mgr: &NamedDataMgr,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<CyfsPullResult, String> {
     ensure_task_can_continue(store.clone(), task_id).await?;
 
@@ -1133,35 +1117,40 @@ async fn update_app_doc_progress(
         Some(((completed_sub_pkgs as f32 / total_sub_pkgs as f32) * 99.0).min(99.0))
     };
 
-    store
-        .update_task(
-            task_id,
-            None,
-            progress,
-            Some(format!(
-                "Downloading sub package {}/{}: {}",
-                completed_sub_pkgs.min(total_sub_pkgs),
-                total_sub_pkgs,
-                current_sub_pkg
-            )),
-            Some(json!({
-                "download": {
-                    "downloaded_bytes": downloaded_bytes,
-                    "sub_pkg_total": total_sub_pkgs,
-                    "sub_pkg_completed": completed_sub_pkgs,
-                    "current_sub_pkg": current_sub_pkg,
-                }
-            })),
-            "download_executor_app_doc_progress",
-        )
-        .await
-        .map(|_| ())
+    update_download_task_data(
+        store,
+        task_id,
+        None,
+        progress,
+        Some(format!(
+            "Downloading sub package {}/{}: {}",
+            completed_sub_pkgs.min(total_sub_pkgs),
+            total_sub_pkgs,
+            current_sub_pkg
+        )),
+        "download_executor_app_doc_progress",
+        |data| {
+            data.set_byte_progress(downloaded_bytes, None);
+            if let Some(progress) = data.progress.as_mut() {
+                progress.counters.insert(
+                    "sub_pkg".to_string(),
+                    TaskDataCounter::new(completed_sub_pkgs as u64, Some(total_sub_pkgs as u64)),
+                );
+            }
+            let result = data.result.get_or_insert_with(Default::default);
+            result.sub_pkg_total = Some(total_sub_pkgs as u64);
+            result.sub_pkg_completed = Some(completed_sub_pkgs as u64);
+            result.current_sub_pkg = Some(current_sub_pkg.to_string());
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 fn resolve_app_doc_sub_pkg_specs(
     app_doc: &AppDoc,
     app_doc_url: &str,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<Vec<SubPkgDownloadSpec>, String> {
     let mut sub_pkgs = Vec::new();
 
@@ -1222,7 +1211,7 @@ fn resolve_app_doc_sub_pkg_specs(
 fn resolve_related_download_url(
     base_url: &str,
     objid: &ObjId,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> std::result::Result<String, String> {
     replace_obj_id_in_url(base_url, objid).or_else(|_| {
         build_download_url_from_default_remote(objid, download_options).ok_or_else(|| {
@@ -1283,17 +1272,14 @@ fn replace_obj_id_in_url(base_url: &str, objid: &ObjId) -> std::result::Result<S
 
 fn build_download_url_from_default_remote(
     objid: &ObjId,
-    download_options: &Value,
+    download_options: &DownloadTaskOptions,
 ) -> Option<String> {
     let default_remote_url = download_options
-        .get("default_remote_url")
-        .and_then(|value| value.as_str())
+        .default_remote_url
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let obj_id_in_host = download_options
-        .get("obj_id_in_host")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+    let obj_id_in_host = download_options.obj_id_in_host.unwrap_or(false);
 
     let parsed = url::Url::parse(default_remote_url).ok()?;
     if obj_id_in_host {
@@ -1329,36 +1315,32 @@ fn push_stored_object(stored_objects: &mut Vec<ObjId>, objid: ObjId) {
     }
 }
 
-fn build_completed_patch(
+fn apply_completed_result(
+    data: &mut DownloadTaskData,
     spec: &DownloadTaskSpec,
     result: &CyfsPullResult,
     local_output_path: Option<PathBuf>,
-) -> Value {
+) {
     let resolved_objid = result.obj_id.clone().or_else(|| spec.objid.clone());
-    let mut patch = json!({
-        "download": {
-            "state": "completed",
-            "mode": download_mode(spec.objid.as_ref()),
-            "downloaded_bytes": result.total_size,
-            "total_bytes": result.total_size,
-            "chunk_count": result.chunk_count,
-            "stored_objects": result
-                .stored_objects
-                .iter()
-                .map(|objid| objid.to_string())
-                .collect::<Vec<_>>(),
-            "completed_at": now_secs(),
-        }
-    });
-
+    data.set_state(
+        "completed",
+        Some(download_mode(spec.objid.as_ref()).to_string()),
+    );
+    data.set_byte_progress(result.total_size, Some(result.total_size));
+    let task_result = data.result.get_or_insert_with(Default::default);
+    task_result.chunk_count = Some(result.chunk_count as u64);
+    task_result.stored_objects = result
+        .stored_objects
+        .iter()
+        .map(|objid| objid.to_string())
+        .collect();
+    task_result.completed_at = Some(now_secs());
     if let Some(resolved_objid) = resolved_objid {
-        patch["resolved_objid"] = json!(resolved_objid.to_string());
+        data.request.resolved_objid = Some(resolved_objid.to_string());
     }
     if let Some(local_output_path) = local_output_path {
-        patch["local_path"] = json!(local_output_path.to_string_lossy().to_string());
+        task_result.local_path = Some(local_output_path.to_string_lossy().to_string());
     }
-
-    patch
 }
 
 async fn handle_run_error(
@@ -1368,16 +1350,16 @@ async fn handle_run_error(
 ) -> std::result::Result<(), String> {
     match store.load_task(task_id).await {
         Ok(task) if task.status == TaskStatus::Canceled => {
-            let _ = store
-                .update_task(
-                    task_id,
-                    Some(TaskStatus::Canceled),
-                    None,
-                    Some("Download canceled".to_string()),
-                    Some(json!({ "download": { "state": "canceled" } })),
-                    "download_executor_canceled",
-                )
-                .await?;
+            let _ = update_download_task_data(
+                store.clone(),
+                task_id,
+                Some(TaskStatus::Canceled),
+                None,
+                Some("Download canceled".to_string()),
+                "download_executor_canceled",
+                |data| data.set_state("canceled", None),
+            )
+            .await?;
             Ok(())
         }
         Ok(_) => {
@@ -1411,15 +1393,13 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn merge_download_source_patch_appends_unique_url() {
-        let task_data = json!({
-            "download_url": "https://example.com/a",
-            "urls": ["https://example.com/a"],
-        });
+        let task_data = build_download_task_data("https://example.com/a", None, None);
 
-        let patch = merge_download_source_patch(
+        let updated = merge_download_source_patch(
             &task_data,
             "https://example.com/b",
             None,
@@ -1427,15 +1407,15 @@ mod tests {
         )
         .unwrap();
 
+        let data = match parse_typed_task_data(TaskDataType::Download.as_str(), updated).unwrap() {
+            TypedTaskData::Download(data) => data,
+            _ => unreachable!(),
+        };
+        assert_eq!(data.request.urls.len(), 2);
         assert_eq!(
-            patch
-                .get("urls")
-                .and_then(|value| value.as_array())
-                .unwrap()
-                .len(),
-            2
+            data.request.options.and_then(|options| options.timeout_ms),
+            Some(1000)
         );
-        assert!(patch.get("download_options").is_some());
     }
 
     #[test]
@@ -1487,7 +1467,7 @@ mod tests {
         let specs = resolve_app_doc_sub_pkg_specs(
             &app_doc,
             "https://repo.example.com/pkg:55667788/appdoc.json",
-            &json!({}),
+            &DownloadTaskOptions::default(),
         )
         .unwrap();
 

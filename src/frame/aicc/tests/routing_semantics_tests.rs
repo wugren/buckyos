@@ -340,17 +340,14 @@ async fn route_08_tenant_mapping_override_global_on_complete() {
         .expect("list tasks");
     let task = tasks
         .into_iter()
-        .find(|t| {
-            t.data
-                .pointer("/aicc/external_task_id")
-                .and_then(|v| v.as_str())
-                == Some(response.task_id.as_str())
-        })
+        .find(|t| typed_aicc_external_task_id(t).as_deref() == Some(response.task_id.as_str()))
         .expect("task should exist");
     assert_eq!(
-        task.data
-            .pointer("/aicc/route/provider_model")
-            .and_then(|v| v.as_str()),
+        typed_aicc_task_data(&task)
+            .and_then(|data| data.request.route)
+            .and_then(|route| route.pointer("/provider_model").cloned())
+            .and_then(|v| v.as_str().map(ToString::to_string))
+            .as_deref(),
         Some("tenant-model")
     , "assert_eq failed in route_08_tenant_mapping_override_global_on_complete: expected left == right; check this scenario's routing/status/error-code branch.");
 }
