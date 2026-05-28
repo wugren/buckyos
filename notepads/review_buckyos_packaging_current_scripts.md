@@ -611,5 +611,8 @@
    处理记录：commit `de9de32e`。修改文件和行号：新增 `src/publish/package_common.py:24-37` 公共 YAML/JSON 加载，`40-58` bool/type 校验，`61-78` arch 和产物命名，`81-125` manifest/component item 读取，`128-143` hook discovery；新增 `src/publish/tests/test_package_common.py:16-87` 覆盖 bool/type、arch/命名、manifest helper 和 hook discovery；`src/publish/make_local_deb.py:29`、`175-177`、`345`、`357`、`526` 接入公共模块；`src/publish/make_local_osx_pkg.py:35`、`180-182`、`281`、`603` 接入公共模块；`src/publish/make_local_win_installer.py:31`、`188-190`、`292`、`378`、`661`、`1382`、`1445` 接入公共模块。
 
 6. 统一 manifest 解析：公共模块处理 `module_items/data_items/clean_items` 语义；module/data path 缺失直接失败。
+
+   处理记录：commit `0d149320`。修改文件和行号：`src/publish/package_common.py:128-153` 增加统一 relpath 规范化和 manifest `source_path` 解析；`src/publish/make_local_deb.py:97-103`、`642`、`673` 使用公共 source 解析并让本地 update 遇到缺失 source 失败；`src/publish/make_local_osx_pkg.py:102-108`、`1010`、`1041` 同步使用公共 source 解析和缺失失败；`src/publish/make_local_win_installer.py:87-88`、`167-168`、`195-196` 为 Windows layout 增加 source map，`551-585` staging 时使用 manifest `source_path`；`src/publish/tests/test_package_common.py:90-107` 增加 source_path 映射优先级测试。
+
 7. 新增 rpm，并复用公共模块。
 8. 最后扩展 verify-pkg，让它覆盖 metadata、payload 白名单、组件、hook、依赖声明和 defaults 规则。
