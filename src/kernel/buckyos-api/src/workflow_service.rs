@@ -78,6 +78,20 @@ pub enum WorkflowScheduledTaskSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WorkflowScheduledTaskTarget {
+    Remind {
+        text: String,
+        #[serde(default)]
+        to: Option<String>,
+    },
+    AgentTask {
+        title: String,
+        objective: String,
+        workspace_id: String,
+        #[serde(default)]
+        behavior: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
+    },
     #[serde(rename = "workflow.run")]
     WorkflowRun {
         workflow_id: String,

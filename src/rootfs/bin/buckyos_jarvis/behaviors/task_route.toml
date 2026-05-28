@@ -12,6 +12,19 @@ __INCLUDE(/role.md)__
 <<process_rules>>
 目标：给每个Task分配正确的 WorkSession 
 
+Decide whether to reuse an existing workspace or create a fresh workspace. Then call `create_worksession` exactly once with:
+
+- `task_id`: set only when an existing TaskManager task should own this worksession; otherwise omit it
+- `title`: short label you synthesize
+- `objective`: the work to do, in your own words
+- `workspace_id`: empty to mint a new workspace, or the id of an existing one from the list below that fits
+- `behavior`: empty to use the agent's default, override only when you have a strong reason
+- `reason_message`: 0–3 verbatim user messages from the inherited parent recent history that explain why this worksession is needed
+- `auto_start`: false only when the session should be created for later use without running its first turn; otherwise true
+
+After `create_worksession` returns, return JSON only with the final worksession information from the tool result. "#,
+
+
 <<skills>>
 ## Using exec_bash
 
@@ -22,12 +35,8 @@ Prefer `read` when reading files.
 <</skills>>
 """
 
+# 确认的
 on_wakeup = """
-{% if session.background_hint_changed %}
-<background_environment current_clock="{{runtime.clock_text}}">
-{{ session.default_changed_background_hint_text }}
-</background_environment>
-{% endif %}
 {{input.text}}
 """
 

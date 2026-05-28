@@ -1003,6 +1003,51 @@ impl WorkflowRpcHandler {
         }
 
         match &schedule.target {
+            ScheduleTarget::Remind { .. } => {
+                let completed = self
+                    .schedules
+                    .complete_fire(&fire.fire_id, FireStatus::RunCreated, None, None)
+                    .await
+                    .unwrap_or(fire);
+                self.complete_schedule_after_success(&schedule, fire_time, manual, None)
+                    .await;
+                Ok(completed)
+            }
+            ScheduleTarget::AgentTask { .. } => {
+                let Some(mirror) = self.schedule_mirror.as_ref() else {
+                    return Err(self
+                        .fail_schedule_fire(
+                            &schedule,
+                            &fire,
+                            "task_manager_unavailable".to_string(),
+                        )
+                        .await);
+                };
+                let task_id = match mirror.create_agent_delegate_task(&schedule, &fire).await {
+                    Ok(task_id) => task_id,
+                    Err(err) => {
+                        return Err(self.fail_schedule_fire(&schedule, &fire, err).await);
+                    }
+                };
+                let completed = self
+                    .schedules
+                    .complete_fire(
+                        &fire.fire_id,
+                        FireStatus::RunCreated,
+                        Some(task_id.to_string()),
+                        None,
+                    )
+                    .await
+                    .unwrap_or(fire);
+                self.complete_schedule_after_success(
+                    &schedule,
+                    fire_time,
+                    manual,
+                    Some(task_id.to_string()),
+                )
+                .await;
+                Ok(completed)
+            }
             ScheduleTarget::WorkflowRun { workflow_id, input } => {
                 let definition = match self.definitions.get_by_id(workflow_id).await {
                     Some(record) if record.status != DefinitionStatus::Archived => record,
@@ -1104,6 +1149,35 @@ impl WorkflowRpcHandler {
             _ => Err(self
                 .fail_schedule_fire(&schedule, &fire, "target_not_supported_in_p0".to_string())
                 .await),
+        }
+    }
+
+    async fn complete_schedule_after_success(
+        &self,
+        schedule: &WorkflowSchedule,
+        fire_time: i64,
+        manual: bool,
+        run_id: Option<String>,
+    ) {
+        let updated = self
+            .schedules
+            .update(&schedule.schedule_id, |record| {
+                record.state.last_fire_at = Some(fire_time);
+                record.state.last_run_id = run_id;
+                record.state.consecutive_failures = 0;
+                record.state.last_error = None;
+                if matches!(record.schedule, ScheduleSpec::Once { .. }) {
+                    record.status = ScheduleStatus::Archived;
+                    record.state.next_fire_at = None;
+                } else if is_reboot_schedule(&record.schedule) {
+                    record.state.next_fire_at = None;
+                } else if !manual {
+                    record.state.next_fire_at = next_fire_after(&record.schedule, fire_time);
+                }
+            })
+            .await;
+        if let Some(record) = updated.as_ref() {
+            self.update_scheduled_task_root_task(record).await;
         }
     }
 

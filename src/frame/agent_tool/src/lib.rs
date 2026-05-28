@@ -21,6 +21,7 @@ use tokio::time::{timeout, Duration};
 
 pub mod agent_memory;
 pub mod agent_notebook;
+pub mod dcrontab_tool;
 pub mod file_tools;
 pub mod glob_tool;
 pub mod grep_tool;
@@ -47,6 +48,7 @@ pub use agent_memory::{
     AgentMemory, AgentMemoryConfig, AgentMemoryError, Envelope as AgentMemoryEnvelope, LoadItem,
     LoadOptions, Preamble, VerifyReport,
 };
+pub use dcrontab_tool::{DcrontabTool, TOOL_DCRONTAB};
 pub use file_tools::{
     parse_read_file_bash_args, rewrite_read_file_path_with_shell_cwd, EditFileTool, FileToolConfig,
     FileWriteAuditBackend, FileWriteAuditRecord, NoopFileWriteAudit, ReadFileTool, WriteFileTool,

@@ -1019,29 +1019,23 @@ fn render_sub_system_prompt(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "You are a short-lived fork sub-context spawned by `try_create_worksession`. \
-         Step 1: decide whether to select an existing worksession or create a \
-         new worksession.\n\
-         - If one existing worksession below already covers the goal, do not \
-           call `create_worksession`. Return JSON only: \
-           {\"status\":\"selected\",\"selected_worksession_id\":\"...\",\"reason\":\"...\"}.\n\
-         - Otherwise create a worksession.\n\n\
-         Step 2: if creating, decide whether to reuse an existing workspace or \
-         create a fresh workspace. Then call `create_worksession` exactly once with:\n   \
-            - `task_id`: set only when an existing TaskManager task should own \
-              this worksession; otherwise omit it\n   \
-            - `title`: short label you synthesize\n   \
-            - `objective`: the work to do, in your own words\n   \
-            - `workspace_id`: empty to mint a new workspace, or the id of an \
-              existing one from the list below that fits\n   \
-            - `behavior`: empty to use the agent's default, override only when \
-              you have a strong reason\n   \
-            - `reason_message`: 0–3 verbatim user messages from the inherited \
-              parent recent history that explain why this worksession is needed\n   \
-            - `auto_start`: false only when the session should be created for \
-              later use without running its first turn; otherwise true\n\
-         After `create_worksession` returns, return JSON only with the final \
-         worksession information from the tool result. ",
+        r#"You are a short-lived fork sub-context spawned by `try_create_worksession`.
+
+Step 1: decide whether to select an existing worksession or create a new worksession.
+- If one existing worksession below already covers the goal, do not call `create_worksession`. Return JSON only:
+  {"status":"selected","selected_worksession_id":"...","reason":"..."}.
+- Otherwise create a worksession.
+
+Step 2: if creating, decide whether to reuse an existing workspace or create a fresh workspace. Then call `create_worksession` exactly once with:
+  - `task_id`: set only when an existing TaskManager task should own this worksession; otherwise omit it
+  - `title`: short label you synthesize
+  - `objective`: the work to do, in your own words
+  - `workspace_id`: empty to mint a new workspace, or the id of an existing one from the list below that fits
+  - `behavior`: empty to use the agent's default, override only when you have a strong reason
+  - `reason_message`: 0–3 verbatim user messages from the inherited parent recent history that explain why this worksession is needed
+  - `auto_start`: false only when the session should be created for later use without running its first turn; otherwise true
+
+After `create_worksession` returns, return JSON only with the final worksession information from the tool result. "#,
     );
     if let Some(ws) = parent_workspace_id {
         out.push_str(&format!(

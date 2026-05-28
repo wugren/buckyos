@@ -52,6 +52,20 @@ pub enum ScheduleSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ScheduleTarget {
+    Remind {
+        text: String,
+        #[serde(default)]
+        to: Option<String>,
+    },
+    AgentTask {
+        title: String,
+        objective: String,
+        workspace_id: String,
+        #[serde(default)]
+        behavior: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
+    },
     #[serde(rename = "workflow.run")]
     WorkflowRun {
         workflow_id: String,
@@ -483,6 +497,70 @@ impl ScheduleTaskMirrorClient {
             .await
             .map_err(|err| err.to_string())
     }
+
+    pub async fn create_agent_delegate_task(
+        &self,
+        schedule: &WorkflowSchedule,
+        fire: &ScheduleFireRecord,
+    ) -> Result<i64, String> {
+        let ScheduleTarget::AgentTask {
+            title,
+            objective,
+            workspace_id,
+            behavior,
+            agent,
+        } = &schedule.target
+        else {
+            return Err("schedule target is not agent_task".to_string());
+        };
+        let runner = agent
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| schedule.owner.app_id.clone());
+        let task = self
+            .client
+            .create_task(
+                title,
+                "agent.delegate",
+                Some(json!({
+                    "agent_delegate": {
+                        "version": 1,
+                        "purpose": objective,
+                        "title": title,
+                        "requester_agent_id": schedule.owner.app_id,
+                        "owner_session_id": format!("schedule-{}", schedule.schedule_id),
+                        "input": {
+                            "text": objective
+                        },
+                        "workspace_hints": [{
+                            "workspace_id": workspace_id
+                        }],
+                        "trigger": {
+                            "schedule_id": schedule.schedule_id,
+                            "fire_id": fire.fire_id,
+                            "fire_time": fire.fire_time,
+                            "manual": fire.manual
+                        },
+                        "execution": {
+                            "workspace_id": workspace_id,
+                            "behavior": behavior,
+                            "runner": runner,
+                            "status": "pending"
+                        }
+                    }
+                })),
+                schedule.owner.user_id.as_str(),
+                schedule.owner.app_id.as_str(),
+                Some(CreateTaskOptions {
+                    runner: Some(runner),
+                    root_id: Some(schedule.schedule_id.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(task.id)
+    }
 }
 
 fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {
@@ -617,6 +695,39 @@ pub fn schedule_target_from_value(value: &Value) -> Result<ScheduleTarget, Strin
         .and_then(Value::as_str)
         .ok_or_else(|| "missing target.kind".to_string())?;
     match kind {
+        "remind" => Ok(ScheduleTarget::Remind {
+            text: value
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing target.text".to_string())?
+                .to_string(),
+            to: value.get("to").and_then(Value::as_str).map(str::to_string),
+        }),
+        "agent_task" | "task" => Ok(ScheduleTarget::AgentTask {
+            title: value
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing target.title".to_string())?
+                .to_string(),
+            objective: value
+                .get("objective")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing target.objective".to_string())?
+                .to_string(),
+            workspace_id: value
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing target.workspace_id".to_string())?
+                .to_string(),
+            behavior: value
+                .get("behavior")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            agent: value
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
         "workflow.run" => Ok(ScheduleTarget::WorkflowRun {
             workflow_id: value
                 .get("workflow_id")

@@ -29,9 +29,9 @@ use agent_tool::{
     cli_error_result, cli_exit_code_for_error, cli_result_from_tool_result, cli_success_result,
     normalize_abs_path, now_ms, render_cli_output, session_record_path, AgentToolError,
     AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus, BindWorkspaceTool,
-    CliRunOutput, CreateWorkspaceTool, EditFileTool, FileToolConfig, GetSessionTool, GlobTool,
-    GrepTool, NoopFileWriteAudit, ReadFileTool, SessionRuntimeContext, SessionViewBackend,
-    TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
+    CliRunOutput, CreateWorkspaceTool, DcrontabTool, EditFileTool, FileToolConfig, GetSessionTool,
+    GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, SessionRuntimeContext,
+    SessionViewBackend, TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
 
@@ -41,9 +41,10 @@ const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
-const TOOL_NAMES: [&str; 15] = [
+const TOOL_NAMES: [&str; 16] = [
     "Glob",
     "Grep",
+    "dcrontab",
     "read_file",
     "write_file",
     "edit_file",
@@ -2780,6 +2781,7 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
     let audit = Arc::new(NoopFileWriteAudit);
     mgr.register_typed_tool(GlobTool::new(file_cfg.clone()))?;
     mgr.register_typed_tool(GrepTool::new(file_cfg.clone()))?;
+    mgr.register_typed_tool(DcrontabTool::new())?;
     mgr.register_typed_tool(ReadFileTool::new(file_cfg.clone()))?;
     mgr.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()))?;
     mgr.register_typed_tool(EditFileTool::new(file_cfg, audit))?;
