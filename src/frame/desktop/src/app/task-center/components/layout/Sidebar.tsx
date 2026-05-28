@@ -1,12 +1,13 @@
 /* ── TaskCenter sidebar ── */
 
-import { Home, ListTodo, Activity } from 'lucide-react'
+import { Activity, CalendarClock, Home, ListTodo } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import type { TaskCenterPage } from './navigation'
 
 const navItems: { key: TaskCenterPage; labelKey: string; fallback: string; icon: typeof Home }[] = [
   { key: 'home', labelKey: 'taskCenter.nav.home', fallback: 'Home', icon: Home },
   { key: 'tasks', labelKey: 'taskCenter.nav.tasks', fallback: 'Tasks', icon: ListTodo },
+  { key: 'schedules', labelKey: 'taskCenter.nav.schedules', fallback: 'Scheduled Tasks', icon: CalendarClock },
   { key: 'events', labelKey: 'taskCenter.nav.events', fallback: 'System Events', icon: Activity },
 ]
 

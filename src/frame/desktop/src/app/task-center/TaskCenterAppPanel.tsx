@@ -8,6 +8,7 @@ import { TaskCenterShell } from './components/layout/TaskCenterShell'
 import type { TaskCenterNav } from './components/layout/navigation'
 import { HomePage } from './pages/HomePage'
 import { TasksPage } from './pages/TasksPage'
+import { ScheduledTasksPage } from './pages/ScheduledTasksPage'
 import { TaskDetailPage } from './pages/TaskDetailPage'
 import { SystemEventsPage } from './pages/SystemEventsPage'
 
@@ -18,9 +19,8 @@ function PageRouter({
   nav: TaskCenterNav
   onNavigate: (nav: TaskCenterNav) => void
 }) {
-  // If taskId is specified, show detail page
   if (nav.taskId) {
-    return <TaskDetailPage taskId={nav.taskId} onNavigate={onNavigate} />
+    return <TaskDetailPage taskId={nav.taskId} backPage={nav.page} onNavigate={onNavigate} />
   }
 
   switch (nav.page) {
@@ -28,6 +28,8 @@ function PageRouter({
       return <HomePage onNavigate={onNavigate} />
     case 'tasks':
       return <TasksPage onNavigate={onNavigate} />
+    case 'schedules':
+      return <ScheduledTasksPage onNavigate={onNavigate} />
     case 'events':
       return <SystemEventsPage onNavigate={onNavigate} />
     default:

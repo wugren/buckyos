@@ -12,7 +12,7 @@ import {
 import { useI18n } from '../../../i18n/provider'
 import { useTaskCenterStore } from '../hooks/use-task-center-store'
 import type { Task } from '../mock/types'
-import type { TaskCenterNav } from '../components/layout/navigation'
+import type { TaskCenterNav, TaskCenterPage } from '../components/layout/navigation'
 
 function statusIcon(status: Task['status'], size = 16) {
   switch (status) {
@@ -112,25 +112,30 @@ function SubTaskRow({ task }: { task: Task }) {
 
 interface TaskDetailPageProps {
   taskId: string
+  backPage?: TaskCenterPage
   onNavigate: (nav: TaskCenterNav) => void
 }
 
-export function TaskDetailPage({ taskId, onNavigate }: TaskDetailPageProps) {
+export function TaskDetailPage({ taskId, backPage = 'tasks', onNavigate }: TaskDetailPageProps) {
   const store = useTaskCenterStore()
   const { t } = useI18n()
   const task = store.getTaskById(taskId)
+  const backLabel =
+    backPage === 'schedules'
+      ? t('taskCenter.detail.backSchedules', 'Back to Scheduled Tasks')
+      : t('taskCenter.detail.back', 'Back to Tasks')
 
   if (!task) {
     return (
       <div className="space-y-4">
         <button
           type="button"
-          onClick={() => onNavigate({ page: 'tasks' })}
+          onClick={() => onNavigate({ page: backPage })}
           className="flex items-center gap-1.5 text-sm transition-colors"
           style={{ color: 'var(--cp-accent)' }}
         >
           <ArrowLeft size={16} />
-          {t('taskCenter.detail.back', 'Back to Tasks')}
+          {backLabel}
         </button>
         <div
           className="flex flex-col items-center justify-center gap-3 py-16"
@@ -155,12 +160,12 @@ export function TaskDetailPage({ taskId, onNavigate }: TaskDetailPageProps) {
       {/* Back link */}
       <button
         type="button"
-        onClick={() => onNavigate({ page: 'tasks' })}
+        onClick={() => onNavigate({ page: backPage })}
         className="flex items-center gap-1.5 text-sm transition-colors"
         style={{ color: 'var(--cp-accent)' }}
       >
         <ArrowLeft size={16} />
-        {t('taskCenter.detail.back', 'Back to Tasks')}
+        {backLabel}
       </button>
 
       {/* Header */}

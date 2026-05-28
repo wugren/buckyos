@@ -5,6 +5,7 @@ import type {
   TaskStatus,
   TaskType,
   TaskSource,
+  WorkflowScheduleTaskPayload,
   SystemNotification,
   SystemEvent,
 } from './types'
@@ -159,16 +160,64 @@ const seedTasks: Task[] = [
   makeTask({
     taskId: 'task-006',
     rootTaskId: 'task-006',
-    title: 'Scheduled Backup: Weekly Full',
-    summary: 'Next run scheduled for 2026-04-07 02:00',
+    title: 'workflow/schedule/weekly-full-backup',
+    summary: 'Next fire at 2026-05-31 02:00',
     type: 'scheduled',
-    status: 'completed',
+    status: 'running',
     source: 'system',
-    progress: 100,
-    createdAt: '2026-03-31T02:00:00Z',
-    updatedAt: '2026-03-31T03:45:00Z',
-    startedAt: '2026-03-31T02:00:00Z',
-    endedAt: '2026-03-31T03:45:00Z',
+    progress: null,
+    schemaType: 'workflow/schedule',
+    createdAt: '2026-05-01T09:00:00Z',
+    updatedAt: '2026-05-24T09:45:00Z',
+    startedAt: '2026-05-01T09:00:00Z',
+    endedAt: null,
+    payload: {
+      request: {
+        schedule_id: 'sch-weekly-full-backup',
+        name: 'weekly-full-backup',
+        status: 'enabled',
+        schedule: {
+          kind: 'cron',
+          expr: '0 2 * * 0',
+          timezone: 'America/Los_Angeles',
+          calendar: 'standard',
+        },
+        target: {
+          task_type: 'workflow.run',
+          runner: 'workflow',
+          name_template: 'workflow/run: weekly-full-backup [${fire.fire_id}]',
+          data_template: {
+            workflow_run: {
+              workflow_id: 'wf_weekly_backup',
+              input: { volume: '/data' },
+            },
+          },
+        },
+      },
+      result: {
+        next_fire_at: '2026-05-31T02:00:00-07:00',
+        last_fire_at: '2026-05-24T02:00:00-07:00',
+        last_task_id: 'task-006-1',
+        last_run_id: 'run-weekly-backup-20260524',
+        consecutive_failures: 0,
+      },
+    } satisfies WorkflowScheduleTaskPayload,
+    children: [
+      makeTask({
+        taskId: 'task-006-1',
+        rootTaskId: 'task-006',
+        parentTaskId: 'task-006',
+        title: 'weekly-full-backup fire 2026-05-24T02:00:00-07:00',
+        type: 'workflow',
+        status: 'completed',
+        progress: 100,
+        summary: 'Backup completed in 1h 45m',
+        createdAt: '2026-05-24T09:00:00Z',
+        updatedAt: '2026-05-24T10:45:00Z',
+        startedAt: '2026-05-24T09:00:00Z',
+        endedAt: '2026-05-24T10:45:00Z',
+      }),
+    ],
   }),
   makeTask({
     taskId: 'task-007',
@@ -195,6 +244,181 @@ const seedTasks: Task[] = [
     createdAt: '2026-04-04T06:00:00Z',
     updatedAt: '2026-04-04T08:00:00Z',
     startedAt: '2026-04-04T06:05:00Z',
+  }),
+  makeTask({
+    taskId: 'task-009',
+    rootTaskId: 'task-009',
+    title: 'workflow/schedule/scan-new-images',
+    summary: 'Next fire at 2026-05-29 03:00',
+    type: 'scheduled',
+    status: 'running',
+    source: 'agent',
+    progress: null,
+    schemaType: 'workflow/schedule',
+    createdAt: '2026-05-20T18:00:00Z',
+    updatedAt: '2026-05-28T10:02:00Z',
+    startedAt: '2026-05-20T18:00:00Z',
+    payload: {
+      request: {
+        schedule_id: 'sch-scan-new-images',
+        name: 'scan-new-images',
+        status: 'enabled',
+        schedule: {
+          kind: 'cron',
+          expr: '0 3 * * *',
+          timezone: 'America/Los_Angeles',
+          calendar: 'standard',
+        },
+        target: {
+          task_type: 'workflow.run',
+          runner: 'workflow',
+          name_template: 'workflow/run: scan-new-images [${fire.fire_id}]',
+          data_template: {
+            workflow_run: {
+              workflow_id: 'wf_scan_images',
+              input: { album: 'camera-roll' },
+            },
+          },
+        },
+      },
+      result: {
+        next_fire_at: '2026-05-29T03:00:00-07:00',
+        last_fire_at: '2026-05-28T03:00:00-07:00',
+        last_task_id: 'task-009-1',
+        last_run_id: 'run-scan-images-20260528',
+        consecutive_failures: 0,
+      },
+    } satisfies WorkflowScheduleTaskPayload,
+    children: [
+      makeTask({
+        taskId: 'task-009-1',
+        rootTaskId: 'task-009',
+        parentTaskId: 'task-009',
+        title: 'scan-new-images fire 2026-05-28T03:00:00-07:00',
+        type: 'workflow',
+        status: 'completed',
+        progress: 100,
+        summary: 'Scanned 182 new photos',
+        createdAt: '2026-05-28T10:00:00Z',
+        updatedAt: '2026-05-28T10:02:00Z',
+        startedAt: '2026-05-28T10:00:00Z',
+        endedAt: '2026-05-28T10:02:00Z',
+      }),
+    ],
+  }),
+  makeTask({
+    taskId: 'task-010',
+    rootTaskId: 'task-010',
+    title: 'workflow/schedule/monthly-agent-report',
+    summary: 'Paused by user',
+    type: 'scheduled',
+    status: 'paused',
+    source: 'agent',
+    progress: null,
+    schemaType: 'workflow/schedule',
+    createdAt: '2026-05-03T12:30:00Z',
+    updatedAt: '2026-05-26T16:20:00Z',
+    startedAt: '2026-05-03T12:30:00Z',
+    payload: {
+      request: {
+        schedule_id: 'sch-monthly-agent-report',
+        name: 'monthly-agent-report',
+        status: 'paused',
+        schedule: {
+          kind: 'cron',
+          expr: '0 9 1 * *',
+          timezone: 'Asia/Shanghai',
+          calendar: 'standard',
+        },
+        target: {
+          task_type: 'agent.delegate',
+          runner: 'jarvis',
+          name_template: 'agent/delegate: monthly-agent-report [${fire.fire_id}]',
+          data_template: {
+            agent_task: {
+              prompt: 'Summarize the previous month and notify the owner.',
+            },
+          },
+        },
+      },
+      result: {
+        next_fire_at: null,
+        last_fire_at: '2026-05-01T09:00:00+08:00',
+        last_task_id: 'task-010-1',
+        consecutive_failures: 0,
+      },
+    } satisfies WorkflowScheduleTaskPayload,
+    children: [
+      makeTask({
+        taskId: 'task-010-1',
+        rootTaskId: 'task-010',
+        parentTaskId: 'task-010',
+        title: 'monthly-agent-report fire 2026-05-01T09:00:00+08:00',
+        type: 'workflow',
+        status: 'completed',
+        progress: 100,
+        summary: 'Agent report delivered',
+        createdAt: '2026-05-01T01:00:00Z',
+        updatedAt: '2026-05-01T01:08:00Z',
+        startedAt: '2026-05-01T01:00:00Z',
+        endedAt: '2026-05-01T01:08:00Z',
+      }),
+    ],
+  }),
+  makeTask({
+    taskId: 'task-011',
+    rootTaskId: 'task-011',
+    title: 'workflow/schedule/cleanup-temp-files',
+    summary: 'Schedule target validation failed',
+    type: 'scheduled',
+    status: 'failed',
+    source: 'system',
+    progress: null,
+    schemaType: 'workflow/schedule',
+    createdAt: '2026-05-12T05:40:00Z',
+    updatedAt: '2026-05-28T09:30:00Z',
+    startedAt: '2026-05-12T05:40:00Z',
+    payload: {
+      request: {
+        schedule_id: 'sch-cleanup-temp-files',
+        name: 'cleanup-temp-files',
+        status: 'error',
+        schedule: {
+          kind: 'run_every',
+          every_sec: 21600,
+          timezone: 'UTC',
+        },
+        target: {
+          task_type: 'service.rpc',
+          runner: 'storage.cleaner',
+          name_template: 'service/rpc: cleanup-temp-files [${fire.fire_id}]',
+          data_template: { service: 'storage.cleaner', method: 'cleanup_temp' },
+        },
+      },
+      result: {
+        next_fire_at: null,
+        last_fire_at: '2026-05-28T06:00:00Z',
+        last_task_id: 'task-011-1',
+        consecutive_failures: 3,
+        last_error: 'runner storage.cleaner is unavailable',
+      },
+    } satisfies WorkflowScheduleTaskPayload,
+    children: [
+      makeTask({
+        taskId: 'task-011-1',
+        rootTaskId: 'task-011',
+        parentTaskId: 'task-011',
+        title: 'cleanup-temp-files fire 2026-05-28T06:00:00Z',
+        type: 'one-time',
+        status: 'failed',
+        progress: null,
+        summary: 'runner storage.cleaner is unavailable',
+        createdAt: '2026-05-28T06:00:00Z',
+        updatedAt: '2026-05-28T06:00:05Z',
+        startedAt: '2026-05-28T06:00:00Z',
+        endedAt: '2026-05-28T06:00:05Z',
+      }),
+    ],
   }),
 ]
 
@@ -374,13 +598,21 @@ export class TaskCenterMockStore {
   }
 
   getRunningTasks(): Task[] {
-    return this.tasks.filter((t) => t.status === 'running' || t.status === 'paused')
+    return this.tasks.filter(
+      (t) => t.schemaType !== 'workflow/schedule' && (t.status === 'running' || t.status === 'paused'),
+    )
   }
 
   getRecentFinishedTasks(): Task[] {
     return this.tasks.filter(
-      (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled',
+      (t) =>
+        t.schemaType !== 'workflow/schedule' &&
+        (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled'),
     )
+  }
+
+  getScheduledTasks(): Task[] {
+    return this.tasks.filter((t) => t.schemaType === 'workflow/schedule' || t.type === 'scheduled')
   }
 
   getTaskById(taskId: string): Task | null {
