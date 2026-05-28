@@ -162,7 +162,7 @@ publish:
       buckyos:
         name: BuckyOS Desktop Service
         type: app
-        system_service: true,
+        system_service: true
         optional: true
         default_target: "%APPDATA%\\BuckyOS\\" #window下运行用户选择安装位置
 

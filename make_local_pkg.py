@@ -38,7 +38,6 @@ except ModuleNotFoundError:  # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parent
 SRC_DIR = REPO_ROOT / "src"
 PUBLISH_DIR = SRC_DIR / "publish"
-VERSION_FILE = SRC_DIR / "VERSION"
 CYFS_SRC_DIR = REPO_ROOT.parent / "cyfs-gateway" / "src"
 DESKTOP_APP_REPO_DIR = REPO_ROOT.parent / "BuckyOSApp"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
@@ -391,7 +390,7 @@ def _build_project_manifest(project_path: Path, *, build_root: Path, app_publish
                 raise RuntimeError(f"publish.{platform_key}.apps.{component_key} missing default_target")
             system_service_raw = component_cfg.get("system_service", False)
             if isinstance(system_service_raw, str):
-                system_service = system_service_raw.lower().strip().rstrip(",") == "true"
+                system_service = system_service_raw.lower().strip() == "true"
             else:
                 system_service = bool(system_service_raw)
 
@@ -510,13 +509,6 @@ def detect_target(arch_override: str | None = None, build_root_override: str | N
         architecture=architecture,
         build_root=build_root,
     )
-
-
-def _default_version() -> str:
-    base_version = VERSION_FILE.read_text(encoding="utf-8").strip()
-    if not base_version:
-        raise RuntimeError(f"empty version file: {VERSION_FILE}")
-    return f"{base_version}+build{datetime.now().strftime('%y%m%d')}"
 
 
 def _node_daemon_candidates(build_root: Path, target: TargetScript) -> list[Path]:
@@ -941,7 +933,6 @@ def build_pkg(argv: list[str]) -> int:
     parser.add_argument("--skip-cargo-update", action="store_true", help="Skip cargo update in shared build steps")
     parser.add_argument("--skip-cyfs-gateway", action="store_true", help="Skip cyfs-gateway staging")
     parser.add_argument("--rust-target", default=None, help="Pass explicit --target to internal buckyos-build commands")
-    parser.add_argument("--no-sync-scripts", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args, forwarded = parser.parse_known_args(argv)
 
@@ -988,8 +979,6 @@ def build_pkg(argv: list[str]) -> int:
             "--out-dir",
             args.out_dir,
         ]
-        if args.no_sync_scripts:
-            cmd.append("--no-sync-scripts")
         if args.dry_run:
             cmd.append("--dry-run")
         cmd += forwarded
