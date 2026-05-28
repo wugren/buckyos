@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: &str = "0.2";
+pub const SCHEMA_VERSION: &str = "0.3";
 pub const SYSTEM_NOTEBOOK_ID: &str = "system";
 pub const SYSTEM_NOTEBOOK_MAX_ACTIVE: usize = 10;
 
@@ -295,6 +295,10 @@ pub enum NotebookEventType {
     ItemPromotedToSystem,
     #[serde(rename = "item.demoted_from_system")]
     ItemDemotedFromSystem,
+    #[serde(rename = "item.remark_appended")]
+    ItemRemarkAppended,
+    #[serde(rename = "item.remark_removed")]
+    ItemRemarkRemoved,
 }
 
 impl NotebookEventType {
@@ -307,6 +311,8 @@ impl NotebookEventType {
             Self::ItemSuperseded => "item.superseded",
             Self::ItemPromotedToSystem => "item.promoted_to_system",
             Self::ItemDemotedFromSystem => "item.demoted_from_system",
+            Self::ItemRemarkAppended => "item.remark_appended",
+            Self::ItemRemarkRemoved => "item.remark_removed",
         }
     }
 }
@@ -406,6 +412,24 @@ pub struct NotebookItem {
     pub updated_at: String,
     pub item_revision: i64,
     pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NotebookItemRemark {
+    pub remark_id: String,
+    pub item_id: String,
+    pub notebook_id: String,
+    pub owner_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    pub remark_type: String,
+    pub content: String,
+    pub status: NotebookItemRemarkStatus,
+    pub actor_kind: ActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 // ============================================================ input / output
@@ -621,6 +645,75 @@ pub struct MarkNoteStatusInput {
 #[derive(Clone, Debug, Serialize)]
 pub struct MarkNoteStatusResult {
     pub status: &'static str,
+    pub item_id: String,
+    pub notebook_id: String,
+    pub notebook_version: String,
+    pub notebook_revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotebookItemRemarkStatus {
+    Active,
+    Deleted,
+}
+
+impl NotebookItemRemarkStatus {
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "active" => Self::Active,
+            "deleted" => Self::Deleted,
+            other => {
+                return Err(NotebookError::Storage(format!(
+                    "bad item remark status: {other}"
+                )))
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ListItemRemarksInput {
+    pub scope: OwnerScope,
+    pub item_id: String,
+    pub remark_type: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppendItemRemarkInput {
+    pub scope: OwnerScope,
+    pub session_id: Option<String>,
+    pub item_id: String,
+    pub remark_type: String,
+    pub content: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AppendItemRemarkResult {
+    pub status: &'static str,
+    pub remark_id: String,
+    pub item_id: String,
+    pub notebook_id: String,
+    pub notebook_version: String,
+    pub notebook_revision: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoveItemRemarkInput {
+    pub scope: OwnerScope,
+    pub session_id: Option<String>,
+    pub item_id: String,
+    pub remark_id: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoveItemRemarkResult {
+    pub status: &'static str,
+    pub remark_id: String,
     pub item_id: String,
     pub notebook_id: String,
     pub notebook_version: String,
@@ -1668,6 +1761,235 @@ impl AgentNotebook {
         })
     }
 
+    pub fn list_item_remarks(
+        &self,
+        input: ListItemRemarksInput,
+    ) -> Result<Vec<NotebookItemRemark>> {
+        validate_owner(&input.scope)?;
+        let item_id = validate_item_id(&input.item_id)?;
+        let remark_type = input
+            .remark_type
+            .as_deref()
+            .map(normalize_remark_type)
+            .transpose()?;
+        let conn = self.lock_conn()?;
+        let notebook_id = item_notebook_id(&conn, &input.scope, &item_id)?
+            .ok_or_else(|| NotebookError::NotFound(format!("notebook item {item_id}")))?;
+        let mut query = String::from(
+            "SELECT remark_id, remark_type, content, status, actor_kind, actor_id,
+                    created_at, updated_at
+             FROM notebook_item_remarks
+             WHERE owner_user_id = ? AND owner_agent_id = ? AND item_id = ?
+               AND status = 'active'",
+        );
+        let agent = input.scope.agent().to_string();
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+            vec![&input.scope.owner_user_id, &agent, &item_id];
+        if let Some(remark_type) = &remark_type {
+            query.push_str(" AND remark_type = ?");
+            params_vec.push(remark_type);
+        }
+        query.push_str(" ORDER BY created_at ASC, remark_id ASC");
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                remark_id,
+                remark_type,
+                content,
+                status,
+                actor_kind,
+                actor_id,
+                created_at,
+                updated_at,
+            ) = row?;
+            out.push(NotebookItemRemark {
+                remark_id,
+                item_id: item_id.clone(),
+                notebook_id: notebook_id.clone(),
+                owner_user_id: input.scope.owner_user_id.clone(),
+                owner_agent_id: input.scope.owner_agent_id.clone(),
+                remark_type,
+                content,
+                status: NotebookItemRemarkStatus::from_str(&status)?,
+                actor_kind: ActorKind::from_str(&actor_kind)?,
+                actor_id,
+                created_at,
+                updated_at,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn append_item_remark(
+        &self,
+        input: AppendItemRemarkInput,
+    ) -> Result<AppendItemRemarkResult> {
+        validate_owner(&input.scope)?;
+        let item_id = validate_item_id(&input.item_id)?;
+        let remark_type = normalize_remark_type(&input.remark_type)?;
+        if input.content.trim().is_empty() {
+            return Err(NotebookError::InvalidInput(
+                "remark content is empty".into(),
+            ));
+        }
+
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let now = now_iso8601();
+        let (notebook_id, item_title, item_status) =
+            load_item_remark_target(&tx, &input.scope, &item_id)?
+                .ok_or_else(|| NotebookError::NotFound(format!("notebook item {item_id}")))?;
+        if item_status == NotebookItemStatus::Deleted {
+            return Err(NotebookError::InvalidInput(
+                "cannot append remark to deleted item".into(),
+            ));
+        }
+
+        let remark_id = new_remark_id();
+        tx.execute(
+            "INSERT INTO notebook_item_remarks(
+                remark_id, item_id, owner_user_id, owner_agent_id, remark_type, content,
+                status, actor_kind, actor_id, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            params![
+                remark_id,
+                item_id,
+                input.scope.owner_user_id,
+                input.scope.agent(),
+                remark_type,
+                input.content,
+                input.actor_kind.as_str(),
+                input.actor_id,
+                now,
+                now
+            ],
+        )?;
+        tx.execute(
+            "UPDATE notebook_items SET updated_at = ?, item_revision = item_revision + 1
+             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
+            params![now, item_id, input.scope.owner_user_id, input.scope.agent()],
+        )?;
+        let event_id = new_event_id();
+        let notebook_version =
+            bump_notebook_version(&tx, &input.scope, &notebook_id, &now, Some(&event_id))?;
+        let notebook_revision = notebook_revision(&tx, &input.scope, &notebook_id)?;
+        let tags = fetch_item_tags(&tx, &item_id)?;
+        let seq = next_event_seq(&tx)?;
+        insert_event(
+            &tx,
+            &EventRow {
+                event_id,
+                seq,
+                event_type: NotebookEventType::ItemRemarkAppended,
+                notebook_id: notebook_id.clone(),
+                owner_user_id: input.scope.owner_user_id.clone(),
+                owner_agent_id: input.scope.agent().to_string(),
+                item_id: Some(item_id.clone()),
+                actor_session_id: input.session_id.clone(),
+                actor_kind: input.actor_kind,
+                title: Some(item_title),
+                summary: Some(format!("{remark_type}: {}", short_summary(&input.content))),
+                tags: Some(tags),
+                notebook_version: notebook_version.clone(),
+                notebook_revision,
+                created_at: now.clone(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(AppendItemRemarkResult {
+            status: "ok",
+            remark_id,
+            item_id,
+            notebook_id,
+            notebook_version,
+            notebook_revision,
+        })
+    }
+
+    pub fn remove_item_remark(
+        &self,
+        input: RemoveItemRemarkInput,
+    ) -> Result<RemoveItemRemarkResult> {
+        validate_owner(&input.scope)?;
+        let item_id = validate_item_id(&input.item_id)?;
+        let remark_id = validate_remark_id(&input.remark_id)?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let now = now_iso8601();
+        let (notebook_id, item_title, remark_type) =
+            load_active_remark_target(&tx, &input.scope, &item_id, &remark_id)?.ok_or_else(
+                || {
+                    NotebookError::NotFound(format!(
+                        "remark {remark_id} on notebook item {item_id}"
+                    ))
+                },
+            )?;
+        tx.execute(
+            "UPDATE notebook_item_remarks SET status = 'deleted', updated_at = ?
+             WHERE remark_id = ? AND item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
+            params![
+                now,
+                remark_id,
+                item_id,
+                input.scope.owner_user_id,
+                input.scope.agent()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE notebook_items SET updated_at = ?, item_revision = item_revision + 1
+             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
+            params![now, item_id, input.scope.owner_user_id, input.scope.agent()],
+        )?;
+        let event_id = new_event_id();
+        let notebook_version =
+            bump_notebook_version(&tx, &input.scope, &notebook_id, &now, Some(&event_id))?;
+        let notebook_revision = notebook_revision(&tx, &input.scope, &notebook_id)?;
+        let tags = fetch_item_tags(&tx, &item_id)?;
+        let seq = next_event_seq(&tx)?;
+        insert_event(
+            &tx,
+            &EventRow {
+                event_id,
+                seq,
+                event_type: NotebookEventType::ItemRemarkRemoved,
+                notebook_id: notebook_id.clone(),
+                owner_user_id: input.scope.owner_user_id.clone(),
+                owner_agent_id: input.scope.agent().to_string(),
+                item_id: Some(item_id.clone()),
+                actor_session_id: input.session_id.clone(),
+                actor_kind: input.actor_kind,
+                title: Some(item_title),
+                summary: Some(format!("removed remark {remark_type}")),
+                tags: Some(tags),
+                notebook_version: notebook_version.clone(),
+                notebook_revision,
+                created_at: now.clone(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(RemoveItemRemarkResult {
+            status: "ok",
+            remark_id,
+            item_id,
+            notebook_id,
+            notebook_version,
+            notebook_revision,
+        })
+    }
+
     // --------------------------------- promote_to_system_notebook (§5.6)
 
     pub fn promote_to_system_notebook(
@@ -2340,6 +2662,21 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_by   TEXT,
             PRIMARY KEY(from_item_id, to_item_id, edge_type)
          );
+         CREATE TABLE IF NOT EXISTS notebook_item_remarks (
+            remark_id       TEXT PRIMARY KEY,
+            item_id         TEXT NOT NULL,
+            owner_user_id   TEXT NOT NULL,
+            owner_agent_id  TEXT NOT NULL DEFAULT '',
+            remark_type     TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'active',
+            actor_kind      TEXT NOT NULL,
+            actor_id        TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_item_remarks_owner_item_type_status
+            ON notebook_item_remarks(owner_user_id, owner_agent_id, item_id, remark_type, status, created_at);
          CREATE TABLE IF NOT EXISTS notebook_events (
             event_id          TEXT PRIMARY KEY,
             seq               INTEGER NOT NULL,
@@ -2410,6 +2747,54 @@ fn validate_notebook_id(id: &str) -> Result<String> {
         ));
     }
     Ok(t.to_string())
+}
+
+fn validate_item_id(id: &str) -> Result<String> {
+    let t = id.trim();
+    if t.is_empty() {
+        return Err(NotebookError::InvalidInput("item_id is empty".into()));
+    }
+    if t.len() > 128 {
+        return Err(NotebookError::InvalidInput("item_id too long".into()));
+    }
+    if t.contains('\0') || t.chars().any(|c| c.is_control()) {
+        return Err(NotebookError::InvalidInput(
+            "item_id has control chars".into(),
+        ));
+    }
+    Ok(t.to_string())
+}
+
+fn validate_remark_id(id: &str) -> Result<String> {
+    let t = id.trim();
+    if t.is_empty() {
+        return Err(NotebookError::InvalidInput("remark_id is empty".into()));
+    }
+    if t.len() > 128 {
+        return Err(NotebookError::InvalidInput("remark_id too long".into()));
+    }
+    if t.contains('\0') || t.chars().any(|c| c.is_control()) {
+        return Err(NotebookError::InvalidInput(
+            "remark_id has control chars".into(),
+        ));
+    }
+    Ok(t.to_string())
+}
+
+fn normalize_remark_type(raw: &str) -> Result<String> {
+    let value = collapse_whitespace(raw.trim());
+    if value.is_empty() {
+        return Err(NotebookError::InvalidInput("remark_type is empty".into()));
+    }
+    if value.len() > 64 {
+        return Err(NotebookError::InvalidInput("remark_type too long".into()));
+    }
+    if value.contains('\0') || value.chars().any(|c| c.is_control()) {
+        return Err(NotebookError::InvalidInput(
+            "remark_type has control chars".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn default_kind_for_id(id: &str) -> NotebookKind {
@@ -2516,6 +2901,10 @@ fn new_item_id() -> String {
 
 fn new_event_id() -> String {
     format!("evt_{}", random_hex(12))
+}
+
+fn new_remark_id() -> String {
+    format!("rmk_{}", random_hex(12))
 }
 
 fn random_hex(n_bytes: usize) -> String {
@@ -3127,6 +3516,105 @@ fn fetch_items_by_ids(
         });
     }
     Ok(out)
+}
+
+fn item_notebook_id(
+    conn: &Connection,
+    scope: &OwnerScope,
+    item_id: &str,
+) -> Result<Option<String>> {
+    let notebook_id = conn
+        .query_row(
+            "SELECT notebook_id FROM notebook_items
+             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
+            params![item_id, scope.owner_user_id, scope.agent()],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(notebook_id)
+}
+
+fn load_item_remark_target(
+    conn: &Connection,
+    scope: &OwnerScope,
+    item_id: &str,
+) -> Result<Option<(String, String, NotebookItemStatus)>> {
+    let row = conn
+        .query_row(
+            "SELECT notebook_id, title, status FROM notebook_items
+             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
+            params![item_id, scope.owner_user_id, scope.agent()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((notebook_id, title, status)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        notebook_id,
+        title,
+        NotebookItemStatus::from_str(&status)?,
+    )))
+}
+
+fn load_active_remark_target(
+    conn: &Connection,
+    scope: &OwnerScope,
+    item_id: &str,
+    remark_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT i.notebook_id, i.title, r.remark_type
+             FROM notebook_item_remarks r
+             JOIN notebook_items i
+               ON i.item_id = r.item_id
+              AND i.owner_user_id = r.owner_user_id
+              AND i.owner_agent_id = r.owner_agent_id
+             WHERE r.remark_id = ? AND r.item_id = ?
+               AND r.owner_user_id = ? AND r.owner_agent_id = ?
+               AND r.status = 'active'",
+            params![remark_id, item_id, scope.owner_user_id, scope.agent()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn notebook_revision(conn: &Connection, scope: &OwnerScope, notebook_id: &str) -> Result<i64> {
+    let revision = conn.query_row(
+        "SELECT revision FROM notebooks
+         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
+        params![scope.owner_user_id, scope.agent(), notebook_id],
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(revision)
+}
+
+fn fetch_item_tags(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT tag FROM notebook_item_tags
+         WHERE item_id = ?
+         ORDER BY tag ASC",
+    )?;
+    let rows = stmt.query_map(params![item_id], |r| r.get::<_, String>(0))?;
+    let mut tags = Vec::new();
+    for row in rows {
+        tags.push(row?);
+    }
+    Ok(tags)
 }
 
 fn is_expired(item: &NotebookItem, now: &str) -> bool {
@@ -3940,6 +4428,78 @@ mod tests {
                 && c.matched_tags
                     .as_ref()
                     .is_some_and(|m| m.contains(&"tone".to_string()))));
+    }
+
+    #[test]
+    fn item_remarks_append_list_filter_and_remove() {
+        let (_t, n) = open_tmp();
+        let item_id = append(&n, "user/preferences", "a", "x", &["focus"]);
+        let first = n
+            .append_item_remark(AppendItemRemarkInput {
+                scope: scope(),
+                session_id: Some("sess-A".into()),
+                item_id: item_id.clone(),
+                remark_type: "red".into(),
+                content: "needs confirmation".into(),
+                actor_kind: ActorKind::OnlineAgent,
+                actor_id: None,
+            })
+            .unwrap();
+        let second = n
+            .append_item_remark(AppendItemRemarkInput {
+                scope: scope(),
+                session_id: Some("sess-A".into()),
+                item_id: item_id.clone(),
+                remark_type: "blue".into(),
+                content: "owner supplied".into(),
+                actor_kind: ActorKind::OnlineAgent,
+                actor_id: None,
+            })
+            .unwrap();
+        assert_eq!(first.item_id, item_id);
+        assert_ne!(first.notebook_version, second.notebook_version);
+
+        let all = n
+            .list_item_remarks(ListItemRemarksInput {
+                scope: scope(),
+                item_id: item_id.clone(),
+                remark_type: None,
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        let red = n
+            .list_item_remarks(ListItemRemarksInput {
+                scope: scope(),
+                item_id: item_id.clone(),
+                remark_type: Some("red".into()),
+            })
+            .unwrap();
+        assert_eq!(red.len(), 1);
+        assert_eq!(red[0].remark_id, first.remark_id);
+        assert_eq!(red[0].content, "needs confirmation");
+
+        let removed = n
+            .remove_item_remark(RemoveItemRemarkInput {
+                scope: scope(),
+                session_id: Some("sess-A".into()),
+                item_id: item_id.clone(),
+                remark_id: first.remark_id.clone(),
+                actor_kind: ActorKind::OnlineAgent,
+                actor_id: None,
+            })
+            .unwrap();
+        assert_eq!(removed.remark_id, first.remark_id);
+
+        let after = n
+            .list_item_remarks(ListItemRemarksInput {
+                scope: scope(),
+                item_id,
+                remark_type: None,
+            })
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].remark_id, second.remark_id);
     }
 
     #[test]

@@ -18,11 +18,12 @@ use tokio::process::Command;
 
 use agent_tool::agent_memory::{AgentMemory, AgentMemoryConfig, AgentMemoryError, LoadOptions};
 use agent_tool::agent_notebook::{
-    self as nb, ActorKind, AgentNotebook, AgentNotebookConfig, AppendNoteInput, BuildHintsInput,
-    BuildRegistryContextInput, BuildSystemContextInput, Confidence, CreateOrUpdateNotebookInput,
-    ListNotebooksInput, MarkNoteStatusInput, NotebookError, NotebookItemStatus, NotebookKind,
-    NotebookReadResult, OwnerScope, PromoteToSystemInput, PromoteToSystemResult, ReadNotebookInput,
-    WriteReason,
+    self as nb, ActorKind, AgentNotebook, AgentNotebookConfig, AppendItemRemarkInput,
+    AppendNoteInput, BuildHintsInput, BuildRegistryContextInput, BuildSystemContextInput,
+    Confidence, CreateOrUpdateNotebookInput, ListItemRemarksInput, ListNotebooksInput,
+    MarkNoteStatusInput, NotebookError, NotebookItemStatus, NotebookKind, NotebookReadResult,
+    OwnerScope, PromoteToSystemInput, PromoteToSystemResult, ReadNotebookInput,
+    RemoveItemRemarkInput, WriteReason,
 };
 use agent_tool::llm_tool_carft::{self, CommandNotFoundRequest};
 use agent_tool::{
@@ -1258,7 +1259,7 @@ const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NO
 [--owner-agent <agent> | env OPENDAN_AGENT_ID] \
 [--session <id> | env OPENDAN_SESSION_ID] \
 <list|read|append|status|promote|create-notebook|registry-context|\
-system-context|hints> [...]";
+system-context|hints|remarks> [...]";
 const DEFAULT_AGENT_NOTEBOOK_ID: &str = "user/actions";
 
 #[derive(Clone, Debug)]
@@ -1334,6 +1335,23 @@ enum AgentNotebookVerb {
         topic_tags: Option<Vec<String>>,
         candidate_notebook_ids: Option<Vec<String>>,
         max_hints: Option<usize>,
+    },
+    RemarkList {
+        item_id: String,
+        remark_type: Option<String>,
+    },
+    RemarkAppend {
+        item_id: String,
+        remark_type: String,
+        content: Option<String>,
+        actor_kind: ActorKind,
+        actor_id: Option<String>,
+    },
+    RemarkRemove {
+        item_id: String,
+        remark_id: String,
+        actor_kind: ActorKind,
+        actor_id: Option<String>,
     },
 }
 
@@ -1421,6 +1439,10 @@ fn parse_agent_notebook_cli_command(
         "registry-context" => parse_agent_notebook_registry_context(rest)?,
         "system-context" => parse_agent_notebook_system_context(rest)?,
         "hints" => parse_agent_notebook_hints(rest)?,
+        "remarks" | "remark" => parse_agent_notebook_remarks(rest)?,
+        "remark-list" => parse_agent_notebook_remark_list(rest)?,
+        "remark-append" => parse_agent_notebook_remark_append(rest)?,
+        "remark-remove" => parse_agent_notebook_remark_remove(rest)?,
         other => return Err(agent_notebook_invalid(format!("unknown verb `{other}`"))),
     };
 
@@ -2105,6 +2127,190 @@ fn parse_agent_notebook_hints(rest: &[String]) -> Result<AgentNotebookVerb, Agen
     })
 }
 
+fn parse_agent_notebook_remarks(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
+    let sub = rest
+        .first()
+        .ok_or_else(|| agent_notebook_invalid("`remarks` requires list|append|remove"))?;
+    match sub.as_str() {
+        "list" => parse_agent_notebook_remark_list(&rest[1..]),
+        "append" => parse_agent_notebook_remark_append(&rest[1..]),
+        "remove" => parse_agent_notebook_remark_remove(&rest[1..]),
+        other => Err(agent_notebook_invalid(format!(
+            "unknown `remarks` subcommand `{other}`"
+        ))),
+    }
+}
+
+fn parse_agent_notebook_remark_list(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut remark_type: Option<String> = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        let token = &rest[idx];
+        match token.as_str() {
+            "--type" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--type`"))?;
+                remark_type = Some(value.clone());
+            }
+            v if v.starts_with("--type=") => {
+                remark_type = Some(v["--type=".len()..].to_string());
+            }
+            v if v.starts_with("--") => {
+                return Err(agent_notebook_invalid(format!(
+                    "unsupported flag `{v}` for `remarks list`"
+                )))
+            }
+            v => positionals.push(v.to_string()),
+        }
+        idx += 1;
+    }
+    if positionals.len() != 1 {
+        return Err(agent_notebook_invalid(format!(
+            "`remarks list` expects 1 positional argument (item_id), got {}",
+            positionals.len()
+        )));
+    }
+    Ok(AgentNotebookVerb::RemarkList {
+        item_id: positionals.into_iter().next().unwrap(),
+        remark_type,
+    })
+}
+
+fn parse_agent_notebook_remark_append(
+    rest: &[String],
+) -> Result<AgentNotebookVerb, AgentToolError> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut use_stdin = false;
+    let mut actor_kind: Option<ActorKind> = None;
+    let mut actor_id: Option<String> = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        let token = &rest[idx];
+        match token.as_str() {
+            "--stdin" => use_stdin = true,
+            "--actor-kind" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
+                actor_kind = Some(parse_actor_kind(value)?);
+            }
+            v if v.starts_with("--actor-kind=") => {
+                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
+            }
+            "--actor-id" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
+                actor_id = Some(value.clone());
+            }
+            v if v.starts_with("--actor-id=") => {
+                actor_id = Some(v["--actor-id=".len()..].to_string());
+            }
+            v if v.starts_with("--") => {
+                return Err(agent_notebook_invalid(format!(
+                    "unsupported flag `{v}` for `remarks append`"
+                )))
+            }
+            v => positionals.push(v.to_string()),
+        }
+        idx += 1;
+    }
+    let actor_kind = actor_kind
+        .ok_or_else(|| agent_notebook_invalid("`remarks append` requires `--actor-kind`"))?;
+    let (item_id, remark_type, content) = match (use_stdin, positionals.len()) {
+        (false, 3) => {
+            let mut it = positionals.into_iter();
+            (
+                it.next().unwrap(),
+                it.next().unwrap(),
+                Some(it.next().unwrap()),
+            )
+        }
+        (true, 2) => {
+            let mut it = positionals.into_iter();
+            (it.next().unwrap(), it.next().unwrap(), None)
+        }
+        (false, n) => {
+            return Err(agent_notebook_invalid(format!(
+                "`remarks append` expects 3 positional arguments (item_id, type, content), got {n}"
+            )))
+        }
+        (true, n) => {
+            return Err(agent_notebook_invalid(format!(
+                "`remarks append --stdin` expects 2 positional arguments (item_id, type), got {n}"
+            )))
+        }
+    };
+    Ok(AgentNotebookVerb::RemarkAppend {
+        item_id,
+        remark_type,
+        content,
+        actor_kind,
+        actor_id,
+    })
+}
+
+fn parse_agent_notebook_remark_remove(
+    rest: &[String],
+) -> Result<AgentNotebookVerb, AgentToolError> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut actor_kind: Option<ActorKind> = None;
+    let mut actor_id: Option<String> = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        let token = &rest[idx];
+        match token.as_str() {
+            "--actor-kind" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
+                actor_kind = Some(parse_actor_kind(value)?);
+            }
+            v if v.starts_with("--actor-kind=") => {
+                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
+            }
+            "--actor-id" => {
+                idx += 1;
+                let value = rest
+                    .get(idx)
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
+                actor_id = Some(value.clone());
+            }
+            v if v.starts_with("--actor-id=") => {
+                actor_id = Some(v["--actor-id=".len()..].to_string());
+            }
+            v if v.starts_with("--") => {
+                return Err(agent_notebook_invalid(format!(
+                    "unsupported flag `{v}` for `remarks remove`"
+                )))
+            }
+            v => positionals.push(v.to_string()),
+        }
+        idx += 1;
+    }
+    if positionals.len() != 2 {
+        return Err(agent_notebook_invalid(format!(
+            "`remarks remove` expects 2 positional arguments (item_id, remark_id), got {}",
+            positionals.len()
+        )));
+    }
+    let actor_kind = actor_kind
+        .ok_or_else(|| agent_notebook_invalid("`remarks remove` requires `--actor-kind`"))?;
+    let mut it = positionals.into_iter();
+    Ok(AgentNotebookVerb::RemarkRemove {
+        item_id: it.next().unwrap(),
+        remark_id: it.next().unwrap(),
+        actor_kind,
+        actor_id,
+    })
+}
+
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_string())
@@ -2349,6 +2555,51 @@ async fn dispatch_agent_notebook(
                 };
             }
         },
+        AgentNotebookVerb::RemarkAppend {
+            item_id,
+            remark_type,
+            content,
+            actor_kind,
+            actor_id,
+        } if content.is_none() => match read_stdin_content(stdin_override).await {
+            Ok(body) => {
+                if body.is_empty() {
+                    return CliRunOutput {
+                        exit_code: 2,
+                        stdout: format!(
+                            "{}\n",
+                            json!({
+                                "status": "error",
+                                "code": "invalid_input",
+                                "message": "stdin produced 0 bytes; refusing empty remark content",
+                            })
+                        ),
+                        stderr: String::new(),
+                    };
+                }
+                AgentNotebookVerb::RemarkAppend {
+                    item_id,
+                    remark_type,
+                    content: Some(body),
+                    actor_kind,
+                    actor_id,
+                }
+            }
+            Err(err) => {
+                return CliRunOutput {
+                    exit_code: 1,
+                    stdout: format!(
+                        "{}\n",
+                        json!({
+                            "status": "error",
+                            "code": "storage_error",
+                            "message": err.to_string(),
+                        })
+                    ),
+                    stderr: String::new(),
+                };
+            }
+        },
         v => v,
     };
 
@@ -2572,6 +2823,55 @@ fn run_agent_notebook_blocking(
                 "status": "ok",
                 "hints_block": result,
             }))
+        }
+        AgentNotebookVerb::RemarkList {
+            item_id,
+            remark_type,
+        } => {
+            let remarks = notebook.list_item_remarks(ListItemRemarksInput {
+                scope,
+                item_id: item_id.clone(),
+                remark_type,
+            })?;
+            Ok(json!({
+                "status": "ok",
+                "item_id": item_id,
+                "remarks": remarks,
+            }))
+        }
+        AgentNotebookVerb::RemarkAppend {
+            item_id,
+            remark_type,
+            content,
+            actor_kind,
+            actor_id,
+        } => {
+            let result = notebook.append_item_remark(AppendItemRemarkInput {
+                scope,
+                session_id: session_id.map(|s| s.to_string()),
+                item_id,
+                remark_type,
+                content: content.expect("stdin form resolved earlier"),
+                actor_kind,
+                actor_id,
+            })?;
+            Ok(serde_json::to_value(result)?)
+        }
+        AgentNotebookVerb::RemarkRemove {
+            item_id,
+            remark_id,
+            actor_kind,
+            actor_id,
+        } => {
+            let result = notebook.remove_item_remark(RemoveItemRemarkInput {
+                scope,
+                session_id: session_id.map(|s| s.to_string()),
+                item_id,
+                remark_id,
+                actor_kind,
+                actor_id,
+            })?;
+            Ok(serde_json::to_value(result)?)
         }
     }
 }
@@ -4711,6 +5011,140 @@ mod tests {
         assert_eq!(output.exit_code, EXIT_SUCCESS);
         let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse append json");
         assert_eq!(payload["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn agent_notebook_remarks_roundtrip() {
+        let _lock = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+
+        let seed = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("--session"),
+                OsString::from("s1"),
+                OsString::from("append"),
+                OsString::from("fact"),
+                OsString::from("body"),
+                OsString::from("--id"),
+                OsString::from("user/preferences"),
+                OsString::from("--actor-kind"),
+                OsString::from("online_agent"),
+                OsString::from("--write-reason"),
+                OsString::from("user_explicit"),
+                OsString::from("--tags"),
+                OsString::from("fact"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("seed notebook item");
+        assert_eq!(seed.exit_code, EXIT_SUCCESS);
+        let seed_payload: Json = serde_json::from_str(seed.stdout.trim()).expect("parse seed json");
+        let item_id = seed_payload["item_id"]
+            .as_str()
+            .expect("item_id string")
+            .to_string();
+
+        let append = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("--session"),
+                OsString::from("s1"),
+                OsString::from("remarks"),
+                OsString::from("append"),
+                OsString::from(item_id.clone()),
+                OsString::from("red"),
+                OsString::from("needs confirmation"),
+                OsString::from("--actor-kind"),
+                OsString::from("online_agent"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("append remark");
+        assert_eq!(append.exit_code, EXIT_SUCCESS);
+        let append_payload: Json =
+            serde_json::from_str(append.stdout.trim()).expect("parse remark append json");
+        assert_eq!(append_payload["status"], "ok");
+        let remark_id = append_payload["remark_id"]
+            .as_str()
+            .expect("remark_id string")
+            .to_string();
+
+        let list = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("remarks"),
+                OsString::from("list"),
+                OsString::from(item_id.clone()),
+                OsString::from("--type"),
+                OsString::from("red"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("list remarks");
+        assert_eq!(list.exit_code, EXIT_SUCCESS);
+        let list_payload: Json =
+            serde_json::from_str(list.stdout.trim()).expect("parse remark list json");
+        let remarks = list_payload["remarks"].as_array().expect("remarks array");
+        assert_eq!(remarks.len(), 1);
+        assert_eq!(remarks[0]["remark_id"], remark_id);
+        assert_eq!(remarks[0]["content"], "needs confirmation");
+
+        let remove = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("remarks"),
+                OsString::from("remove"),
+                OsString::from(item_id.clone()),
+                OsString::from(remark_id),
+                OsString::from("--actor-kind"),
+                OsString::from("online_agent"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("remove remark");
+        assert_eq!(remove.exit_code, EXIT_SUCCESS);
+
+        let after = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("--owner-user"),
+                OsString::from("alice"),
+                OsString::from("remarks"),
+                OsString::from("list"),
+                OsString::from(item_id),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("list remarks after remove");
+        assert_eq!(after.exit_code, EXIT_SUCCESS);
+        let after_payload: Json =
+            serde_json::from_str(after.stdout.trim()).expect("parse remark list after remove");
+        let remarks = after_payload["remarks"].as_array().expect("remarks array");
+        assert!(remarks.is_empty());
     }
 
     #[tokio::test]

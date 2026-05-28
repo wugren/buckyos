@@ -50,6 +50,7 @@ Agent Notebook 模块需要实现以下能力：
 | Cross-session update hint | 其他 session 更新相关 notebook 后，对曾读/写过或已自动订阅相关 notebook / title 的 session 提供轻量提示 |
 | System Notebook | 极少数高置信、长期有效的事实可强注入 prompt |
 | Status management | 支持 active、stale、superseded、deleted 等状态 |
+| Item remarks | 支持基于 notebook item id 的备注 list / append / remove，可按备注类型过滤 |
 | Curator API | 允许后台 self-improve 进行整理、淘汰、提升、降级 |
 | Auditability | 每个条目保留来源、时间、actor、reason，便于追溯 |
 
@@ -278,6 +279,41 @@ Requirements：
 6. `deleted` 默认表示软删除；如有隐私合规要求，可额外实现 purge，但 purge 不在 MVP 必需范围；
 7. `tags` 是召回信号，必须经过 §3.6 规范化；写入时若有非法 tag，直接拒绝。
 
+### 3.2.1 NotebookItemRemark
+
+NotebookItemRemark 是挂在 Note Item 上的备注。它不替代 item content，也不参与 tag 召回；语义上类似人在纸质笔记上用不同颜色的笔添加边注。
+
+```ts
+type NotebookItemRemarkStatus = "active" | "deleted";
+
+interface NotebookItemRemark {
+  remark_id: string;
+  item_id: string;
+  notebook_id: string;
+  owner_user_id: string;
+  owner_agent_id?: string;
+
+  remark_type: string;           // e.g. "red", "blue", "warning", "verified"
+  content: string;
+  status: NotebookItemRemarkStatus;
+
+  actor_kind: ActorKind;
+  actor_id?: string;
+
+  created_at: string;
+  updated_at: string;
+}
+```
+
+Requirements：
+
+1. 备注必须通过 `item_id` 归属到一个已存在的 NotebookItem；
+2. `remark_type` 和 `content` 必填，`remark_type` 经 trim / 空白归并后存储；
+3. `list` 默认只返回 active remarks，可通过 `remark_type` 过滤；
+4. `remove` 默认软删除 remark，不物理删除记录；
+5. append / remove remark 必须更新 item 的 `updated_at` / `item_revision`，并更新 notebook version；
+6. append / remove remark 必须写 NotebookEvent，event summary 不放完整 item content。
+
 ### 3.3 Supersede Edge
 
 Notebook 不应通过覆盖旧内容来表达事实变化，而应通过状态和 edge 表达。
@@ -352,7 +388,9 @@ type NotebookEventType =
   | "item.status_changed"
   | "item.superseded"
   | "item.promoted_to_system"
-  | "item.demoted_from_system";
+  | "item.demoted_from_system"
+  | "item.remark_appended"
+  | "item.remark_removed";
 
 interface NotebookEvent {
   event_id: string;
@@ -773,6 +811,60 @@ Requirements：
 5. 默认 read 不返回 stale/superseded/deleted；
 6. `deleted` 默认软删除。
 
+### 5.5.1 item remark management
+
+```ts
+list_item_remarks(input: {
+  owner_user_id: string;
+  owner_agent_id?: string;
+  item_id: string;
+  remark_type?: string;
+}) -> NotebookItemRemark[]
+
+append_item_remark(input: {
+  owner_user_id: string;
+  owner_agent_id?: string;
+  session_id?: string;
+  item_id: string;
+  remark_type: string;
+  content: string;
+  actor_kind: ActorKind;
+  actor_id?: string;
+}) -> {
+  status: "ok";
+  remark_id: string;
+  item_id: string;
+  notebook_id: string;
+  notebook_version: string;
+  notebook_revision: number;
+}
+
+remove_item_remark(input: {
+  owner_user_id: string;
+  owner_agent_id?: string;
+  session_id?: string;
+  item_id: string;
+  remark_id: string;
+  actor_kind: ActorKind;
+  actor_id?: string;
+}) -> {
+  status: "ok";
+  remark_id: string;
+  item_id: string;
+  notebook_id: string;
+  notebook_version: string;
+  notebook_revision: number;
+}
+```
+
+Requirements：
+
+1. 三个接口都以 `item_id` 为入口；
+2. list 支持按 `remark_type` 精确过滤；
+3. append 不覆盖已有 remark；
+4. remove 是软删除，默认 list 不返回已删除 remark；
+5. append / remove 会改变 notebook version，使 read cache 和 cross-session hint 能通过 version / event 感知变化。
+
 ### 5.6 promote_to_system_notebook
 
 ```ts
@@ -1177,7 +1269,30 @@ agent-notebook status <item_id> stale \
   --actor-kind curator
 ```
 
-### 9.6 registry-context
+### 9.6 remarks
+
+```bash
+agent-notebook remarks list <item_id> \
+  --owner-user <user_id> \
+  [--type <remark_type>]
+
+agent-notebook remarks append <item_id> <remark_type> <content> \
+  --owner-user <user_id> \
+  --actor-kind online_agent
+
+cat remark.md | agent-notebook remarks append <item_id> <remark_type> \
+  --owner-user <user_id> \
+  --actor-kind online_agent \
+  --stdin
+
+agent-notebook remarks remove <item_id> <remark_id> \
+  --owner-user <user_id> \
+  --actor-kind online_agent
+```
+
+`remarks list` 默认返回 active remarks；`--type` 只返回指定备注类型。`remarks append` 不覆盖已有 remark。`remarks remove` 是软删除。
+
+### 9.7 registry-context
 
 ```bash
 agent-notebook registry-context \
@@ -1185,7 +1300,7 @@ agent-notebook registry-context \
   [--owner-agent <agent_id>]
 ```
 
-### 9.7 hints
+### 9.8 hints
 
 ```bash
 agent-notebook hints \

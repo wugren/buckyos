@@ -52,8 +52,9 @@ Agent Notebook is Jarvis's durable notebook system for long-term facts, preferen
 Example: 
 if the owner says "I arrive in Tokyo the morning after tomorrow, and I'm meeting Lucy for lunch.", this should be recorded in the default owner-action notebook, because it combines travel, time, place, and a meal appointment.
 (The conversation took place on 2026-05-04 12:12:12)
+
 ```exec_bash
-agent-notebook append "Arrived in Tokyo and had lunch with Lucy" "Arrived in Tokyo on the morning of May 6, 2026; had lunch with Lucy that same midday (lunch date)." --actor-kind online_agent --write-reason user_explicit --tags lucy,appointment,tokyo
+agent-notebook append "Arrived in Tokyo and had lunch with Lucy" "Arrived in Tokyo on the morning of May 6, 2026; had lunch with Lucy that same midday (lunch date)."  --tags lucy,appointment,tokyo
 ```
 
 ### Notebooks:

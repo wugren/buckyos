@@ -1369,6 +1369,9 @@ EOF
 agent-notebook read --id nb_01HXY
 agent-notebook list --kind project
 agent-notebook mark-status --id nb_01HXY --status done
+agent-notebook remarks append itm_01HXY red "needs confirmation" --actor-kind online_agent
+agent-notebook remarks list itm_01HXY --type red
+agent-notebook remarks remove itm_01HXY rmk_01HXY --actor-kind online_agent
 
 # 装配 prompt 用的 context
 agent-notebook build-system-context
