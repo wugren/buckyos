@@ -1,5 +1,5 @@
 import { buckyos } from 'buckyos'
-import { DESKTOP_USE_MOCK } from '../runtime'
+import { isMockRuntime } from '../runtime'
 import { TaskCenterMockStore } from './task_mgr_mock.ts'
 
 export type TaskStatus =
@@ -177,12 +177,14 @@ interface RawTask {
   updated_at?: number
 }
 
-interface RawListTasksResult {
-  tasks?: RawTask[]
+interface TaskMgrSdkClient {
+  listTasks(params?: Record<string, unknown>): Promise<RawTask[]>
+  updateTaskData(id: number, data: unknown): Promise<void>
 }
 
-interface TaskMgrRpcClient {
-  call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>
+interface TaskCenterRpcProvider {
+  listTasks(): Promise<RawTask[]>
+  handleNotificationAction(task: Task, action: string): Promise<void>
 }
 
 const terminalStatuses = new Set<TaskStatus>(['completed', 'failed', 'cancelled'])
@@ -211,6 +213,11 @@ function normalizeTaskId(value: number | string | null | undefined): string | nu
   if (value === null || value === undefined) return null
   const text = String(value)
   return text.trim() ? text : null
+}
+
+function normalizeNumericTaskId(value: string): number | null {
+  const numeric = Number(value)
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null
 }
 
 function toIsoTime(value: unknown): string {
@@ -465,6 +472,30 @@ function flattenTasks(tasks: Task[]): Task[] {
   return out
 }
 
+function taskDataForUpdate(task: Task): Record<string, unknown> {
+  const data = { ...task.payload }
+  delete data.backendStatus
+  return data
+}
+
+function toHumanActionKind(action: string): 'approve' | 'reject' | null {
+  switch (action) {
+    case 'approve':
+    case 'confirm':
+      return 'approve'
+    case 'reject':
+    case 'dismiss':
+      return 'reject'
+    default:
+      return null
+  }
+}
+
+function notificationTaskId(id: string): string | null {
+  const prefix = 'task-approval-'
+  return id.startsWith(prefix) ? id.slice(prefix.length) : null
+}
+
 function matchesTaskFilter(task: Task, opts: TaskCenterFilter): boolean {
   if (opts.status && task.status !== opts.status) return false
   if (opts.type && task.type !== opts.type) return false
@@ -525,20 +556,23 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
   private notifications: SystemNotification[] = []
   private events: SystemEvent[] = []
   private handledNotifications = new Map<string, Pick<SystemNotification, 'handledAction' | 'handledAt'>>()
+  private readonly provider: TaskCenterRpcProvider
 
-  constructor() {
+  constructor(provider: TaskCenterRpcProvider = new BuckyOSTaskMgrProvider()) {
     super()
+    this.provider = provider
     void this.refresh()
   }
 
   async refresh(): Promise<void> {
-    const { data, error } = await callTaskMgrRpc<RawListTasksResult>('list_tasks', {})
-    if (error) {
-      console.error('task_mgr.list_tasks failed', error)
+    let rawTasks: RawTask[]
+    try {
+      rawTasks = await this.provider.listTasks()
+    } catch (error) {
+      console.error('task_mgr.listTasks failed', error)
       return
     }
 
-    const rawTasks = Array.isArray(data?.tasks) ? data.tasks : []
     this.tasks = buildTaskTree(rawTasks)
     this.notifications = deriveNotifications(this.tasks).map((notification) => {
       const handled = this.handledNotifications.get(notification.id)
@@ -573,11 +607,7 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
   }
 
   getTaskById(taskId: string): Task | null {
-    for (const task of this.tasks) {
-      if (task.taskId === taskId) return task
-      if (task.children.some((child) => child.taskId === taskId)) return task
-    }
-    return null
+    return flattenTasks(this.tasks).find((task) => task.taskId === taskId) ?? null
   }
 
   filterTasks(opts: TaskCenterFilter): Task[] {
@@ -591,6 +621,8 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
   handleNotification(id: string, action: string): void {
     const notification = this.notifications.find((item) => item.id === id)
     if (!notification) return
+    const taskId = notificationTaskId(id)
+    const task = taskId ? this.getTaskById(taskId) : null
 
     const handled = {
       handledAction: action as SystemNotificationAction,
@@ -601,6 +633,19 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
     notification.handledAction = handled.handledAction
     notification.handledAt = handled.handledAt
     this.emitChange()
+
+    if (!task) return
+
+    void this.provider.handleNotificationAction(task, action)
+      .then(() => this.refresh())
+      .catch((error) => {
+        console.error('task_mgr.handleNotification failed', error)
+        this.handledNotifications.delete(id)
+        notification.handled = false
+        delete notification.handledAction
+        delete notification.handledAt
+        this.emitChange()
+      })
   }
 
   getEvents(): SystemEvent[] {
@@ -609,33 +654,35 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
 }
 
 export function createTaskCenterModel(options: { useMock?: boolean } = {}): TaskCenterModel {
-  return (options.useMock ?? DESKTOP_USE_MOCK) ? new TaskCenterMockModel() : new TaskCenterRpcModel()
+  return (options.useMock ?? isMockRuntime()) ? new TaskCenterMockModel() : new TaskCenterRpcModel()
 }
 
-async function callTaskMgrRpc<T>(
-  method: string,
-  params: Record<string, unknown> = {},
-): Promise<{ data: T | null; error: unknown }> {
-  try {
-    const rpcClient = getTaskMgrRpcClient()
-    const result = await rpcClient.call<T>(method, params)
-    return { data: result, error: null }
-  } catch (error) {
-    return { data: null, error }
-  }
-}
+class BuckyOSTaskMgrProvider implements TaskCenterRpcProvider {
+  private client: TaskMgrSdkClient | null = null
 
-function getTaskMgrRpcClient(): TaskMgrRpcClient {
-  const sdk = buckyos as unknown as {
-    getServiceRpcClient?: (serviceName: string) => TaskMgrRpcClient
-    kRPCClient?: new (apiUrl: string) => TaskMgrRpcClient
+  async listTasks(): Promise<RawTask[]> {
+    return this.getClient().listTasks()
   }
 
-  if (sdk.getServiceRpcClient) {
-    return sdk.getServiceRpcClient('task-manager')
+  async handleNotificationAction(task: Task, action: string): Promise<void> {
+    const kind = toHumanActionKind(action)
+    const id = normalizeNumericTaskId(task.taskId)
+    if (!kind || id === null) return
+
+    await this.getClient().updateTaskData(id, {
+      ...taskDataForUpdate(task),
+      human_action: {
+        kind,
+        acted_at: new Date().toISOString(),
+        source: 'desktop',
+      },
+    })
   }
-  if (sdk.kRPCClient) {
-    return new sdk.kRPCClient('/kapi/task-manager')
+
+  private getClient(): TaskMgrSdkClient {
+    if (!this.client) {
+      this.client = buckyos.getTaskManagerClient() as unknown as TaskMgrSdkClient
+    }
+    return this.client
   }
-  throw new Error('buckyos task-manager rpc client is unavailable')
 }
