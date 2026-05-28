@@ -1,4 +1,4 @@
-use crate::task::{Task, TaskPermissions, TaskStatus};
+use crate::task::{Task, TaskNote, TaskPermissions, TaskStatus};
 use buckyos_api::{
     get_rdb_instance, RdbBackend, TASK_MANAGER_RDB_INSTANCE_ID, TASK_MANAGER_RDB_SCHEMA_POSTGRES,
     TASK_MANAGER_RDB_SCHEMA_SQLITE, TASK_MANAGER_SERVICE_NAME,
@@ -176,6 +176,54 @@ impl TaskDb {
             .fetch_optional(self.pool())
             .await?;
         row.map(task_from_row).transpose()
+    }
+
+    pub async fn add_task_note(&self, note: &TaskNote) -> DbResult<i64> {
+        let data_str = serde_json::to_string(&note.data).unwrap_or_else(|_| "{}".to_string());
+        let created_at = note.created_at as i64;
+        let updated_at = note.updated_at as i64;
+
+        let sql = self.render_sql(
+            "INSERT INTO task_note (
+                task_id, note_type, content, data,
+                author_user_id, author_app_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id",
+        );
+
+        let row = sqlx::query(&sql)
+            .bind(note.task_id)
+            .bind(note.note_type.clone())
+            .bind(note.content.clone())
+            .bind(data_str)
+            .bind(note.author_user_id.clone())
+            .bind(note.author_app_id.clone())
+            .bind(created_at)
+            .bind(updated_at)
+            .fetch_one(self.pool())
+            .await?;
+
+        let id: i64 = row.try_get("id")?;
+        info!(
+            "task_db.add_task_note: id={} task_id={} note_type={} author_user_id={} author_app_id={}",
+            id,
+            note.task_id,
+            note.note_type,
+            note.author_user_id,
+            note.author_app_id
+        );
+        Ok(id)
+    }
+
+    pub async fn list_task_notes(&self, task_id: i64) -> DbResult<Vec<TaskNote>> {
+        let sql = self.render_sql(
+            "SELECT * FROM task_note WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(task_note_from_row).collect()
     }
 
     pub async fn list_tasks_filtered(
@@ -570,6 +618,30 @@ fn task_from_row(row: AnyRow) -> DbResult<Task> {
     })
 }
 
+fn task_note_from_row(row: AnyRow) -> DbResult<TaskNote> {
+    let id: i64 = row.try_get("id")?;
+    let task_id: i64 = row.try_get("task_id")?;
+    let note_type: String = row.try_get("note_type")?;
+    let content: String = row.try_get("content")?;
+    let data_str: Option<String> = row.try_get("data")?;
+    let author_user_id: String = row.try_get("author_user_id")?;
+    let author_app_id: String = row.try_get("author_app_id")?;
+    let created_at: i64 = row.try_get("created_at")?;
+    let updated_at: i64 = row.try_get("updated_at")?;
+
+    Ok(TaskNote {
+        id,
+        task_id,
+        note_type,
+        content,
+        data: parse_data(data_str),
+        author_user_id,
+        author_app_id,
+        created_at: created_at.max(0) as u64,
+        updated_at: updated_at.max(0) as u64,
+    })
+}
+
 fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -620,6 +692,20 @@ mod tests {
         }
     }
 
+    fn create_test_note(task_id: i64, content: &str) -> TaskNote {
+        TaskNote {
+            id: 0,
+            task_id,
+            note_type: "human".to_string(),
+            content: content.to_string(),
+            data: json!({"priority": "high"}),
+            author_user_id: "user1".to_string(),
+            author_app_id: "task-center".to_string(),
+            created_at: 2,
+            updated_at: 2,
+        }
+    }
+
     async fn setup_test_db() -> (TaskDb, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -655,6 +741,34 @@ mod tests {
         assert_eq!(retrieved_task.id, id);
         assert_eq!(retrieved_task.name, "task1");
         assert_eq!(retrieved_task.status, TaskStatus::Pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_and_list_task_notes() {
+        let (db, _temp_dir) = setup_test_db().await;
+
+        let task_id = db
+            .create_task(&create_test_task("note_parent"))
+            .await
+            .unwrap();
+
+        let first_id = db
+            .add_task_note(&create_test_note(task_id, "first note"))
+            .await
+            .unwrap();
+        let second_id = db
+            .add_task_note(&create_test_note(task_id, "second note"))
+            .await
+            .unwrap();
+
+        let notes = db.list_task_notes(task_id).await.unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].id, first_id);
+        assert_eq!(notes[0].task_id, task_id);
+        assert_eq!(notes[0].content, "first note");
+        assert_eq!(notes[0].data, json!({"priority": "high"}));
+        assert_eq!(notes[1].id, second_id);
+        assert_eq!(notes[1].content, "second note");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -942,6 +1056,23 @@ mod tests {
             db.get_task(child_id).await.unwrap().is_none(),
             "child task should have been cascade-deleted"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_task_delete_cascades_notes() {
+        let (db, _temp_dir) = setup_test_db().await;
+        let task_id = db
+            .create_task(&create_test_task("note_cascade_parent"))
+            .await
+            .unwrap();
+        db.add_task_note(&create_test_note(task_id, "will be deleted"))
+            .await
+            .unwrap();
+
+        db.delete_task(task_id).await.unwrap();
+
+        let notes = db.list_task_notes(task_id).await.unwrap();
+        assert!(notes.is_empty());
     }
 
     #[test]

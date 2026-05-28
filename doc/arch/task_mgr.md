@@ -22,7 +22,8 @@ TaskMgr 的核心职责是：
 3. 维护父子任务关系，使复杂工作可以表现为一棵任务树。
 4. 通过权限字段约束任务读写范围。
 5. 在任务变化时发布 kevent 事件，避免调用方长期轮询。
-6. 为常见系统任务提供可复用能力，目前内置了下载任务执行路径。
+6. 提供独立 Task Notes 旁路，让用户或系统在不修改 `Task.data` 和任务运行语义的前提下补充执行参考。
+7. 为常见系统任务提供可复用能力，目前内置了下载任务执行路径。
 
 TaskMgr 不是调度器，也不是业务编排器。调度器、Workflow、AICC、Control Panel 等模块决定“做什么、怎么做、在哪里做”，TaskMgr 负责“外部如何看到这件事做到了哪里，以及如何把通用状态变更写回同一个可观察面”。
 
@@ -72,6 +73,24 @@ pub struct Task {
     pub updated_at: u64,
 }
 ```
+
+Task Notes 是独立于 `Task.data` 的旁路数据：
+
+```rust
+pub struct TaskNote {
+    pub id: i64,
+    pub task_id: i64,
+    pub note_type: String,
+    pub content: String,
+    pub data: serde_json::Value,
+    pub author_user_id: String,
+    pub author_app_id: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+```
+
+新增 note 只写入 `task_note` 表，不更新 task 的 `data`、`status`、`progress` 或 `updated_at`，也不触发 task changed 事件。Agent 可以把 notes 当作执行历史旁路参考，但不能把 notes 当成任务输入或执行回执本身。
 
 字段语义：
 
@@ -179,7 +198,7 @@ task-mgr-main
 Schema version 当前为：
 
 ```text
-3
+4
 ```
 
 默认 Sqlite 连接为空，由 rdb_mgr 在解析时生成 `sqlite://$appdata/main.db`。服务启动时会从 service spec 中获取 RDB instance，并应用 schema。测试场景可以直接用编译期默认 DDL 打开临时 Sqlite。
@@ -221,6 +240,25 @@ Schema version 当前为：
 - `idx_task_status_created`：`(status, created_at DESC)`
 - `idx_task_type_created`：`(task_type, created_at DESC)`
 - `idx_task_runner_status`：`(runner, status)`
+
+Notes 表为 `task_note`，逻辑字段包括：
+
+| 列 | 说明 |
+| --- | --- |
+| `id` | 自增 note ID |
+| `task_id` | 归属任务 ID，外键，删除 task 时级联删除 notes |
+| `note_type` | note 类型，默认 `human` |
+| `content` | note 正文 |
+| `data` | 可选 JSON 字符串，用于结构化 note metadata |
+| `author_user_id` | note 作者用户 |
+| `author_app_id` | note 作者应用 |
+| `created_at` | 创建时间 |
+| `updated_at` | 更新时间 |
+
+主要索引：
+
+- `idx_task_note_task_created`：`(task_id, created_at ASC, id ASC)`，支持按 task_id 列出全部 notes
+- `idx_task_note_author_created`：`(author_user_id, author_app_id, created_at DESC)`，保留作者维度检索能力
 
 ### 4.2 JSON 更新语义
 
@@ -745,6 +783,8 @@ RPC method 清单：
 | `create_task` | `TaskManagerCreateTaskReq` | `CreateTaskResult` | 创建普通任务 |
 | `create_download_task` | `TaskManagerCreateDownloadTaskReq` | `CreateDownloadTaskResult` | 创建或复用下载任务，并提交下载执行器 |
 | `get_task` | `TaskManagerGetTaskReq` | `GetTaskResult` | 获取单个任务 |
+| `add_task_note` | `TaskManagerAddTaskNoteReq` | `AddTaskNoteResult` | 给 task 追加独立 note，不修改 `Task.data` |
+| `list_task_notes` | `TaskManagerListTaskNotesReq` | `ListTaskNotesResult` | 按 `task_id` 列出全部 notes |
 | `list_tasks` | `TaskManagerListTasksReq` | `ListTasksResult` | 按字段过滤任务 |
 | `list_tasks_by_time_range` | `TaskManagerListTasksByTimeRangeReq` | `ListTasksResult` | 按创建时间范围过滤任务 |
 | `get_subtasks` | `TaskManagerGetSubtasksReq` | `ListTasksResult` | 获取直接子任务 |

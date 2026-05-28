@@ -3,7 +3,7 @@ use crate::download_executor::{
     merge_download_source_patch, shared_download_executor, should_enqueue_download_task,
     spec_from_task, task_has_download_url, task_has_objid, DownloadTaskStore, DOWNLOAD_TASK_TYPE,
 };
-use crate::task::{new_task, Task, TaskScope, TaskStatus};
+use crate::task::{new_task, Task, TaskNote, TaskScope, TaskStatus};
 use crate::task_db::TaskDb;
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -651,6 +651,78 @@ impl TaskManagerHandler for TaskManagerService {
         Ok(task)
     }
 
+    async fn handle_add_task_note(
+        &self,
+        task_id: i64,
+        note_type: Option<&str>,
+        content: &str,
+        data: Option<Value>,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<TaskNote> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "note content is required".to_string(),
+            ));
+        }
+
+        let request_ctx = request_context_from_source_or_rpc(source_user_id, source_app_id, &ctx);
+        let task = self.load_task(task_id).await?;
+        if !self.can_read_task(&request_ctx, &task) {
+            return Err(RPCErrors::NoPermission(
+                "No permission to add task note".to_string(),
+            ));
+        }
+
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let mut note = TaskNote {
+            id: 0,
+            task_id,
+            note_type: note_type
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("human")
+                .to_string(),
+            content: content.to_string(),
+            data: data.unwrap_or_else(|| json!({})),
+            author_user_id: request_ctx.user_id,
+            author_app_id: request_ctx.app_id,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let note_id = self
+            .db
+            .add_task_note(&note)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        note.id = note_id;
+        Ok(note)
+    }
+
+    async fn handle_list_task_notes(
+        &self,
+        task_id: i64,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<Vec<TaskNote>> {
+        let request_ctx = request_context_from_source_or_rpc(source_user_id, source_app_id, &ctx);
+        let task = self.load_task(task_id).await?;
+        if !self.can_read_task(&request_ctx, &task) {
+            return Err(RPCErrors::NoPermission(
+                "No permission to list task notes".to_string(),
+            ));
+        }
+
+        self.db
+            .list_task_notes(task_id)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))
+    }
+
     async fn handle_list_tasks(
         &self,
         filter: TaskFilter,
@@ -1252,6 +1324,85 @@ mod tests {
             }
         } else {
             panic!("Failed to create task");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_and_list_task_notes_does_not_change_task_data() {
+        let (server, _temp_dir) = setup_test_environment().await;
+        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+
+        let create_req = create_rpc_request(
+            "create_task",
+            json!({
+                "name": "note_task",
+                "task_type": "test_type",
+                "app_id": "task-center",
+                "user_id": "user1",
+                "data": {"request": {"payload": "original"}}
+            }),
+        );
+        let create_resp = server.handle_rpc_call(create_req, ip).await.unwrap();
+        let task_id = if let RPCResult::Success(result) = create_resp.result {
+            result["task_id"].as_i64().unwrap()
+        } else {
+            panic!("Failed to create task");
+        };
+
+        let add_note_req = create_rpc_request(
+            "add_task_note",
+            json!({
+                "task_id": task_id,
+                "note_type": "human",
+                "content": "Prefer the previous successful approach.",
+                "data": {"source": "review"},
+                "source_user_id": "user1",
+                "source_app_id": "task-center"
+            }),
+        );
+        let add_note_resp = server.handle_rpc_call(add_note_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = add_note_resp.result {
+            assert!(result["note_id"].as_i64().unwrap() > 0);
+            assert_eq!(result["note"]["task_id"], task_id);
+            assert_eq!(
+                result["note"]["content"],
+                "Prefer the previous successful approach."
+            );
+            assert_eq!(result["note"]["data"]["source"], "review");
+        } else {
+            panic!("Failed to add task note");
+        }
+
+        let list_notes_req = create_rpc_request(
+            "list_task_notes",
+            json!({
+                "task_id": task_id,
+                "source_user_id": "user1",
+                "source_app_id": "task-center"
+            }),
+        );
+        let list_notes_resp = server.handle_rpc_call(list_notes_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = list_notes_resp.result {
+            let notes = result["notes"].as_array().unwrap();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0]["note_type"], "human");
+            assert_eq!(notes[0]["author_user_id"], "user1");
+            assert_eq!(notes[0]["author_app_id"], "task-center");
+        } else {
+            panic!("Failed to list task notes");
+        }
+
+        let get_req = create_rpc_request("get_task", json!({ "id": task_id }));
+        let get_resp = server.handle_rpc_call(get_req, ip).await.unwrap();
+        if let RPCResult::Success(result) = get_resp.result {
+            assert_eq!(
+                result["task"]["data"],
+                json!({"request": {"payload": "original"}})
+            );
+            assert_eq!(result["task"]["status"], "Pending");
+            assert_eq!(result["task"]["progress"], 0.0);
+        } else {
+            panic!("Failed to get task after adding note");
         }
     }
 

@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-pub use buckyos_api::{Task, TaskPermissions, TaskScope, TaskStatus};
+pub use buckyos_api::{Task, TaskNote, TaskPermissions, TaskScope, TaskStatus};
 
 pub fn new_task(
     name: String,

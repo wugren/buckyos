@@ -4,6 +4,12 @@
 
 TaskManager 的数据库字段仍然保存 JSON，核心服务只负责保存、合并和事件通知；业务侧应优先通过 `buckyos-api` 中的 `TaskDataType` / `TypedTaskData` / 各具体 `*TaskData` 类型读写，避免继续散落使用未约束的 `serde_json::Value`。
 
+## Task Notes 边界
+
+Task Notes 是 Task Manager 的平行功能，不属于 `Task.data`，也不参与任务的一次性运行语义。用户或系统可以通过 `add_task_note` 给某个 `task_id` 追加 note，并通过 `list_task_notes` 按 `task_id` 读取全部 notes。
+
+Notes 持久化在独立的 `task_note` 表中，包含 `task_id`、`note_type`、`content`、可选 JSON `data`、作者信息和创建/更新时间。新增 note 不会修改 `task.data`、`task.status`、`task.progress` 或 task 的 `updated_at`，因此 Agent 可以把人类 notes 作为执行历史旁路参考，而不会污染任务自身的输入/进度/结果数据。
+
 ## 通用结构
 
 新的 TaskData 语义统一分为三段：
