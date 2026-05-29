@@ -357,7 +357,7 @@ Self-Check Round History = 短期推理痕迹
 - 长期事实必须沉淀到 Notebook、Schedule-Task 或用户偏好中。
 - 不要依赖旧 Round History 来恢复计划状态。
 
-### 8.3 触发频率建议
+### 8.3 触发频率
 
 Self-Check 不应无条件高频运行。
 

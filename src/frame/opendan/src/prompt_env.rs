@@ -932,7 +932,7 @@ mod tests {
             runtime_last_schedule_task_list_text:
                 "- created task_id=task-1 task_title=\"daily mail check\" note=\"create from Notebook Item notebook=user/actions item=item-9\"\n".into(),
             notebook_list_text: "Available notebooks: 1 total.\n- user/preferences: preferences, 2 records, last modified 2026-05-24T10:00:00Z\n".into(),
-            notebook_last_items_text: "Recent notebook items: latest 1.\n- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)\n".into(),
+            notebook_last_items_text: "Recent notebook items: latest 1.\nitem-1 active 2026-05-24T10:00:00Z sess-1\nUse a concise tone.\n".into(),
             llm_context: LlmContextEnv {
                 msgs: vec![json!({
                     "record_id": "msg-1",

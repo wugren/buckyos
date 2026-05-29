@@ -87,6 +87,20 @@ fn schedule_task_prompt_text_extracts_source_and_failure() {
 }
 
 #[test]
+fn schedule_task_prompt_reader_uses_unfiltered_fallback_for_system_owner() {
+    let (user_id, app_id) = schedule_task_prompt_reader_identity("system", "jarvis");
+    if user_id.is_none() {
+        assert_eq!(app_id, None);
+    } else {
+        assert!(app_id.is_some());
+    }
+
+    let (user_id, app_id) = schedule_task_prompt_reader_identity("alice", "jarvis");
+    assert_eq!(user_id, Some("alice".to_string()));
+    assert!(app_id.as_deref().is_some_and(|value| !value.is_empty()));
+}
+
+#[test]
 fn self_check_behavior_end_keeps_session_idle() {
     assert_eq!(
         session_end_disposition(SessionKind::SelfCheck),
@@ -1441,6 +1455,9 @@ fn session_meta_round_trips_pending_inputs() {
         last_report_delivery: None,
         internal_continuation: None,
         task_binding: None,
+        self_check_seen_item_update_secs: 0,
+        self_check_last_round_at_ms: 0,
+        self_check_idle_heartbeats: 0,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let restored: SessionMeta = serde_json::from_str(&json).unwrap();

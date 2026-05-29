@@ -1484,15 +1484,15 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
-            "--id" => {
+            "--bookid" => {
                 idx += 1;
                 let value = rest
                     .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--bookid`"))?;
                 notebook_id = Some(value.clone());
             }
-            v if v.starts_with("--id=") => {
-                notebook_id = Some(v["--id=".len()..].to_string());
+            v if v.starts_with("--bookid=") => {
+                notebook_id = Some(v["--bookid=".len()..].to_string());
             }
             "--tags" => {
                 idx += 1;
@@ -1587,7 +1587,7 @@ fn parse_agent_notebook_read(rest: &[String]) -> Result<AgentNotebookVerb, Agent
     }
     if !positionals.is_empty() {
         return Err(agent_notebook_invalid(format!(
-            "`read` does not accept positional notebook_id; use `--id <notebook_id>` (got {} positional arguments)",
+            "`read` does not accept positional notebook_id; use `--bookid <notebook_id>` (got {} positional arguments)",
             positionals.len()
         )));
     }
@@ -1620,15 +1620,15 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
-            "--id" => {
+            "--bookid" => {
                 idx += 1;
                 let value = rest
                     .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--bookid`"))?;
                 notebook_id = Some(value.clone());
             }
-            v if v.starts_with("--id=") => {
-                notebook_id = Some(v["--id=".len()..].to_string());
+            v if v.starts_with("--bookid=") => {
+                notebook_id = Some(v["--bookid=".len()..].to_string());
             }
             "--stdin" => use_stdin = true,
             "--source-excerpt" => {
@@ -1712,7 +1712,7 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
         }
         (_, n) => {
             return Err(agent_notebook_invalid(format!(
-                "`append` expects 1-2 positional arguments (title[, content]); use `--id <notebook_id>` to select a notebook, got {n}"
+                "`append` expects 1-2 positional arguments (title[, content]); use `--bookid <notebook_id>` to select a notebook, got {n}"
             )));
         }
     };
@@ -1862,15 +1862,15 @@ fn parse_agent_notebook_create(rest: &[String]) -> Result<AgentNotebookVerb, Age
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
-            "--id" => {
+            "--bookid" => {
                 idx += 1;
                 let value = rest
                     .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--id`"))?;
+                    .ok_or_else(|| agent_notebook_invalid("missing value for `--bookid`"))?;
                 notebook_id = Some(value.clone());
             }
-            v if v.starts_with("--id=") => {
-                notebook_id = Some(v["--id=".len()..].to_string());
+            v if v.starts_with("--bookid=") => {
+                notebook_id = Some(v["--bookid=".len()..].to_string());
             }
             "--kind" => {
                 idx += 1;
@@ -1913,12 +1913,12 @@ fn parse_agent_notebook_create(rest: &[String]) -> Result<AgentNotebookVerb, Age
     }
     if !positionals.is_empty() {
         return Err(agent_notebook_invalid(format!(
-            "`create-notebook` does not accept positional notebook_id; use `--id <notebook_id>` (got {} positional arguments)",
+            "`create-notebook` does not accept positional notebook_id; use `--bookid <notebook_id>` (got {} positional arguments)",
             positionals.len()
         )));
     }
-    let notebook_id =
-        notebook_id.ok_or_else(|| agent_notebook_invalid("`create-notebook` requires `--id`"))?;
+    let notebook_id = notebook_id
+        .ok_or_else(|| agent_notebook_invalid("`create-notebook` requires `--bookid`"))?;
     Ok(AgentNotebookVerb::CreateNotebook {
         notebook_id,
         kind,
@@ -4620,7 +4620,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("concise replies"),
                 OsString::from("user prefers terse output"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--confidence"),
                 OsString::from("high"),
@@ -4669,7 +4669,7 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("read"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("reply-style"),
@@ -4693,7 +4693,7 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("read"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("reply-style"),
@@ -4727,7 +4727,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("design notes"),
                 OsString::from("--stdin"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("projects/demo"),
                 OsString::from("--tags"),
                 OsString::from("design,notes"),
@@ -4758,7 +4758,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("fact"),
                 OsString::from("body"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("fact"),
@@ -4907,7 +4907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_create_notebook_requires_id_flag() {
+    async fn agent_notebook_create_notebook_requires_bookid_flag() {
         let _lock = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
@@ -4916,7 +4916,7 @@ mod tests {
             .await
             .expect("create workspace dir");
 
-        let missing_id = execute(
+        let missing_bookid = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("create-notebook"),
@@ -4927,16 +4927,32 @@ mod tests {
             None,
         )
         .await
-        .expect_err("create-notebook without id should fail during parse");
-        assert!(missing_id
+        .expect_err("create-notebook without bookid should fail during parse");
+        assert!(missing_bookid
             .to_string()
-            .contains("`create-notebook` requires `--id`"));
+            .contains("`create-notebook` requires `--bookid`"));
+
+        let old_id = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("create-notebook"),
+                OsString::from("--id"),
+                OsString::from("projects/demo"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect_err("old --id flag should fail during parse");
+        assert!(old_id
+            .to_string()
+            .contains("unsupported flag `--id` for `create-notebook`"));
 
         let created = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("create-notebook"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("projects/demo"),
                 OsString::from("--kind"),
                 OsString::from("project"),
@@ -5006,7 +5022,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("old fact"),
                 OsString::from("a stale fact"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("fact"),
@@ -5048,7 +5064,7 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("read"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
             ],
             test_env(root, cwd),
@@ -5080,7 +5096,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("bad"),
                 OsString::from("x"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("bad\"tag"),
@@ -5126,7 +5142,7 @@ mod tests {
                 OsString::from("append"),
                 OsString::from("from env"),
                 OsString::from("body via env-resolved scope"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("env-test"),
@@ -5144,7 +5160,7 @@ mod tests {
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("read"),
-                OsString::from("--id"),
+                OsString::from("--bookid"),
                 OsString::from("user/preferences"),
                 OsString::from("--tags"),
                 OsString::from("env-test"),
@@ -5202,7 +5218,7 @@ mod tests {
                     OsString::from("append"),
                     OsString::from(title),
                     OsString::from("seed content"),
-                    OsString::from("--id"),
+                    OsString::from("--bookid"),
                     OsString::from(nb_id),
                     OsString::from("--tags"),
                     OsString::from("tone,style"),

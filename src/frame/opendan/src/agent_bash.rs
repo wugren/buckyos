@@ -356,6 +356,7 @@ pub struct SessionToolsBuild {
     pub agent_root: PathBuf,
     pub agent_id: String,
     pub session_id: String,
+    pub appclient_session_token: String,
     pub filesystem_policy: FilesystemPolicy,
     /// Pre-resolved Session Exec Bin renderer (per the behavior's tool
     /// plan). `None` ⇒ no tombstones and no Agent tool sync — useful in
@@ -431,7 +432,11 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
         &layout,
         &bash_runtime_dir,
         build.bin_renderer.clone(),
-        session_exec_base_env(&build.agent_root, &build.session_id),
+        session_exec_base_env(
+            &build.agent_root,
+            &build.session_id,
+            &build.appclient_session_token,
+        ),
     );
     Ok(manager)
 }
@@ -476,7 +481,11 @@ fn symlink_agent_tool(agent_tool: &Path, path: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(agent_tool, path)
 }
 
-fn session_exec_base_env(agent_root: &Path, session_id: &str) -> Vec<(String, String)> {
+fn session_exec_base_env(
+    agent_root: &Path,
+    session_id: &str,
+    appclient_session_token: &str,
+) -> Vec<(String, String)> {
     let mut env = vec![
         (
             OPENDAN_AGENT_ROOT_ENV.to_string(),
@@ -484,14 +493,12 @@ fn session_exec_base_env(agent_root: &Path, session_id: &str) -> Vec<(String, St
         ),
         (OPENDAN_SESSION_ID_ENV.to_string(), session_id.to_string()),
     ];
-    if let Ok(token) = std::env::var(agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV) {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            env.push((
-                agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV.to_string(),
-                token,
-            ));
-        }
+    let token = appclient_session_token.trim();
+    if !token.is_empty() {
+        env.push((
+            agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV.to_string(),
+            token.to_string(),
+        ));
     }
     env
 }
@@ -993,6 +1000,7 @@ mod tests {
             agent_root: dir.path().join("agent_root"),
             agent_id: "test-agent".to_string(),
             session_id: format!("s_{}", now_ms()),
+            appclient_session_token: "test-token".to_string(),
             filesystem_policy: FilesystemPolicy::Workspace,
             bin_renderer: None,
         })
@@ -1190,10 +1198,16 @@ mod tests {
                 ),
                 ("AGENT_MEMORY_ROOT".to_string(), "/tmp/memory".to_string()),
             ],
-            &[(
-                OPENDAN_AGENT_ROOT_ENV.to_string(),
-                "/tmp/agent-root".to_string(),
-            )],
+            &[
+                (
+                    OPENDAN_AGENT_ROOT_ENV.to_string(),
+                    "/tmp/agent-root".to_string(),
+                ),
+                (
+                    agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV.to_string(),
+                    "runtime-token".to_string(),
+                ),
+            ],
             &ctx,
         );
         let value = |key: &str| {
@@ -1206,6 +1220,10 @@ mod tests {
         assert_eq!(value(OPENDAN_SESSION_ID_ENV), "session-real");
         assert_eq!(value(OPENDAN_AGENT_ROOT_ENV), "/tmp/agent-root");
         assert_eq!(value(OPENDAN_TRACE_ID_ENV), "trace-1");
+        assert_eq!(
+            value(agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV),
+            "runtime-token"
+        );
         assert!(value("OPENDAN_AGENT_TOOL").is_empty());
     }
 

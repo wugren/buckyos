@@ -367,7 +367,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | --- | --- | --- | --- |
 | `$notebook` | `{{ notebook }}` | object | 下列字段的聚合 |
 | `$notebook.list_text` | `{{ notebook.list_text }}` | string | Agent Notebook registry 的默认纯文本渲染；列出当前一共有多少个 Notebook、每个 Notebook 有多少条记录，以及最后修改时间 |
-| `$notebook.last_items_text` | `{{ notebook.last_items_text }}` | string | Agent Notebook 最近变化 item 的默认纯文本渲染；按当前 `session_id` 上次访问后的增量窗口读取，最多列出最近 8 条 item；带 active `self_check` remark 且标记 `keep_observing` 的 item 不受该窗口限制 |
+| `$notebook.last_items_text` | `{{ notebook.last_items_text }}` | string | Agent Notebook 最近变化 item 的默认纯文本渲染；按当前 `session_id` 上次访问后的增量窗口读取，最多列出最近 8 条 item；每条 item 直接输出 `item_id status updated_at source_session_id` 和正文内容；带 active `self_check` remark 且标记 `keep_observing` 的 item 不受该窗口限制 |
 
 推荐在 system prompt 中直接插入这两个字段：
 
@@ -376,7 +376,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 {{ notebook.last_items_text }}
 ```
 
-`notebook.list_text` 用于帮助 Agent 选择应该读取哪本 notebook；`notebook.last_items_text` 用于提示最近变化的记录标题和归属，但不应替代 `agent-notebook read` 的事实读取。
+`notebook.list_text` 用于帮助 Agent 选择应该读取哪本 notebook；`notebook.last_items_text` 用于直接暴露最近变化 item 的状态、更新时间、来源 session 和内容，避免只拿到标题后再补读。
 
 ## 4. `on_behavior_switch` 变量
 

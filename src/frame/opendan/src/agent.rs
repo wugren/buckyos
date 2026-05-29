@@ -194,6 +194,38 @@ pub fn decide_forward_route(
     ForwardRouteDecision::KeepInUi
 }
 
+async fn resolve_appclient_session_token() -> Result<String> {
+    let runtime = match get_buckyos_api_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            #[cfg(test)]
+            {
+                warn!("opendan.agent: buckyos runtime unavailable before session tools: {err}");
+                return Ok(String::new());
+            }
+            #[cfg(not(test))]
+            {
+                return Err(anyhow!("load buckyos runtime before session tools: {err}"));
+            }
+        }
+    };
+    let token = runtime.get_session_token().await;
+    if token.trim().is_empty() {
+        #[cfg(test)]
+        {
+            warn!("opendan.agent: buckyos runtime returned empty session token for session tools");
+            return Ok(String::new());
+        }
+        #[cfg(not(test))]
+        {
+            return Err(anyhow!(
+                "buckyos runtime returned empty session token before session tools"
+            ));
+        }
+    }
+    Ok(token)
+}
+
 /// Shutdown signal. Owners drop the sender or `send(())` to start a graceful
 /// shutdown.
 type ShutdownRx = mpsc::Receiver<()>;
@@ -1410,6 +1442,7 @@ impl AIAgent {
         }
         let agent_id = self.agent_id();
         let bin_renderer = self.build_session_bin_renderer(&agent_id, &session_id, &behavior_name);
+        let appclient_session_token = resolve_appclient_session_token().await?;
 
         let tools = build_session_tools(SessionToolsBuild {
             workspace_root: tool_root.clone(),
@@ -1417,6 +1450,7 @@ impl AIAgent {
             agent_root: self.config.layout.root.clone(),
             agent_id: agent_id.clone(),
             session_id: session_id.clone(),
+            appclient_session_token,
             filesystem_policy: self.config.toml.runtime.filesystem_policy,
             bin_renderer,
         })

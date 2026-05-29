@@ -5,9 +5,10 @@ use std::sync::{Arc, Weak};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use buckyos_api::{
-    match_event_patterns, parse_typed_task_data, AiContent, AiMessage, AiRole, MsgCenterClient,
-    Task, TaskFilter, TaskManagerClient, TaskNote, TaskStatus, TypedTaskData,
-    UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
+    get_buckyos_api_runtime, match_event_patterns, parse_typed_task_data, AiContent, AiMessage,
+    AiRole, MsgCenterClient, Task, TaskFilter, TaskManagerClient, TaskNote, TaskStatus,
+    TypedTaskData, UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY,
+    UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
 use ndn_lib::{MsgContent, MsgObjKind, MsgObject};
@@ -61,6 +62,7 @@ pub use crate::session_model::{
     ImprovementBudget, ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus,
     InternalContinuation, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
     ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
+    TimerEventKind,
 };
 use crate::task_dispatch::TaskDispatch;
 use crate::worksession_tools::render_workspace_inventory;
@@ -76,6 +78,12 @@ const MAX_PENDING_INPUTS: usize = 256;
 const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
 const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_IDLE_WORKER_RETIRE_MS: u64 = 3 * 60 * 1000;
+/// Self-Check heartbeat (doc/opendan/Self-Check Behavior.md §8.3): force a
+/// round every 15min while the Notebook is active, backing off to 30min once
+/// it goes quiet so an input-free system wakes at most ~48 times/day. The
+/// underlying timer still ticks every 60s — these only gate the LLM round.
+const SELF_CHECK_ACTIVE_HEARTBEAT_MS: u64 = 15 * 60 * 1000;
+const SELF_CHECK_IDLE_HEARTBEAT_MS: u64 = 30 * 60 * 1000;
 const BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS: u64 = 60 * 1000;
 static FLUSH_META_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1652,6 +1660,24 @@ impl AgentSession {
                 }
             }
 
+            // Self-Check wakeup gate (§8.3): the hard-barrier timer ticks
+            // every 60s, but we only want to spend an LLM round when there is
+            // real work — a new/changed Notebook item, a user message, or a
+            // non-heartbeat timer event — or when a heartbeat is due. Skipping
+            // the no-op ticks is what keeps an idle system at ~48 rounds/day.
+            if matches!(self.kind, SessionKind::SelfCheck) {
+                let has_non_heartbeat_event = turn_events
+                    .iter()
+                    .any(|e| e.event_id != TimerEventKind::HardBarrier.event_id());
+                if !self
+                    .self_check_should_run_round(msg_count > 0, has_non_heartbeat_event)
+                    .await
+                {
+                    self.discard_consumed(&consumed_keys).await;
+                    continue;
+                }
+            }
+
             let hook_env = self
                 .apply_hook(SessionHookPoint::OnWakeup, &driver, &pending)
                 .await;
@@ -1784,6 +1810,15 @@ impl AgentSession {
                     // Successful turn ⇒ remove the items we just fed to the
                     // LLM from the persistent queue.
                     self.discard_consumed(&consumed_keys).await;
+                    // Advance the Self-Check change-watermark to the Notebook's
+                    // state *after* this round. Self-Check appends review
+                    // remarks, and `append_item_remark` bumps the item's
+                    // `updated_at` — capturing the post-round max absorbs those
+                    // self-inflicted writes so the next 60s tick doesn't treat
+                    // them as a fresh change (which would loop every minute).
+                    if matches!(self.kind, SessionKind::SelfCheck) {
+                        self.self_check_advance_seen_watermark().await;
+                    }
                     match action {
                         NextAction::Continue => continue,
                         NextAction::WaitForMsg => {
@@ -1829,6 +1864,116 @@ impl AgentSession {
                         Some(SessionInput::Wakeup) => {}
                     }
                 }
+            }
+        }
+    }
+
+    /// Decide whether this Self-Check timer wakeup should run a real LLM round
+    /// or be skipped as a cheap no-op tick (doc/opendan/Self-Check Behavior.md
+    /// §8.3). Returns `true` to run; on a run it advances the persisted gate
+    /// state (seen-watermark, last-round time, idle-heartbeat count) and
+    /// flushes. A run happens when there is real work — a pending user message,
+    /// a non-heartbeat timer event, or a Notebook item updated since the last
+    /// round we acted on — or when the heartbeat is due (every 15min while
+    /// active, backing off to 30min once the Notebook stays quiet).
+    async fn self_check_should_run_round(
+        &self,
+        has_user_msg: bool,
+        has_non_heartbeat_event: bool,
+    ) -> bool {
+        let now = now_ms();
+        let latest_update_secs = notebook_latest_active_update_secs(
+            &self.agent_config,
+            self.owner.trim(),
+            &self.agent_name,
+        );
+        let (seen_secs, last_round_ms, idle_heartbeats) = {
+            let meta = self.meta.lock().await;
+            (
+                meta.self_check_seen_item_update_secs,
+                meta.self_check_last_round_at_ms,
+                meta.self_check_idle_heartbeats,
+            )
+        };
+        let notebook_changed = latest_update_secs > seen_secs;
+        let real_work = has_user_msg || has_non_heartbeat_event || notebook_changed;
+
+        let (run, next_idle_heartbeats, reason) = if real_work {
+            (true, 0u32, if notebook_changed { "notebook_changed" } else { "input" })
+        } else {
+            // No change: only the periodic hard-barrier heartbeat keeps us
+            // running. First gap after activity is 15min; once we've fired an
+            // empty heartbeat we stretch to 30min until something changes.
+            let interval_ms = if idle_heartbeats == 0 {
+                SELF_CHECK_ACTIVE_HEARTBEAT_MS
+            } else {
+                SELF_CHECK_IDLE_HEARTBEAT_MS
+            };
+            let heartbeat_due =
+                last_round_ms == 0 || now.saturating_sub(last_round_ms) >= interval_ms;
+            if heartbeat_due {
+                (true, idle_heartbeats.saturating_add(1), "heartbeat")
+            } else {
+                (false, idle_heartbeats, "skip")
+            }
+        };
+
+        if run {
+            // Record that we're spending a round now. The change-watermark is
+            // advanced *after* the round completes (see
+            // `self_check_advance_seen_watermark`) so Self-Check's own remark
+            // writes are absorbed rather than re-triggering us next tick.
+            {
+                let mut meta = self.meta.lock().await;
+                meta.self_check_last_round_at_ms = now;
+                meta.self_check_idle_heartbeats = next_idle_heartbeats;
+            }
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush self_check gate state failed: {err:#}",
+                    self.session_id
+                );
+            }
+            info!(
+                "opendan.session[{}]: self_check gate=run reason={reason} latest_update_secs={latest_update_secs} seen_secs={seen_secs} idle_heartbeats={idle_heartbeats}->{next_idle_heartbeats}",
+                self.session_id
+            );
+        } else {
+            info!(
+                "opendan.session[{}]: self_check gate=skip latest_update_secs={latest_update_secs} seen_secs={seen_secs} idle_heartbeats={idle_heartbeats} since_last_round_ms={}",
+                self.session_id,
+                now.saturating_sub(last_round_ms)
+            );
+        }
+        run
+    }
+
+    /// Advance the Self-Check change-watermark to the Notebook's current max
+    /// `updated_at`, called after a round completes. This absorbs the
+    /// `updated_at` bumps caused by Self-Check's own review-remark writes so
+    /// the next timer tick only fires a real round on a genuinely newer change.
+    /// (A change that lands in the brief window *during* a round is absorbed
+    /// too; the 15–30min heartbeat is the backstop that re-reviews it.)
+    async fn self_check_advance_seen_watermark(&self) {
+        let latest_update_secs = notebook_latest_active_update_secs(
+            &self.agent_config,
+            self.owner.trim(),
+            &self.agent_name,
+        );
+        let mut changed = false;
+        {
+            let mut meta = self.meta.lock().await;
+            if latest_update_secs > meta.self_check_seen_item_update_secs {
+                meta.self_check_seen_item_update_secs = latest_update_secs;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(err) = self.flush_meta().await {
+                warn!(
+                    "opendan.session[{}]: flush self_check watermark failed: {err:#}",
+                    self.session_id
+                );
             }
         }
     }
@@ -3802,14 +3947,12 @@ impl AgentSession {
                 meta.last_schedule_task_list_access_at,
             )
         };
-        let owner_filter = if owner.trim().is_empty() {
-            None
-        } else {
-            Some(owner.as_str())
-        };
+        let (source_user_id, source_app_id) =
+            schedule_task_prompt_reader_identity(&owner, &self.agent_name);
         let text = match render_last_schedule_task_list_text(
             task_mgr.as_ref(),
-            owner_filter,
+            source_user_id.as_deref(),
+            source_app_id.as_deref(),
             since_secs,
             now_secs,
         )
@@ -6176,7 +6319,8 @@ struct ScheduleTaskPromptLine {
 
 async fn render_last_schedule_task_list_text(
     task_mgr: &TaskManagerClient,
-    owner: Option<&str>,
+    source_user_id: Option<&str>,
+    source_app_id: Option<&str>,
     since_secs: u64,
     now_secs: u64,
 ) -> std::result::Result<String, String> {
@@ -6186,8 +6330,8 @@ async fn render_last_schedule_task_list_text(
                 task_type: Some("workflow/schedule".to_string()),
                 ..Default::default()
             }),
-            owner,
-            None,
+            source_user_id,
+            source_app_id,
         )
         .await
         .map_err(|err| err.to_string())?;
@@ -6217,7 +6361,10 @@ async fn render_last_schedule_task_list_text(
             });
         }
 
-        match task_mgr.list_task_notes(task.id, owner, None).await {
+        match task_mgr
+            .list_task_notes(task.id, source_user_id, source_app_id)
+            .await
+        {
             Ok(notes) => {
                 for note in notes.into_iter().filter(is_user_manual_task_note) {
                     if is_prompt_time_window(note.created_at, since_secs, now_secs) {
@@ -6305,6 +6452,43 @@ fn schedule_task_created_note(task: &Task) -> String {
             truncate_prompt_text(&sources.join("; "), 240)
         )
     }
+}
+
+fn schedule_task_prompt_reader_identity(
+    session_owner: &str,
+    agent_name: &str,
+) -> (Option<String>, Option<String>) {
+    let trimmed_owner = session_owner.trim();
+    let runtime = get_buckyos_api_runtime().ok();
+    let runtime_user_id = runtime
+        .as_ref()
+        .and_then(|runtime| {
+            runtime
+                .get_owner_user_id()
+                .or_else(|| runtime.user_id.clone())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let runtime_app_id = runtime
+        .as_ref()
+        .map(|runtime| runtime.get_app_id())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let user_id = if trimmed_owner.is_empty() || trimmed_owner == "system" {
+        runtime_user_id
+    } else {
+        Some(trimmed_owner.to_string())
+    };
+    let app_id = runtime_app_id.or_else(|| {
+        let fallback = agent_name.trim();
+        if fallback.is_empty() {
+            None
+        } else {
+            Some(fallback.to_string())
+        }
+    });
+    let app_id = if user_id.is_some() { app_id } else { None };
+    (user_id, app_id)
 }
 
 fn schedule_task_failure_note(task: &Task) -> String {
@@ -6452,6 +6636,36 @@ fn build_notebook_prompt_texts(
         }
     };
     (list_text, last_items_text)
+}
+
+/// Max `updated_at` (unix secs) of any active Notebook item for this agent, or
+/// 0 when the notebook is empty/absent or unreadable. Cheap probe used by the
+/// Self-Check wakeup gate to detect change without building the prompt.
+fn notebook_latest_active_update_secs(
+    agent_config: &AgentConfig,
+    owner: &str,
+    agent_name: &str,
+) -> u64 {
+    let owner = resolve_notebook_prompt_owner(owner, agent_name);
+    if owner.is_empty() || !agent_config.layout.notebook_dir.exists() {
+        return 0;
+    }
+    let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
+        agent_config.layout.notebook_dir.clone(),
+    )) {
+        Ok(notebook) => notebook,
+        Err(err) => {
+            warn!("opendan.session: open notebook for self_check gate failed: {err}");
+            return 0;
+        }
+    };
+    match notebook.latest_active_item_update_secs() {
+        Ok(secs) => secs,
+        Err(err) => {
+            warn!("opendan.session: query notebook latest update for self_check gate failed: {err}");
+            0
+        }
+    }
 }
 
 fn resolve_notebook_prompt_owner(session_owner: &str, agent_appid: &str) -> String {

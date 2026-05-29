@@ -202,6 +202,18 @@ pub struct SessionMeta {
     pub internal_continuation: Option<InternalContinuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<AgentTaskBinding>,
+    /// Self-Check wakeup-gating state (see doc/opendan/Self-Check Behavior.md
+    /// §8.3). `seen_item_update_secs` is the max notebook-item `updated_at`
+    /// (unix secs) we have already acted on — a newer value means the Notebook
+    /// changed and the next timer tick should run a real round.
+    /// `last_round_at_ms` / `idle_heartbeats` drive the heartbeat that forces a
+    /// round every 15min, backing off to 30min while the Notebook stays quiet.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_check_seen_item_update_secs: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_check_last_round_at_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub self_check_idle_heartbeats: u32,
 }
 
 impl SessionMeta {
@@ -240,6 +252,9 @@ impl SessionMeta {
             last_report_delivery: None,
             internal_continuation: None,
             task_binding: None,
+            self_check_seen_item_update_secs: 0,
+            self_check_last_round_at_ms: 0,
+            self_check_idle_heartbeats: 0,
         };
         meta.ensure_default_event_subscriptions(0);
         meta
@@ -386,6 +401,10 @@ fn serde_json_value_is_null(value: &serde_json::Value) -> bool {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 

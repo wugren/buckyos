@@ -20,6 +20,7 @@ mod orchestrator;
 mod runtime;
 mod scheduled_task_manager;
 mod schema;
+mod send_message_executor;
 mod server;
 mod state;
 mod subscriptions;
@@ -77,6 +78,7 @@ use log::{error, info, warn};
 use std::sync::Arc;
 
 use crate::scheduled_task_manager::{ScheduleStore, ScheduleTaskMirrorClient};
+use crate::send_message_executor::SendMessageTaskExecutor;
 use crate::server::WorkflowRpcHandler;
 use crate::service_schemas::aicc::AiccAdapter;
 use crate::state::{DefinitionStore, RunStore, ServiceTracker};
@@ -147,6 +149,7 @@ pub async fn start_workflow_service() -> Result<()> {
     let data_dir = runtime
         .get_data_folder()
         .map_err(|err| anyhow::anyhow!("workflow data folder unavailable: {:?}", err))?;
+    let buckyos_root = runtime.buckyos_root_dir.clone();
 
     // §6.3：Run / Step / Map shard / Thunk 同步到 task_manager。客户端拿不到
     // 时退化为 noop（参考 §1.2 的"task_manager 不可用时仍可推进 adapter 主路径"）。
@@ -168,6 +171,16 @@ pub async fn start_workflow_service() -> Result<()> {
             ServiceTracker::from_task_manager(client, user_id.clone(), app_id.clone())
         }
         None => ServiceTracker::noop(),
+    };
+    let msg_center_client = match runtime.get_msg_center_client().await {
+        Ok(client) => Some(Arc::new(client)),
+        Err(err) => {
+            warn!(
+                "msg_center client unavailable, workflow.send_message tasks will stay pending: {}",
+                err
+            );
+            None
+        }
     };
 
     // §1.2 / §9：一期 P0 必须有的 service:: adapter。aicc 拿不到客户端时不算
@@ -192,6 +205,10 @@ pub async fn start_workflow_service() -> Result<()> {
     let definitions = Arc::new(DefinitionStore::new());
     let runs = Arc::new(RunStore::new());
     let schedules = Arc::new(ScheduleStore::load(data_dir.join("schedules.json")));
+    if let (Some(task_mgr), Some(msg_center)) = (task_mgr_client.clone(), msg_center_client) {
+        SendMessageTaskExecutor::new(task_mgr, msg_center, schedules.clone(), buckyos_root).start();
+        info!("workflow.send_message executor started");
+    }
     // 一期使用进程内 dispatcher / object store；§5.1 提到的 sled / Named Object
     // Store 持久化是后续提交的工作。`func::*` 调度路径暂时不接 Scheduler，命中
     // 时会按 §6.2 落到 require_function_object 的明确错误。

@@ -1183,8 +1183,8 @@ fn schedule_summary(record: &WorkflowScheduledTask) -> Json {
         "schedule_id": record.schedule_id,
         "name": record.name,
         "status": status_text(record.status),
-        "trigger": trigger_detail(&record.schedule),
-        "target": target_detail(&record.target),
+        "trigger": trigger_summary(&record.schedule),
+        "target": target_summary(&record.target),
         "next_fire_at": record.state.next_fire_at.map(rfc3339),
     })
 }
@@ -1233,6 +1233,26 @@ fn trigger_detail(schedule: &WorkflowScheduledTaskSchedule) -> Json {
     }
 }
 
+fn trigger_summary(schedule: &WorkflowScheduledTaskSchedule) -> Json {
+    match schedule {
+        WorkflowScheduledTaskSchedule::Cron { expr, timezone, .. } => {
+            json!({ "kind": "cron", "expr": expr, "timezone": timezone })
+        }
+        WorkflowScheduledTaskSchedule::Once { run_at, timezone } => {
+            json!({ "kind": "once", "run_at": rfc3339(*run_at), "timezone": timezone })
+        }
+        WorkflowScheduledTaskSchedule::RunEvery {
+            every_sec,
+            timezone,
+            ..
+        } => json!({
+            "kind": "every",
+            "every_sec": every_sec,
+            "timezone": timezone,
+        }),
+    }
+}
+
 fn target_detail(target: &WorkflowScheduledTaskTarget) -> Json {
     match target.task_type.as_str() {
         "workflow.send_message" => {
@@ -1268,6 +1288,62 @@ fn target_detail(target: &WorkflowScheduledTaskTarget) -> Json {
         }
         _ => json!(target),
     }
+}
+
+fn target_summary(target: &WorkflowScheduledTaskTarget) -> Json {
+    match target.task_type.as_str() {
+        "workflow.send_message" => {
+            let send_message = target.data_template.get("send_message");
+            json!({
+                "kind": "remind",
+                "to": send_message
+                    .and_then(|value| value.get("to"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("self"),
+                "text": send_message
+                    .and_then(|value| value.get("text"))
+                    .and_then(Json::as_str)
+                    .map(|text| truncate_summary_text(text, 80))
+                    .unwrap_or_default(),
+            })
+        }
+        "agent.delegate" => {
+            let delegate = target.data_template.get("agent_delegate");
+            let workspace_id = delegate
+                .and_then(|value| value.get("workspace_hints"))
+                .and_then(Json::as_array)
+                .and_then(|items| items.first())
+                .and_then(|value| value.get("workspace_id"))
+                .and_then(Json::as_str);
+            json!({
+                "kind": "task",
+                "title": delegate
+                    .and_then(|value| value.get("title"))
+                    .and_then(Json::as_str)
+                    .map(|text| truncate_summary_text(text, 80))
+                    .unwrap_or_default(),
+                "objective": delegate
+                    .and_then(|value| value.get("purpose"))
+                    .and_then(Json::as_str)
+                    .map(|text| truncate_summary_text(text, 120))
+                    .unwrap_or_default(),
+                "workspace_id": workspace_id,
+            })
+        }
+        _ => json!({
+            "kind": target_kind(target),
+        }),
+    }
+}
+
+fn truncate_summary_text(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn validate_detail(trigger: &TriggerArgs, result: WorkflowValidateScheduledTaskResult) -> Json {
@@ -1364,6 +1440,40 @@ fn shell_join(tokens: &[String]) -> String {
 mod tests {
     use super::*;
 
+    fn test_record(target: WorkflowScheduledTaskTarget) -> WorkflowScheduledTask {
+        WorkflowScheduledTask {
+            schedule_id: "sch-1".to_string(),
+            owner: WorkflowOwner {
+                user_id: "devtest".to_string(),
+                app_id: "jarvis".to_string(),
+            },
+            name: "standup".to_string(),
+            description: Some("description should stay out of list".to_string()),
+            status: WorkflowScheduledTaskStatus::Enabled,
+            schedule: WorkflowScheduledTaskSchedule::Cron {
+                expr: "*/30 9-17 * * 1-6".to_string(),
+                timezone: "America/Los_Angeles".to_string(),
+                calendar: None,
+                start_at: None,
+                end_at: None,
+            },
+            target,
+            state: buckyos_api::WorkflowScheduledTaskState {
+                next_fire_at: Some(1_780_000_000),
+                ..Default::default()
+            },
+            policy: WorkflowScheduledTaskPolicy {
+                misfire: WorkflowScheduledTaskMisfirePolicy::Skip,
+                max_parallel_runs: 1,
+                catch_up_limit: 1,
+                jitter_sec: 0,
+            },
+            task_mirror: Default::default(),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
     fn parse(tokens: &[&str]) -> DcrontabArgs {
         parse_dcrontab_tokens(
             &tokens
@@ -1410,5 +1520,34 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("MULTIPLE_TRIGGERS"));
+    }
+
+    #[test]
+    fn list_summary_omits_show_level_target_fields() {
+        let record = test_record(WorkflowScheduledTaskTarget {
+            task_type: "agent.delegate".to_string(),
+            runner: Some("jarvis".to_string()),
+            name_template: "scheduled task".to_string(),
+            data_template: json!({
+                "agent_delegate": {
+                    "title": "Daily mail scan",
+                    "purpose": "This long objective starts with duplicate-check context and then keeps adding verbose implementation details that are useful in show but should not be repeated in list output.",
+                    "workspace_hints": [{"workspace_id": "mail"}],
+                    "execution": {
+                        "behavior": "work_default"
+                    }
+                }
+            }),
+        });
+
+        let summary = schedule_summary(&record);
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(text.contains("Daily mail scan"));
+        assert!(text.contains("mail"));
+        assert!(text.contains("long objective"));
+        assert!(!text.contains("agent.delegate"));
+        assert!(!text.contains("jarvis"));
+        assert!(!text.contains("repeated in list output"));
+        assert!(!text.contains("work_default"));
     }
 }

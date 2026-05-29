@@ -25,7 +25,7 @@ description, or a compact review note.
 
 - Focus on new/changed notebook items; do not re-review all old notes.
 - Create schedule-task only when intent, action, time/trigger, recipient/result, and type are clear.
-- Check duplicates first; link/update existing equivalent or broader schedules.
+- Check duplicates first. Prefer `runtime.last_schedule_task_list_text` and existing notebook self_check remarks for recent schedule state; use `dcrontab list` only when creating/updating/canceling a schedule requires confirming the full existing inventory.
 - Notebook 是用户计划意图的唯一真相源；Schedule-Task 是派生状态。创建、更新、取消 Schedule-Task 时，必须保留来源 Notebook Item 的 id/title 关联。
 - 如果 Notebook Item 的执行条件是确定时间条件，先结合当前时间、时区和相关上下文判断前提是否已经满足；未过期且动作明确时，创建一次性计划任务。
 - Remove/pause only for explicit cancel, expiry, invalid premise, replacement, or repeated unrecoverable failure.
@@ -52,7 +52,7 @@ description, or a compact review note.
 创建前必须依次确认：
 - 存在真实用户意图。
 - 动作、时间/触发条件、收件人/结果、任务类型足够明确。
-- 已检查现有 Schedule-Task，确认没有相同、等价或更宽泛的任务覆盖该事项。
+- 已通过 `runtime.last_schedule_task_list_text`、已有 self_check 备注，或必要时的 `dcrontab list/show` 确认没有相同、等价或更宽泛的任务覆盖该事项。
 - 创建任务不会造成明显不必要打扰。
 
 优先选择最低复杂度的任务类型：
@@ -66,13 +66,13 @@ description, or a compact review note.
 ### 完善Notebook item
 
 当 Notebook Item 本身缺少 Self-Check Review 状态、来源关联或备注时，补充备注，而不是改写用户原文。备注应紧凑、可追踪，至少包含：
-- review_status：`observing` / `task_created` / `linked_existing_task` / `no_action` / `needs_user_confirmation` / `cancel_signal_detected` 等。
+- review_status：`observing` / `task_created` / `linked_existing_task` / `no_action` / `needs_user_confirmation` / `cancel_signal_detected` / `blocked` 等。
 - decision：`create_task` / `update_task` / `cancel_task` / `link_task` / `keep_observing` / `mark_no_action` / `flag_for_user`。
 - reason、confidence、linked_plan_task_ids、observation_until。
 
 ### 需要调整已有的计划任务:
 
-先用 `dcrontab list` / `dcrontab show` 检查已有任务，再决定动作：
+先利用 `runtime.last_schedule_task_list_text` 和已有 self_check 备注判断近期计划任务变化；只有要创建、更新或取消计划任务且需要确认完整存量时，才用 `dcrontab list` / `dcrontab show` 检查已有任务，再决定动作：
 - `link_task`：已有任务已经覆盖该 Notebook Item，只补充来源关联和备注。
 - `update_task`：用户新增信息明确改变时间、动作、范围、收件人或执行方式。
 - `cancel_task`：仅在明确取消、已过期且执行无意义、前提失效、被新计划覆盖，或执行报告显示长期不可恢复失败时取消/暂停。
@@ -107,9 +107,10 @@ description, or a compact review note.
 
 ## agent notebook skill
 
-- 读取相关 Notebook Item：`agent-notebook read --items item_id` 或 `agent-notebook read --title "$title"`。
-- 查看已有备注：`agent-notebook remarks list item_id --type self_check`。
-- 增加 Self-Check 备注：`agent-notebook remarks append item_id self_check "$compact_review_note"`。
+- 读取单个 Notebook Item：`agent-notebook read --items $itm_a,$itm_b,itm_c`。
+- 也可按标题读取：`agent-notebook read --title "$title"`。
+- 查看已有备注：`agent-notebook remarks list $itm_xxx --type self_check`。
+- 增加 Self-Check 备注：`agent-notebook remarks append $itm_xxx self_check "$compact_review_note"`。
 - 当基于一条 Notebook Item 创建、关联、更新或取消计划任务后，必须用备注记录该操作，建立 Notebook Item 到 Schedule-Task 的关系。
 - 不要改写用户原始 Notebook Item 内容来表达 Self-Check 结论；使用 remarks 保存派生状态。
 
@@ -198,9 +199,9 @@ Continue Self-Check from PROCESS_RULES.
 """
 
 on_behavior_step_ob = """
-<<last_step_action_results>>
+
 {{ default_last_step_action_results_text }}
-<</last_step_action_results>>
+
 
 {% if input.has_msgs %}
 ## New User Messages

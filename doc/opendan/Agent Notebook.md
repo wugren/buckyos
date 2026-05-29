@@ -1110,11 +1110,11 @@ include_status = ["active", "stale", "superseded"]
 
 Notebook selector 约定：
 
-1. `read` / `append` 使用可选 `--id <notebook_id>` 选择 notebook，不再把 `notebook_id` 作为 positional 参数；
-2. `read` / `append` 不传 `--id` 时，CLI 必须解析为当前 `owner_agent` 的默认 notebook；
-3. `create-notebook` 是显式 notebook 管理命令，必须传 `--id <notebook_id>`，不使用默认 notebook 兜底；
+1. `read` / `append` 使用可选 `--bookid <notebook_id>` 选择 notebook，不再把 `notebook_id` 作为 positional 参数；
+2. `read` / `append` 不传 `--bookid` 时，CLI 必须解析为当前 `owner_agent` 的默认 notebook；
+3. `create-notebook` 是显式 notebook 管理命令，必须传 `--bookid <notebook_id>`，不使用默认 notebook 兜底；
 4. CLI 在调用底层接口前必须得到 concrete `notebook_id`；底层 read cache、subscription、event、返回 JSON 都使用解析后的 id；
-5. `status` / `promote` 这类以 `item_id` 定位既有条目的命令，不要求 `--id`，其 notebook 归属由 item 元数据确定。
+5. `status` / `promote` 这类以 `item_id` 定位既有条目的命令，不要求 `--bookid`，其 notebook 归属由 item 元数据确定。
 
 Owner / session / actor selector 约定：Agent Notebook 是当前 Agent 专用的 durable notebook。CLI 从 AgentTool 最小环境契约和 Agent RootFS identity 推导当前 Agent appid、agent id 与 session id；命令行参数只表达业务语义，不需要传 `--owner-user`、`--session`、`--actor-kind`、`--write-reason`。
 
@@ -1131,7 +1131,7 @@ agent-notebook list \
 
 ```bash
 agent-notebook read \
-  [--id <notebook_id>] \
+  [--bookid <notebook_id>] \
   [--tags <tag1,tag2,tag3>] \
   [--title <title>] \
   [--latest 10] \
@@ -1143,7 +1143,7 @@ agent-notebook read \
 
 输出 `NotebookReadResult` JSON。
 
-`--id` 是可选 notebook 选择器；不传时读取当前 `owner_agent` 的默认 notebook。`read` 不再要求 positional `notebook_id`。
+`--bookid` 是可选 notebook 选择器；不传时读取当前 `owner_agent` 的默认 notebook。`read` 不再要求 positional `notebook_id`。
 
 `--tags` 是 tag list，逗号拆分；trim 后按 §3.6 规范化。**不传 `--tags` 即无过滤，返回该 notebook 全部 active items（按时间倒序）**；`--tags '*'` 语义等价于不传。
 
@@ -1157,7 +1157,7 @@ agent-notebook read \
 
 ```bash
 agent-notebook append <title> <content> \
-  [--id <notebook_id>] \
+  [--bookid <notebook_id>] \
   [--confidence high] \
   [--tags read-cache,unchanged-response] \
   [--valid-until 2026-12-25]
@@ -1167,12 +1167,12 @@ agent-notebook append <title> <content> \
 
 ```bash
 cat note.md | agent-notebook append <title> \
-  [--id <notebook_id>] \
+  [--bookid <notebook_id>] \
   --tags read-cache,unchanged-response \
   --stdin
 ```
 
-`--id` 是可选 notebook 选择器；不传时写入当前 `owner_agent` 的默认 notebook。`append` 不再要求 positional `notebook_id`。
+`--bookid` 是可选 notebook 选择器；不传时写入当前 `owner_agent` 的默认 notebook。`append` 不再要求 positional `notebook_id`。
 
 如果解析后的目标 notebook 不存在，append 成功路径必须先自动创建该 notebook，再写入 note；这保证 Agent 可以直接向默认 notebook 写入。
 
@@ -1184,13 +1184,13 @@ cat note.md | agent-notebook append <title> \
 
 ```bash
 agent-notebook create-notebook \
-  --id <notebook_id> \
+  --bookid <notebook_id> \
   [--kind normal|project|agent] \
   [--title <title>] \
   [--description <description>]
 ```
 
-`--id` 是必填 notebook id；`create-notebook` 不再要求 positional `notebook_id`，也不使用默认 notebook 兜底。
+`--bookid` 是必填 notebook id；`create-notebook` 不再要求 positional `notebook_id`，也不使用默认 notebook 兜底。
 
 ### 9.5 status
 

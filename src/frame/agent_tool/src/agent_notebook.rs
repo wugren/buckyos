@@ -1993,6 +1993,33 @@ impl AgentNotebook {
         self.build_recent_items_text_inner(max_items, since_access_at_secs, true)
     }
 
+    /// Max `updated_at` (unix seconds) across all active items in active
+    /// notebooks, or 0 when there are none. Cheap single-row query used by the
+    /// Self-Check wakeup gate to detect "the Notebook changed" without
+    /// rendering the full prompt or invoking the LLM. Note that appending a
+    /// remark *does* bump the item's `updated_at`, so the gate compares against
+    /// a watermark it advances after each round (see agent_session.rs) rather
+    /// than treating any nonzero value as a change.
+    pub fn latest_active_item_update_secs(&self) -> Result<u64> {
+        let conn = self.lock_conn()?;
+        let max_updated_at: Option<String> = conn.query_row(
+            "SELECT MAX(i.updated_at)
+             FROM notebook_items i
+             JOIN notebooks n
+               ON n.id = i.notebook_id
+             WHERE i.status = 'active'
+               AND n.status = 'active'",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )?;
+        let secs = max_updated_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp().max(0) as u64)
+            .unwrap_or(0);
+        Ok(secs)
+    }
+
     fn build_recent_items_text_inner(
         &self,
         max_items: usize,
@@ -2004,7 +2031,7 @@ impl AgentNotebook {
         let now = now_iso8601();
         let since = since_access_at_secs_to_iso8601(since_access_at_secs);
         let mut stmt = conn.prepare(
-            "SELECT i.item_id, i.notebook_id, i.title, i.created_at, i.updated_at
+            "SELECT i.item_id, i.status, i.updated_at, i.source_session_id, i.content
              FROM notebook_items i
              JOIN notebooks n
                ON n.id = i.notebook_id
@@ -2049,7 +2076,7 @@ impl AgentNotebook {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
                 ))
             },
@@ -2065,10 +2092,14 @@ impl AgentNotebook {
         }
 
         let mut text = format!("Recent notebook items: latest {}.\n", items.len());
-        for (item_id, notebook_id, title, created_at, updated_at) in items {
+        for (item_id, status, updated_at, source_session_id, content) in items {
             text.push_str(&format!(
-                "- [{}] {} ({}, created {}, updated {})\n",
-                notebook_id, title, item_id, created_at, updated_at
+                "{} {} {} {}\n{}\n",
+                item_id,
+                status,
+                updated_at,
+                source_session_id.as_deref().unwrap_or("-"),
+                content
             ));
         }
         Ok(text)
@@ -3603,6 +3634,34 @@ mod tests {
     }
 
     #[test]
+    fn latest_active_item_update_secs_tracks_items_and_remark_bumps() {
+        let (_t, n) = open_tmp();
+        // Empty notebook → 0.
+        assert_eq!(n.latest_active_item_update_secs().unwrap(), 0);
+
+        // Appending an item yields a positive watermark.
+        let item_id = append(&n, "user/plans", "drink water", "every 30m", &["health"]);
+        let after_item = n.latest_active_item_update_secs().unwrap();
+        assert!(after_item > 0, "watermark should be set after first item");
+
+        // A self_check remark bumps the item's updated_at, so the watermark is
+        // >= the item's — this is exactly why the gate compares against a
+        // post-round watermark instead of any nonzero value.
+        n.append_item_remark(AppendItemRemarkInput {
+            session_id: Some("sess-A".into()),
+            item_id: item_id.clone(),
+            remark_type: "self_check".into(),
+            content: "decision=keep_observing".into(),
+        })
+        .unwrap();
+        let after_remark = n.latest_active_item_update_secs().unwrap();
+        assert!(
+            after_remark >= after_item,
+            "remark append must not lower the watermark"
+        );
+    }
+
+    #[test]
     fn tag_normalization_rejects_bad_chars_and_collapses_whitespace() {
         let ok = normalize_tags(&[
             "  Phone   Case ".to_string(),
@@ -4167,16 +4226,16 @@ mod tests {
     }
 
     #[test]
-    fn prompt_notebook_texts_include_registry_and_recent_item_metadata_only() {
+    fn prompt_notebook_texts_include_registry_and_recent_item_content() {
         let (_t, n) = open_tmp();
-        append(&n, "user/preferences", "tone", "DO NOT LEAK", &["tone"]);
         append(
             &n,
-            "projects/demo",
-            "scope",
-            "DO NOT LEAK EITHER",
-            &["scope"],
+            "user/preferences",
+            "tone",
+            "direct content A",
+            &["tone"],
         );
+        append(&n, "projects/demo", "scope", "direct content B", &["scope"]);
 
         let list_text = n.build_notebook_list_text().unwrap();
         assert!(list_text.contains("Available notebooks: 2 total."));
@@ -4184,20 +4243,22 @@ mod tests {
         assert!(list_text.contains("projects/demo"));
         assert!(list_text.contains("1 records"));
         assert!(list_text.contains("last modified"));
-        assert!(!list_text.contains("DO NOT LEAK"));
+        assert!(!list_text.contains("direct content A"));
 
-        let recent_text = n.build_recent_items_text(1, 0).unwrap();
-        assert!(recent_text.contains("Recent notebook items: latest 1."));
-        assert!(recent_text.contains("["));
-        assert!(recent_text.contains("created "));
-        assert!(recent_text.contains("updated "));
-        assert!(!recent_text.contains("DO NOT LEAK"));
+        let recent_text = n.build_recent_items_text(2, 0).unwrap();
+        assert!(recent_text.contains("Recent notebook items: latest 2."));
+        assert!(recent_text.contains("active"));
+        assert!(recent_text.contains("sess-A"));
+        assert!(recent_text.contains("direct content A"));
+        assert!(recent_text.contains("direct content B"));
+        assert!(!recent_text.contains("tone"));
+        assert!(!recent_text.contains("scope"));
     }
 
     #[test]
     fn recent_items_text_respects_since_window_except_keep_observing() {
         let (_t, n) = open_tmp();
-        append(&n, "user/preferences", "old action", "content", &["action"]);
+        let old_id = append(&n, "user/preferences", "old action", "content", &["action"]);
         let observing_id = append(
             &n,
             "user/preferences",
@@ -4207,7 +4268,7 @@ mod tests {
         );
         n.append_item_remark(AppendItemRemarkInput {
             session_id: Some("sess-A".into()),
-            item_id: observing_id,
+            item_id: observing_id.clone(),
             remark_type: "self_check".into(),
             content: "decision=keep_observing reason=missing context".into(),
         })
@@ -4215,14 +4276,17 @@ mod tests {
 
         let future_since = 4_102_444_800;
         let recent_text = n.build_recent_items_text(8, future_since).unwrap();
-        assert!(recent_text.contains("observing action"));
+        assert!(recent_text.contains(&observing_id));
+        assert!(recent_text.contains("content"));
+        assert!(!recent_text.contains(&old_id));
+        assert!(!recent_text.contains("observing action"));
         assert!(!recent_text.contains("old action"));
     }
 
     #[test]
     fn self_check_recent_items_include_unreviewed_outside_since_window() {
         let (_t, n) = open_tmp();
-        append(
+        let pending_id = append(
             &n,
             "user/preferences",
             "pending exercise reminder",
@@ -4248,10 +4312,13 @@ mod tests {
         let recent_text = n
             .build_recent_items_text_for_self_check(8, future_since)
             .unwrap();
-        assert!(recent_text.contains("pending exercise reminder"));
+        assert!(recent_text.contains(&pending_id));
+        assert!(recent_text.contains("content"));
+        assert!(!recent_text.contains("pending exercise reminder"));
         assert!(!recent_text.contains("finished email note"));
 
         let normal_recent_text = n.build_recent_items_text(8, future_since).unwrap();
+        assert!(!normal_recent_text.contains(&pending_id));
         assert!(!normal_recent_text.contains("pending exercise reminder"));
     }
 

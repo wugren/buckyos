@@ -1411,12 +1411,12 @@ CLI-only。
 ### CLI 命令解释 + 常用例子
 
 ```bash
-agent-notebook create --id nb_01HXY --kind project --title "buckyos beta2.2"
-agent-notebook append "read_tool unchanged 短路" --id nb_01HXY --stdin <<EOF
+agent-notebook create --bookid nb_01HXY --kind project --title "buckyos beta2.2"
+agent-notebook append "read_tool unchanged 短路" --bookid nb_01HXY --stdin <<EOF
 今天梳理了 read_tool 的 unchanged 短路。
 EOF
 
-agent-notebook read --id nb_01HXY
+agent-notebook read --bookid nb_01HXY
 agent-notebook list
 agent-notebook status itm_01HXY stale --reason "no longer applies"
 agent-notebook remarks append itm_01HXY red "needs confirmation"
@@ -1435,7 +1435,7 @@ agent-notebook hints --topic-tags agent-notebook,state-management
   "agent_tool_protocol": "1",
   "status": "success",
   "cmd_name": "agent-notebook",
-  "cmd_args": "agent-notebook read --id nb_01HXY",
+  "cmd_args": "agent-notebook read --bookid nb_01HXY",
   "title": "agent-notebook read nb_01HXY => ok",
   "summary": "read nb_01HXY (1.2 KB)",
   "detail": {
