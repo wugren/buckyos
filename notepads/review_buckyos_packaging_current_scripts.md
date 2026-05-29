@@ -615,4 +615,7 @@
    处理记录：commit `0d149320`。修改文件和行号：`src/publish/package_common.py:128-153` 增加统一 relpath 规范化和 manifest `source_path` 解析；`src/publish/make_local_deb.py:97-103`、`642`、`673` 使用公共 source 解析并让本地 update 遇到缺失 source 失败；`src/publish/make_local_osx_pkg.py:102-108`、`1010`、`1041` 同步使用公共 source 解析和缺失失败；`src/publish/make_local_win_installer.py:87-88`、`167-168`、`195-196` 为 Windows layout 增加 source map，`551-585` staging 时使用 manifest `source_path`；`src/publish/tests/test_package_common.py:90-107` 增加 source_path 映射优先级测试。
 
 7. 新增 rpm，并复用公共模块。
+
+   处理记录：commit `5da54baf`。修改文件和行号：新增 `src/publish/make_local_rpm.py:181-228` 按 manifest/common source 解析 staging module/data 并在缺失时失败，`257-275` 实现 canonical arch 到 rpm arch 与 `Version/Release` 转换，`336-356` 复用公共 hook discovery 查找 Linux rpm/deb hook，`400-510` 生成 rpm spec、Requires、`%pre/%post/%preun/%postun` 和 systemd 服务行为，`525-620` 接入 rpmbuild、输出规范 rpm 文件名并保留外层版本，`622-659` 增加 rpm 基础 verify；新增 `src/publish/tests/test_make_local_rpm.py:13-45` 覆盖 rpm arch/version 转换和 spec 关键契约。
+
 8. 最后扩展 verify-pkg，让它覆盖 metadata、payload 白名单、组件、hook、依赖声明和 defaults 规则。
