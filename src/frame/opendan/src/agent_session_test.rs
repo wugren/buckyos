@@ -102,6 +102,52 @@ fn self_check_behavior_end_keeps_session_idle() {
     );
 }
 
+#[test]
+fn notebook_prompt_owner_uses_agent_appid() {
+    assert_eq!(resolve_notebook_prompt_owner("system", "jarvis"), "jarvis");
+    assert_eq!(resolve_notebook_prompt_owner("", "jarvis"), "jarvis");
+    assert_eq!(resolve_notebook_prompt_owner("alice", "jarvis"), "jarvis");
+    assert_eq!(resolve_notebook_prompt_owner("alice", ""), "alice");
+}
+
+#[test]
+fn notebook_prompt_texts_read_agent_scope_not_session_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_config = AgentConfig::open(dir.path().to_path_buf()).unwrap();
+    let notebook = AgentNotebook::open(AgentNotebookConfig::new(
+        agent_config.layout.notebook_dir.clone(),
+    ))
+    .unwrap();
+    notebook
+        .append_note(agent_tool::agent_notebook::AppendNoteInput {
+            session_id: Some("ui".into()),
+            notebook_id: "user/actions".into(),
+            title: "Standing reminder schedule".into(),
+            content: "stand every 30 minutes".into(),
+            source_excerpt: None,
+            source_ref: None,
+            source_session_id: Some("ui".into()),
+            write_reason: agent_tool::agent_notebook::WriteReason::UserExplicit,
+            valid_from: None,
+            valid_until: None,
+            confidence: None,
+            tags: vec!["reminder".into(), "standing".into()],
+            detect_conflicts: false,
+        })
+        .unwrap();
+
+    let (list_text, recent_text) = build_notebook_prompt_texts(
+        &agent_config,
+        "devtest",
+        "jarvis",
+        0,
+        SessionKind::SelfCheck,
+    );
+
+    assert!(list_text.contains("user/actions"));
+    assert!(recent_text.contains("Standing reminder schedule"));
+}
+
 #[tokio::test]
 async fn on_behavior_step_ob_renders_pending_msgs_as_input_msgs() {
     let dir = tempfile::tempdir().unwrap();

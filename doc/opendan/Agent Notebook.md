@@ -100,7 +100,7 @@ Note Item 是 Notebook 里的最小事实单元。它应实现为统一 Item 系
 item_type = "agent.notebook.note"
 ```
 
-Note Item 的正文、title、tags、metadata 应能被统一 Item 索引系统处理。Notebook 模块不关心索引内部实现，只负责调用统一写入接口和查询接口。
+Note Item 的正文、title、tags 以及最小索引属性应能被统一 Item 索引系统处理。Notebook 模块不关心索引内部实现，只负责调用统一写入接口和查询接口。
 
 ### 2.3 System Notebook
 
@@ -183,8 +183,6 @@ type NotebookStatus = "active" | "archived" | "deleted";
 
 interface Notebook {
   id: string;                    // e.g. "user/preferences"
-  owner_user_id: string;
-  owner_agent_id?: string;
 
   kind: NotebookKind;
   title: string;
@@ -208,7 +206,7 @@ interface Notebook {
 
 Requirements：
 
-1. `id` 在同一个 owner scope 内唯一；
+1. `id` 在当前 Agent Notebook DB 内唯一；owner / agent scope 由 Agent RootFS 路径提供，不在 SQL 表内重复存储；
 2. `version` 每次 notebook 内容或状态变化都必须变化；
 3. `version` 不能只依赖秒级时间戳；
 4. `revision` 必须单调递增；
@@ -221,7 +219,6 @@ Note Item 需要作为统一 Item 系统的 Item 存在，同时 Notebook 模块
 ```ts
 type NotebookItemStatus = "active" | "stale" | "superseded" | "deleted";
 type Confidence = "low" | "medium" | "high";
-type ActorKind = "user" | "online_agent" | "curator" | "system" | "admin";
 type WriteReason =
   | "user_explicit"
   | "strong_rule"
@@ -233,8 +230,6 @@ type WriteReason =
 interface NotebookItem {
   item_id: string;               // Item Store id
   notebook_id: string;
-  owner_user_id: string;
-  owner_agent_id?: string;
 
   title: string;
   content: string;
@@ -248,8 +243,6 @@ interface NotebookItem {
   };
 
   source_session_id?: string;
-  actor_kind: ActorKind;
-  actor_id?: string;
   write_reason: WriteReason;
 
   confidence: Confidence;
@@ -259,7 +252,6 @@ interface NotebookItem {
   valid_until?: string | null;    // date or ISO-8601
 
   tags: string[];                 // 用于召回的固有 tags；须符合 §3.6
-  metadata?: Record<string, unknown>;
 
   created_at: string;
   updated_at: string;
@@ -290,15 +282,10 @@ interface NotebookItemRemark {
   remark_id: string;
   item_id: string;
   notebook_id: string;
-  owner_user_id: string;
-  owner_agent_id?: string;
 
   remark_type: string;           // e.g. "red", "blue", "warning", "verified"
   content: string;
   status: NotebookItemRemarkStatus;
-
-  actor_kind: ActorKind;
-  actor_id?: string;
 
   created_at: string;
   updated_at: string;
@@ -399,7 +386,6 @@ interface NotebookEvent {
   notebook_id: string;
   item_id?: string;
   actor_session_id?: string;
-  actor_kind: ActorKind;
 
   title?: string;
   summary?: string;              // short, safe, no full content
@@ -464,7 +450,7 @@ Item.type = "agent.notebook.note"
 Item.title = NotebookItem.title
 Item.body = NotebookItem.content
 Item.tags = NotebookItem.tags           // 已规范化
-Item.metadata = NotebookItem metadata + notebook_id + status + timestamps
+Item metadata = notebook_id + status + timestamps
 ```
 
 Notebook 模块负责 Notebook 容器、状态、版本、事件和 session read cache。
@@ -480,7 +466,7 @@ Notebook 模块负责 Notebook 容器、状态、版本、事件和 session read
 3. Notebook 模块不实现 BM25；
 4. Notebook 模块不实现 embedding 生成与向量索引；
 5. Note Item 写入后，通过统一 Item Store 的标准 hook / repository 接口进入统一索引；
-6. 查询时调用统一 `ItemSearch` 能力，并加上 `item_type = "agent.notebook.note"`、`notebook_id`、`owner_user_id` 等过滤条件；
+6. 查询时调用统一 `ItemSearch` 能力，并加上 `item_type = "agent.notebook.note"`、`notebook_id` 等过滤条件；owner / agent scope 由 Agent RootFS 路径确定；
 7. 召回输入是 ordered tag list，由 Notebook 模块原样下发给 `ItemSearchPort.searchItemsByTags`，由统一 Item 系统决定如何转换为 FTS query 或 phrase OR 查询。
 
 建议定义端口，而不是具体实现：
@@ -489,8 +475,6 @@ Notebook 模块负责 Notebook 容器、状态、版本、事件和 session read
 interface ItemRepositoryPort {
   createItem(input: {
     item_type: "agent.notebook.note";
-    owner_user_id: string;
-    owner_agent_id?: string;
     title: string;
     body: string;
     tags: string[];                       // 已规范化
@@ -511,8 +495,6 @@ interface ItemRepositoryPort {
 interface ItemSearchPort {
   // 主召回接口：ordered tag list
   searchItemsByTags(input: {
-    owner_user_id: string;
-    owner_agent_id?: string;
     item_type: "agent.notebook.note";
     tags: string[];                       // ordered, 已规范化；空数组等价于全量候选
     filters?: Record<string, unknown>;    // 例如 { notebook_id, status }
@@ -531,14 +513,12 @@ interface ItemSearchPort {
 
 ## 5. 工具 / 服务接口
 
-接口可以实现为内部 TypeScript/Python service，也可以包装成 CLI。无论具体形态如何，语义必须一致。
+接口可以实现为内部 TypeScript/Python service，也可以包装成 CLI。无论具体形态如何，语义必须一致。Notebook DB 由 Agent RootFS 路径隔离；接口输入不再包含 `owner_user_id`、`owner_agent_id`、`actor_kind`、`actor_id` 或 item 级 `metadata`。
 
 ### 5.1 list_notebooks
 
 ```ts
 list_notebooks(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   include_archived?: boolean;
 }) -> {
   notebooks: Array<{
@@ -566,8 +546,6 @@ Requirements：
 
 ```ts
 create_or_update_notebook(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   notebook_id: string;
   kind?: NotebookKind;
   title?: string;
@@ -589,8 +567,6 @@ Requirements：
 
 ```ts
 read_notebook(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id?: string;
 
   notebook_id: string;
@@ -718,8 +694,6 @@ This notebook range has not changed since it was last read in this session. Use 
 
 ```ts
 append_note(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id?: string;
 
   notebook_id: string;
@@ -730,8 +704,6 @@ append_note(input: {
   source_ref?: NotebookItem["source_ref"];
   source_session_id?: string;
 
-  actor_kind: ActorKind;
-  actor_id?: string;
   write_reason: WriteReason;
 
   valid_from?: string | null;
@@ -761,28 +733,24 @@ Requirements：
 
 1. append-first：不得覆盖旧 item content；
 2. 如果目标 notebook 不存在，必须在同一事务中自动创建 notebook，再写入 note；
-3. 写入必须在事务中完成：创建 Item、创建 NotebookItem metadata、更新 notebook revision/version、创建 event；
+3. 写入必须在事务中完成：创建 Item、创建 NotebookItem row、更新 notebook revision/version、创建 event；
 4. `title` 和 `content` 不能为空；
-5. `actor_kind = "online_agent"` 时，`write_reason` 只能是 `user_explicit`、`strong_rule`、`project_state`；
-6. `actor_kind = "curator"` 时，允许 `curator_extracted`、`curator_cleanup`；
-7. `tags` 必须先经 §3.6 规范化再持久化；非法 tag 直接返回 `invalid_input`；
-8. 返回 possible conflicts，但默认不阻止写入；
-9. possible conflicts 候选来源：
+5. `tags` 必须先经 §3.6 规范化再持久化；非法 tag 直接返回 `invalid_input`；
+6. 返回 possible conflicts，但默认不阻止写入；
+7. possible conflicts 候选来源：
    - 同 notebook、规范化 title 完全相同；
    - 同 notebook、title 近似（实现自定）；
    - 通过 `ItemSearchPort.searchItemsByTags` 用新 item 的 tags 召回的 top-N active item（`reason = "tag_overlap"`）；
    - 当前 active item 的 valid time 与新 item 重叠；
-10. 不要为冲突检测实现独立全文索引；
-11. 写入后必须发布 NotebookEvent，event.tags 为新 item 的规范化 tags；
-12. 写入后应使相关 session 的旧 read cache 失效，或通过 version mismatch 自然失效；
-13. 写入成功且存在 `session_id` 时，必须自动订阅当前 session 的 `notebook_id + title`，后续其它 session 对该 notebook 或相同/相近 title 的更新可触发 `agent-note` hint。
+8. 不要为冲突检测实现独立全文索引；
+9. 写入后必须发布 NotebookEvent，event.tags 为新 item 的规范化 tags；
+10. 写入后应使相关 session 的旧 read cache 失效，或通过 version mismatch 自然失效；
+11. 写入成功且存在 `session_id` 时，必须自动订阅当前 session 的 `notebook_id + title`，后续其它 session 对该 notebook 或相同/相近 title 的更新可触发 `agent-note` hint。
 
 ### 5.5 mark_note_status
 
 ```ts
 mark_note_status(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id?: string;
 
   item_id: string;
@@ -790,9 +758,6 @@ mark_note_status(input: {
   reason: string;
   superseded_by?: string;
   expected_item_revision?: number;
-
-  actor_kind: ActorKind;
-  actor_id?: string;
 }) -> {
   status: "ok";
   item_id: string;
@@ -804,7 +769,7 @@ mark_note_status(input: {
 
 Requirements：
 
-1. 状态变化必须更新 item metadata；
+1. 状态变化必须更新 item row；
 2. 状态变化必须更新 notebook version；
 3. 如果提供 `expected_item_revision`，不匹配则返回 conflict；
 4. `superseded_by` 存在时应创建 `supersedes` edge；
@@ -815,21 +780,15 @@ Requirements：
 
 ```ts
 list_item_remarks(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   item_id: string;
   remark_type?: string;
 }) -> NotebookItemRemark[]
 
 append_item_remark(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id?: string;
   item_id: string;
   remark_type: string;
   content: string;
-  actor_kind: ActorKind;
-  actor_id?: string;
 }) -> {
   status: "ok";
   remark_id: string;
@@ -840,13 +799,9 @@ append_item_remark(input: {
 }
 
 remove_item_remark(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id?: string;
   item_id: string;
   remark_id: string;
-  actor_kind: ActorKind;
-  actor_id?: string;
 }) -> {
   status: "ok";
   remark_id: string;
@@ -869,11 +824,8 @@ Requirements：
 
 ```ts
 promote_to_system_notebook(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   item_id: string;
   reason: string;
-  actor_kind: "curator" | "admin" | "system";
   replace_item_id?: string;
 }) -> {
   status: "ok" | "limit_exceeded";
@@ -896,8 +848,6 @@ Requirements：
 
 ```ts
 build_notebook_registry_context(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   max_notebooks?: number;
 }) -> {
   block_type: "notebook_registry";
@@ -924,8 +874,6 @@ Requirements：
 
 ```ts
 build_system_notebook_context(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   max_items?: number;             // default: 10
 }) -> {
   block_type: "system_notebook";
@@ -951,8 +899,6 @@ Requirements：
 
 ```ts
 build_notebook_hints(input: {
-  owner_user_id: string;
-  owner_agent_id?: string;
   session_id: string;
 
   topic_tags?: string[];                  // tag list；由上层 session 合并器输出；缺省=不做 topic 过滤
@@ -1092,8 +1038,6 @@ Notebook update since your last turn:
 ```ts
 interface SessionNotebookEventWatermark {
   session_id: string;
-  owner_user_id: string;
-  owner_agent_id?: string;
   last_seen_seq: number;
   last_seen_at: string;
 }
@@ -1172,14 +1116,12 @@ Notebook selector 约定：
 4. CLI 在调用底层接口前必须得到 concrete `notebook_id`；底层 read cache、subscription、event、返回 JSON 都使用解析后的 id；
 5. `status` / `promote` 这类以 `item_id` 定位既有条目的命令，不要求 `--id`，其 notebook 归属由 item 元数据确定。
 
-Owner selector 约定：`--owner-user <user_id>` 可省略；省略时 CLI 使用当前 Agent owner（解析顺序为 `OPENDAN_OWNER_USER_ID`、`OPENDAN_AGENT_OWNER`、`BUCKYOS_OWNER_USER_ID`、当前 BuckyOS runtime / `app_instance_config`）。
+Owner / session / actor selector 约定：Agent Notebook 是当前 Agent 专用的 durable notebook。CLI 从 AgentTool 最小环境契约和 Agent RootFS identity 推导当前 Agent appid、agent id 与 session id；命令行参数只表达业务语义，不需要传 `--owner-user`、`--session`、`--actor-kind`、`--write-reason`。
 
 ### 9.1 list
 
 ```bash
 agent-notebook list \
-  --owner-user <user_id> \
-  [--owner-agent <agent_id>] \
   [--include-archived]
 ```
 
@@ -1189,8 +1131,6 @@ agent-notebook list \
 
 ```bash
 agent-notebook read \
-  --owner-user <user_id> \
-  --session <session_id> \
   [--id <notebook_id>] \
   [--tags <tag1,tag2,tag3>] \
   [--title <title>] \
@@ -1209,7 +1149,7 @@ agent-notebook read \
 
 互斥优先级：`--items` > `--title` > `--tags` > `--latest` > 全部缺省（= all_active）。当多个同时给出时，CLI 按优先级取一个并在 stderr warning 提示忽略的参数。
 
-当传入 `--session` 且读取结果为 `ok` 时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id`，并订阅本次读取输入或返回 entries 中涉及的 title。
+当读取结果为 `ok` 时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id`，并订阅本次读取输入或返回 entries 中涉及的 title。
 
 ### 9.3 append
 
@@ -1217,10 +1157,6 @@ agent-notebook read \
 
 ```bash
 agent-notebook append <title> <content> \
-  --owner-user <user_id> \
-  --session <session_id> \
-  --actor-kind online_agent \
-  --write-reason user_explicit \
   [--id <notebook_id>] \
   [--confidence high] \
   [--tags read-cache,unchanged-response] \
@@ -1231,10 +1167,6 @@ agent-notebook append <title> <content> \
 
 ```bash
 cat note.md | agent-notebook append <title> \
-  --owner-user <user_id> \
-  --session <session_id> \
-  --actor-kind curator \
-  --write-reason curator_extracted \
   [--id <notebook_id>] \
   --tags read-cache,unchanged-response \
   --stdin
@@ -1246,14 +1178,12 @@ cat note.md | agent-notebook append <title> \
 
 `--tags` 同样是逗号拆分的 ordered list；写入时强制规范化校验。
 
-当传入 `--session` 且 append 成功时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id + title`。后续其它 session 修改同一 notebook 或相同/相近 title 时，`build_notebook_hints` 会把这类订阅命中合并到返回的 hint block。
+当 append 成功时，CLI 应把当前 session 自动订阅到解析后的 `notebook_id + title`。后续其它 session 修改同一 notebook 或相同/相近 title 时，`build_notebook_hints` 会把这类订阅命中合并到返回的 hint block。
 
 ### 9.4 create-notebook
 
 ```bash
 agent-notebook create-notebook \
-  --owner-user <user_id> \
-  [--owner-agent <agent_id>] \
   --id <notebook_id> \
   [--kind normal|project|agent] \
   [--title <title>] \
@@ -1266,30 +1196,21 @@ agent-notebook create-notebook \
 
 ```bash
 agent-notebook status <item_id> stale \
-  --owner-user <user_id> \
-  --reason "expired seasonal preference" \
-  --actor-kind curator
+  --reason "expired seasonal preference"
 ```
 
 ### 9.6 remarks
 
 ```bash
 agent-notebook remarks list <item_id> \
-  --owner-user <user_id> \
   [--type <remark_type>]
 
-agent-notebook remarks append <item_id> <remark_type> <content> \
-  --owner-user <user_id> \
-  --actor-kind online_agent
+agent-notebook remarks append <item_id> <remark_type> <content>
 
 cat remark.md | agent-notebook remarks append <item_id> <remark_type> \
-  --owner-user <user_id> \
-  --actor-kind online_agent \
   --stdin
 
-agent-notebook remarks remove <item_id> <remark_id> \
-  --owner-user <user_id> \
-  --actor-kind online_agent
+agent-notebook remarks remove <item_id> <remark_id>
 ```
 
 `remarks list` 默认返回 active remarks；`--type` 只返回指定备注类型。`remarks append` 不覆盖已有 remark。`remarks remove` 是软删除。
@@ -1297,17 +1218,13 @@ agent-notebook remarks remove <item_id> <remark_id> \
 ### 9.7 registry-context
 
 ```bash
-agent-notebook registry-context \
-  --owner-user <user_id> \
-  [--owner-agent <agent_id>]
+agent-notebook registry-context
 ```
 
 ### 9.8 hints
 
 ```bash
 agent-notebook hints \
-  --owner-user <user_id> \
-  --session <session_id> \
   --topic-tags agent-notebook,state-management,technical-requirement \
   --max-hints 3
 ```
@@ -1360,12 +1277,12 @@ interface NotebookError {
 
 ### 11.1 Owner scope
 
-所有操作必须限定 owner：
+Notebook DB 位于当前 Agent RootFS 的 `notebook/` 下，owner / agent scope 由运行时路径和身份元信息确定，不在 notebook SQL 表中重复保存：
 
-1. `owner_user_id` 必须参与查询过滤；
-2. `owner_agent_id` 如果存在，也必须参与过滤；
-3. session 必须有权限访问该 owner scope；
-4. 不同用户之间不得共享 notebook 结果。
+1. SQL schema 不包含 `owner_user_id` / `owner_agent_id` 列；
+2. 查询不再按 owner 列过滤，而是依赖当前打开的 Agent Notebook DB；
+3. session 必须有权限访问该 Agent RootFS；
+4. 不同用户或 Agent 之间不得共享同一个 notebook DB 路径。
 
 ### 11.2 Registry 隐私
 
@@ -1397,7 +1314,7 @@ MVP 不必实现 purge，但数据模型不要阻碍未来硬删除。
 
 1. 确认 notebook 存在或创建；
 2. 写入 Item Store；
-3. 写入 NotebookItem metadata；
+3. 写入 NotebookItem row；
 4. 更新 Notebook revision/version/statistics；
 5. 写入 NotebookEvent；
 6. 提交。
@@ -1461,12 +1378,11 @@ Curator 可做：
 
 Curator 写入要求：
 
-1. `actor_kind = "curator"`；
-2. `write_reason = "curator_extracted"` 或 `curator_cleanup`；
-3. 必须带 source_ref 或 source_excerpt；
-4. 必须给 confidence；
-5. 对推断事实建议 confidence 不高于 medium，除非来源明确；
-6. 必须给 tags，且尽量与 Memory 中同一事实的 tags 对齐，避免 Memory 召回得到、Notebook 召回不到（反之亦然）。
+1. `write_reason = "curator_extracted"` 或 `curator_cleanup`；
+2. 必须带 source_ref 或 source_excerpt；
+3. 必须给 confidence；
+4. 对推断事实建议 confidence 不高于 medium，除非来源明确；
+5. 必须给 tags，且尽量与 Memory 中同一事实的 tags 对齐，避免 Memory 召回得到、Notebook 召回不到（反之亦然）。
 
 ---
 
@@ -1564,7 +1480,7 @@ Curator 写入要求：
 
 ### Phase 1：Domain + Storage
 
-1. 新增 Notebook、NotebookItem metadata、Event、ReadCache 存储；
+1. 新增 Notebook、NotebookItem row、Event、ReadCache 存储；
 2. 接入 ItemRepositoryPort；
 3. 确保 append 是事务性；
 4. 实现 version/revision；
@@ -1642,7 +1558,7 @@ Curator 写入要求：
 - [ ] status 过滤通过测试；
 - [ ] cross-session update hint 不含正文；
 - [ ] System Notebook 上限通过测试；
-- [ ] 所有操作按 owner_user_id 隔离；
+- [ ] 所有操作按当前 Agent Notebook DB 路径隔离；
 - [ ] tag 召回统一走 ItemSearchPort；
 - [ ] ItemSearchPort 不可用时不会偷偷 fallback 到私有索引，但 latest/title/items 路径仍可工作。
 

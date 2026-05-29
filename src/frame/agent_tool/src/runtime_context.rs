@@ -328,7 +328,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(ctx.session_id, "sess-1");
-        assert_eq!(ctx.session_root, ctx.agent_root.join("sessions").join("sess-1"));
+        assert_eq!(
+            ctx.session_root,
+            ctx.agent_root.join("sessions").join("sess-1")
+        );
         assert_eq!(ctx.trace_id, "trace-1");
         assert!(!ctx.is_dev_fallback());
         assert_eq!(ctx.require_identity().unwrap().agent_id, "jarvis");

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: &str = "0.3";
+pub const SCHEMA_VERSION: &str = "0.4";
 pub const SYSTEM_NOTEBOOK_ID: &str = "system";
 pub const SYSTEM_NOTEBOOK_MAX_ACTIVE: usize = 10;
 
@@ -206,38 +206,6 @@ impl Confidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActorKind {
-    User,
-    OnlineAgent,
-    Curator,
-    System,
-    Admin,
-}
-
-impl ActorKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::OnlineAgent => "online_agent",
-            Self::Curator => "curator",
-            Self::System => "system",
-            Self::Admin => "admin",
-        }
-    }
-    fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
-            "user" => Self::User,
-            "online_agent" => Self::OnlineAgent,
-            "curator" => Self::Curator,
-            "system" => Self::System,
-            "admin" => Self::Admin,
-            other => return Err(NotebookError::Storage(format!("bad actor kind: {other}"))),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum WriteReason {
     UserExplicit,
     StrongRule,
@@ -357,9 +325,6 @@ pub struct SourceRef {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Notebook {
     pub id: String,
-    pub owner_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_agent_id: Option<String>,
     pub kind: NotebookKind,
     pub title: String,
     pub description: String,
@@ -384,9 +349,6 @@ pub struct Notebook {
 pub struct NotebookItem {
     pub item_id: String,
     pub notebook_id: String,
-    pub owner_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_agent_id: Option<String>,
     pub title: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,9 +357,6 @@ pub struct NotebookItem {
     pub source_ref: Option<SourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_session_id: Option<String>,
-    pub actor_kind: ActorKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_id: Option<String>,
     pub write_reason: WriteReason,
     pub confidence: Confidence,
     pub status: NotebookItemStatus,
@@ -406,8 +365,6 @@ pub struct NotebookItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<String>,
     pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Json>,
     pub created_at: String,
     pub updated_at: String,
     pub item_revision: i64,
@@ -419,46 +376,17 @@ pub struct NotebookItemRemark {
     pub remark_id: String,
     pub item_id: String,
     pub notebook_id: String,
-    pub owner_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_agent_id: Option<String>,
     pub remark_type: String,
     pub content: String,
     pub status: NotebookItemRemarkStatus,
-    pub actor_kind: ActorKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 // ============================================================ input / output
 
-#[derive(Clone, Debug, Default)]
-pub struct OwnerScope {
-    pub owner_user_id: String,
-    pub owner_agent_id: Option<String>,
-}
-
-impl OwnerScope {
-    pub fn new(owner_user_id: impl Into<String>) -> Self {
-        Self {
-            owner_user_id: owner_user_id.into(),
-            owner_agent_id: None,
-        }
-    }
-    pub fn with_agent(mut self, agent_id: impl Into<String>) -> Self {
-        self.owner_agent_id = Some(agent_id.into());
-        self
-    }
-    fn agent(&self) -> &str {
-        self.owner_agent_id.as_deref().unwrap_or("")
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ListNotebooksInput {
-    pub scope: OwnerScope,
     pub include_archived: bool,
 }
 
@@ -477,7 +405,6 @@ pub struct NotebookRegistryEntry {
 
 #[derive(Clone, Debug)]
 pub struct CreateOrUpdateNotebookInput {
-    pub scope: OwnerScope,
     pub notebook_id: String,
     pub kind: Option<NotebookKind>,
     pub title: Option<String>,
@@ -492,7 +419,6 @@ pub struct CreateOrUpdateNotebookResult {
 
 #[derive(Clone, Debug)]
 pub struct ReadNotebookInput {
-    pub scope: OwnerScope,
     pub session_id: Option<String>,
     pub notebook_id: String,
     pub tags: Option<Vec<String>>,
@@ -510,7 +436,6 @@ pub struct ReadNotebookInput {
 impl Default for ReadNotebookInput {
     fn default() -> Self {
         Self {
-            scope: OwnerScope::default(),
             session_id: None,
             notebook_id: String::new(),
             tags: None,
@@ -580,7 +505,6 @@ pub const UNCHANGED_INSTRUCTION: &str = "This notebook range has not changed sin
 
 #[derive(Clone, Debug)]
 pub struct AppendNoteInput {
-    pub scope: OwnerScope,
     pub session_id: Option<String>,
     pub notebook_id: String,
     pub title: String,
@@ -588,14 +512,11 @@ pub struct AppendNoteInput {
     pub source_excerpt: Option<String>,
     pub source_ref: Option<SourceRef>,
     pub source_session_id: Option<String>,
-    pub actor_kind: ActorKind,
-    pub actor_id: Option<String>,
     pub write_reason: WriteReason,
     pub valid_from: Option<String>,
     pub valid_until: Option<String>,
     pub confidence: Option<Confidence>,
     pub tags: Vec<String>,
-    pub metadata: Option<Json>,
     pub detect_conflicts: bool,
 }
 
@@ -631,15 +552,12 @@ pub struct AppendNoteResult {
 
 #[derive(Clone, Debug)]
 pub struct MarkNoteStatusInput {
-    pub scope: OwnerScope,
     pub session_id: Option<String>,
     pub item_id: String,
     pub status: NotebookItemStatus,
     pub reason: String,
     pub superseded_by: Option<String>,
     pub expected_item_revision: Option<i64>,
-    pub actor_kind: ActorKind,
-    pub actor_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -674,20 +592,16 @@ impl NotebookItemRemarkStatus {
 
 #[derive(Clone, Debug)]
 pub struct ListItemRemarksInput {
-    pub scope: OwnerScope,
     pub item_id: String,
     pub remark_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AppendItemRemarkInput {
-    pub scope: OwnerScope,
     pub session_id: Option<String>,
     pub item_id: String,
     pub remark_type: String,
     pub content: String,
-    pub actor_kind: ActorKind,
-    pub actor_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -702,12 +616,9 @@ pub struct AppendItemRemarkResult {
 
 #[derive(Clone, Debug)]
 pub struct RemoveItemRemarkInput {
-    pub scope: OwnerScope,
     pub session_id: Option<String>,
     pub item_id: String,
     pub remark_id: String,
-    pub actor_kind: ActorKind,
-    pub actor_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -722,10 +633,8 @@ pub struct RemoveItemRemarkResult {
 
 #[derive(Clone, Debug)]
 pub struct PromoteToSystemInput {
-    pub scope: OwnerScope,
     pub item_id: String,
     pub reason: String,
-    pub actor_kind: ActorKind,
     pub replace_item_id: Option<String>,
 }
 
@@ -747,7 +656,6 @@ pub enum PromoteToSystemResult {
 
 #[derive(Clone, Debug)]
 pub struct BuildRegistryContextInput {
-    pub scope: OwnerScope,
     pub max_notebooks: Option<usize>,
 }
 
@@ -760,7 +668,6 @@ pub struct RegistryContext {
 
 #[derive(Clone, Debug)]
 pub struct BuildSystemContextInput {
-    pub scope: OwnerScope,
     pub max_items: Option<usize>,
 }
 
@@ -781,7 +688,6 @@ pub struct SystemContext {
 
 #[derive(Clone, Debug)]
 pub struct BuildHintsInput {
-    pub scope: OwnerScope,
     pub session_id: String,
     pub topic_tags: Option<Vec<String>>,
     pub candidate_notebook_ids: Option<Vec<String>>,
@@ -881,39 +787,29 @@ impl AgentNotebook {
     // -------------------------------------------------- list_notebooks (§5.1)
 
     pub fn list_notebooks(&self, input: ListNotebooksInput) -> Result<Vec<NotebookRegistryEntry>> {
-        validate_owner(&input.scope)?;
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, kind, title, description, entry_count, active_entry_count,
                     latest_title, latest_updated_at, version, status
              FROM notebooks
-             WHERE owner_user_id = ?
-               AND owner_agent_id = ?
-               AND (? OR status = 'active')
+             WHERE (? OR status = 'active')
              ORDER BY id ASC",
         )?;
         let include_archived = if input.include_archived { 1 } else { 0 };
-        let rows = stmt.query_map(
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                include_archived
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, String>(9)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![include_archived], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             let (id, kind, title, description, ec, aec, lt, lu, v, status) = row?;
@@ -942,7 +838,6 @@ impl AgentNotebook {
         &self,
         input: CreateOrUpdateNotebookInput,
     ) -> Result<CreateOrUpdateNotebookResult> {
-        validate_owner(&input.scope)?;
         let notebook_id = validate_notebook_id(&input.notebook_id)?;
         if let Some(t) = &input.title {
             if t.trim().is_empty() {
@@ -953,7 +848,7 @@ impl AgentNotebook {
         let tx = conn.transaction()?;
         let now = now_iso8601();
 
-        let existing = load_notebook(&tx, &input.scope, &notebook_id)?;
+        let existing = load_notebook(&tx, &notebook_id)?;
         let (notebook, created) = match existing {
             None => {
                 let kind = input.kind.unwrap_or(default_kind_for_id(&notebook_id));
@@ -964,13 +859,11 @@ impl AgentNotebook {
                 let version = make_version(revision, &event_id);
                 tx.execute(
                     "INSERT INTO notebooks(
-                        owner_user_id, owner_agent_id, id, kind, title, description, status,
+                        id, kind, title, description, status,
                         revision, version, latest_item_id, latest_title, latest_updated_at,
                         entry_count, active_entry_count, created_at, updated_at, archived_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, NULL)",
+                     ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, NULL)",
                     params![
-                        input.scope.owner_user_id,
-                        input.scope.agent(),
                         notebook_id,
                         kind.as_str(),
                         title,
@@ -989,11 +882,8 @@ impl AgentNotebook {
                         seq,
                         event_type: NotebookEventType::NotebookCreated,
                         notebook_id: notebook_id.clone(),
-                        owner_user_id: input.scope.owner_user_id.clone(),
-                        owner_agent_id: input.scope.agent().to_string(),
                         item_id: None,
                         actor_session_id: None,
-                        actor_kind: ActorKind::System,
                         title: Some(title.clone()),
                         summary: Some(format!("created notebook {notebook_id}")),
                         tags: None,
@@ -1002,8 +892,7 @@ impl AgentNotebook {
                         created_at: now.clone(),
                     },
                 )?;
-                let nb = load_notebook(&tx, &input.scope, &notebook_id)?
-                    .expect("notebook just inserted");
+                let nb = load_notebook(&tx, &notebook_id)?.expect("notebook just inserted");
                 (nb, true)
             }
             Some(mut nb) => {
@@ -1034,7 +923,7 @@ impl AgentNotebook {
                     tx.execute(
                         "UPDATE notebooks SET kind = ?, title = ?, description = ?,
                                               revision = ?, version = ?, updated_at = ?
-                         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
+                         WHERE id = ?",
                         params![
                             nb.kind.as_str(),
                             nb.title,
@@ -1042,8 +931,6 @@ impl AgentNotebook {
                             nb.revision,
                             nb.version,
                             nb.updated_at,
-                            input.scope.owner_user_id,
-                            input.scope.agent(),
                             notebook_id
                         ],
                     )?;
@@ -1055,11 +942,8 @@ impl AgentNotebook {
                             seq,
                             event_type: NotebookEventType::NotebookUpdated,
                             notebook_id: notebook_id.clone(),
-                            owner_user_id: input.scope.owner_user_id.clone(),
-                            owner_agent_id: input.scope.agent().to_string(),
                             item_id: None,
                             actor_session_id: None,
-                            actor_kind: ActorKind::System,
                             title: Some(nb.title.clone()),
                             summary: Some("notebook metadata updated".to_string()),
                             tags: None,
@@ -1080,7 +964,6 @@ impl AgentNotebook {
     // -------------------------------------------------- read_notebook (§5.3)
 
     pub fn read_notebook(&self, input: ReadNotebookInput) -> Result<NotebookReadResult> {
-        validate_owner(&input.scope)?;
         let notebook_id = validate_notebook_id(&input.notebook_id)?;
 
         // Resolve include_status. Default: active only. include_superseded sugar
@@ -1179,20 +1062,16 @@ impl AgentNotebook {
         let read_scope_hash = blake3_hex(canonical_json(&read_scope_value).as_bytes());
 
         let conn = self.lock_conn()?;
-        let notebook = load_notebook(&conn, &input.scope, &notebook_id)?
+        let notebook = load_notebook(&conn, &notebook_id)?
             .ok_or_else(|| NotebookError::NotFound(format!("notebook {notebook_id}")))?;
 
         // Unchanged short-circuit (§5.3.3).
         if input.allow_unchanged {
             if let Some(sid) = input.session_id.as_deref() {
                 // Direct hit on same scope.
-                if let Some(prev_version) = fetch_read_cache_version(
-                    &conn,
-                    sid,
-                    &input.scope,
-                    &notebook_id,
-                    &read_scope_hash,
-                )? {
+                if let Some(prev_version) =
+                    fetch_read_cache_version(&conn, sid, &notebook_id, &read_scope_hash)?
+                {
                     if prev_version == notebook.version {
                         return Ok(NotebookReadResult::Unchanged {
                             notebook_id: notebook_id.clone(),
@@ -1206,14 +1085,8 @@ impl AgentNotebook {
                 // since_version pin per §5.3.3 (3).
                 if let Some(sv) = input.since_version.as_deref() {
                     if sv == notebook.version
-                        && fetch_read_cache_version(
-                            &conn,
-                            sid,
-                            &input.scope,
-                            &notebook_id,
-                            &read_scope_hash,
-                        )?
-                        .is_some()
+                        && fetch_read_cache_version(&conn, sid, &notebook_id, &read_scope_hash)?
+                            .is_some()
                     {
                         return Ok(NotebookReadResult::Unchanged {
                             notebook_id: notebook_id.clone(),
@@ -1227,13 +1100,7 @@ impl AgentNotebook {
                 // If session previously read all_active on this notebook+version,
                 // any narrower scope is already covered.
                 if mode != ReadMode::AllActive
-                    && session_has_all_active_at(
-                        &conn,
-                        sid,
-                        &input.scope,
-                        &notebook_id,
-                        &notebook.version,
-                    )?
+                    && session_has_all_active_at(&conn, sid, &notebook_id, &notebook.version)?
                 {
                     return Ok(NotebookReadResult::Unchanged {
                         notebook_id: notebook_id.clone(),
@@ -1256,22 +1123,18 @@ impl AgentNotebook {
                 .collect(),
             ReadMode::Title => {
                 let needle = input.title.as_deref().unwrap_or("");
-                title_candidates(&conn, &input.scope, &notebook_id, needle, &include_status)?
+                title_candidates(&conn, &notebook_id, needle, &include_status)?
             }
-            ReadMode::Tags => tag_candidates(
-                &conn,
-                &input.scope,
-                &notebook_id,
-                &tags_effective,
-                &include_status,
-            )?,
+            ReadMode::Tags => {
+                tag_candidates(&conn, &notebook_id, &tags_effective, &include_status)?
+            }
             ReadMode::Latest | ReadMode::AllActive => {
-                all_candidates(&conn, &input.scope, &notebook_id, &include_status)?
+                all_candidates(&conn, &notebook_id, &include_status)?
             }
         };
 
         // Fetch the actual item rows.
-        let items = fetch_items_by_ids(&conn, &input.scope, &candidate_ids)?;
+        let items = fetch_items_by_ids(&conn, &candidate_ids)?;
         let mut items_map: BTreeMap<String, NotebookItem> = BTreeMap::new();
         for it in items {
             items_map.insert(it.item_id.clone(), it);
@@ -1358,7 +1221,6 @@ impl AgentNotebook {
             upsert_read_cache(
                 &conn,
                 sid,
-                &input.scope,
                 &notebook_id,
                 &read_scope_hash,
                 mode,
@@ -1387,7 +1249,6 @@ impl AgentNotebook {
     // -------------------------------------------------- append_note (§5.4)
 
     pub fn append_note(&self, input: AppendNoteInput) -> Result<AppendNoteResult> {
-        validate_owner(&input.scope)?;
         let notebook_id = validate_notebook_id(&input.notebook_id)?;
         let title = input.title.trim();
         if title.is_empty() {
@@ -1407,35 +1268,9 @@ impl AgentNotebook {
             )));
         }
 
-        // Online-agent write reasons are restricted (§5.4 #4).
-        match (input.actor_kind, input.write_reason) {
-            (ActorKind::OnlineAgent, WriteReason::CuratorExtracted)
-            | (ActorKind::OnlineAgent, WriteReason::CuratorCleanup)
-            | (ActorKind::OnlineAgent, WriteReason::ManualAdmin) => {
-                return Err(NotebookError::PermissionDenied(format!(
-                    "online_agent may not use write_reason {}",
-                    input.write_reason.as_str()
-                )))
-            }
-            (ActorKind::Curator, WriteReason::UserExplicit)
-            | (ActorKind::Curator, WriteReason::StrongRule)
-            | (ActorKind::Curator, WriteReason::ProjectState)
-            | (ActorKind::Curator, WriteReason::ManualAdmin) => {
-                return Err(NotebookError::PermissionDenied(format!(
-                    "curator may not use write_reason {}",
-                    input.write_reason.as_str()
-                )))
-            }
-            _ => {}
-        }
-
         let confidence = input.confidence.unwrap_or(Confidence::Medium);
         let source_ref_json = match &input.source_ref {
             Some(s) => Some(serde_json::to_string(s)?),
-            None => None,
-        };
-        let metadata_json = match &input.metadata {
-            Some(m) => Some(serde_json::to_string(m)?),
             None => None,
         };
 
@@ -1445,7 +1280,7 @@ impl AgentNotebook {
 
         // Auto-create notebook if missing (mirrors the spec's append-first
         // ergonomics; create_or_update_notebook stays the canonical creator).
-        let mut notebook = match load_notebook(&tx, &input.scope, &notebook_id)? {
+        let mut notebook = match load_notebook(&tx, &notebook_id)? {
             Some(nb) => nb,
             None => {
                 let kind = default_kind_for_id(&notebook_id);
@@ -1454,13 +1289,11 @@ impl AgentNotebook {
                 let version = make_version(revision, &event_id);
                 tx.execute(
                     "INSERT INTO notebooks(
-                        owner_user_id, owner_agent_id, id, kind, title, description, status,
+                        id, kind, title, description, status,
                         revision, version, latest_item_id, latest_title, latest_updated_at,
                         entry_count, active_entry_count, created_at, updated_at, archived_at
-                     ) VALUES (?, ?, ?, ?, ?, '', 'active', ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, NULL)",
+                     ) VALUES (?, ?, ?, '', 'active', ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, NULL)",
                     params![
-                        input.scope.owner_user_id,
-                        input.scope.agent(),
                         notebook_id,
                         kind.as_str(),
                         notebook_id.clone(),
@@ -1478,11 +1311,8 @@ impl AgentNotebook {
                         seq,
                         event_type: NotebookEventType::NotebookCreated,
                         notebook_id: notebook_id.clone(),
-                        owner_user_id: input.scope.owner_user_id.clone(),
-                        owner_agent_id: input.scope.agent().to_string(),
                         item_id: None,
                         actor_session_id: None,
-                        actor_kind: ActorKind::System,
                         title: Some(notebook_id.clone()),
                         summary: Some(format!("auto-created notebook {notebook_id}")),
                         tags: None,
@@ -1491,7 +1321,7 @@ impl AgentNotebook {
                         created_at: now.clone(),
                     },
                 )?;
-                load_notebook(&tx, &input.scope, &notebook_id)?.expect("notebook just inserted")
+                load_notebook(&tx, &notebook_id)?.expect("notebook just inserted")
             }
         };
 
@@ -1500,7 +1330,6 @@ impl AgentNotebook {
         if input.detect_conflicts {
             conflicts = detect_conflicts(
                 &tx,
-                &input.scope,
                 &notebook_id,
                 title,
                 &tags,
@@ -1514,28 +1343,23 @@ impl AgentNotebook {
         let content_hash = blake3_hex(input.content.as_bytes());
         tx.execute(
             "INSERT INTO notebook_items(
-                item_id, notebook_id, owner_user_id, owner_agent_id, title, content,
-                source_excerpt, source_ref, source_session_id, actor_kind, actor_id,
-                write_reason, confidence, status, valid_from, valid_until, metadata,
+                item_id, notebook_id, title, content,
+                source_excerpt, source_ref, source_session_id,
+                write_reason, confidence, status, valid_from, valid_until,
                 created_at, updated_at, item_revision, content_hash
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, 1, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 1, ?)",
             params![
                 item_id,
                 notebook_id,
-                input.scope.owner_user_id,
-                input.scope.agent(),
                 title,
                 input.content,
                 input.source_excerpt,
                 source_ref_json,
                 input.source_session_id,
-                input.actor_kind.as_str(),
-                input.actor_id,
                 input.write_reason.as_str(),
                 confidence.as_str(),
                 input.valid_from,
                 input.valid_until,
-                metadata_json,
                 now,
                 now,
                 content_hash
@@ -1564,7 +1388,7 @@ impl AgentNotebook {
             "UPDATE notebooks SET revision = ?, version = ?, latest_item_id = ?,
                                   latest_title = ?, latest_updated_at = ?,
                                   entry_count = ?, active_entry_count = ?, updated_at = ?
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
+             WHERE id = ?",
             params![
                 notebook.revision,
                 notebook.version,
@@ -1574,8 +1398,6 @@ impl AgentNotebook {
                 notebook.entry_count,
                 notebook.active_entry_count,
                 notebook.updated_at,
-                input.scope.owner_user_id,
-                input.scope.agent(),
                 notebook_id
             ],
         )?;
@@ -1588,11 +1410,8 @@ impl AgentNotebook {
                 seq,
                 event_type: NotebookEventType::ItemAppended,
                 notebook_id: notebook_id.clone(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.agent().to_string(),
                 item_id: Some(item_id.clone()),
                 actor_session_id: input.session_id.clone(),
-                actor_kind: input.actor_kind,
                 title: Some(title.to_string()),
                 summary: Some(short_summary(&input.content)),
                 tags: Some(tags.clone()),
@@ -1615,7 +1434,6 @@ impl AgentNotebook {
     // -------------------------------------------------- mark_note_status (§5.5)
 
     pub fn mark_note_status(&self, input: MarkNoteStatusInput) -> Result<MarkNoteStatusResult> {
-        validate_owner(&input.scope)?;
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = now_iso8601();
@@ -1623,12 +1441,8 @@ impl AgentNotebook {
         let row: Option<(String, String, i64)> = tx
             .query_row(
                 "SELECT notebook_id, status, item_revision FROM notebook_items
-                 WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-                params![
-                    input.item_id,
-                    input.scope.owner_user_id,
-                    input.scope.agent()
-                ],
+                 WHERE item_id = ?",
+                params![input.item_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1652,7 +1466,7 @@ impl AgentNotebook {
                  WHERE item_id = ?",
                 params![now, input.item_id],
             )?;
-            let nb = load_notebook(&tx, &input.scope, &notebook_id)?
+            let nb = load_notebook(&tx, &notebook_id)?
                 .ok_or_else(|| NotebookError::Storage("notebook missing".into()))?;
             tx.commit()?;
             return Ok(MarkNoteStatusResult {
@@ -1673,7 +1487,7 @@ impl AgentNotebook {
         )?;
 
         // Adjust notebook active counts.
-        let mut nb = load_notebook(&tx, &input.scope, &notebook_id)?
+        let mut nb = load_notebook(&tx, &notebook_id)?
             .ok_or_else(|| NotebookError::Storage("notebook missing".into()))?;
         let was_active = prev_status == NotebookItemStatus::Active;
         let now_active = input.status == NotebookItemStatus::Active;
@@ -1697,15 +1511,13 @@ impl AgentNotebook {
         tx.execute(
             "UPDATE notebooks SET revision = ?, version = ?, updated_at = ?,
                                   active_entry_count = ?, entry_count = ?
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
+             WHERE id = ?",
             params![
                 nb.revision,
                 nb.version,
                 nb.updated_at,
                 nb.active_entry_count,
                 nb.entry_count,
-                input.scope.owner_user_id,
-                input.scope.agent(),
                 notebook_id
             ],
         )?;
@@ -1718,7 +1530,7 @@ impl AgentNotebook {
                     "INSERT OR REPLACE INTO notebook_item_edges(
                         from_item_id, to_item_id, edge_type, reason, created_at, created_by
                      ) VALUES (?, ?, 'supersedes', ?, ?, ?)",
-                    params![by, input.item_id, input.reason, now, input.actor_id],
+                    params![by, input.item_id, input.reason, now, ""],
                 )?;
             }
             event_type = NotebookEventType::ItemSuperseded;
@@ -1732,11 +1544,8 @@ impl AgentNotebook {
                 seq,
                 event_type,
                 notebook_id: notebook_id.clone(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.agent().to_string(),
                 item_id: Some(input.item_id.clone()),
                 actor_session_id: input.session_id.clone(),
-                actor_kind: input.actor_kind,
                 title: None,
                 summary: Some(format!(
                     "{} -> {}: {}",
@@ -1765,7 +1574,6 @@ impl AgentNotebook {
         &self,
         input: ListItemRemarksInput,
     ) -> Result<Vec<NotebookItemRemark>> {
-        validate_owner(&input.scope)?;
         let item_id = validate_item_id(&input.item_id)?;
         let remark_type = input
             .remark_type
@@ -1773,18 +1581,15 @@ impl AgentNotebook {
             .map(normalize_remark_type)
             .transpose()?;
         let conn = self.lock_conn()?;
-        let notebook_id = item_notebook_id(&conn, &input.scope, &item_id)?
+        let notebook_id = item_notebook_id(&conn, &item_id)?
             .ok_or_else(|| NotebookError::NotFound(format!("notebook item {item_id}")))?;
         let mut query = String::from(
-            "SELECT remark_id, remark_type, content, status, actor_kind, actor_id,
+            "SELECT remark_id, remark_type, content, status,
                     created_at, updated_at
              FROM notebook_item_remarks
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND item_id = ?
-               AND status = 'active'",
+             WHERE item_id = ? AND status = 'active'",
         );
-        let agent = input.scope.agent().to_string();
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> =
-            vec![&input.scope.owner_user_id, &agent, &item_id];
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&item_id];
         if let Some(remark_type) = &remark_type {
             query.push_str(" AND remark_type = ?");
             params_vec.push(remark_type);
@@ -1798,34 +1603,19 @@ impl AgentNotebook {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (
-                remark_id,
-                remark_type,
-                content,
-                status,
-                actor_kind,
-                actor_id,
-                created_at,
-                updated_at,
-            ) = row?;
+            let (remark_id, remark_type, content, status, created_at, updated_at) = row?;
             out.push(NotebookItemRemark {
                 remark_id,
                 item_id: item_id.clone(),
                 notebook_id: notebook_id.clone(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.owner_agent_id.clone(),
                 remark_type,
                 content,
                 status: NotebookItemRemarkStatus::from_str(&status)?,
-                actor_kind: ActorKind::from_str(&actor_kind)?,
-                actor_id,
                 created_at,
                 updated_at,
             });
@@ -1837,7 +1627,6 @@ impl AgentNotebook {
         &self,
         input: AppendItemRemarkInput,
     ) -> Result<AppendItemRemarkResult> {
-        validate_owner(&input.scope)?;
         let item_id = validate_item_id(&input.item_id)?;
         let remark_type = normalize_remark_type(&input.remark_type)?;
         if input.content.trim().is_empty() {
@@ -1849,9 +1638,8 @@ impl AgentNotebook {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = now_iso8601();
-        let (notebook_id, item_title, item_status) =
-            load_item_remark_target(&tx, &input.scope, &item_id)?
-                .ok_or_else(|| NotebookError::NotFound(format!("notebook item {item_id}")))?;
+        let (notebook_id, item_title, item_status) = load_item_remark_target(&tx, &item_id)?
+            .ok_or_else(|| NotebookError::NotFound(format!("notebook item {item_id}")))?;
         if item_status == NotebookItemStatus::Deleted {
             return Err(NotebookError::InvalidInput(
                 "cannot append remark to deleted item".into(),
@@ -1861,31 +1649,18 @@ impl AgentNotebook {
         let remark_id = new_remark_id();
         tx.execute(
             "INSERT INTO notebook_item_remarks(
-                remark_id, item_id, owner_user_id, owner_agent_id, remark_type, content,
-                status, actor_kind, actor_id, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
-            params![
-                remark_id,
-                item_id,
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                remark_type,
-                input.content,
-                input.actor_kind.as_str(),
-                input.actor_id,
-                now,
-                now
-            ],
+                remark_id, item_id, remark_type, content, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            params![remark_id, item_id, remark_type, input.content, now, now],
         )?;
         tx.execute(
             "UPDATE notebook_items SET updated_at = ?, item_revision = item_revision + 1
-             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![now, item_id, input.scope.owner_user_id, input.scope.agent()],
+             WHERE item_id = ?",
+            params![now, item_id],
         )?;
         let event_id = new_event_id();
-        let notebook_version =
-            bump_notebook_version(&tx, &input.scope, &notebook_id, &now, Some(&event_id))?;
-        let notebook_revision = notebook_revision(&tx, &input.scope, &notebook_id)?;
+        let notebook_version = bump_notebook_version(&tx, &notebook_id, &now, Some(&event_id))?;
+        let notebook_revision = notebook_revision(&tx, &notebook_id)?;
         let tags = fetch_item_tags(&tx, &item_id)?;
         let seq = next_event_seq(&tx)?;
         insert_event(
@@ -1895,11 +1670,8 @@ impl AgentNotebook {
                 seq,
                 event_type: NotebookEventType::ItemRemarkAppended,
                 notebook_id: notebook_id.clone(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.agent().to_string(),
                 item_id: Some(item_id.clone()),
                 actor_session_id: input.session_id.clone(),
-                actor_kind: input.actor_kind,
                 title: Some(item_title),
                 summary: Some(format!("{remark_type}: {}", short_summary(&input.content))),
                 tags: Some(tags),
@@ -1923,40 +1695,28 @@ impl AgentNotebook {
         &self,
         input: RemoveItemRemarkInput,
     ) -> Result<RemoveItemRemarkResult> {
-        validate_owner(&input.scope)?;
         let item_id = validate_item_id(&input.item_id)?;
         let remark_id = validate_remark_id(&input.remark_id)?;
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = now_iso8601();
         let (notebook_id, item_title, remark_type) =
-            load_active_remark_target(&tx, &input.scope, &item_id, &remark_id)?.ok_or_else(
-                || {
-                    NotebookError::NotFound(format!(
-                        "remark {remark_id} on notebook item {item_id}"
-                    ))
-                },
-            )?;
+            load_active_remark_target(&tx, &item_id, &remark_id)?.ok_or_else(|| {
+                NotebookError::NotFound(format!("remark {remark_id} on notebook item {item_id}"))
+            })?;
         tx.execute(
             "UPDATE notebook_item_remarks SET status = 'deleted', updated_at = ?
-             WHERE remark_id = ? AND item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![
-                now,
-                remark_id,
-                item_id,
-                input.scope.owner_user_id,
-                input.scope.agent()
-            ],
+             WHERE remark_id = ? AND item_id = ?",
+            params![now, remark_id, item_id],
         )?;
         tx.execute(
             "UPDATE notebook_items SET updated_at = ?, item_revision = item_revision + 1
-             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![now, item_id, input.scope.owner_user_id, input.scope.agent()],
+             WHERE item_id = ?",
+            params![now, item_id],
         )?;
         let event_id = new_event_id();
-        let notebook_version =
-            bump_notebook_version(&tx, &input.scope, &notebook_id, &now, Some(&event_id))?;
-        let notebook_revision = notebook_revision(&tx, &input.scope, &notebook_id)?;
+        let notebook_version = bump_notebook_version(&tx, &notebook_id, &now, Some(&event_id))?;
+        let notebook_revision = notebook_revision(&tx, &notebook_id)?;
         let tags = fetch_item_tags(&tx, &item_id)?;
         let seq = next_event_seq(&tx)?;
         insert_event(
@@ -1966,11 +1726,8 @@ impl AgentNotebook {
                 seq,
                 event_type: NotebookEventType::ItemRemarkRemoved,
                 notebook_id: notebook_id.clone(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.agent().to_string(),
                 item_id: Some(item_id.clone()),
                 actor_session_id: input.session_id.clone(),
-                actor_kind: input.actor_kind,
                 title: Some(item_title),
                 summary: Some(format!("removed remark {remark_type}")),
                 tags: Some(tags),
@@ -1996,15 +1753,6 @@ impl AgentNotebook {
         &self,
         input: PromoteToSystemInput,
     ) -> Result<PromoteToSystemResult> {
-        validate_owner(&input.scope)?;
-        if !matches!(
-            input.actor_kind,
-            ActorKind::Curator | ActorKind::Admin | ActorKind::System
-        ) {
-            return Err(NotebookError::PermissionDenied(
-                "promote requires curator/admin/system actor".into(),
-            ));
-        }
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = now_iso8601();
@@ -2014,12 +1762,8 @@ impl AgentNotebook {
             .query_row(
                 "SELECT notebook_id, status, confidence, title, valid_until
                  FROM notebook_items
-                 WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-                params![
-                    input.item_id,
-                    input.scope.owner_user_id,
-                    input.scope.agent()
-                ],
+                 WHERE item_id = ?",
+                params![input.item_id],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -2054,18 +1798,13 @@ impl AgentNotebook {
         }
 
         // Ensure system notebook exists.
-        ensure_system_notebook(&tx, &input.scope, &now)?;
+        ensure_system_notebook(&tx, &now)?;
 
         // Compute active count after the prospective promotion.
         let active_in_system: usize = tx.query_row(
             "SELECT COUNT(*) FROM notebook_items
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-               AND status = 'active'",
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                SYSTEM_NOTEBOOK_ID
-            ],
+             WHERE notebook_id = ? AND status = 'active'",
+            params![SYSTEM_NOTEBOOK_ID],
             |r| r.get::<_, i64>(0),
         )? as usize;
 
@@ -2074,27 +1813,15 @@ impl AgentNotebook {
             tx.execute(
                 "UPDATE notebook_items SET status = 'superseded', updated_at = ?,
                                             item_revision = item_revision + 1
-                 WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?
-                   AND notebook_id = ?",
-                params![
-                    now,
-                    rep_id,
-                    input.scope.owner_user_id,
-                    input.scope.agent(),
-                    SYSTEM_NOTEBOOK_ID
-                ],
+                 WHERE item_id = ? AND notebook_id = ?",
+                params![now, rep_id, SYSTEM_NOTEBOOK_ID],
             )?;
             // The replaced count is one less active in system; recompute below.
         }
         let active_after_replace: usize = tx.query_row(
             "SELECT COUNT(*) FROM notebook_items
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-               AND status = 'active'",
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                SYSTEM_NOTEBOOK_ID
-            ],
+             WHERE notebook_id = ? AND status = 'active'",
+            params![SYSTEM_NOTEBOOK_ID],
             |r| r.get::<_, i64>(0),
         )? as usize;
 
@@ -2117,19 +1844,14 @@ impl AgentNotebook {
         )?;
 
         // Bump source notebook stats.
-        adjust_notebook_counts(&tx, &input.scope, &src_nb_id, -1, -1)?;
-        bump_notebook_version(&tx, &input.scope, &src_nb_id, &now, None)?;
+        adjust_notebook_counts(&tx, &src_nb_id, -1, -1)?;
+        bump_notebook_version(&tx, &src_nb_id, &now, None)?;
 
         // Bump system notebook stats.
-        adjust_notebook_counts(&tx, &input.scope, SYSTEM_NOTEBOOK_ID, 1, 1)?;
+        adjust_notebook_counts(&tx, SYSTEM_NOTEBOOK_ID, 1, 1)?;
         let sys_event_id = new_event_id();
-        let sys_nb_version = bump_notebook_version(
-            &tx,
-            &input.scope,
-            SYSTEM_NOTEBOOK_ID,
-            &now,
-            Some(&sys_event_id),
-        )?;
+        let sys_nb_version =
+            bump_notebook_version(&tx, SYSTEM_NOTEBOOK_ID, &now, Some(&sys_event_id))?;
 
         // Promote event under the system notebook.
         let seq = next_event_seq(&tx)?;
@@ -2140,11 +1862,8 @@ impl AgentNotebook {
                 seq,
                 event_type: NotebookEventType::ItemPromotedToSystem,
                 notebook_id: SYSTEM_NOTEBOOK_ID.to_string(),
-                owner_user_id: input.scope.owner_user_id.clone(),
-                owner_agent_id: input.scope.agent().to_string(),
                 item_id: Some(input.item_id.clone()),
                 actor_session_id: None,
-                actor_kind: input.actor_kind,
                 title: Some(title.clone()),
                 summary: Some(short_summary(&input.reason)),
                 tags: None,
@@ -2157,13 +1876,8 @@ impl AgentNotebook {
         // Recompute final active count for the return value.
         let final_count: usize = tx.query_row(
             "SELECT COUNT(*) FROM notebook_items
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-               AND status = 'active'",
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                SYSTEM_NOTEBOOK_ID
-            ],
+             WHERE notebook_id = ? AND status = 'active'",
+            params![SYSTEM_NOTEBOOK_ID],
             |r| r.get::<_, i64>(0),
         )? as usize;
         tx.commit()?;
@@ -2182,7 +1896,6 @@ impl AgentNotebook {
         input: BuildRegistryContextInput,
     ) -> Result<RegistryContext> {
         let mut notebooks = self.list_notebooks(ListNotebooksInput {
-            scope: input.scope.clone(),
             include_archived: false,
         })?;
         let cap = input.max_notebooks.unwrap_or(50);
@@ -2222,18 +1935,15 @@ impl AgentNotebook {
         })
     }
 
-    pub fn build_notebook_list_text(&self, scope: OwnerScope) -> Result<String> {
-        validate_owner(&scope)?;
+    pub fn build_notebook_list_text(&self) -> Result<String> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, title, description, active_entry_count, updated_at
              FROM notebooks
-             WHERE owner_user_id = ?
-               AND owner_agent_id = ?
-               AND status = 'active'
+             WHERE status = 'active'
              ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![scope.owner_user_id, scope.agent()], |r| {
+        let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -2269,11 +1979,26 @@ impl AgentNotebook {
 
     pub fn build_recent_items_text(
         &self,
-        scope: OwnerScope,
         max_items: usize,
         since_access_at_secs: u64,
     ) -> Result<String> {
-        validate_owner(&scope)?;
+        self.build_recent_items_text_inner(max_items, since_access_at_secs, false)
+    }
+
+    pub fn build_recent_items_text_for_self_check(
+        &self,
+        max_items: usize,
+        since_access_at_secs: u64,
+    ) -> Result<String> {
+        self.build_recent_items_text_inner(max_items, since_access_at_secs, true)
+    }
+
+    fn build_recent_items_text_inner(
+        &self,
+        max_items: usize,
+        since_access_at_secs: u64,
+        include_unreviewed: bool,
+    ) -> Result<String> {
         let max_items = max_items.max(1);
         let conn = self.lock_conn()?;
         let now = now_iso8601();
@@ -2282,12 +2007,8 @@ impl AgentNotebook {
             "SELECT i.item_id, i.notebook_id, i.title, i.created_at, i.updated_at
              FROM notebook_items i
              JOIN notebooks n
-               ON n.owner_user_id = i.owner_user_id
-              AND n.owner_agent_id = i.owner_agent_id
-              AND n.id = i.notebook_id
-             WHERE i.owner_user_id = ?
-               AND i.owner_agent_id = ?
-               AND i.status = 'active'
+               ON n.id = i.notebook_id
+             WHERE i.status = 'active'
                AND n.status = 'active'
                AND (i.valid_until IS NULL OR i.valid_until >= ?)
                AND (
@@ -2296,12 +2017,20 @@ impl AgentNotebook {
                     OR EXISTS (
                         SELECT 1
                         FROM notebook_item_remarks r
-                        WHERE r.owner_user_id = i.owner_user_id
-                          AND r.owner_agent_id = i.owner_agent_id
-                          AND r.item_id = i.item_id
+                        WHERE r.item_id = i.item_id
                           AND r.status = 'active'
                           AND r.remark_type = 'self_check'
                           AND r.content LIKE '%keep_observing%'
+                    )
+                    OR (
+                        ? != 0
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM notebook_item_remarks r
+                            WHERE r.item_id = i.item_id
+                              AND r.status = 'active'
+                              AND r.remark_type = 'self_check'
+                        )
                     )
                )
              ORDER BY i.updated_at DESC, i.created_at DESC, i.item_id ASC
@@ -2309,11 +2038,10 @@ impl AgentNotebook {
         )?;
         let rows = stmt.query_map(
             params![
-                scope.owner_user_id,
-                scope.agent(),
                 now,
                 since,
                 since,
+                if include_unreviewed { 1_i64 } else { 0_i64 },
                 max_items as i64
             ],
             |r| {
@@ -2352,36 +2080,26 @@ impl AgentNotebook {
         &self,
         input: BuildSystemContextInput,
     ) -> Result<SystemContext> {
-        validate_owner(&input.scope)?;
         let max = input.max_items.unwrap_or(SYSTEM_NOTEBOOK_MAX_ACTIVE);
         let conn = self.lock_conn()?;
         let now = now_iso8601();
         let mut stmt = conn.prepare(
             "SELECT item_id, title, content, updated_at, valid_until, confidence
              FROM notebook_items
-             WHERE owner_user_id = ? AND owner_agent_id = ?
-               AND notebook_id = ? AND status = 'active'
+             WHERE notebook_id = ? AND status = 'active'
              ORDER BY updated_at DESC, created_at DESC, item_id ASC
              LIMIT ?",
         )?;
-        let rows = stmt.query_map(
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                SYSTEM_NOTEBOOK_ID,
-                max as i64
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, String>(5)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![SYSTEM_NOTEBOOK_ID, max as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
         let mut items = Vec::new();
         for row in rows {
             let (id, title, content, upd, valid_until, confidence) = row?;
@@ -2421,7 +2139,6 @@ impl AgentNotebook {
     // -------------------------------- build_notebook_hints (§5.9)
 
     pub fn build_notebook_hints(&self, input: BuildHintsInput) -> Result<HintsContext> {
-        validate_owner(&input.scope)?;
         let topic_tags = match &input.topic_tags {
             Some(t) => normalize_tags(t)?,
             None => Vec::new(),
@@ -2434,41 +2151,30 @@ impl AgentNotebook {
         let mut seen_notebooks: HashSet<String> = HashSet::new();
 
         // 1) Cross-session update hints from event log (§5.9 #5, §7).
-        let watermark_seq = fetch_watermark_seq(&conn, &input.session_id, &input.scope)?;
+        let watermark_seq = fetch_watermark_seq(&conn, &input.session_id)?;
         let mut event_stmt = conn.prepare(
             "SELECT e.seq, e.event_id, e.notebook_id, e.event_type, e.title, e.tags,
                     e.notebook_version, e.created_at, e.actor_session_id, n.version
              FROM notebook_events e
              JOIN notebooks n ON n.id = e.notebook_id
-                              AND n.owner_user_id = e.owner_user_id
-                              AND n.owner_agent_id = e.owner_agent_id
-             WHERE e.owner_user_id = ? AND e.owner_agent_id = ?
-               AND e.seq > ?
+             WHERE e.seq > ?
                AND (e.actor_session_id IS NULL OR e.actor_session_id != ?)
              ORDER BY e.seq ASC",
         )?;
-        let rows = event_stmt.query_map(
-            params![
-                input.scope.owner_user_id,
-                input.scope.agent(),
-                watermark_seq,
-                input.session_id
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, String>(9)?,
-                ))
-            },
-        )?;
+        let rows = event_stmt.query_map(params![watermark_seq, input.session_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
+            ))
+        })?;
         let mut latest_seq = watermark_seq;
         let mut per_notebook: HashMap<
             String,
@@ -2487,14 +2193,8 @@ impl AgentNotebook {
             );
         }
         for (nb_id, (title, upd, tags, version)) in per_notebook.drain() {
-            if has_session_read(&conn, &input.session_id, &input.scope, &nb_id)? {
-                if session_has_unchanged_for_notebook(
-                    &conn,
-                    &input.session_id,
-                    &input.scope,
-                    &nb_id,
-                    &version,
-                )? {
+            if has_session_read(&conn, &input.session_id, &nb_id)? {
+                if session_has_unchanged_for_notebook(&conn, &input.session_id, &nb_id, &version)? {
                     suppressed.push(SuppressedHint {
                         notebook_id: nb_id,
                         reason: HintSuppressionReason::AlreadyReadUnchanged,
@@ -2556,7 +2256,6 @@ impl AgentNotebook {
         if !topic_tags.is_empty() && hints.len() < max_hints {
             let candidates = topic_relevance_candidates(
                 &conn,
-                &input.scope,
                 &topic_tags,
                 input.candidate_notebook_ids.as_deref(),
             )?;
@@ -2572,13 +2271,7 @@ impl AgentNotebook {
                     continue;
                 }
                 // Suppress already-read & unchanged (§5.9 #3).
-                if session_has_unchanged_for_notebook(
-                    &conn,
-                    &input.session_id,
-                    &input.scope,
-                    &nb_id,
-                    &version,
-                )? {
+                if session_has_unchanged_for_notebook(&conn, &input.session_id, &nb_id, &version)? {
                     suppressed.push(SuppressedHint {
                         notebook_id: nb_id,
                         reason: HintSuppressionReason::AlreadyReadUnchanged,
@@ -2604,7 +2297,7 @@ impl AgentNotebook {
 
         // 3) Advance watermark so we don't repeat the same events next turn.
         if latest_seq > watermark_seq {
-            upsert_watermark(&conn, &input.session_id, &input.scope, latest_seq)?;
+            upsert_watermark(&conn, &input.session_id, latest_seq)?;
         }
 
         Ok(HintsContext {
@@ -2626,10 +2319,23 @@ impl AgentNotebook {
 // ============================================================ free helpers
 
 fn ensure_schema(conn: &Connection) -> Result<()> {
+    if table_has_column(conn, "notebooks", "owner_user_id")?
+        || table_has_column(conn, "notebook_items", "actor_kind")?
+        || table_has_column(conn, "notebook_items", "metadata")?
+    {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS session_watermarks;
+             DROP TABLE IF EXISTS session_reads;
+             DROP TABLE IF EXISTS notebook_events;
+             DROP TABLE IF EXISTS notebook_item_remarks;
+             DROP TABLE IF EXISTS notebook_item_edges;
+             DROP TABLE IF EXISTS notebook_item_tags;
+             DROP TABLE IF EXISTS notebook_items;
+             DROP TABLE IF EXISTS notebooks;",
+        )?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS notebooks (
-            owner_user_id      TEXT NOT NULL,
-            owner_agent_id     TEXT NOT NULL DEFAULT '',
             id                 TEXT NOT NULL,
             kind               TEXT NOT NULL,
             title              TEXT NOT NULL,
@@ -2645,35 +2351,30 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_at         TEXT NOT NULL,
             updated_at         TEXT NOT NULL,
             archived_at        TEXT,
-            PRIMARY KEY(owner_user_id, owner_agent_id, id)
+            PRIMARY KEY(id)
          );
          CREATE TABLE IF NOT EXISTS notebook_items (
             item_id            TEXT PRIMARY KEY,
             notebook_id        TEXT NOT NULL,
-            owner_user_id      TEXT NOT NULL,
-            owner_agent_id     TEXT NOT NULL DEFAULT '',
             title              TEXT NOT NULL,
             content            TEXT NOT NULL,
             source_excerpt     TEXT,
             source_ref         TEXT,
             source_session_id  TEXT,
-            actor_kind         TEXT NOT NULL,
-            actor_id           TEXT,
             write_reason       TEXT NOT NULL,
             confidence         TEXT NOT NULL DEFAULT 'medium',
             status             TEXT NOT NULL DEFAULT 'active',
             valid_from         TEXT,
             valid_until        TEXT,
-            metadata           TEXT,
             created_at         TEXT NOT NULL,
             updated_at         TEXT NOT NULL,
             item_revision      INTEGER NOT NULL DEFAULT 1,
             content_hash       TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_items_owner_nb_status_upd
-            ON notebook_items(owner_user_id, owner_agent_id, notebook_id, status, updated_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_items_nb_status_upd
+            ON notebook_items(notebook_id, status, updated_at DESC);
          CREATE INDEX IF NOT EXISTS idx_items_title
-            ON notebook_items(owner_user_id, owner_agent_id, notebook_id, title);
+            ON notebook_items(notebook_id, title);
          CREATE TABLE IF NOT EXISTS notebook_item_tags (
             item_id TEXT NOT NULL,
             tag     TEXT NOT NULL,
@@ -2692,28 +2393,21 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS notebook_item_remarks (
             remark_id       TEXT PRIMARY KEY,
             item_id         TEXT NOT NULL,
-            owner_user_id   TEXT NOT NULL,
-            owner_agent_id  TEXT NOT NULL DEFAULT '',
             remark_type     TEXT NOT NULL,
             content         TEXT NOT NULL,
             status          TEXT NOT NULL DEFAULT 'active',
-            actor_kind      TEXT NOT NULL,
-            actor_id        TEXT,
             created_at      TEXT NOT NULL,
             updated_at      TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_item_remarks_owner_item_type_status
-            ON notebook_item_remarks(owner_user_id, owner_agent_id, item_id, remark_type, status, created_at);
+         CREATE INDEX IF NOT EXISTS idx_item_remarks_item_type_status
+            ON notebook_item_remarks(item_id, remark_type, status, created_at);
          CREATE TABLE IF NOT EXISTS notebook_events (
             event_id          TEXT PRIMARY KEY,
             seq               INTEGER NOT NULL,
             event_type        TEXT NOT NULL,
             notebook_id       TEXT NOT NULL,
-            owner_user_id     TEXT NOT NULL,
-            owner_agent_id    TEXT NOT NULL DEFAULT '',
             item_id           TEXT,
             actor_session_id  TEXT,
-            actor_kind        TEXT NOT NULL,
             title             TEXT,
             summary           TEXT,
             tags              TEXT,
@@ -2722,12 +2416,10 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             created_at        TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_events_seq ON notebook_events(seq);
-         CREATE INDEX IF NOT EXISTS idx_events_owner_nb_seq
-            ON notebook_events(owner_user_id, owner_agent_id, notebook_id, seq);
+         CREATE INDEX IF NOT EXISTS idx_events_nb_seq
+            ON notebook_events(notebook_id, seq);
          CREATE TABLE IF NOT EXISTS session_reads (
             session_id        TEXT NOT NULL,
-            owner_user_id     TEXT NOT NULL,
-            owner_agent_id    TEXT NOT NULL DEFAULT '',
             notebook_id       TEXT NOT NULL,
             read_scope_hash   TEXT NOT NULL,
             mode              TEXT NOT NULL,
@@ -2737,27 +2429,29 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             returned_item_ids TEXT NOT NULL,
             max_bytes         INTEGER,
             read_at           TEXT NOT NULL,
-            PRIMARY KEY(session_id, owner_user_id, owner_agent_id, notebook_id, read_scope_hash)
+            PRIMARY KEY(session_id, notebook_id, read_scope_hash)
          );
          CREATE INDEX IF NOT EXISTS idx_session_reads_nb
-            ON session_reads(session_id, owner_user_id, owner_agent_id, notebook_id);
+            ON session_reads(session_id, notebook_id);
          CREATE TABLE IF NOT EXISTS session_watermarks (
             session_id     TEXT NOT NULL,
-            owner_user_id  TEXT NOT NULL,
-            owner_agent_id TEXT NOT NULL DEFAULT '',
             last_seen_seq  INTEGER NOT NULL DEFAULT 0,
             last_seen_at   TEXT NOT NULL,
-            PRIMARY KEY(session_id, owner_user_id, owner_agent_id)
+            PRIMARY KEY(session_id)
          );",
     )?;
     Ok(())
 }
 
-fn validate_owner(scope: &OwnerScope) -> Result<()> {
-    if scope.owner_user_id.trim().is_empty() {
-        return Err(NotebookError::InvalidInput("owner_user_id is empty".into()));
+fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column_name {
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn validate_notebook_id(id: &str) -> Result<String> {
@@ -3046,11 +2740,8 @@ struct EventRow {
     seq: i64,
     event_type: NotebookEventType,
     notebook_id: String,
-    owner_user_id: String,
-    owner_agent_id: String,
     item_id: Option<String>,
     actor_session_id: Option<String>,
-    actor_kind: ActorKind,
     title: Option<String>,
     summary: Option<String>,
     tags: Option<Vec<String>>,
@@ -3066,20 +2757,17 @@ fn insert_event(conn: &Connection, e: &EventRow) -> Result<()> {
     };
     conn.execute(
         "INSERT INTO notebook_events(
-            event_id, seq, event_type, notebook_id, owner_user_id, owner_agent_id,
-            item_id, actor_session_id, actor_kind, title, summary, tags,
+            event_id, seq, event_type, notebook_id,
+            item_id, actor_session_id, title, summary, tags,
             notebook_version, notebook_revision, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             e.event_id,
             e.seq,
             e.event_type.as_str(),
             e.notebook_id,
-            e.owner_user_id,
-            e.owner_agent_id,
             e.item_id,
             e.actor_session_id,
-            e.actor_kind.as_str(),
             e.title,
             e.summary,
             tags_s,
@@ -3100,19 +2788,15 @@ fn next_event_seq(conn: &Connection) -> Result<i64> {
     Ok(v)
 }
 
-fn load_notebook(
-    conn: &Connection,
-    scope: &OwnerScope,
-    notebook_id: &str,
-) -> Result<Option<Notebook>> {
+fn load_notebook(conn: &Connection, notebook_id: &str) -> Result<Option<Notebook>> {
     let row = conn
         .query_row(
             "SELECT id, kind, title, description, status, entry_count, active_entry_count,
                     latest_item_id, latest_title, latest_updated_at, revision, version,
                     created_at, updated_at, archived_at
              FROM notebooks
-             WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
-            params![scope.owner_user_id, scope.agent(), notebook_id],
+             WHERE id = ?",
+            params![notebook_id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -3156,8 +2840,6 @@ fn load_notebook(
     };
     Ok(Some(Notebook {
         id,
-        owner_user_id: scope.owner_user_id.clone(),
-        owner_agent_id: scope.owner_agent_id.clone(),
         kind: NotebookKind::from_str(&kind)?,
         title,
         description,
@@ -3177,7 +2859,6 @@ fn load_notebook(
 
 fn detect_conflicts(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     title: &str,
     tags: &[String],
@@ -3190,21 +2871,17 @@ fn detect_conflicts(
     // 1) Same / near title.
     let mut stmt = conn.prepare(
         "SELECT item_id, title, status, updated_at FROM notebook_items
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-           AND status = 'active' AND lower(title) = lower(?)
+         WHERE notebook_id = ? AND status = 'active' AND lower(title) = lower(?)
          LIMIT 8",
     )?;
-    let rows = stmt.query_map(
-        params![scope.owner_user_id, scope.agent(), notebook_id, title],
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(params![notebook_id, title], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
     for row in rows {
         let (id, t, s, upd) = row?;
         seen.insert(id.clone());
@@ -3228,18 +2905,14 @@ fn detect_conflicts(
             "SELECT i.item_id, i.title, i.status, i.updated_at, GROUP_CONCAT(t.tag, ',')
              FROM notebook_items i
              JOIN notebook_item_tags t ON t.item_id = i.item_id
-             WHERE i.owner_user_id = ? AND i.owner_agent_id = ?
-               AND i.notebook_id = ? AND i.status = 'active'
+             WHERE i.notebook_id = ? AND i.status = 'active'
                AND t.tag IN ({})
              GROUP BY i.item_id
              ORDER BY i.updated_at DESC
              LIMIT 8",
             placeholders
         );
-        let agent = scope.agent().to_string();
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
-        params_vec.push(&scope.owner_user_id);
-        params_vec.push(&agent);
         params_vec.push(&notebook_id);
         for t in tags {
             params_vec.push(t);
@@ -3286,24 +2959,20 @@ fn detect_conflicts(
         let mut stmt = conn.prepare(
             "SELECT item_id, title, status, updated_at, valid_from, valid_until
              FROM notebook_items
-             WHERE owner_user_id = ? AND owner_agent_id = ?
-               AND notebook_id = ? AND status = 'active'
+             WHERE notebook_id = ? AND status = 'active'
                AND (valid_from IS NOT NULL OR valid_until IS NOT NULL)
              LIMIT 16",
         )?;
-        let rows = stmt.query_map(
-            params![scope.owner_user_id, scope.agent(), notebook_id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![notebook_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
         for row in rows {
             let (id, t, s, upd, vf, vu) = row?;
             if seen.contains(&id) {
@@ -3330,7 +2999,6 @@ fn detect_conflicts(
 
 fn title_candidates(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     needle: &str,
     include_status: &HashSet<NotebookItemStatus>,
@@ -3338,16 +3006,12 @@ fn title_candidates(
     let status_filter = build_status_filter(include_status);
     let q = format!(
         "SELECT item_id FROM notebook_items
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-           AND lower(title) = lower(?) AND status IN ({})",
+         WHERE notebook_id = ? AND lower(title) = lower(?) AND status IN ({})",
         status_filter
     );
     let mut stmt = conn.prepare(&q)?;
     let mut ids = Vec::new();
-    let rows = stmt.query_map(
-        params![scope.owner_user_id, scope.agent(), notebook_id, needle],
-        |r| r.get::<_, String>(0),
-    )?;
+    let rows = stmt.query_map(params![notebook_id, needle], |r| r.get::<_, String>(0))?;
     for row in rows {
         ids.push(row?);
     }
@@ -3356,13 +3020,12 @@ fn title_candidates(
 
 fn tag_candidates(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     tags: &[String],
     include_status: &HashSet<NotebookItemStatus>,
 ) -> Result<Vec<String>> {
     if tags.is_empty() {
-        return all_candidates(conn, scope, notebook_id, include_status);
+        return all_candidates(conn, notebook_id, include_status);
     }
     let placeholders = std::iter::repeat("?")
         .take(tags.len())
@@ -3372,17 +3035,13 @@ fn tag_candidates(
     let q = format!(
         "SELECT i.item_id FROM notebook_items i
          JOIN notebook_item_tags t ON t.item_id = i.item_id
-         WHERE i.owner_user_id = ? AND i.owner_agent_id = ?
-           AND i.notebook_id = ? AND i.status IN ({})
+         WHERE i.notebook_id = ? AND i.status IN ({})
            AND t.tag IN ({})
          GROUP BY i.item_id",
         status_filter, placeholders
     );
     let mut stmt = conn.prepare(&q)?;
-    let agent = scope.agent().to_string();
     let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
-    params_vec.push(&scope.owner_user_id);
-    params_vec.push(&agent);
     params_vec.push(&notebook_id);
     for t in tags {
         params_vec.push(t);
@@ -3399,22 +3058,17 @@ fn tag_candidates(
 
 fn all_candidates(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     include_status: &HashSet<NotebookItemStatus>,
 ) -> Result<Vec<String>> {
     let status_filter = build_status_filter(include_status);
     let q = format!(
         "SELECT item_id FROM notebook_items
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?
-           AND status IN ({})",
+         WHERE notebook_id = ? AND status IN ({})",
         status_filter
     );
     let mut stmt = conn.prepare(&q)?;
-    let rows = stmt.query_map(
-        params![scope.owner_user_id, scope.agent(), notebook_id],
-        |r| r.get::<_, String>(0),
-    )?;
+    let rows = stmt.query_map(params![notebook_id], |r| r.get::<_, String>(0))?;
     let mut ids = Vec::new();
     for row in rows {
         ids.push(row?);
@@ -3434,11 +3088,7 @@ fn build_status_filter(include_status: &HashSet<NotebookItemStatus>) -> String {
     }
 }
 
-fn fetch_items_by_ids(
-    conn: &Connection,
-    scope: &OwnerScope,
-    ids: &[String],
-) -> Result<Vec<NotebookItem>> {
+fn fetch_items_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<NotebookItem>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -3448,20 +3098,17 @@ fn fetch_items_by_ids(
         .join(",");
     let q = format!(
         "SELECT i.item_id, i.notebook_id, i.title, i.content, i.source_excerpt, i.source_ref,
-                i.source_session_id, i.actor_kind, i.actor_id, i.write_reason, i.confidence,
-                i.status, i.valid_from, i.valid_until, i.metadata, i.created_at, i.updated_at,
+                i.source_session_id, i.write_reason, i.confidence,
+                i.status, i.valid_from, i.valid_until, i.created_at, i.updated_at,
                 i.item_revision, i.content_hash,
                 COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM notebook_item_tags
                           WHERE item_id = i.item_id ORDER BY tag), '')
          FROM notebook_items i
-         WHERE i.owner_user_id = ? AND i.owner_agent_id = ? AND i.item_id IN ({})",
+         WHERE i.item_id IN ({})",
         placeholders
     );
     let mut stmt = conn.prepare(&q)?;
-    let agent = scope.agent().to_string();
     let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
-    params_vec.push(&scope.owner_user_id);
-    params_vec.push(&agent);
     for id in ids {
         params_vec.push(id);
     }
@@ -3475,18 +3122,15 @@ fn fetch_items_by_ids(
             r.get::<_, Option<String>>(5)?,
             r.get::<_, Option<String>>(6)?,
             r.get::<_, String>(7)?,
-            r.get::<_, Option<String>>(8)?,
+            r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
-            r.get::<_, String>(10)?,
-            r.get::<_, String>(11)?,
-            r.get::<_, Option<String>>(12)?,
-            r.get::<_, Option<String>>(13)?,
-            r.get::<_, Option<String>>(14)?,
+            r.get::<_, Option<String>>(10)?,
+            r.get::<_, Option<String>>(11)?,
+            r.get::<_, String>(12)?,
+            r.get::<_, String>(13)?,
+            r.get::<_, i64>(14)?,
             r.get::<_, String>(15)?,
             r.get::<_, String>(16)?,
-            r.get::<_, i64>(17)?,
-            r.get::<_, String>(18)?,
-            r.get::<_, String>(19)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -3499,14 +3143,11 @@ fn fetch_items_by_ids(
             source_excerpt,
             source_ref_s,
             source_session_id,
-            actor_kind,
-            actor_id,
             write_reason,
             confidence,
             status,
             valid_from,
             valid_until,
-            metadata_s,
             created_at,
             updated_at,
             item_revision,
@@ -3517,10 +3158,6 @@ fn fetch_items_by_ids(
             Some(s) if !s.is_empty() => Some(serde_json::from_str::<SourceRef>(&s)?),
             _ => None,
         };
-        let metadata = match metadata_s {
-            Some(s) if !s.is_empty() => Some(serde_json::from_str::<Json>(&s)?),
-            _ => None,
-        };
         let tags: Vec<String> = if tags_concat.is_empty() {
             Vec::new()
         } else {
@@ -3529,22 +3166,17 @@ fn fetch_items_by_ids(
         out.push(NotebookItem {
             item_id,
             notebook_id,
-            owner_user_id: scope.owner_user_id.clone(),
-            owner_agent_id: scope.owner_agent_id.clone(),
             title,
             content,
             source_excerpt,
             source_ref,
             source_session_id,
-            actor_kind: ActorKind::from_str(&actor_kind)?,
-            actor_id,
             write_reason: WriteReason::from_str(&write_reason)?,
             confidence: Confidence::from_str(&confidence)?,
             status: NotebookItemStatus::from_str(&status)?,
             valid_from,
             valid_until,
             tags,
-            metadata,
             created_at,
             updated_at,
             item_revision,
@@ -3554,16 +3186,12 @@ fn fetch_items_by_ids(
     Ok(out)
 }
 
-fn item_notebook_id(
-    conn: &Connection,
-    scope: &OwnerScope,
-    item_id: &str,
-) -> Result<Option<String>> {
+fn item_notebook_id(conn: &Connection, item_id: &str) -> Result<Option<String>> {
     let notebook_id = conn
         .query_row(
             "SELECT notebook_id FROM notebook_items
-             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![item_id, scope.owner_user_id, scope.agent()],
+             WHERE item_id = ?",
+            params![item_id],
             |r| r.get::<_, String>(0),
         )
         .optional()?;
@@ -3572,14 +3200,13 @@ fn item_notebook_id(
 
 fn load_item_remark_target(
     conn: &Connection,
-    scope: &OwnerScope,
     item_id: &str,
 ) -> Result<Option<(String, String, NotebookItemStatus)>> {
     let row = conn
         .query_row(
             "SELECT notebook_id, title, status FROM notebook_items
-             WHERE item_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![item_id, scope.owner_user_id, scope.agent()],
+             WHERE item_id = ?",
+            params![item_id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -3601,7 +3228,6 @@ fn load_item_remark_target(
 
 fn load_active_remark_target(
     conn: &Connection,
-    scope: &OwnerScope,
     item_id: &str,
     remark_id: &str,
 ) -> Result<Option<(String, String, String)>> {
@@ -3611,12 +3237,9 @@ fn load_active_remark_target(
              FROM notebook_item_remarks r
              JOIN notebook_items i
                ON i.item_id = r.item_id
-              AND i.owner_user_id = r.owner_user_id
-              AND i.owner_agent_id = r.owner_agent_id
              WHERE r.remark_id = ? AND r.item_id = ?
-               AND r.owner_user_id = ? AND r.owner_agent_id = ?
                AND r.status = 'active'",
-            params![remark_id, item_id, scope.owner_user_id, scope.agent()],
+            params![remark_id, item_id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -3629,11 +3252,11 @@ fn load_active_remark_target(
     Ok(row)
 }
 
-fn notebook_revision(conn: &Connection, scope: &OwnerScope, notebook_id: &str) -> Result<i64> {
+fn notebook_revision(conn: &Connection, notebook_id: &str) -> Result<i64> {
     let revision = conn.query_row(
         "SELECT revision FROM notebooks
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
-        params![scope.owner_user_id, scope.agent(), notebook_id],
+         WHERE id = ?",
+        params![notebook_id],
         |r| r.get::<_, i64>(0),
     )?;
     Ok(revision)
@@ -3660,7 +3283,6 @@ fn is_expired(item: &NotebookItem, now: &str) -> bool {
 fn upsert_read_cache(
     conn: &Connection,
     session_id: &str,
-    scope: &OwnerScope,
     notebook_id: &str,
     read_scope_hash: &str,
     mode: ReadMode,
@@ -3675,11 +3297,11 @@ fn upsert_read_cache(
     let ids_s = serde_json::to_string(returned_ids)?;
     conn.execute(
         "INSERT INTO session_reads(
-            session_id, owner_user_id, owner_agent_id, notebook_id, read_scope_hash,
+            session_id, notebook_id, read_scope_hash,
             mode, read_scope, notebook_version, notebook_revision, returned_item_ids,
             max_bytes, read_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(session_id, owner_user_id, owner_agent_id, notebook_id, read_scope_hash)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, notebook_id, read_scope_hash)
          DO UPDATE SET mode = excluded.mode, read_scope = excluded.read_scope,
                        notebook_version = excluded.notebook_version,
                        notebook_revision = excluded.notebook_revision,
@@ -3688,8 +3310,6 @@ fn upsert_read_cache(
                        read_at = excluded.read_at",
         params![
             session_id,
-            scope.owner_user_id,
-            scope.agent(),
             notebook_id,
             read_scope_hash,
             mode.as_str(),
@@ -3707,22 +3327,14 @@ fn upsert_read_cache(
 fn fetch_read_cache_version(
     conn: &Connection,
     session_id: &str,
-    scope: &OwnerScope,
     notebook_id: &str,
     read_scope_hash: &str,
 ) -> Result<Option<String>> {
     let v = conn
         .query_row(
             "SELECT notebook_version FROM session_reads
-             WHERE session_id = ? AND owner_user_id = ? AND owner_agent_id = ?
-               AND notebook_id = ? AND read_scope_hash = ?",
-            params![
-                session_id,
-                scope.owner_user_id,
-                scope.agent(),
-                notebook_id,
-                read_scope_hash
-            ],
+             WHERE session_id = ? AND notebook_id = ? AND read_scope_hash = ?",
+            params![session_id, notebook_id, read_scope_hash],
             |r| r.get::<_, String>(0),
         )
         .optional()?;
@@ -3732,36 +3344,23 @@ fn fetch_read_cache_version(
 fn session_has_all_active_at(
     conn: &Connection,
     session_id: &str,
-    scope: &OwnerScope,
     notebook_id: &str,
     notebook_version: &str,
 ) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM session_reads
-         WHERE session_id = ? AND owner_user_id = ? AND owner_agent_id = ?
-           AND notebook_id = ? AND mode = 'all_active' AND notebook_version = ?",
-        params![
-            session_id,
-            scope.owner_user_id,
-            scope.agent(),
-            notebook_id,
-            notebook_version
-        ],
+         WHERE session_id = ? AND notebook_id = ? AND mode = 'all_active' AND notebook_version = ?",
+        params![session_id, notebook_id, notebook_version],
         |r| r.get(0),
     )?;
     Ok(n > 0)
 }
 
-fn has_session_read(
-    conn: &Connection,
-    session_id: &str,
-    scope: &OwnerScope,
-    notebook_id: &str,
-) -> Result<bool> {
+fn has_session_read(conn: &Connection, session_id: &str, notebook_id: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM session_reads
-         WHERE session_id = ? AND owner_user_id = ? AND owner_agent_id = ? AND notebook_id = ?",
-        params![session_id, scope.owner_user_id, scope.agent(), notebook_id],
+         WHERE session_id = ? AND notebook_id = ?",
+        params![session_id, notebook_id],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -3770,89 +3369,68 @@ fn has_session_read(
 fn session_has_unchanged_for_notebook(
     conn: &Connection,
     session_id: &str,
-    scope: &OwnerScope,
     notebook_id: &str,
     current_version: &str,
 ) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM session_reads
-         WHERE session_id = ? AND owner_user_id = ? AND owner_agent_id = ?
-           AND notebook_id = ? AND notebook_version = ?",
-        params![
-            session_id,
-            scope.owner_user_id,
-            scope.agent(),
-            notebook_id,
-            current_version
-        ],
+         WHERE session_id = ? AND notebook_id = ? AND notebook_version = ?",
+        params![session_id, notebook_id, current_version],
         |r| r.get(0),
     )?;
     Ok(n > 0)
 }
 
-fn fetch_watermark_seq(conn: &Connection, session_id: &str, scope: &OwnerScope) -> Result<i64> {
+fn fetch_watermark_seq(conn: &Connection, session_id: &str) -> Result<i64> {
     let v = conn
         .query_row(
             "SELECT last_seen_seq FROM session_watermarks
-             WHERE session_id = ? AND owner_user_id = ? AND owner_agent_id = ?",
-            params![session_id, scope.owner_user_id, scope.agent()],
+             WHERE session_id = ?",
+            params![session_id],
             |r| r.get::<_, i64>(0),
         )
         .optional()?;
     Ok(v.unwrap_or(0))
 }
 
-fn upsert_watermark(
-    conn: &Connection,
-    session_id: &str,
-    scope: &OwnerScope,
-    seq: i64,
-) -> Result<()> {
+fn upsert_watermark(conn: &Connection, session_id: &str, seq: i64) -> Result<()> {
     let now = now_iso8601();
     conn.execute(
         "INSERT INTO session_watermarks(
-            session_id, owner_user_id, owner_agent_id, last_seen_seq, last_seen_at
-         ) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(session_id, owner_user_id, owner_agent_id) DO UPDATE SET
+            session_id, last_seen_seq, last_seen_at
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
             last_seen_seq = MAX(excluded.last_seen_seq, session_watermarks.last_seen_seq),
             last_seen_at = excluded.last_seen_at",
-        params![session_id, scope.owner_user_id, scope.agent(), seq, now],
+        params![session_id, seq, now],
     )?;
     Ok(())
 }
 
 fn adjust_notebook_counts(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     delta_entry: i64,
     delta_active: i64,
 ) -> Result<()> {
     conn.execute(
         "UPDATE notebooks SET entry_count = entry_count + ?, active_entry_count = active_entry_count + ?
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
-        params![
-            delta_entry,
-            delta_active,
-            scope.owner_user_id,
-            scope.agent(),
-            notebook_id
-        ],
+         WHERE id = ?",
+        params![delta_entry, delta_active, notebook_id],
     )?;
     Ok(())
 }
 
 fn bump_notebook_version(
     conn: &Connection,
-    scope: &OwnerScope,
     notebook_id: &str,
     now: &str,
     event_id: Option<&str>,
 ) -> Result<String> {
     let revision: i64 = conn.query_row(
         "SELECT revision FROM notebooks
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
-        params![scope.owner_user_id, scope.agent(), notebook_id],
+         WHERE id = ?",
+        params![notebook_id],
         |r| r.get(0),
     )?;
     let new_rev = revision + 1;
@@ -3867,21 +3445,14 @@ fn bump_notebook_version(
     let version = make_version(new_rev, eid);
     conn.execute(
         "UPDATE notebooks SET revision = ?, version = ?, updated_at = ?
-         WHERE owner_user_id = ? AND owner_agent_id = ? AND id = ?",
-        params![
-            new_rev,
-            version,
-            now,
-            scope.owner_user_id,
-            scope.agent(),
-            notebook_id
-        ],
+         WHERE id = ?",
+        params![new_rev, version, now, notebook_id],
     )?;
     Ok(version)
 }
 
-fn ensure_system_notebook(conn: &Connection, scope: &OwnerScope, now: &str) -> Result<()> {
-    if load_notebook(conn, scope, SYSTEM_NOTEBOOK_ID)?.is_some() {
+fn ensure_system_notebook(conn: &Connection, now: &str) -> Result<()> {
+    if load_notebook(conn, SYSTEM_NOTEBOOK_ID)?.is_some() {
         return Ok(());
     }
     let event_id = new_event_id();
@@ -3889,20 +3460,12 @@ fn ensure_system_notebook(conn: &Connection, scope: &OwnerScope, now: &str) -> R
     let version = make_version(revision, &event_id);
     conn.execute(
         "INSERT INTO notebooks(
-            owner_user_id, owner_agent_id, id, kind, title, description, status,
+            id, kind, title, description, status,
             revision, version, latest_item_id, latest_title, latest_updated_at,
             entry_count, active_entry_count, created_at, updated_at, archived_at
-         ) VALUES (?, ?, ?, 'system', 'System Notebook', 'High-confidence facts injected into the system prompt.',
+         ) VALUES (?, 'system', 'System Notebook', 'High-confidence facts injected into the system prompt.',
                    'active', ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, NULL)",
-        params![
-            scope.owner_user_id,
-            scope.agent(),
-            SYSTEM_NOTEBOOK_ID,
-            revision,
-            version,
-            now,
-            now
-        ],
+        params![SYSTEM_NOTEBOOK_ID, revision, version, now, now],
     )?;
     let seq = next_event_seq(conn)?;
     insert_event(
@@ -3912,11 +3475,8 @@ fn ensure_system_notebook(conn: &Connection, scope: &OwnerScope, now: &str) -> R
             seq,
             event_type: NotebookEventType::NotebookCreated,
             notebook_id: SYSTEM_NOTEBOOK_ID.to_string(),
-            owner_user_id: scope.owner_user_id.clone(),
-            owner_agent_id: scope.agent().to_string(),
             item_id: None,
             actor_session_id: None,
-            actor_kind: ActorKind::System,
             title: Some("System Notebook".into()),
             summary: Some("system notebook bootstrapped".into()),
             tags: None,
@@ -3930,7 +3490,6 @@ fn ensure_system_notebook(conn: &Connection, scope: &OwnerScope, now: &str) -> R
 
 fn topic_relevance_candidates(
     conn: &Connection,
-    scope: &OwnerScope,
     topic_tags: &[String],
     candidate_notebook_ids: Option<&[String]>,
 ) -> Result<Vec<(String, Option<String>, Option<String>, Vec<String>, String)>> {
@@ -3959,9 +3518,7 @@ fn topic_relevance_candidates(
          FROM notebook_items i
          JOIN notebook_item_tags t ON t.item_id = i.item_id
          JOIN notebooks n ON n.id = i.notebook_id
-                          AND n.owner_user_id = i.owner_user_id
-                          AND n.owner_agent_id = i.owner_agent_id
-         WHERE i.owner_user_id = ? AND i.owner_agent_id = ? AND i.status = 'active'
+         WHERE i.status = 'active'
            AND t.tag IN ({tags}) {where_extra}
          GROUP BY i.item_id
          ORDER BY i.updated_at DESC, i.item_id ASC
@@ -3970,14 +3527,11 @@ fn topic_relevance_candidates(
         where_extra = where_extra
     );
     let mut stmt = conn.prepare(&q)?;
-    let agent = scope.agent().to_string();
     let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
     // First `tags` placeholders (subquery).
     for t in topic_tags {
         params_vec.push(t);
     }
-    params_vec.push(&scope.owner_user_id);
-    params_vec.push(&agent);
     // Second `tags` placeholders (filter).
     for t in topic_tags {
         params_vec.push(t);
@@ -4027,15 +3581,9 @@ mod tests {
         let n = AgentNotebook::open(AgentNotebookConfig::new(tmp.path())).unwrap();
         (tmp, n)
     }
-
-    fn scope() -> OwnerScope {
-        OwnerScope::new("user-1")
-    }
-
     fn append(n: &AgentNotebook, nb: &str, title: &str, content: &str, tags: &[&str]) -> String {
         let res = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: Some("sess-A".into()),
                 notebook_id: nb.into(),
                 title: title.into(),
@@ -4043,14 +3591,11 @@ mod tests {
                 source_excerpt: None,
                 source_ref: None,
                 source_session_id: Some("sess-A".into()),
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: Some(Confidence::High),
                 tags: tags.iter().map(|s| s.to_string()).collect(),
-                metadata: None,
                 detect_conflicts: true,
             })
             .unwrap();
@@ -4076,7 +3621,6 @@ mod tests {
         let (_t, n) = open_tmp();
         let r1 = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 title: "concise replies".into(),
@@ -4084,14 +3628,11 @@ mod tests {
                 source_excerpt: Some("user said \"be concise\"".into()),
                 source_ref: None,
                 source_session_id: None,
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: Some(Confidence::High),
                 tags: vec!["reply-style".into(), "tone".into()],
-                metadata: None,
                 detect_conflicts: true,
             })
             .unwrap();
@@ -4100,7 +3641,6 @@ mod tests {
         let v1 = r1.version.clone();
         let r2 = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 title: "use markdown".into(),
@@ -4108,14 +3648,11 @@ mod tests {
                 source_excerpt: None,
                 source_ref: None,
                 source_session_id: None,
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: Some(Confidence::Medium),
                 tags: vec!["formatting".into()],
-                metadata: None,
                 detect_conflicts: true,
             })
             .unwrap();
@@ -4123,7 +3660,6 @@ mod tests {
         assert!(r2.version.starts_with("n_3_"));
         let regs = n
             .list_notebooks(ListNotebooksInput {
-                scope: scope(),
                 include_archived: false,
             })
             .unwrap();
@@ -4138,7 +3674,6 @@ mod tests {
         let (_t, n) = open_tmp();
         let err = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 title: "bad".into(),
@@ -4146,14 +3681,11 @@ mod tests {
                 source_excerpt: None,
                 source_ref: None,
                 source_session_id: None,
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: None,
                 tags: vec!["bad\"tag".into()],
-                metadata: None,
                 detect_conflicts: false,
             })
             .unwrap_err();
@@ -4170,7 +3702,6 @@ mod tests {
         let _ = append(&n, "projects/p", "c", "third", &["alpha", "beta"]);
         let res = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("sess-1".into()),
                 notebook_id: "projects/p".into(),
                 tags: None,
@@ -4196,7 +3727,6 @@ mod tests {
         // bubble c to a different position vs single-tag matches.
         let res = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("sess-2".into()),
                 notebook_id: "projects/p".into(),
                 tags: Some(vec!["alpha".into(), "beta".into()]),
@@ -4234,7 +3764,6 @@ mod tests {
         append(&n, "user/preferences", "a", "one", &["focus"]);
         let r1 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: None,
@@ -4254,7 +3783,6 @@ mod tests {
         };
         let r2 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: None,
@@ -4278,7 +3806,6 @@ mod tests {
         append(&n, "user/preferences", "a", "x", &["focus", "tone"]);
         let r1 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: Some(vec!["focus".into(), "tone".into()]),
@@ -4287,7 +3814,6 @@ mod tests {
             .unwrap();
         let r2 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: Some(vec!["tone".into(), "focus".into()]),
@@ -4314,7 +3840,6 @@ mod tests {
 
         let r3 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: Some(vec!["tone".into()]),
@@ -4338,7 +3863,6 @@ mod tests {
         append(&n, "user/preferences", "a", "x", &["focus"]);
         let r1 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: None, // all_active
@@ -4350,7 +3874,6 @@ mod tests {
         };
         let r2 = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 tags: Some(vec!["focus".into()]),
@@ -4365,20 +3888,16 @@ mod tests {
         let (_t, n) = open_tmp();
         let id = append(&n, "user/preferences", "old habit", "x", &["focus"]);
         n.mark_note_status(MarkNoteStatusInput {
-            scope: scope(),
             session_id: None,
             item_id: id.clone(),
             status: NotebookItemStatus::Stale,
             reason: "no longer applies".into(),
             superseded_by: None,
             expected_item_revision: None,
-            actor_kind: ActorKind::Curator,
-            actor_id: None,
         })
         .unwrap();
         let r = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 tags: None,
@@ -4405,20 +3924,16 @@ mod tests {
         let old_id = append(&n, "user/preferences", "concise", "v1", &["tone"]);
         let new_id = append(&n, "user/preferences", "concise v2", "v2", &["tone"]);
         n.mark_note_status(MarkNoteStatusInput {
-            scope: scope(),
             session_id: None,
             item_id: old_id.clone(),
             status: NotebookItemStatus::Superseded,
             reason: "replaced".into(),
             superseded_by: Some(new_id.clone()),
             expected_item_revision: None,
-            actor_kind: ActorKind::Curator,
-            actor_id: None,
         })
         .unwrap();
         let r = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 ..Default::default()
@@ -4438,7 +3953,6 @@ mod tests {
         append(&n, "user/preferences", "a", "x", &["focus", "tone"]);
         let r = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: None,
                 notebook_id: "user/preferences".into(),
                 title: "b".into(),
@@ -4446,14 +3960,11 @@ mod tests {
                 source_excerpt: None,
                 source_ref: None,
                 source_session_id: None,
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: None,
                 tags: vec!["tone".into()],
-                metadata: None,
                 detect_conflicts: true,
             })
             .unwrap();
@@ -4472,24 +3983,18 @@ mod tests {
         let item_id = append(&n, "user/preferences", "a", "x", &["focus"]);
         let first = n
             .append_item_remark(AppendItemRemarkInput {
-                scope: scope(),
                 session_id: Some("sess-A".into()),
                 item_id: item_id.clone(),
                 remark_type: "red".into(),
                 content: "needs confirmation".into(),
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
             })
             .unwrap();
         let second = n
             .append_item_remark(AppendItemRemarkInput {
-                scope: scope(),
                 session_id: Some("sess-A".into()),
                 item_id: item_id.clone(),
                 remark_type: "blue".into(),
                 content: "owner supplied".into(),
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
             })
             .unwrap();
         assert_eq!(first.item_id, item_id);
@@ -4497,7 +4002,6 @@ mod tests {
 
         let all = n
             .list_item_remarks(ListItemRemarksInput {
-                scope: scope(),
                 item_id: item_id.clone(),
                 remark_type: None,
             })
@@ -4506,7 +4010,6 @@ mod tests {
 
         let red = n
             .list_item_remarks(ListItemRemarksInput {
-                scope: scope(),
                 item_id: item_id.clone(),
                 remark_type: Some("red".into()),
             })
@@ -4517,19 +4020,15 @@ mod tests {
 
         let removed = n
             .remove_item_remark(RemoveItemRemarkInput {
-                scope: scope(),
                 session_id: Some("sess-A".into()),
                 item_id: item_id.clone(),
                 remark_id: first.remark_id.clone(),
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
             })
             .unwrap();
         assert_eq!(removed.remark_id, first.remark_id);
 
         let after = n
             .list_item_remarks(ListItemRemarksInput {
-                scope: scope(),
                 item_id,
                 remark_type: None,
             })
@@ -4552,10 +4051,8 @@ mod tests {
             );
             let r = n
                 .promote_to_system_notebook(PromoteToSystemInput {
-                    scope: scope(),
                     item_id: id,
                     reason: format!("promote {}", i),
-                    actor_kind: ActorKind::Curator,
                     replace_item_id: None,
                 })
                 .unwrap();
@@ -4565,10 +4062,8 @@ mod tests {
         let extra = append(&n, "user/preferences", "extra", "x", &["focus"]);
         let r = n
             .promote_to_system_notebook(PromoteToSystemInput {
-                scope: scope(),
                 item_id: extra,
                 reason: "over the cap".into(),
-                actor_kind: ActorKind::Curator,
                 replace_item_id: None,
             })
             .unwrap();
@@ -4582,7 +4077,6 @@ mod tests {
         append(&n, "projects/p", "first", "content", &["aa"]);
         let _ = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("A".into()),
                 notebook_id: "projects/p".into(),
                 ..Default::default()
@@ -4591,7 +4085,6 @@ mod tests {
         // Session B writes.
         let _ = n
             .append_note(AppendNoteInput {
-                scope: scope(),
                 session_id: Some("B".into()),
                 notebook_id: "projects/p".into(),
                 title: "from B".into(),
@@ -4599,20 +4092,16 @@ mod tests {
                 source_excerpt: None,
                 source_ref: None,
                 source_session_id: Some("B".into()),
-                actor_kind: ActorKind::OnlineAgent,
-                actor_id: None,
                 write_reason: WriteReason::UserExplicit,
                 valid_from: None,
                 valid_until: None,
                 confidence: None,
                 tags: vec!["aa".into()],
-                metadata: None,
                 detect_conflicts: false,
             })
             .unwrap();
         let h = n
             .build_notebook_hints(BuildHintsInput {
-                scope: scope(),
                 session_id: "A".into(),
                 topic_tags: None,
                 candidate_notebook_ids: None,
@@ -4626,7 +4115,6 @@ mod tests {
         // Watermark advanced — next call should produce no fresh hint.
         let h2 = n
             .build_notebook_hints(BuildHintsInput {
-                scope: scope(),
                 session_id: "A".into(),
                 topic_tags: None,
                 candidate_notebook_ids: None,
@@ -4645,7 +4133,6 @@ mod tests {
         append(&n, "user/preferences", "a", "x", &["focus"]);
         let _ = n
             .read_notebook(ReadNotebookInput {
-                scope: scope(),
                 session_id: Some("S".into()),
                 notebook_id: "user/preferences".into(),
                 ..Default::default()
@@ -4653,7 +4140,6 @@ mod tests {
             .unwrap();
         let h = n
             .build_notebook_hints(BuildHintsInput {
-                scope: scope(),
                 session_id: "S".into(),
                 topic_tags: Some(vec!["focus".into()]),
                 candidate_notebook_ids: None,
@@ -4673,7 +4159,6 @@ mod tests {
         append(&n, "user/preferences", "secret", "DO NOT LEAK", &["xx"]);
         let ctx = n
             .build_notebook_registry_context(BuildRegistryContextInput {
-                scope: scope(),
                 max_notebooks: None,
             })
             .unwrap();
@@ -4693,7 +4178,7 @@ mod tests {
             &["scope"],
         );
 
-        let list_text = n.build_notebook_list_text(scope()).unwrap();
+        let list_text = n.build_notebook_list_text().unwrap();
         assert!(list_text.contains("Available notebooks: 2 total."));
         assert!(list_text.contains("user/preferences"));
         assert!(list_text.contains("projects/demo"));
@@ -4701,7 +4186,7 @@ mod tests {
         assert!(list_text.contains("last modified"));
         assert!(!list_text.contains("DO NOT LEAK"));
 
-        let recent_text = n.build_recent_items_text(scope(), 1, 0).unwrap();
+        let recent_text = n.build_recent_items_text(1, 0).unwrap();
         assert!(recent_text.contains("Recent notebook items: latest 1."));
         assert!(recent_text.contains("["));
         assert!(recent_text.contains("created "));
@@ -4721,20 +4206,53 @@ mod tests {
             &["action"],
         );
         n.append_item_remark(AppendItemRemarkInput {
-            scope: scope(),
             session_id: Some("sess-A".into()),
             item_id: observing_id,
             remark_type: "self_check".into(),
             content: "decision=keep_observing reason=missing context".into(),
-            actor_kind: ActorKind::OnlineAgent,
-            actor_id: None,
         })
         .unwrap();
 
         let future_since = 4_102_444_800;
-        let recent_text = n.build_recent_items_text(scope(), 8, future_since).unwrap();
+        let recent_text = n.build_recent_items_text(8, future_since).unwrap();
         assert!(recent_text.contains("observing action"));
         assert!(!recent_text.contains("old action"));
+    }
+
+    #[test]
+    fn self_check_recent_items_include_unreviewed_outside_since_window() {
+        let (_t, n) = open_tmp();
+        append(
+            &n,
+            "user/preferences",
+            "pending exercise reminder",
+            "content",
+            &["action"],
+        );
+        let reviewed_id = append(
+            &n,
+            "user/preferences",
+            "finished email note",
+            "content",
+            &["action"],
+        );
+        n.append_item_remark(AppendItemRemarkInput {
+            session_id: Some("sess-A".into()),
+            item_id: reviewed_id,
+            remark_type: "self_check".into(),
+            content: "decision=mark_no_action reason=reviewed".into(),
+        })
+        .unwrap();
+
+        let future_since = 4_102_444_800;
+        let recent_text = n
+            .build_recent_items_text_for_self_check(8, future_since)
+            .unwrap();
+        assert!(recent_text.contains("pending exercise reminder"));
+        assert!(!recent_text.contains("finished email note"));
+
+        let normal_recent_text = n.build_recent_items_text(8, future_since).unwrap();
+        assert!(!normal_recent_text.contains("pending exercise reminder"));
     }
 
     #[test]
@@ -4742,7 +4260,6 @@ mod tests {
         let (_t, n) = open_tmp();
         let _ = n
             .create_or_update_notebook(CreateOrUpdateNotebookInput {
-                scope: scope(),
                 notebook_id: "user/profile".into(),
                 kind: None,
                 title: Some("profile".into()),
@@ -4751,7 +4268,6 @@ mod tests {
             .unwrap();
         let regs = n
             .list_notebooks(ListNotebooksInput {
-                scope: scope(),
                 include_archived: false,
             })
             .unwrap();

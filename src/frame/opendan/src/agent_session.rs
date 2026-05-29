@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput, OwnerScope};
+use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput};
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
 use agent_tool::{AgentMemory, AgentMemoryConfig, LoadOptions};
@@ -3858,7 +3858,10 @@ impl AgentSession {
         let topic_tags = load_session_topic_tags(&self.session_dir);
         let mut candidates = Vec::new();
         candidates.extend(build_background_event_hints(&bg_events));
-        candidates.extend(self.build_notebook_background_hints(&topic_tags, &owner).await);
+        candidates.extend(
+            self.build_notebook_background_hints(&topic_tags, &owner)
+                .await,
+        );
         candidates.extend(self.build_memory_hints(&topic_tags).await);
 
         let mut next_fingerprints = BTreeMap::new();
@@ -3894,7 +3897,7 @@ impl AgentSession {
         topic_tags: &[String],
         owner: &str,
     ) -> Vec<BackgroundHint> {
-        let owner = owner.trim();
+        let owner = resolve_notebook_prompt_owner(owner, &self.agent_name);
         if owner.is_empty() || !self.agent_config.layout.notebook_dir.exists() {
             return Vec::new();
         }
@@ -3912,9 +3915,7 @@ impl AgentSession {
             }
         };
         let candidate_notebook_ids = load_subscribed_notebook_ids(&self.session_dir);
-        let scope = OwnerScope::new(owner.to_string()).with_agent(self.agent_name.clone());
         let hints = match notebook.build_notebook_hints(BuildHintsInput {
-            scope,
             session_id: self.session_id.clone(),
             topic_tags: if topic_tags.is_empty() {
                 None
@@ -6090,8 +6091,13 @@ async fn build_agent_session_env(
     let workspace_root = workspace_id
         .as_deref()
         .map(|ws| agent_config.layout.workspaces_dir.join(ws));
-    let (notebook_list_text, notebook_last_items_text) =
-        build_notebook_prompt_texts(agent_config, owner.trim(), agent_name, notebook_since_secs);
+    let (notebook_list_text, notebook_last_items_text) = build_notebook_prompt_texts(
+        agent_config,
+        owner.trim(),
+        agent_name,
+        notebook_since_secs,
+        kind,
+    );
     let runtime_workspace_list_text =
         build_runtime_workspace_list_text(agent_config, workspace_since_secs).await;
     {
@@ -6406,7 +6412,9 @@ fn build_notebook_prompt_texts(
     owner: &str,
     agent_name: &str,
     recent_since_secs: u64,
+    session_kind: SessionKind,
 ) -> (String, String) {
+    let owner = resolve_notebook_prompt_owner(owner, agent_name);
     if owner.is_empty() || !agent_config.layout.notebook_dir.exists() {
         return (
             "Available notebooks: 0 total.\n".to_string(),
@@ -6423,15 +6431,20 @@ fn build_notebook_prompt_texts(
             return (String::new(), String::new());
         }
     };
-    let scope = OwnerScope::new(owner.to_string()).with_agent(agent_name.to_string());
-    let list_text = match notebook.build_notebook_list_text(scope.clone()) {
+    let list_text = match notebook.build_notebook_list_text() {
         Ok(text) => text,
         Err(err) => {
             warn!("opendan.session: build notebook list prompt text failed: {err}");
             String::new()
         }
     };
-    let last_items_text = match notebook.build_recent_items_text(scope, 8, recent_since_secs) {
+    let include_unreviewed = matches!(session_kind, SessionKind::SelfCheck);
+    let last_items_result = if include_unreviewed {
+        notebook.build_recent_items_text_for_self_check(8, recent_since_secs)
+    } else {
+        notebook.build_recent_items_text(8, recent_since_secs)
+    };
+    let last_items_text = match last_items_result {
         Ok(text) => text,
         Err(err) => {
             warn!("opendan.session: build notebook recent items prompt text failed: {err}");
@@ -6439,6 +6452,15 @@ fn build_notebook_prompt_texts(
         }
     };
     (list_text, last_items_text)
+}
+
+fn resolve_notebook_prompt_owner(session_owner: &str, agent_appid: &str) -> String {
+    let appid = agent_appid.trim();
+    if appid.is_empty() {
+        session_owner.trim().to_string()
+    } else {
+        appid.to_string()
+    }
 }
 
 fn apply_hook_env_to_prompt_env(env: &mut AgentSessionEnv, hook_env: LlmContextEnv) {

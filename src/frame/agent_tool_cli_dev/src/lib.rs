@@ -19,12 +19,11 @@ use tokio::process::Command;
 
 use agent_tool::agent_memory::{AgentMemory, AgentMemoryConfig, AgentMemoryError, LoadOptions};
 use agent_tool::agent_notebook::{
-    self as nb, ActorKind, AgentNotebook, AgentNotebookConfig, AppendItemRemarkInput,
-    AppendNoteInput, BuildHintsInput, BuildRegistryContextInput, BuildSystemContextInput,
-    Confidence, CreateOrUpdateNotebookInput, ListItemRemarksInput, ListNotebooksInput,
-    MarkNoteStatusInput, NotebookError, NotebookItemStatus, NotebookKind, NotebookReadResult,
-    OwnerScope, PromoteToSystemInput, PromoteToSystemResult, ReadNotebookInput,
-    RemoveItemRemarkInput, WriteReason,
+    self as nb, AgentNotebook, AgentNotebookConfig, AppendItemRemarkInput, AppendNoteInput,
+    BuildHintsInput, BuildRegistryContextInput, BuildSystemContextInput, Confidence,
+    CreateOrUpdateNotebookInput, ListItemRemarksInput, ListNotebooksInput, MarkNoteStatusInput,
+    NotebookError, NotebookItemStatus, NotebookKind, NotebookReadResult, PromoteToSystemInput,
+    PromoteToSystemResult, ReadNotebookInput, RemoveItemRemarkInput, WriteReason,
 };
 use agent_tool::llm_tool_carft::{self, CommandNotFoundRequest};
 use agent_tool::{
@@ -1066,76 +1065,8 @@ fn resolve_agent_notebook_root(env: &CliRuntimeEnv, override_path: Option<PathBu
     cli_state_root(env).join(AGENT_NOTEBOOK_DIR_NAME)
 }
 
-fn resolve_agent_notebook_owner_user(
-    env: &CliRuntimeEnv,
-    owner_user_id: Option<String>,
-) -> Result<String, String> {
-    if let Some(owner_id) = owner_user_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(owner_id);
-    }
-    if let Some(identity) = env.runtime_context.identity.as_ref() {
-        return Ok(identity.owner_user_id.clone());
-    }
-    if let Some(owner_id) = get_buckyos_api_runtime()
-        .ok()
-        .and_then(|runtime| {
-            runtime
-                .get_owner_user_id()
-                .or_else(|| runtime.user_id.clone())
-        })
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(owner_id);
-    }
-    match load_app_identity_from_env() {
-        Ok(Some((_app_id, owner_id))) => {
-            let owner_id = owner_id.trim().to_string();
-            if !owner_id.is_empty() {
-                return Ok(owner_id);
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            return Err(format!(
-                "load owner user from app_instance_config failed: {err}"
-            ));
-        }
-    }
-    Err(format!(
-        "missing current owner user; configure Agent RootFS identity metadata under {} or pass --owner-user",
-        env.agent_env_root.display()
-    ))
-}
-
-fn resolve_agent_notebook_owner_agent(
-    env: &CliRuntimeEnv,
-    owner_agent_id: Option<String>,
-) -> Option<String> {
-    owner_agent_id
-        .or_else(|| {
-            env.runtime_context
-                .identity
-                .as_ref()
-                .map(|identity| identity.agent_id.clone())
-        })
-        .or_else(|| {
-            env.allow_dev_overrides()
-                .then(|| DEFAULT_AGENT_NAME.to_string())
-        })
-        .filter(|v| !v.trim().is_empty())
-}
-
-fn resolve_agent_notebook_session_id(
-    env: &CliRuntimeEnv,
-    session_id: Option<String>,
-) -> Option<String> {
-    session_id
-        .or_else(|| Some(env.runtime_context.session_id.clone()))
-        .filter(|v| !v.trim().is_empty())
+fn resolve_agent_notebook_session_id(env: &CliRuntimeEnv) -> Option<String> {
+    Some(env.runtime_context.session_id.clone()).filter(|v| !v.trim().is_empty())
 }
 
 fn require_runtime_token_for_rpc(env: &CliRuntimeEnv) -> Result<(), AgentToolError> {
@@ -1369,9 +1300,6 @@ fn format_verify_report(report: &agent_tool::VerifyReport) -> String {
 // =================================================================
 
 const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NOTEBOOK_ROOT] \
-[--owner-user <user_id> | current agent owner] \
-[--owner-agent <agent> | current agent id] \
-[--session <id> | current session id] \
 <list|read|append|status|promote|create-notebook|registry-context|\
 system-context|hints|remarks> [...]";
 const DEFAULT_AGENT_NOTEBOOK_ID: &str = "user/actions";
@@ -1379,9 +1307,6 @@ const DEFAULT_AGENT_NOTEBOOK_ID: &str = "user/actions";
 #[derive(Clone, Debug)]
 struct AgentNotebookInvocation {
     root_override: Option<PathBuf>,
-    owner_user_id: Option<String>,
-    owner_agent_id: Option<String>,
-    session_id: Option<String>,
     verb: AgentNotebookVerb,
 }
 
@@ -1409,8 +1334,6 @@ enum AgentNotebookVerb {
         /// `Some` → content from positional arg. `None` → read stdin.
         content: Option<String>,
         source_excerpt: Option<String>,
-        actor_kind: ActorKind,
-        actor_id: Option<String>,
         write_reason: WriteReason,
         confidence: Option<Confidence>,
         valid_from: Option<String>,
@@ -1424,13 +1347,10 @@ enum AgentNotebookVerb {
         reason: String,
         superseded_by: Option<String>,
         expected_item_revision: Option<i64>,
-        actor_kind: ActorKind,
-        actor_id: Option<String>,
     },
     Promote {
         item_id: String,
         reason: String,
-        actor_kind: ActorKind,
         replace_item_id: Option<String>,
     },
     CreateNotebook {
@@ -1458,14 +1378,10 @@ enum AgentNotebookVerb {
         item_id: String,
         remark_type: String,
         content: Option<String>,
-        actor_kind: ActorKind,
-        actor_id: Option<String>,
     },
     RemarkRemove {
         item_id: String,
         remark_id: String,
-        actor_kind: ActorKind,
-        actor_id: Option<String>,
     },
 }
 
@@ -1483,9 +1399,6 @@ fn parse_agent_notebook_cli_command(
 ) -> Result<ParsedCommand, AgentToolError> {
     // Global flags ahead of the verb.
     let mut root_override: Option<PathBuf> = None;
-    let mut owner_user_id: Option<String> = None;
-    let mut owner_agent_id: Option<String> = None;
-    let mut session_id: Option<String> = None;
     let mut idx = 0usize;
 
     while idx < tokens.len() {
@@ -1500,36 +1413,6 @@ fn parse_agent_notebook_cli_command(
             }
             v if v.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(&v["--root=".len()..]));
-            }
-            "--owner-user" => {
-                idx += 1;
-                let value = tokens
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--owner-user`"))?;
-                owner_user_id = Some(value.clone());
-            }
-            v if v.starts_with("--owner-user=") => {
-                owner_user_id = Some(v["--owner-user=".len()..].to_string());
-            }
-            "--owner-agent" => {
-                idx += 1;
-                let value = tokens
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--owner-agent`"))?;
-                owner_agent_id = Some(value.clone());
-            }
-            v if v.starts_with("--owner-agent=") => {
-                owner_agent_id = Some(v["--owner-agent=".len()..].to_string());
-            }
-            "--session" => {
-                idx += 1;
-                let value = tokens
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--session`"))?;
-                session_id = Some(value.clone());
-            }
-            v if v.starts_with("--session=") => {
-                session_id = Some(v["--session=".len()..].to_string());
             }
             // First non-global token ends the global-flag region.
             _ => break,
@@ -1564,9 +1447,6 @@ fn parse_agent_notebook_cli_command(
         tool_name,
         invocation: AgentNotebookInvocation {
             root_override,
-            owner_user_id,
-            owner_agent_id,
-            session_id,
             verb,
         },
     })
@@ -1731,9 +1611,6 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
     let mut notebook_id: Option<String> = None;
     let mut use_stdin = false;
     let mut source_excerpt: Option<String> = None;
-    let mut actor_kind: Option<ActorKind> = None;
-    let mut actor_id: Option<String> = None;
-    let mut write_reason: Option<WriteReason> = None;
     let mut confidence: Option<Confidence> = None;
     let mut valid_from: Option<String> = None;
     let mut valid_until: Option<String> = None;
@@ -1763,36 +1640,6 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
             }
             v if v.starts_with("--source-excerpt=") => {
                 source_excerpt = Some(v["--source-excerpt=".len()..].to_string());
-            }
-            "--actor-kind" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
-                actor_kind = Some(parse_actor_kind(value)?);
-            }
-            v if v.starts_with("--actor-kind=") => {
-                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
-            }
-            "--actor-id" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
-                actor_id = Some(value.clone());
-            }
-            v if v.starts_with("--actor-id=") => {
-                actor_id = Some(v["--actor-id=".len()..].to_string());
-            }
-            "--write-reason" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--write-reason`"))?;
-                write_reason = Some(parse_write_reason(value)?);
-            }
-            v if v.starts_with("--write-reason=") => {
-                write_reason = Some(parse_write_reason(&v["--write-reason=".len()..])?);
             }
             "--confidence" => {
                 idx += 1;
@@ -1844,11 +1691,6 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
         }
         idx += 1;
     }
-    let actor_kind =
-        actor_kind.ok_or_else(|| agent_notebook_invalid("`append` requires `--actor-kind`"))?;
-    let write_reason =
-        write_reason.ok_or_else(|| agent_notebook_invalid("`append` requires `--write-reason`"))?;
-
     let (title, content) = match (use_stdin, positionals.len()) {
         (false, 2) => {
             let mut it = positionals.into_iter();
@@ -1880,9 +1722,7 @@ fn parse_agent_notebook_append(rest: &[String]) -> Result<AgentNotebookVerb, Age
         title,
         content,
         source_excerpt,
-        actor_kind,
-        actor_id,
-        write_reason,
+        write_reason: WriteReason::UserExplicit,
         confidence,
         valid_from,
         valid_until,
@@ -1896,8 +1736,6 @@ fn parse_agent_notebook_status(rest: &[String]) -> Result<AgentNotebookVerb, Age
     let mut reason: Option<String> = None;
     let mut superseded_by: Option<String> = None;
     let mut expected_item_revision: Option<i64> = None;
-    let mut actor_kind: Option<ActorKind> = None;
-    let mut actor_id: Option<String> = None;
     let mut idx = 0usize;
     while idx < rest.len() {
         let token = &rest[idx];
@@ -1935,26 +1773,6 @@ fn parse_agent_notebook_status(rest: &[String]) -> Result<AgentNotebookVerb, Age
                     "expected-item-revision",
                 )?);
             }
-            "--actor-kind" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
-                actor_kind = Some(parse_actor_kind(value)?);
-            }
-            v if v.starts_with("--actor-kind=") => {
-                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
-            }
-            "--actor-id" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
-                actor_id = Some(value.clone());
-            }
-            v if v.starts_with("--actor-id=") => {
-                actor_id = Some(v["--actor-id=".len()..].to_string());
-            }
             v if v.starts_with("--") => {
                 return Err(agent_notebook_invalid(format!(
                     "unsupported flag `{v}` for `status`"
@@ -1974,23 +1792,18 @@ fn parse_agent_notebook_status(rest: &[String]) -> Result<AgentNotebookVerb, Age
     let item_id = it.next().unwrap();
     let status = parse_item_status(&it.next().unwrap())?;
     let reason = reason.ok_or_else(|| agent_notebook_invalid("`status` requires `--reason`"))?;
-    let actor_kind =
-        actor_kind.ok_or_else(|| agent_notebook_invalid("`status` requires `--actor-kind`"))?;
     Ok(AgentNotebookVerb::Status {
         item_id,
         status,
         reason,
         superseded_by,
         expected_item_revision,
-        actor_kind,
-        actor_id,
     })
 }
 
 fn parse_agent_notebook_promote(rest: &[String]) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
     let mut reason: Option<String> = None;
-    let mut actor_kind: Option<ActorKind> = None;
     let mut replace_item_id: Option<String> = None;
     let mut idx = 0usize;
     while idx < rest.len() {
@@ -2005,16 +1818,6 @@ fn parse_agent_notebook_promote(rest: &[String]) -> Result<AgentNotebookVerb, Ag
             }
             v if v.starts_with("--reason=") => {
                 reason = Some(v["--reason=".len()..].to_string());
-            }
-            "--actor-kind" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
-                actor_kind = Some(parse_actor_kind(value)?);
-            }
-            v if v.starts_with("--actor-kind=") => {
-                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
             }
             "--replace" => {
                 idx += 1;
@@ -2042,12 +1845,9 @@ fn parse_agent_notebook_promote(rest: &[String]) -> Result<AgentNotebookVerb, Ag
         )));
     }
     let reason = reason.ok_or_else(|| agent_notebook_invalid("`promote` requires `--reason`"))?;
-    let actor_kind =
-        actor_kind.ok_or_else(|| agent_notebook_invalid("`promote` requires `--actor-kind`"))?;
     Ok(AgentNotebookVerb::Promote {
         item_id: positionals.into_iter().next().unwrap(),
         reason,
-        actor_kind,
         replace_item_id,
     })
 }
@@ -2298,33 +2098,11 @@ fn parse_agent_notebook_remark_append(
 ) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
     let mut use_stdin = false;
-    let mut actor_kind: Option<ActorKind> = None;
-    let mut actor_id: Option<String> = None;
     let mut idx = 0usize;
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
             "--stdin" => use_stdin = true,
-            "--actor-kind" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
-                actor_kind = Some(parse_actor_kind(value)?);
-            }
-            v if v.starts_with("--actor-kind=") => {
-                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
-            }
-            "--actor-id" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
-                actor_id = Some(value.clone());
-            }
-            v if v.starts_with("--actor-id=") => {
-                actor_id = Some(v["--actor-id=".len()..].to_string());
-            }
             v if v.starts_with("--") => {
                 return Err(agent_notebook_invalid(format!(
                     "unsupported flag `{v}` for `remarks append`"
@@ -2334,8 +2112,6 @@ fn parse_agent_notebook_remark_append(
         }
         idx += 1;
     }
-    let actor_kind = actor_kind
-        .ok_or_else(|| agent_notebook_invalid("`remarks append` requires `--actor-kind`"))?;
     let (item_id, remark_type, content) = match (use_stdin, positionals.len()) {
         (false, 3) => {
             let mut it = positionals.into_iter();
@@ -2364,8 +2140,6 @@ fn parse_agent_notebook_remark_append(
         item_id,
         remark_type,
         content,
-        actor_kind,
-        actor_id,
     })
 }
 
@@ -2373,32 +2147,10 @@ fn parse_agent_notebook_remark_remove(
     rest: &[String],
 ) -> Result<AgentNotebookVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
-    let mut actor_kind: Option<ActorKind> = None;
-    let mut actor_id: Option<String> = None;
     let mut idx = 0usize;
     while idx < rest.len() {
         let token = &rest[idx];
         match token.as_str() {
-            "--actor-kind" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-kind`"))?;
-                actor_kind = Some(parse_actor_kind(value)?);
-            }
-            v if v.starts_with("--actor-kind=") => {
-                actor_kind = Some(parse_actor_kind(&v["--actor-kind=".len()..])?);
-            }
-            "--actor-id" => {
-                idx += 1;
-                let value = rest
-                    .get(idx)
-                    .ok_or_else(|| agent_notebook_invalid("missing value for `--actor-id`"))?;
-                actor_id = Some(value.clone());
-            }
-            v if v.starts_with("--actor-id=") => {
-                actor_id = Some(v["--actor-id=".len()..].to_string());
-            }
             v if v.starts_with("--") => {
                 return Err(agent_notebook_invalid(format!(
                     "unsupported flag `{v}` for `remarks remove`"
@@ -2414,14 +2166,10 @@ fn parse_agent_notebook_remark_remove(
             positionals.len()
         )));
     }
-    let actor_kind = actor_kind
-        .ok_or_else(|| agent_notebook_invalid("`remarks remove` requires `--actor-kind`"))?;
     let mut it = positionals.into_iter();
     Ok(AgentNotebookVerb::RemarkRemove {
         item_id: it.next().unwrap(),
         remark_id: it.next().unwrap(),
-        actor_kind,
-        actor_id,
     })
 }
 
@@ -2442,37 +2190,6 @@ fn parse_i64(raw: &str, name: &str) -> Result<i64, AgentToolError> {
     raw.trim()
         .parse::<i64>()
         .map_err(|_| agent_notebook_invalid(format!("invalid `--{name}` value `{raw}`")))
-}
-
-fn parse_actor_kind(raw: &str) -> Result<ActorKind, AgentToolError> {
-    Ok(match raw.trim() {
-        "user" => ActorKind::User,
-        "online_agent" => ActorKind::OnlineAgent,
-        "curator" => ActorKind::Curator,
-        "system" => ActorKind::System,
-        "admin" => ActorKind::Admin,
-        other => {
-            return Err(agent_notebook_invalid(format!(
-                "invalid actor_kind `{other}` (expected user|online_agent|curator|system|admin)"
-            )))
-        }
-    })
-}
-
-fn parse_write_reason(raw: &str) -> Result<WriteReason, AgentToolError> {
-    Ok(match raw.trim() {
-        "user_explicit" => WriteReason::UserExplicit,
-        "strong_rule" => WriteReason::StrongRule,
-        "project_state" => WriteReason::ProjectState,
-        "curator_extracted" => WriteReason::CuratorExtracted,
-        "curator_cleanup" => WriteReason::CuratorCleanup,
-        "manual_admin" => WriteReason::ManualAdmin,
-        other => {
-            return Err(agent_notebook_invalid(format!(
-                "invalid write_reason `{other}`"
-            )))
-        }
-    })
 }
 
 fn parse_confidence(raw: &str) -> Result<Confidence, AgentToolError> {
@@ -2563,31 +2280,10 @@ async fn dispatch_agent_notebook(
 ) -> CliRunOutput {
     let AgentNotebookInvocation {
         root_override,
-        owner_user_id,
-        owner_agent_id,
-        session_id,
         verb,
     } = invocation;
 
-    let owner_user_id = match resolve_agent_notebook_owner_user(env, owner_user_id) {
-        Ok(owner_user_id) => owner_user_id,
-        Err(message) => {
-            return CliRunOutput {
-                exit_code: 2,
-                stdout: format!(
-                    "{}\n",
-                    json!({
-                        "status": "error",
-                        "code": "invalid_input",
-                        "message": message,
-                    })
-                ),
-                stderr: String::new(),
-            };
-        }
-    };
-    let owner_agent_id = resolve_agent_notebook_owner_agent(env, owner_agent_id);
-    let session_id = resolve_agent_notebook_session_id(env, session_id);
+    let session_id = resolve_agent_notebook_session_id(env);
 
     let root = resolve_agent_notebook_root(env, root_override);
 
@@ -2598,8 +2294,6 @@ async fn dispatch_agent_notebook(
             title,
             content,
             source_excerpt,
-            actor_kind,
-            actor_id,
             write_reason,
             confidence,
             valid_from,
@@ -2627,8 +2321,6 @@ async fn dispatch_agent_notebook(
                     title,
                     content: Some(body),
                     source_excerpt,
-                    actor_kind,
-                    actor_id,
                     write_reason,
                     confidence,
                     valid_from,
@@ -2656,8 +2348,6 @@ async fn dispatch_agent_notebook(
             item_id,
             remark_type,
             content,
-            actor_kind,
-            actor_id,
         } if content.is_none() => match read_stdin_content(stdin_override).await {
             Ok(body) => {
                 if body.is_empty() {
@@ -2678,8 +2368,6 @@ async fn dispatch_agent_notebook(
                     item_id,
                     remark_type,
                     content: Some(body),
-                    actor_kind,
-                    actor_id,
                 }
             }
             Err(err) => {
@@ -2702,13 +2390,7 @@ async fn dispatch_agent_notebook(
 
     let session_arg = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_agent_notebook_blocking(
-            &root,
-            &owner_user_id,
-            owner_agent_id.as_deref(),
-            session_arg.as_deref(),
-            resolved_verb,
-        )
+        run_agent_notebook_blocking(&root, session_arg.as_deref(), resolved_verb)
     })
     .await
     .unwrap_or_else(|join| {
@@ -2733,30 +2415,16 @@ async fn dispatch_agent_notebook(
     }
 }
 
-fn build_owner_scope(owner_user_id: &str, owner_agent_id: Option<&str>) -> OwnerScope {
-    let mut scope = OwnerScope::new(owner_user_id.to_string());
-    if let Some(agent) = owner_agent_id {
-        scope = scope.with_agent(agent.to_string());
-    }
-    scope
-}
-
 fn run_agent_notebook_blocking(
     root: &Path,
-    owner_user_id: &str,
-    owner_agent_id: Option<&str>,
     session_id: Option<&str>,
     verb: AgentNotebookVerb,
 ) -> nb::Result<Json> {
     let cfg = AgentNotebookConfig::new(root);
     let notebook = AgentNotebook::open(cfg)?;
-    let scope = build_owner_scope(owner_user_id, owner_agent_id);
     match verb {
         AgentNotebookVerb::List { include_archived } => {
-            let entries = notebook.list_notebooks(ListNotebooksInput {
-                scope,
-                include_archived,
-            })?;
+            let entries = notebook.list_notebooks(ListNotebooksInput { include_archived })?;
             Ok(json!({
                 "status": "ok",
                 "notebooks": entries,
@@ -2776,7 +2444,6 @@ fn run_agent_notebook_blocking(
             allow_unchanged,
         } => {
             let result = notebook.read_notebook(ReadNotebookInput {
-                scope,
                 session_id: session_id.map(|s| s.to_string()),
                 notebook_id,
                 tags,
@@ -2797,8 +2464,6 @@ fn run_agent_notebook_blocking(
             title,
             content,
             source_excerpt,
-            actor_kind,
-            actor_id,
             write_reason,
             confidence,
             valid_from,
@@ -2807,7 +2472,6 @@ fn run_agent_notebook_blocking(
             detect_conflicts,
         } => {
             let result = notebook.append_note(AppendNoteInput {
-                scope,
                 session_id: session_id.map(|s| s.to_string()),
                 notebook_id,
                 title,
@@ -2815,14 +2479,11 @@ fn run_agent_notebook_blocking(
                 source_excerpt,
                 source_ref: None,
                 source_session_id: session_id.map(|s| s.to_string()),
-                actor_kind,
-                actor_id,
                 write_reason,
                 valid_from,
                 valid_until,
                 confidence,
                 tags,
-                metadata: None,
                 detect_conflicts,
             })?;
             Ok(serde_json::to_value(result)?)
@@ -2833,33 +2494,25 @@ fn run_agent_notebook_blocking(
             reason,
             superseded_by,
             expected_item_revision,
-            actor_kind,
-            actor_id,
         } => {
             let result = notebook.mark_note_status(MarkNoteStatusInput {
-                scope,
                 session_id: session_id.map(|s| s.to_string()),
                 item_id,
                 status,
                 reason,
                 superseded_by,
                 expected_item_revision,
-                actor_kind,
-                actor_id,
             })?;
             Ok(serde_json::to_value(result)?)
         }
         AgentNotebookVerb::Promote {
             item_id,
             reason,
-            actor_kind,
             replace_item_id,
         } => {
             let result = notebook.promote_to_system_notebook(PromoteToSystemInput {
-                scope,
                 item_id,
                 reason,
-                actor_kind,
                 replace_item_id,
             })?;
             Ok(serde_json::to_value(PromoteResultWire(result))?)
@@ -2871,7 +2524,6 @@ fn run_agent_notebook_blocking(
             description,
         } => {
             let result = notebook.create_or_update_notebook(CreateOrUpdateNotebookInput {
-                scope,
                 notebook_id,
                 kind,
                 title,
@@ -2884,18 +2536,16 @@ fn run_agent_notebook_blocking(
             }))
         }
         AgentNotebookVerb::RegistryContext { max_notebooks } => {
-            let result = notebook.build_notebook_registry_context(BuildRegistryContextInput {
-                scope,
-                max_notebooks,
-            })?;
+            let result = notebook
+                .build_notebook_registry_context(BuildRegistryContextInput { max_notebooks })?;
             Ok(json!({
                 "status": "ok",
                 "registry": result,
             }))
         }
         AgentNotebookVerb::SystemContext { max_items } => {
-            let result = notebook
-                .build_system_notebook_context(BuildSystemContextInput { scope, max_items })?;
+            let result =
+                notebook.build_system_notebook_context(BuildSystemContextInput { max_items })?;
             Ok(json!({
                 "status": "ok",
                 "system": result,
@@ -2908,9 +2558,8 @@ fn run_agent_notebook_blocking(
         } => {
             let session_id = session_id
                 .map(|s| s.to_string())
-                .ok_or_else(|| NotebookError::InvalidInput("`hints` requires --session".into()))?;
+                .ok_or_else(|| NotebookError::InvalidInput("current session id is empty".into()))?;
             let result = notebook.build_notebook_hints(BuildHintsInput {
-                scope,
                 session_id,
                 topic_tags,
                 candidate_notebook_ids,
@@ -2926,7 +2575,6 @@ fn run_agent_notebook_blocking(
             remark_type,
         } => {
             let remarks = notebook.list_item_remarks(ListItemRemarksInput {
-                scope,
                 item_id: item_id.clone(),
                 remark_type,
             })?;
@@ -2940,33 +2588,20 @@ fn run_agent_notebook_blocking(
             item_id,
             remark_type,
             content,
-            actor_kind,
-            actor_id,
         } => {
             let result = notebook.append_item_remark(AppendItemRemarkInput {
-                scope,
                 session_id: session_id.map(|s| s.to_string()),
                 item_id,
                 remark_type,
                 content: content.expect("stdin form resolved earlier"),
-                actor_kind,
-                actor_id,
             })?;
             Ok(serde_json::to_value(result)?)
         }
-        AgentNotebookVerb::RemarkRemove {
-            item_id,
-            remark_id,
-            actor_kind,
-            actor_id,
-        } => {
+        AgentNotebookVerb::RemarkRemove { item_id, remark_id } => {
             let result = notebook.remove_item_remark(RemoveItemRemarkInput {
-                scope,
                 session_id: session_id.map(|s| s.to_string()),
                 item_id,
                 remark_id,
-                actor_kind,
-                actor_id,
             })?;
             Ok(serde_json::to_value(result)?)
         }
@@ -4071,6 +3706,7 @@ mod tests {
 
     fn test_env(agent_env_root: PathBuf, current_dir: PathBuf) -> CliRuntimeEnv {
         let agent_env_root = canonicalize_or_normalize(agent_env_root, None);
+        seed_agent_identity(&agent_env_root, "alice", "did:example:agent");
         let runtime_context = RuntimeContext::from_agent_root(
             agent_env_root.clone(),
             "session-test".to_string(),
@@ -4981,19 +4617,11 @@ mod tests {
         let append_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("append"),
                 OsString::from("concise replies"),
                 OsString::from("user prefers terse output"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--confidence"),
                 OsString::from("high"),
                 OsString::from("--tags"),
@@ -5018,8 +4646,6 @@ mod tests {
         let list_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("list"),
             ],
             test_env(root.clone(), cwd.clone()),
@@ -5042,10 +4668,6 @@ mod tests {
         let read_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("read"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
@@ -5070,10 +4692,6 @@ mod tests {
         let read_again = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("read"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
@@ -5106,19 +4724,11 @@ mod tests {
         let output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("append"),
                 OsString::from("design notes"),
                 OsString::from("--stdin"),
                 OsString::from("--id"),
                 OsString::from("projects/demo"),
-                OsString::from("--actor-kind"),
-                OsString::from("curator"),
-                OsString::from("--write-reason"),
-                OsString::from("curator_extracted"),
                 OsString::from("--tags"),
                 OsString::from("design,notes"),
             ],
@@ -5145,19 +4755,11 @@ mod tests {
         let seed = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("append"),
                 OsString::from("fact"),
                 OsString::from("body"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--tags"),
                 OsString::from("fact"),
             ],
@@ -5176,17 +4778,11 @@ mod tests {
         let append = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("remarks"),
                 OsString::from("append"),
                 OsString::from(item_id.clone()),
                 OsString::from("red"),
                 OsString::from("needs confirmation"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
             ],
             test_env(root.clone(), cwd.clone()),
             None,
@@ -5205,8 +4801,6 @@ mod tests {
         let list = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("remarks"),
                 OsString::from("list"),
                 OsString::from(item_id.clone()),
@@ -5229,14 +4823,10 @@ mod tests {
         let remove = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("remarks"),
                 OsString::from("remove"),
                 OsString::from(item_id.clone()),
                 OsString::from(remark_id),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
             ],
             test_env(root.clone(), cwd.clone()),
             None,
@@ -5248,8 +4838,6 @@ mod tests {
         let after = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("remarks"),
                 OsString::from("list"),
                 OsString::from(item_id),
@@ -5279,17 +4867,9 @@ mod tests {
         let append_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("append"),
                 OsString::from("Tokyo lunch"),
                 OsString::from("Lunch with Lucy in Tokyo."),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--tags"),
                 OsString::from("travel,appointment"),
             ],
@@ -5307,10 +4887,6 @@ mod tests {
         let read_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s2"),
                 OsString::from("read"),
                 OsString::from("--title"),
                 OsString::from("Tokyo lunch"),
@@ -5343,8 +4919,6 @@ mod tests {
         let missing_id = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("create-notebook"),
                 OsString::from("--title"),
                 OsString::from("Project Demo"),
@@ -5361,8 +4935,6 @@ mod tests {
         let created = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("create-notebook"),
                 OsString::from("--id"),
                 OsString::from("projects/demo"),
@@ -5385,7 +4957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_owner_user_defaults_to_agent_root_identity() {
+    async fn agent_notebook_owner_user_defaults_to_agent_appid() {
         let _lock = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
@@ -5431,17 +5003,11 @@ mod tests {
         let seed = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("append"),
                 OsString::from("old fact"),
                 OsString::from("a stale fact"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--tags"),
                 OsString::from("fact"),
             ],
@@ -5461,15 +5027,11 @@ mod tests {
         let status_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("status"),
                 OsString::from(item_id.clone()),
                 OsString::from("stale"),
                 OsString::from("--reason"),
                 OsString::from("no longer applies"),
-                OsString::from("--actor-kind"),
-                OsString::from("curator"),
             ],
             test_env(root.clone(), cwd.clone()),
             None,
@@ -5485,10 +5047,6 @@ mod tests {
         let read_output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("s1"),
                 OsString::from("read"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
@@ -5519,17 +5077,11 @@ mod tests {
         let output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("append"),
                 OsString::from("bad"),
                 OsString::from("x"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--tags"),
                 OsString::from("bad\"tag"),
             ],
@@ -5545,9 +5097,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_identity_and_root_override_replace_cli_flags() {
-        // --owner-user / --owner-agent come from Agent RootFS identity; --root
-        // comes from the dev-only notebook root override.
+    async fn agent_notebook_identity_and_root_override_resolve_context() {
+        // Default notebook scope belongs to the agent appid; --root comes
+        // from the dev override.
         // Env vars are process-global, so hold ENV_TEST_LOCK to keep other
         // notebook tests from seeing them.
         let _lock = nb_lock();
@@ -5576,10 +5128,6 @@ mod tests {
                 OsString::from("body via env-resolved scope"),
                 OsString::from("--id"),
                 OsString::from("user/preferences"),
-                OsString::from("--actor-kind"),
-                OsString::from("online_agent"),
-                OsString::from("--write-reason"),
-                OsString::from("user_explicit"),
                 OsString::from("--tags"),
                 OsString::from("env-test"),
             ],
@@ -5601,7 +5149,7 @@ mod tests {
                 OsString::from("--tags"),
                 OsString::from("env-test"),
             ],
-            dev_test_env(agent_root, cwd),
+            dev_test_env(agent_root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -5612,6 +5160,25 @@ mod tests {
         let entries = payload["entries"].as_array().expect("entries array");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["title"], "from env");
+
+        let list = execute(
+            vec![
+                OsString::from("/tmp/agent-notebook"),
+                OsString::from("list"),
+            ],
+            dev_test_env(agent_root, cwd),
+            None,
+        )
+        .await
+        .expect("run list via env");
+        assert_eq!(list.exit_code, EXIT_SUCCESS);
+        let list_payload: Json =
+            serde_json::from_str(list.stdout.trim()).expect("parse env list json");
+        let notebooks = list_payload["notebooks"]
+            .as_array()
+            .expect("notebooks array");
+        assert_eq!(notebooks.len(), 1);
+        assert_eq!(notebooks[0]["id"], "user/preferences");
     }
 
     #[tokio::test]
@@ -5632,17 +5199,11 @@ mod tests {
             let out = execute(
                 vec![
                     OsString::from("/tmp/agent-notebook"),
-                    OsString::from("--owner-user"),
-                    OsString::from("alice"),
                     OsString::from("append"),
                     OsString::from(title),
                     OsString::from("seed content"),
                     OsString::from("--id"),
                     OsString::from(nb_id),
-                    OsString::from("--actor-kind"),
-                    OsString::from("online_agent"),
-                    OsString::from("--write-reason"),
-                    OsString::from("user_explicit"),
                     OsString::from("--tags"),
                     OsString::from("tone,style"),
                 ],
@@ -5658,8 +5219,6 @@ mod tests {
         let registry_out = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
                 OsString::from("registry-context"),
             ],
             test_env(root.clone(), cwd.clone()),
@@ -5681,10 +5240,6 @@ mod tests {
         let hints_out = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
-                OsString::from("--owner-user"),
-                OsString::from("alice"),
-                OsString::from("--session"),
-                OsString::from("session-test"),
                 OsString::from("hints"),
                 OsString::from("--topic-tags"),
                 OsString::from("tone"),

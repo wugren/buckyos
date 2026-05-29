@@ -109,7 +109,7 @@ description, or a compact review note.
 
 - 读取相关 Notebook Item：`agent-notebook read --items item_id` 或 `agent-notebook read --title "$title"`。
 - 查看已有备注：`agent-notebook remarks list item_id --type self_check`。
-- 增加 Self-Check 备注：`agent-notebook remarks append item_id self_check "$compact_review_note" --actor-kind online_agent`。
+- 增加 Self-Check 备注：`agent-notebook remarks append item_id self_check "$compact_review_note"`。
 - 当基于一条 Notebook Item 创建、关联、更新或取消计划任务后，必须用备注记录该操作，建立 Notebook Item 到 Schedule-Task 的关系。
 - 不要改写用户原始 Notebook Item 内容来表达 Self-Check 结论；使用 remarks 保存派生状态。
 
