@@ -86,7 +86,7 @@ impl AgentTool for LlmUnderstandMediaTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_LLM_UNDERSTAND_MEDIA.to_string(),
-            description: "Understand an image resource through a controlled LLM side context. Accepts media and goal only; media should be a named_object ResourceRef.".to_string(),
+            description: "Understand an media resource through a controlled LLM side context. Accepts media and goal only; media should be a named_object ResourceRef.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "additionalProperties": false,

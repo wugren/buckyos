@@ -172,6 +172,12 @@ pub struct SessionMeta {
     pub background_events: Vec<BgEventSnapshot>,
     #[serde(default, skip_serializing_if = "BackgroundHintState::is_empty")]
     pub background_hint_state: BackgroundHintState,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_schedule_task_list_access_at: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_workspace_list_access_at: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_notebook_last_items_access_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -219,6 +225,9 @@ impl SessionMeta {
             event_subscriptions: Vec::new(),
             background_events: Vec::new(),
             background_hint_state: BackgroundHintState::default(),
+            last_schedule_task_list_access_at: 0,
+            last_workspace_list_access_at: 0,
+            last_notebook_last_items_access_at: 0,
             workspace_id: None,
             pending_task_calls: Vec::new(),
             improvement_budget: None,

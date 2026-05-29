@@ -40,6 +40,53 @@ fn pending_event(event_id: &str) -> PendingInput {
 }
 
 #[test]
+fn schedule_task_prompt_text_extracts_source_and_failure() {
+    let task = Task {
+        id: 7,
+        user_id: "alice".to_string(),
+        app_id: "jarvis".to_string(),
+        session_id: String::new(),
+        parent_id: None,
+        root_id: "sch-1".to_string(),
+        name: "workflow/schedule/Daily email todo scan from note_123".to_string(),
+        task_type: "workflow/schedule".to_string(),
+        runner: String::new(),
+        status: TaskStatus::Failed,
+        progress: 0.0,
+        message: Some("smtp timeout".to_string()),
+        data: serde_json::json!({
+            "request": {
+                "schedule_id": "sch-1",
+                "name": "Daily email todo scan from note_123",
+                "target": {
+                    "data_template": {
+                        "objective": "Every day scan mail. Source Notebook Item: note_123."
+                    }
+                }
+            },
+            "result": {
+                "last_error": "smtp timeout",
+                "consecutive_failures": 2
+            }
+        }),
+        permissions: buckyos_api::TaskPermissions::default(),
+        created_at: 10,
+        updated_at: 20,
+    };
+
+    assert_eq!(
+        schedule_task_title(&task),
+        "Daily email todo scan from note_123"
+    );
+    assert!(schedule_task_created_note(&task).contains("create from Notebook Item"));
+    assert!(schedule_task_created_note(&task).contains("note_123"));
+    assert_eq!(
+        schedule_task_failure_note(&task),
+        "last run failed: smtp timeout"
+    );
+}
+
+#[test]
 fn self_check_behavior_end_keeps_session_idle() {
     assert_eq!(
         session_end_disposition(SessionKind::SelfCheck),
@@ -1056,6 +1103,7 @@ __INCLUDE(/role.md)__
         recent_activity: String::new(),
         clock_unix_ms: 1,
         runtime_workspace_list_text: String::new(),
+        runtime_last_schedule_task_list_text: String::new(),
         notebook_list_text: String::new(),
         notebook_last_items_text: String::new(),
         llm_context: LlmContextEnv::default(),
@@ -1323,6 +1371,9 @@ fn session_meta_round_trips_pending_inputs() {
         }],
         background_events: Vec::new(),
         background_hint_state: Default::default(),
+        last_schedule_task_list_access_at: 0,
+        last_workspace_list_access_at: 0,
+        last_notebook_last_items_access_at: 0,
         workspace_id: Some("ws-1".to_string()),
         pending_task_calls: vec![PendingTaskCall {
             call_id: "call-1".to_string(),

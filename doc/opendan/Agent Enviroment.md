@@ -338,7 +338,26 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | `$runtime.clock_text` | `{{ runtime.clock_text }}` | string | Driver 冻结环境时的本地时间，格式 `DD-MM HH:MM`，24 小时制 |
 | `$runtime.recent_activity` | `{{ runtime.recent_activity }}` | string | `OneLineStatusSink` 当前值 |
 | `$runtime.has_activity` | `{{ runtime.has_activity }}` | bool | recent activity 是否非空 |
-| `$runtime.workspace_list_text` | `{{ runtime.workspace_list_text }}` | string | `render_workspace_inventory` 渲染出的 workspace 列表文本，按 `updated_at_ms` 倒序读取当前 Agent workspace registry |
+| `$runtime.workspace_list_text` | `{{ runtime.workspace_list_text }}` | string | `render_workspace_inventory` 渲染出的 workspace 列表文本，按当前 `session_id` 上次访问后的 `updated_at_ms` 增量窗口读取当前 Agent workspace registry；首次访问按 `updated_at_ms` 倒序读取 |
+| `$runtime.last_schedule_task_list_text` | `{{ runtime.last_schedule_task_list_text }}` | string | Schedule-Task 增量摘要的预渲染文本；包含从上一次访问到本次环境冻结之间需要 Agent 关注的计划任务变化 |
+
+`runtime.last_schedule_task_list_text` 面向 prompt 直接阅读，不要求 Behavior 再遍历结构化 task 列表。文本只包含下列三类 Schedule-Task：
+
+| 类别 | 触发条件 | 备注要求 |
+| --- | --- | --- |
+| 新计划任务 | 上一次访问后新创建的 Schedule-Task | 必须注明是否 create from Notebook Item；如果是，应包含来源 notebook item 信息 |
+| 运行失败的计划任务 | 上一次访问后执行失败的 Schedule-Task | 应包含失败原因、最近一次 execution report 或可读错误摘要 |
+| 有用户手工 Noted 过的计划任务 | 上一次访问后用户手工追加过 note / remark 的 Schedule-Task | 应包含 note / remark 摘要、作者和时间；只统计用户手工记录，不统计系统自动执行日志 |
+
+每条 task 至少包含：动作、`task_id`、`task_title`、相关备注。建议格式保持简短稳定，例如：
+
+```text
+- created task_id=task-1 task_title="daily mail check" note="create from Notebook Item notebook=user/actions item=item-9"
+- failed task_id=task-2 task_title="send weekly report" note="last run failed: smtp timeout"
+- user_noted task_id=task-3 task_title="book train reminder" note="Alice noted: postpone to Friday"
+```
+
+没有匹配任务时返回可读空结果，例如 `Recent schedule tasks: none.`。
 
 ### 3.7 `notebook`
 
@@ -348,7 +367,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 | --- | --- | --- | --- |
 | `$notebook` | `{{ notebook }}` | object | 下列字段的聚合 |
 | `$notebook.list_text` | `{{ notebook.list_text }}` | string | Agent Notebook registry 的默认纯文本渲染；列出当前一共有多少个 Notebook、每个 Notebook 有多少条记录，以及最后修改时间 |
-| `$notebook.last_items_text` | `{{ notebook.last_items_text }}` | string | Agent Notebook 最近新增 item 的默认纯文本渲染；最多列出最近新增的 8 条 item |
+| `$notebook.last_items_text` | `{{ notebook.last_items_text }}` | string | Agent Notebook 最近变化 item 的默认纯文本渲染；按当前 `session_id` 上次访问后的增量窗口读取，最多列出最近 8 条 item；带 active `self_check` remark 且标记 `keep_observing` 的 item 不受该窗口限制 |
 
 推荐在 system prompt 中直接插入这两个字段：
 
@@ -357,7 +376,7 @@ Behavior 模板需要自然语言 observation 时统一使用 `default_last_step
 {{ notebook.last_items_text }}
 ```
 
-`notebook.list_text` 用于帮助 Agent 选择应该读取哪本 notebook；`notebook.last_items_text` 用于提示最近新增的记录标题和归属，但不应替代 `agent-notebook read` 的事实读取。
+`notebook.list_text` 用于帮助 Agent 选择应该读取哪本 notebook；`notebook.last_items_text` 用于提示最近变化的记录标题和归属，但不应替代 `agent-notebook read` 的事实读取。
 
 ## 4. `on_behavior_switch` 变量
 

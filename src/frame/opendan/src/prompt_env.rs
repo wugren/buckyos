@@ -94,6 +94,7 @@ pub struct AgentSessionEnv {
     pub recent_activity: String,
     pub clock_unix_ms: u64,
     pub runtime_workspace_list_text: String,
+    pub runtime_last_schedule_task_list_text: String,
     pub notebook_list_text: String,
     pub notebook_last_items_text: String,
     pub llm_context: LlmContextEnv,
@@ -335,6 +336,9 @@ fn resolve_phase1(env: &AgentSessionEnv, expr: &str) -> Option<Json> {
         "runtime.workspace_list_text" => {
             Some(Json::String(env.runtime_workspace_list_text.clone()))
         }
+        "runtime.last_schedule_task_list_text" => Some(Json::String(
+            env.runtime_last_schedule_task_list_text.clone(),
+        )),
 
         "task" => Some(task_object(env)),
         "task.id" | "task.task_id" => Some(task_number(env, |task| task.task_id)),
@@ -535,6 +539,7 @@ fn runtime_object(env: &AgentSessionEnv) -> Json {
         "recent_activity": env.recent_activity,
         "has_activity": env.has_recent_activity(),
         "workspace_list_text": env.runtime_workspace_list_text,
+        "last_schedule_task_list_text": env.runtime_last_schedule_task_list_text,
     })
 }
 
@@ -886,6 +891,8 @@ mod tests {
             recent_activity: "running tool".into(),
             clock_unix_ms: 123,
             runtime_workspace_list_text: "- `ws-a` (ready) — Alpha\n".into(),
+            runtime_last_schedule_task_list_text:
+                "- created task_id=task-1 task_title=\"daily mail check\" note=\"create from Notebook Item notebook=user/actions item=item-9\"\n".into(),
             notebook_list_text: "Available notebooks: 1 total.\n- user/preferences: preferences, 2 records, last modified 2026-05-24T10:00:00Z\n".into(),
             notebook_last_items_text: "Recent notebook items: latest 1.\n- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)\n".into(),
             llm_context: LlmContextEnv {
@@ -949,6 +956,7 @@ mod tests {
             recent_activity: String::new(),
             clock_unix_ms: 999,
             runtime_workspace_list_text: String::new(),
+            runtime_last_schedule_task_list_text: String::new(),
             notebook_list_text: String::new(),
             notebook_last_items_text: String::new(),
             llm_context: LlmContextEnv::default(),
@@ -1034,6 +1042,15 @@ mod tests {
         assert_eq!(
             loader.load("$runtime.workspace_list_text").await.unwrap(),
             Some(Json::String(env.runtime_workspace_list_text.clone()))
+        );
+        assert_eq!(
+            loader
+                .load("$runtime.last_schedule_task_list_text")
+                .await
+                .unwrap(),
+            Some(Json::String(
+                env.runtime_last_schedule_task_list_text.clone()
+            ))
         );
         assert_eq!(
             loader.load("$notebook.list_text").await.unwrap(),
@@ -1318,6 +1335,7 @@ workspace={{ workspace.id }}|{{ workspace.root }}|{{ workspace.has_id }}
 paths={{ paths.agent_root }}|{{ paths.session_root }}|{{ paths.workspace_root }}
 runtime={{ runtime.clock_unix_ms }}|{{ runtime.clock_text }}|{{ runtime.recent_activity }}|{{ runtime.has_activity }}
 runtime_workspace={{ runtime.workspace_list_text }}
+runtime_schedule={{ runtime.last_schedule_task_list_text }}
 notebook={{ notebook.list_text }}|{{ notebook.last_items_text }}
 {% if session.has_title %}if_session_title={{ session.title }}{% endif %}
 {% if session.background_hint_changed %}if_background_hint={{ session.default_changed_background_hint_text }}
@@ -1375,6 +1393,7 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
             "paths=/tmp/agent|/tmp/agent/sessions/s-1|/tmp/ws1",
             expected_runtime.as_str(),
             "runtime_workspace=- `ws-a` (ready) — Alpha",
+            "runtime_schedule=- created task_id=task-1 task_title=\"daily mail check\" note=\"create from Notebook Item notebook=user/actions item=item-9\"",
             "notebook=Available notebooks: 1 total.",
             "- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)",
             "if_session_title=hello",

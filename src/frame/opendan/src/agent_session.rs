@@ -5,7 +5,8 @@ use std::sync::{Arc, Weak};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use buckyos_api::{
-    match_event_patterns, AiContent, AiMessage, AiRole, MsgCenterClient, TaskStatus,
+    match_event_patterns, parse_typed_task_data, AiContent, AiMessage, AiRole, MsgCenterClient,
+    Task, TaskFilter, TaskManagerClient, TaskNote, TaskStatus, TypedTaskData,
     UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
@@ -381,8 +382,15 @@ impl StepResultHook for OpenDanStepResultHook {
             &self.meta,
             &self.session_dir,
             &self.behavior,
+            String::new(),
         )
         .await;
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush prompt env cursors after on_behavior_step_ob failed: {err:#}",
+                self.session_id
+            );
+        }
         env.llm_context.msgs = msg_refs;
         env.llm_context.events = event_refs;
         env.llm_context.last_step = snapshot
@@ -3756,15 +3764,71 @@ impl AgentSession {
     /// the two currently-templated sections, and the user-input section is
     /// still composed by the legacy `compose_turn_message` path.
     async fn build_prompt_env(&self, behavior: &BehaviorCfg) -> AgentSessionEnv {
-        build_agent_session_env(
+        let schedule_task_list = self.build_runtime_schedule_task_list_text().await;
+        let env = build_agent_session_env(
             &self.session_id,
             &self.agent_config,
             &self.agent_name,
             &self.meta,
             &self.session_dir,
             behavior,
+            schedule_task_list,
+        )
+        .await;
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush prompt env cursors failed: {err:#}",
+                self.session_id
+            );
+        }
+        env
+    }
+
+    async fn build_runtime_schedule_task_list_text(&self) -> String {
+        let Some(task_mgr) = self.runtime.task_mgr.as_ref() else {
+            return "Recent schedule tasks: unavailable (task-manager not configured).".to_string();
+        };
+        let now_secs = now_ms() / 1000;
+        let (owner, since_secs) = {
+            let meta = self.meta.lock().await;
+            (
+                meta.owner.trim().to_string(),
+                meta.last_schedule_task_list_access_at,
+            )
+        };
+        let owner_filter = if owner.trim().is_empty() {
+            None
+        } else {
+            Some(owner.as_str())
+        };
+        let text = match render_last_schedule_task_list_text(
+            task_mgr.as_ref(),
+            owner_filter,
+            since_secs,
+            now_secs,
         )
         .await
+        {
+            Ok(text) => text,
+            Err(err) => {
+                warn!(
+                    "opendan.session[{}]: build schedule task prompt text failed: {err}",
+                    self.session_id
+                );
+                return "Recent schedule tasks: unavailable.".to_string();
+            }
+        };
+        {
+            let mut meta = self.meta.lock().await;
+            meta.last_schedule_task_list_access_at = now_secs.saturating_sub(1);
+        }
+        if let Err(err) = self.flush_meta().await {
+            warn!(
+                "opendan.session[{}]: flush schedule task prompt cursor failed: {err:#}",
+                self.session_id
+            );
+        }
+        text
     }
 
     async fn load_changed_background_hits(&self) -> Vec<BackgroundHint> {
@@ -5979,8 +6043,20 @@ async fn build_agent_session_env(
     meta: &Arc<Mutex<SessionMeta>>,
     session_dir: &Path,
     behavior: &BehaviorCfg,
+    runtime_last_schedule_task_list_text: String,
 ) -> AgentSessionEnv {
-    let (kind, title, objective, owner, workspace_id, one_line, bg_events, task_binding) = {
+    let (
+        kind,
+        title,
+        objective,
+        owner,
+        workspace_id,
+        one_line,
+        bg_events,
+        task_binding,
+        workspace_since_secs,
+        notebook_since_secs,
+    ) = {
         let meta = meta.lock().await;
         (
             meta.kind,
@@ -5991,6 +6067,8 @@ async fn build_agent_session_env(
             meta.one_line_status.clone(),
             meta.background_events.clone(),
             meta.task_binding.clone(),
+            meta.last_workspace_list_access_at,
+            meta.last_notebook_last_items_access_at,
         )
     };
     let session_objective = if objective.trim().is_empty() {
@@ -6003,8 +6081,15 @@ async fn build_agent_session_env(
         .as_deref()
         .map(|ws| agent_config.layout.workspaces_dir.join(ws));
     let (notebook_list_text, notebook_last_items_text) =
-        build_notebook_prompt_texts(agent_config, owner.trim(), agent_name);
-    let runtime_workspace_list_text = build_runtime_workspace_list_text(agent_config).await;
+        build_notebook_prompt_texts(agent_config, owner.trim(), agent_name, notebook_since_secs);
+    let runtime_workspace_list_text =
+        build_runtime_workspace_list_text(agent_config, workspace_since_secs).await;
+    {
+        let now_secs = now_ms() / 1000;
+        let mut meta = meta.lock().await;
+        meta.last_workspace_list_access_at = now_secs.saturating_sub(1);
+        meta.last_notebook_last_items_access_at = now_secs.saturating_sub(1);
+    }
     AgentSessionEnv {
         session_id: session_id.to_string(),
         session_kind: AgentSessionEnv::kind_str(kind),
@@ -6032,6 +6117,7 @@ async fn build_agent_session_env(
         recent_activity: one_line.trim().to_string(),
         clock_unix_ms: now_ms(),
         runtime_workspace_list_text,
+        runtime_last_schedule_task_list_text,
         notebook_list_text,
         notebook_last_items_text,
         llm_context: LlmContextEnv {
@@ -6042,10 +6128,17 @@ async fn build_agent_session_env(
     }
 }
 
-async fn build_runtime_workspace_list_text(agent_config: &AgentConfig) -> String {
+async fn build_runtime_workspace_list_text(agent_config: &AgentConfig, since_secs: u64) -> String {
     let manager = LocalWorkspaceManager::new(agent_config.layout.workspaces_dir.clone());
     match manager.list().await {
         Ok(mut workspaces) => {
+            if since_secs > 0 {
+                let since_ms = since_secs.saturating_mul(1000);
+                workspaces.retain(|workspace| workspace.updated_at_ms >= since_ms);
+                if workspaces.is_empty() {
+                    return "Recent workspace changes: none.\n".to_string();
+                }
+            }
             workspaces.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
             render_workspace_inventory(&workspaces)
         }
@@ -6056,10 +6149,253 @@ async fn build_runtime_workspace_list_text(agent_config: &AgentConfig) -> String
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScheduleTaskPromptLine {
+    at: u64,
+    action: &'static str,
+    task_id: i64,
+    task_title: String,
+    note: String,
+}
+
+async fn render_last_schedule_task_list_text(
+    task_mgr: &TaskManagerClient,
+    owner: Option<&str>,
+    since_secs: u64,
+    now_secs: u64,
+) -> std::result::Result<String, String> {
+    let mut tasks = task_mgr
+        .list_tasks(
+            Some(TaskFilter {
+                task_type: Some("workflow/schedule".to_string()),
+                ..Default::default()
+            }),
+            owner,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut lines = Vec::new();
+    for task in tasks {
+        if is_prompt_time_window(task.created_at, since_secs, now_secs) {
+            lines.push(ScheduleTaskPromptLine {
+                at: task.created_at,
+                action: "created",
+                task_id: task.id,
+                task_title: schedule_task_title(&task),
+                note: schedule_task_created_note(&task),
+            });
+        }
+
+        if task.status == TaskStatus::Failed
+            && is_prompt_time_window(task.updated_at, since_secs, now_secs)
+        {
+            lines.push(ScheduleTaskPromptLine {
+                at: task.updated_at,
+                action: "failed",
+                task_id: task.id,
+                task_title: schedule_task_title(&task),
+                note: schedule_task_failure_note(&task),
+            });
+        }
+
+        match task_mgr.list_task_notes(task.id, owner, None).await {
+            Ok(notes) => {
+                for note in notes.into_iter().filter(is_user_manual_task_note) {
+                    if is_prompt_time_window(note.created_at, since_secs, now_secs) {
+                        lines.push(ScheduleTaskPromptLine {
+                            at: note.created_at,
+                            action: "user_noted",
+                            task_id: task.id,
+                            task_title: schedule_task_title(&task),
+                            note: schedule_task_note_summary(&note),
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "opendan.session: list schedule task notes failed task_id={}: {err}",
+                    task.id
+                );
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return Ok("Recent schedule tasks: none.".to_string());
+    }
+
+    lines.sort_by(|a, b| {
+        b.at.cmp(&a.at)
+            .then_with(|| a.action.cmp(b.action))
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    Ok(lines
+        .into_iter()
+        .map(|line| {
+            format!(
+                "- {} task_id={} task_title={} note={}",
+                line.action,
+                line.task_id,
+                quote_prompt_text(&line.task_title),
+                quote_prompt_text(&line.note)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn is_prompt_time_window(ts_secs: u64, since_secs: u64, now_secs: u64) -> bool {
+    ts_secs > since_secs && ts_secs <= now_secs
+}
+
+fn schedule_task_title(task: &Task) -> String {
+    if let Ok(TypedTaskData::WorkflowSchedule(data)) =
+        parse_typed_task_data(task.task_type.as_str(), task.data.clone())
+    {
+        if let Some(name) = data.request.name.filter(|name| !name.trim().is_empty()) {
+            return name.trim().to_string();
+        }
+    }
+    task.name
+        .strip_prefix("workflow/schedule/")
+        .unwrap_or(task.name.as_str())
+        .trim()
+        .to_string()
+}
+
+fn schedule_task_created_note(task: &Task) -> String {
+    let mut sources = Vec::new();
+    collect_notebook_source_fragments(&task.data, &mut sources);
+    if notebook_source_like(&task.name) {
+        sources.push(task.name.clone());
+    }
+    if let Some(message) = task
+        .message
+        .as_deref()
+        .filter(|value| notebook_source_like(value))
+    {
+        sources.push(message.to_string());
+    }
+    dedup_prompt_fragments(&mut sources);
+    if sources.is_empty() {
+        "not create from Notebook Item".to_string()
+    } else {
+        format!(
+            "create from Notebook Item {}",
+            truncate_prompt_text(&sources.join("; "), 240)
+        )
+    }
+}
+
+fn schedule_task_failure_note(task: &Task) -> String {
+    if let Ok(TypedTaskData::WorkflowSchedule(data)) =
+        parse_typed_task_data(task.task_type.as_str(), task.data.clone())
+    {
+        if let Some(result) = data.result {
+            if let Some(last_error) = result.last_error {
+                return format!("last run failed: {}", value_prompt_text(&last_error));
+            }
+        }
+    }
+    task.message
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|message| format!("last run failed: {}", truncate_prompt_text(message, 240)))
+        .unwrap_or_else(|| "last run failed".to_string())
+}
+
+fn schedule_task_note_summary(note: &TaskNote) -> String {
+    let author = if note.author_user_id.trim().is_empty() {
+        "user".to_string()
+    } else {
+        note.author_user_id.trim().to_string()
+    };
+    format!(
+        "{} noted at {}: {}",
+        author,
+        note.created_at,
+        truncate_prompt_text(&note.content, 240)
+    )
+}
+
+fn is_user_manual_task_note(note: &TaskNote) -> bool {
+    matches!(
+        note.note_type.trim().to_ascii_lowercase().as_str(),
+        "human" | "manual" | "user" | "user_noted"
+    )
+}
+
+fn collect_notebook_source_fragments(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if notebook_source_like(text) {
+                out.push(truncate_prompt_text(text, 240));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_notebook_source_fragments(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let key_lower = key.to_ascii_lowercase();
+                if key_lower.contains("notebook") || key_lower.contains("note_item") {
+                    out.push(format!("{}={}", key, value_prompt_text(value)));
+                }
+                collect_notebook_source_fragments(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn notebook_source_like(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("notebook item")
+        || lower.contains("source notebook")
+        || lower.contains("source_notebook")
+        || lower.contains("notebook_item")
+        || lower.contains("note_")
+}
+
+fn dedup_prompt_fragments(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
+fn value_prompt_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => truncate_prompt_text(text, 240),
+        serde_json::Value::Null => "null".to_string(),
+        other => truncate_prompt_text(&other.to_string(), 240),
+    }
+}
+
+fn quote_prompt_text(value: &str) -> String {
+    format!("\"{}\"", truncate_prompt_text(value, 240).replace('"', "'"))
+}
+
+fn truncate_prompt_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn build_notebook_prompt_texts(
     agent_config: &AgentConfig,
     owner: &str,
     agent_name: &str,
+    recent_since_secs: u64,
 ) -> (String, String) {
     if owner.is_empty() || !agent_config.layout.notepads_dir.exists() {
         return (
@@ -6085,7 +6421,7 @@ fn build_notebook_prompt_texts(
             String::new()
         }
     };
-    let last_items_text = match notebook.build_recent_items_text(scope, 8) {
+    let last_items_text = match notebook.build_recent_items_text(scope, 8, recent_since_secs) {
         Ok(text) => text,
         Err(err) => {
             warn!("opendan.session: build notebook recent items prompt text failed: {err}");

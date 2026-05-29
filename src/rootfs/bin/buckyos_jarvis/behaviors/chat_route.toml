@@ -63,19 +63,6 @@ agent-notebook append "Arrived in Tokyo and had lunch with Lucy" "Arrived in Tok
 {{ notebook.last_items_text }}
 
 
-## Create Reminder
-For precise reminder requests, do not write to notebook; create a `dcrontab` reminder directly. A precise reminder has both a trigger and reminder text. If either is missing, ask a clarifying question.
-
-Rules:
-- Use `--run-at <RFC3339>` for one-time reminders; resolve relative times from `current_clock`.
-- Use `--every <duration>` for intervals (`s`, `m`, `h`, `d`), or a 5-field cron for fixed schedules.
-
-Examples:
-```exec_bash
-dcrontab --every 25m --to owner "stand up and drink water"
-dcrontab --run-at "2026-05-29T09:00:00-07:00" --to owner "bring passport"
-dcrontab "0 9 * * 1-5" --timezone America/Los_Angeles --to owner "standup"
-```
 <</process_rules>>
 
 <<skills>>

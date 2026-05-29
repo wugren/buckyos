@@ -74,7 +74,25 @@ const OPENDAN_TRACE_ID_ENV: &str = "OPENDAN_TRACE_ID";
 const OPENDAN_BEHAVIOR_ENV: &str = "OPENDAN_BEHAVIOR";
 const OPENDAN_STEP_IDX_ENV: &str = "OPENDAN_STEP_IDX";
 const OPENDAN_WAKEUP_ID_ENV: &str = "OPENDAN_WAKEUP_ID";
-const BUILTIN_AGENT_TOOL_BINS: &[&str] = &["todo", "Glob", "Grep", "read_file"];
+const BUILTIN_AGENT_TOOL_BINS: &[&str] = &[
+    "Glob",
+    "Grep",
+    "dcrontab",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "todo",
+    "get_session",
+    "create_workspace",
+    "bind_workspace",
+    "agent-memory",
+    "agent_memory",
+    "agent-notebook",
+    "agent_notebook",
+    "check_task",
+    "cancel_task",
+    "finish_task",
+];
 
 static EXEC_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 

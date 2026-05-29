@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
@@ -2267,11 +2267,17 @@ impl AgentNotebook {
         Ok(text)
     }
 
-    pub fn build_recent_items_text(&self, scope: OwnerScope, max_items: usize) -> Result<String> {
+    pub fn build_recent_items_text(
+        &self,
+        scope: OwnerScope,
+        max_items: usize,
+        since_access_at_secs: u64,
+    ) -> Result<String> {
         validate_owner(&scope)?;
         let max_items = max_items.max(1);
         let conn = self.lock_conn()?;
         let now = now_iso8601();
+        let since = since_access_at_secs_to_iso8601(since_access_at_secs);
         let mut stmt = conn.prepare(
             "SELECT i.item_id, i.notebook_id, i.title, i.created_at, i.updated_at
              FROM notebook_items i
@@ -2284,11 +2290,32 @@ impl AgentNotebook {
                AND i.status = 'active'
                AND n.status = 'active'
                AND (i.valid_until IS NULL OR i.valid_until >= ?)
-             ORDER BY i.created_at DESC, i.updated_at DESC, i.item_id ASC
+               AND (
+                    ? = ''
+                    OR i.updated_at >= ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM notebook_item_remarks r
+                        WHERE r.owner_user_id = i.owner_user_id
+                          AND r.owner_agent_id = i.owner_agent_id
+                          AND r.item_id = i.item_id
+                          AND r.status = 'active'
+                          AND r.remark_type = 'self_check'
+                          AND r.content LIKE '%keep_observing%'
+                    )
+               )
+             ORDER BY i.updated_at DESC, i.created_at DESC, i.item_id ASC
              LIMIT ?",
         )?;
         let rows = stmt.query_map(
-            params![scope.owner_user_id, scope.agent(), now, max_items as i64],
+            params![
+                scope.owner_user_id,
+                scope.agent(),
+                now,
+                since,
+                since,
+                max_items as i64
+            ],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -2889,6 +2916,15 @@ fn collapse_whitespace(s: &str) -> String {
 
 fn now_iso8601() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn since_access_at_secs_to_iso8601(secs: u64) -> String {
+    if secs == 0 {
+        return String::new();
+    }
+    DateTime::<Utc>::from_timestamp(secs.min(i64::MAX as u64) as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string())
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
@@ -4665,12 +4701,40 @@ mod tests {
         assert!(list_text.contains("last modified"));
         assert!(!list_text.contains("DO NOT LEAK"));
 
-        let recent_text = n.build_recent_items_text(scope(), 1).unwrap();
+        let recent_text = n.build_recent_items_text(scope(), 1, 0).unwrap();
         assert!(recent_text.contains("Recent notebook items: latest 1."));
         assert!(recent_text.contains("["));
         assert!(recent_text.contains("created "));
         assert!(recent_text.contains("updated "));
         assert!(!recent_text.contains("DO NOT LEAK"));
+    }
+
+    #[test]
+    fn recent_items_text_respects_since_window_except_keep_observing() {
+        let (_t, n) = open_tmp();
+        append(&n, "user/preferences", "old action", "content", &["action"]);
+        let observing_id = append(
+            &n,
+            "user/preferences",
+            "observing action",
+            "content",
+            &["action"],
+        );
+        n.append_item_remark(AppendItemRemarkInput {
+            scope: scope(),
+            session_id: Some("sess-A".into()),
+            item_id: observing_id,
+            remark_type: "self_check".into(),
+            content: "decision=keep_observing reason=missing context".into(),
+            actor_kind: ActorKind::OnlineAgent,
+            actor_id: None,
+        })
+        .unwrap();
+
+        let future_since = 4_102_444_800;
+        let recent_text = n.build_recent_items_text(scope(), 8, future_since).unwrap();
+        assert!(recent_text.contains("observing action"));
+        assert!(!recent_text.contains("old action"));
     }
 
     #[test]
