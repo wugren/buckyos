@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use buckyos_api::get_buckyos_api_runtime;
 use log::warn;
 use tokio::fs;
 use tokio::process::Command;
@@ -57,25 +56,9 @@ const TMUX_GC_TRIGGER_COUNT: usize = 16;
 const TMUX_GC_IDLE_SECS: u64 = 24 * 60 * 60;
 const TMUX_BANNER_COMMAND_PREVIEW_CHARS: usize = 512;
 
-/// Env var that gates the bash `command_not_found_handle` proxy injected by
-/// [`build_exec_script`]. When set on the exec_bash request env, its value
-/// must be the absolute path to the `agent_tool` CLI binary; an unknown
-/// command in the user's script is then proxied through
-/// `"$OPENDAN_AGENT_TOOL" __command_not_found__ <argv...>` so the intent
-/// engine bypass (see `agent_tool::llm_tool_carft`) gets a chance to
-/// synthesise a tool before bash falls back to the native
-/// `command not found` error. Unset ⇒ no hook installed, bash behaves
-/// normally. The session-level intent-bypass toggle is responsible for
-/// populating this var when wired up.
-pub const OPENDAN_AGENT_TOOL_ENV: &str = "OPENDAN_AGENT_TOOL";
-const OPENDAN_AGENT_ENV_ENV: &str = "OPENDAN_AGENT_ENV";
-const OPENDAN_AGENT_ID_ENV: &str = "OPENDAN_AGENT_ID";
-const OPENDAN_OWNER_USER_ID_ENV: &str = "OPENDAN_OWNER_USER_ID";
+const OPENDAN_AGENT_ROOT_ENV: &str = "OPENDAN_AGENT_ROOT";
 const OPENDAN_SESSION_ID_ENV: &str = "OPENDAN_SESSION_ID";
 const OPENDAN_TRACE_ID_ENV: &str = "OPENDAN_TRACE_ID";
-const OPENDAN_BEHAVIOR_ENV: &str = "OPENDAN_BEHAVIOR";
-const OPENDAN_STEP_IDX_ENV: &str = "OPENDAN_STEP_IDX";
-const OPENDAN_WAKEUP_ID_ENV: &str = "OPENDAN_WAKEUP_ID";
 const BUILTIN_AGENT_TOOL_BINS: &[&str] = &[
     "Glob",
     "Grep",
@@ -448,7 +431,7 @@ pub fn build_session_tools(build: SessionToolsBuild) -> std::io::Result<Arc<Agen
         &layout,
         &bash_runtime_dir,
         build.bin_renderer.clone(),
-        session_exec_base_env(&build.agent_root, &build.agent_id, &build.session_id),
+        session_exec_base_env(&build.agent_root, &build.session_id),
     );
     Ok(manager)
 }
@@ -493,58 +476,34 @@ fn symlink_agent_tool(agent_tool: &Path, path: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(agent_tool, path)
 }
 
-fn session_exec_base_env(
-    agent_root: &Path,
-    agent_id: &str,
-    session_id: &str,
-) -> Vec<(String, String)> {
+fn session_exec_base_env(agent_root: &Path, session_id: &str) -> Vec<(String, String)> {
     let mut env = vec![
         (
-            OPENDAN_AGENT_ENV_ENV.to_string(),
+            OPENDAN_AGENT_ROOT_ENV.to_string(),
             agent_root.to_string_lossy().to_string(),
         ),
-        (OPENDAN_AGENT_ID_ENV.to_string(), agent_id.to_string()),
         (OPENDAN_SESSION_ID_ENV.to_string(), session_id.to_string()),
     ];
-    if let Some(owner_id) = current_owner_user_id() {
-        env.push((OPENDAN_OWNER_USER_ID_ENV.to_string(), owner_id));
-    }
-    if let Some(agent_tool) = resolve_agent_tool_cli_path() {
-        env.push((
-            OPENDAN_AGENT_TOOL_ENV.to_string(),
-            agent_tool.to_string_lossy().to_string(),
-        ));
-    } else {
-        warn!(
-            "opendan.agent_bash: `{}` is not configured and `agent_tool` sibling binary was not found; shell tool proxy is disabled",
-            OPENDAN_AGENT_TOOL_ENV
-        );
+    if let Ok(token) = std::env::var(agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            env.push((
+                agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV.to_string(),
+                token,
+            ));
+        }
     }
     env
 }
 
-fn current_owner_user_id() -> Option<String> {
-    get_buckyos_api_runtime()
-        .ok()
-        .and_then(|runtime| {
-            runtime
-                .get_owner_user_id()
-                .or_else(|| runtime.user_id.clone())
-        })
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn resolve_agent_tool_cli_path() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var(OPENDAN_AGENT_TOOL_ENV) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
     let exe = std::env::current_exe().ok()?;
     let sibling = exe.parent()?.join(agent_tool_binary_name());
-    sibling.exists().then_some(sibling)
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    let debug_sibling = exe.parent()?.parent()?.join(agent_tool_binary_name());
+    debug_sibling.exists().then_some(debug_sibling)
 }
 
 fn agent_tool_binary_name() -> &'static str {
@@ -560,17 +519,41 @@ fn runtime_exec_env(
     base_env: &[(String, String)],
     ctx: &SessionRuntimeContext,
 ) -> Vec<(String, String)> {
-    let mut env = request_env.to_vec();
+    let mut env = request_env
+        .iter()
+        .filter(|(key, _)| !is_agent_tool_context_override_env(key))
+        .cloned()
+        .collect::<Vec<_>>();
     for (key, value) in base_env {
         set_env_value(&mut env, key, value.clone());
     }
     set_env_value(&mut env, OPENDAN_TRACE_ID_ENV, ctx.trace_id.clone());
-    set_env_value(&mut env, OPENDAN_BEHAVIOR_ENV, ctx.behavior.clone());
-    set_env_value(&mut env, OPENDAN_STEP_IDX_ENV, ctx.step_idx.to_string());
-    set_env_value(&mut env, OPENDAN_WAKEUP_ID_ENV, ctx.wakeup_id.clone());
     set_env_value(&mut env, OPENDAN_SESSION_ID_ENV, ctx.session_id.clone());
-    set_env_value(&mut env, OPENDAN_AGENT_ID_ENV, ctx.agent_name.clone());
     env
+}
+
+fn is_agent_tool_context_override_env(key: &str) -> bool {
+    if matches!(
+        key,
+        OPENDAN_AGENT_ROOT_ENV
+            | OPENDAN_SESSION_ID_ENV
+            | OPENDAN_TRACE_ID_ENV
+            | agent_tool::BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
+    ) {
+        return false;
+    }
+    key.starts_with("OPENDAN_")
+        || matches!(
+            key,
+            "BUCKYOS_OWNER_USER_ID"
+                | "AGENT_MEMORY_ROOT"
+                | "AGENT_NOTEBOOK_ROOT"
+                | "WORKFLOW_SERVICE_URL"
+                | "WORKFLOW_SERVICE_RPC"
+                | "TASK_MANAGER_URL"
+                | "TASK_MANAGER_RPC"
+                | "SESSION_TOKEN"
+        )
 }
 
 fn set_env_value(env: &mut Vec<(String, String)>, key: &str, value: String) {
@@ -921,34 +904,24 @@ fn build_exec_script(
     for (key, value) in env_vars {
         lines.push(format!("  export {}={}", key, shell_quote(value.as_str())));
     }
-    // Intent-engine bypass hook: when the session sets OPENDAN_AGENT_TOOL,
-    // install bash's command-not-found handler so unknown commands are proxied to
-    // `agent_tool __command_not_found__` instead of dying with 127
-    // immediately.
-    // Functions defined here are inherited by the `( ... )` subshell below.
-    lines.push(format!(
-        "  if [ -n \"${{{env}:-}}\" ]; then",
-        env = OPENDAN_AGENT_TOOL_ENV
-    ));
-    lines.push("    __opendan_command_not_found_proxy() {".to_string());
-    lines.push(format!(
-        "      local __od_tool=\"${{{env}:-}}\"",
-        env = OPENDAN_AGENT_TOOL_ENV
-    ));
-    lines.push(format!(
-        "      \"$__od_tool\" {} \"$@\"",
-        shell_quote(agent_tool::CLI_COMMAND_NOT_FOUND_SUBCOMMAND)
-    ));
-    lines.push("      local __od_cnf_ec=$?".to_string());
-    lines.push("      if [ \"$__od_cnf_ec\" -eq 127 ]; then".to_string());
-    lines.push("        printf 'bash: %s: command not found\\n' \"$1\" >&2".to_string());
-    lines.push("      fi".to_string());
-    lines.push("      return \"$__od_cnf_ec\"".to_string());
-    lines.push("    }".to_string());
-    lines.push(
-        "    command_not_found_handle() { __opendan_command_not_found_proxy \"$@\"; }".to_string(),
-    );
-    lines.push("  fi".to_string());
+    if let Some(agent_tool) = resolve_agent_tool_cli_path() {
+        lines.push(format!(
+            "  __od_agent_tool={}",
+            shell_quote(agent_tool.to_string_lossy().as_ref())
+        ));
+        lines.push("  __opendan_command_not_found_proxy() {".to_string());
+        lines.push("    \"$__od_agent_tool\" __command_not_found__ \"$@\"".to_string());
+        lines.push("    local __od_cnf_ec=$?".to_string());
+        lines.push("    if [ \"$__od_cnf_ec\" -eq 127 ]; then".to_string());
+        lines.push("      printf 'bash: %s: command not found\\n' \"$1\" >&2".to_string());
+        lines.push("    fi".to_string());
+        lines.push("    return \"$__od_cnf_ec\"".to_string());
+        lines.push("  }".to_string());
+        lines.push(
+            "  command_not_found_handle() { __opendan_command_not_found_proxy \"$@\"; }"
+                .to_string(),
+        );
+    }
     lines.push("  (".to_string());
     lines.push(command.to_string());
     lines.push("  )".to_string());
@@ -1043,27 +1016,17 @@ mod tests {
     }
 
     #[test]
-    fn links_builtin_agent_tool_bins() {
+    fn links_agent_tool_bin_to_resolved_binary() {
         let dir = tempdir().unwrap();
         let session_bin = dir.path().join("session_bin");
         std::fs::create_dir_all(&session_bin).unwrap();
         let fake_agent_tool = dir.path().join("agent_tool");
         std::fs::write(&fake_agent_tool, "#!/bin/sh\n").unwrap();
-        let _agent_tool = ScopedEnvVar::set(OPENDAN_AGENT_TOOL_ENV, &fake_agent_tool);
 
-        link_builtin_agent_tool_bins(
-            &session_bin,
-            &dir.path().join("agent_root"),
-            "test-agent",
-            "session 1",
-        )
-        .expect("link bins");
+        link_agent_tool_bin(&session_bin, &fake_agent_tool, "read_file").expect("link bin");
 
-        for tool_name in BUILTIN_AGENT_TOOL_BINS {
-            let bin = session_bin.join(tool_name);
-            let linked = std::fs::read_link(&bin).expect("read symlink");
-            assert_eq!(linked, fake_agent_tool);
-        }
+        let linked = std::fs::read_link(session_bin.join("read_file")).expect("read symlink");
+        assert_eq!(linked, fake_agent_tool);
     }
 
     #[test]
@@ -1128,28 +1091,6 @@ mod tests {
         }
     }
 
-    struct ScopedEnvVar {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(p) => std::env::set_var(self.key, p),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[test]
     fn tmux_session_name_is_namespaced_and_sanitized() {
         let raw = "sess/with-dashes:and.colons";
@@ -1205,8 +1146,10 @@ mod tests {
             "missing-cmd",
             &[],
         );
-        // Hook is gated on OPENDAN_AGENT_TOOL being set on the request env.
-        assert!(script.contains(&format!("if [ -n \"${{{}:-}}\" ]", OPENDAN_AGENT_TOOL_ENV)));
+        assert!(!script.contains("OPENDAN_AGENT_TOOL"));
+        if !script.contains("command_not_found_handle()") {
+            return;
+        }
         // Proxies to the shared `__command_not_found__` subcommand…
         assert!(script.contains("command_not_found_handle()"));
         assert!(!script.contains("command_not_found_handler()"));
@@ -1240,17 +1183,17 @@ mod tests {
                     OPENDAN_SESSION_ID_ENV.to_string(),
                     "session-wrong".to_string(),
                 ),
-            ],
-            &[
+                ("OPENDAN_AGENT_ID".to_string(), "agent-wrong".to_string()),
                 (
-                    OPENDAN_AGENT_ENV_ENV.to_string(),
-                    "/tmp/agent-root".to_string(),
-                ),
-                (
-                    OPENDAN_AGENT_TOOL_ENV.to_string(),
+                    "OPENDAN_AGENT_TOOL".to_string(),
                     "/tmp/agent_tool".to_string(),
                 ),
+                ("AGENT_MEMORY_ROOT".to_string(), "/tmp/memory".to_string()),
             ],
+            &[(
+                OPENDAN_AGENT_ROOT_ENV.to_string(),
+                "/tmp/agent-root".to_string(),
+            )],
             &ctx,
         );
         let value = |key: &str| {
@@ -1261,10 +1204,9 @@ mod tests {
         };
         assert_eq!(value("PATH"), "/bin");
         assert_eq!(value(OPENDAN_SESSION_ID_ENV), "session-real");
-        assert_eq!(value(OPENDAN_AGENT_ENV_ENV), "/tmp/agent-root");
-        assert_eq!(value(OPENDAN_AGENT_TOOL_ENV), "/tmp/agent_tool");
-        assert_eq!(value(OPENDAN_BEHAVIOR_ENV), "do");
-        assert_eq!(value(OPENDAN_STEP_IDX_ENV), "7");
+        assert_eq!(value(OPENDAN_AGENT_ROOT_ENV), "/tmp/agent-root");
+        assert_eq!(value(OPENDAN_TRACE_ID_ENV), "trace-1");
+        assert!(value("OPENDAN_AGENT_TOOL").is_empty());
     }
 
     #[test]

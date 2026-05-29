@@ -579,21 +579,22 @@ Agent RootFS 布局以 [../opendan/Agent RootFS.md](../opendan/Agent%20RootFS.md
 
 新工具不要通过 `--agent-env` / `--session-id` / `--agent-id` 重复传上下文参数。命令行参数应只表达业务语义。需要上下文时从统一 `RuntimeContext` 读取。
 
-### 6.4 TODO: 环境变量契约迁移
+### 6.4 环境变量契约迁移（已完成）
 
-后续 Code Agent 修正实现时，按下面顺序收敛：
+beta2.2 已完成迁移。因为 beta2.2 是 breaking-change 版本，无需保留向前兼容，旧上下文变量直接移除而不是留废弃分支。落地情况：
 
-1. 新增统一 `RuntimeContext` resolver，输入只使用 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID`、`BUCKYOS_APPCLIENT_SESSION_TOKEN`、可选 `OPENDAN_TRACE_ID`。
-2. 为 Agent RootFS 确认 identity metadata，例如 `<agent_root>/agent.toml`，至少包含 `owner_user_id`、`agent_id`。不要从任意 dev override 路径字符串猜身份。
-3. 修改 `exec` / tmux 环境注入，只把最小契约和 `PATH` 写入子进程。`OPENDAN_AGENT_TOOL` 这类内部路径应由 runtime 直接写入 generated shell hook 或从路径规则计算，不暴露为工具进程契约。
-4. 修改 `agent_tool_cli_dev::CliRuntimeEnv::from_process()`，优先走 `RuntimeContext` resolver；旧 `OPENDAN_AGENT_ENV`、`OPENDAN_AGENT_ID`、`OPENDAN_BEHAVIOR`、`OPENDAN_STEP_IDX`、`OPENDAN_WAKEUP_ID` 只保留迁移期兼容分支，并标注废弃。
-5. 将 `AGENT_MEMORY_ROOT`、`AGENT_NOTEBOOK_ROOT`、`OPENDAN_WORKFLOW_URL`、`OPENDAN_TASK_MANAGER_URL`、`OPENDAN_SESSION_TOKEN` 等变量移动到 dev-only 代码路径，生产工具通过 Agent RootFS 路径和 BuckyOS runtime client 获取资源。
-6. 更新 `src/frame/agent_tool/create_tmux_debug_session.sh`，让调试 session 默认注入最小契约；如保留旧变量，只作为兼容验证项。
-7. 补测试覆盖：
-   - 最小契约能构造完整 `RuntimeContext`。
-   - `OPENDAN_AGENT_ROOT=/tmp/foo` 且无 metadata 时不会静默猜 identity。
-   - 旧变量兼容路径仍能工作，但新路径优先。
-   - 需要 RPC 的工具缺少 `BUCKYOS_APPCLIENT_SESSION_TOKEN` 时给出明确错误。
+1. ✅ 新增统一 `RuntimeContext` resolver（`agent_tool::runtime_context`），输入只使用 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID`、`BUCKYOS_APPCLIENT_SESSION_TOKEN`、可选 `OPENDAN_TRACE_ID`。
+2. ✅ Agent RootFS identity metadata 按三路推导：`<agent_root>/.meta/agent_identity.json` → `<agent_root>/agent.toml` 的 `[identity]` (`owner_user_id` + `agent_id`) → 规范路径 `data/home/<owner>/.local/share/<agent_id>`。任意 override 路径（如 `/tmp/foo`）无 metadata 时 `identity = None`，不静默猜身份。
+3. ✅ `exec` / tmux 环境注入只把最小契约和 `PATH` 写入子进程，并过滤掉请求里夹带的 `OPENDAN_*` / dev 变量。`OPENDAN_AGENT_TOOL` 不再作为工具进程契约，改由 runtime 用 `resolve_agent_tool_cli_path()` 按路径规则算出并直接写入 generated shell hook。
+4. ✅ `agent_tool_cli_dev::CliRuntimeEnv::from_process()` 改走 `RuntimeContext` resolver。旧 `OPENDAN_AGENT_ENV`、`OPENDAN_AGENT_ID`、`OPENDAN_BEHAVIOR`、`OPENDAN_STEP_IDX`、`OPENDAN_WAKEUP_ID` 已整体移除（breaking change，不保留兼容分支）；`opendan` 主进程也删掉了 `OPENDAN_AGENT_ID` / `OPENDAN_AGENT_OWNER` / `OPENDAN_AGENT_BIN` 等别名。
+5. ✅ `AGENT_MEMORY_ROOT`、`AGENT_NOTEBOOK_ROOT`、`OPENDAN_WORKFLOW_URL`、`OPENDAN_TASK_MANAGER_URL`、`OPENDAN_SESSION_TOKEN` 等只在 dev-only 路径生效（cli_dev 用 `allow_dev_overrides()`、dcrontab 用 `allow_dev_env_overrides()` gate）；生产工具通过 Agent RootFS 路径和 BuckyOS runtime client 获取资源，缺 token 时显式报错。
+6. ✅ `src/frame/agent_tool/create_tmux_debug_session.sh` 只注入最小契约，并自动 seed `agent.toml [identity]` 让身份可推导；旧变量已从脚本移除。
+7. ✅ 测试覆盖（`runtime_context.rs`）：
+   - 最小契约能构造完整 `RuntimeContext`（`minimal_contract_builds_complete_context`）。
+   - `OPENDAN_AGENT_ROOT=/tmp/foo` 且无 metadata 时不会静默猜 identity（`arbitrary_root_without_metadata_has_no_identity`）。
+   - 需要 RPC 的工具缺少 `BUCKYOS_APPCLIENT_SESSION_TOKEN` 时给出明确错误（`rpc_token_missing_yields_clear_error`）。
+   - identity 三路解析与空 session id 拒绝各有用例。
+   - 注：旧变量已移除，不再有"兼容路径仍工作"一项；`runtime_exec_env` 的过滤行为由 `opendan::agent_bash` 的 `runtime_env_overrides_user_session_context` 测试覆盖。
 
 ---
 

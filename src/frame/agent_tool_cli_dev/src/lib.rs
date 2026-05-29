@@ -32,7 +32,7 @@ use agent_tool::{
     normalize_abs_path, now_ms, render_cli_output, session_record_path, AgentToolError,
     AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus, BindWorkspaceTool,
     CliRunOutput, CreateWorkspaceTool, DcrontabTool, EditFileTool, FileToolConfig, GetSessionTool,
-    GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, SessionRuntimeContext,
+    GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext, SessionRuntimeContext,
     SessionViewBackend, TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
@@ -67,24 +67,10 @@ const AGENT_MEMORY_ROOT_ENV: &str = "AGENT_MEMORY_ROOT";
 const AGENT_MEMORY_DIR_NAME: &str = "memory";
 const AGENT_NOTEBOOK_ROOT_ENV: &str = "AGENT_NOTEBOOK_ROOT";
 const AGENT_NOTEBOOK_DIR_NAME: &str = "notebook";
-/// Fallback env when `--owner-user` is not passed. New name; no existing
-/// buckyos env for "the user this agent serves".
-const DEFAULT_OWNER_USER_ENV: &str = "OPENDAN_OWNER_USER_ID";
-const AGENT_OWNER_ENV: &str = "OPENDAN_AGENT_OWNER";
-const BUCKYOS_OWNER_USER_ENV: &str = "BUCKYOS_OWNER_USER_ID";
-/// Fallback env when `--owner-agent` is not passed. Reuses the existing
-/// harness env (the agent's own DID == the owner_agent for its own
-/// notebooks). Kept aligned with `CliRuntimeEnv::call_ctx.agent_name`.
-const DEFAULT_OWNER_AGENT_ENV: &str = "OPENDAN_AGENT_ID";
-/// Fallback env when `--session` is not passed. The harness already sets
-/// this for in-session invocations; ad-hoc shells can export it manually.
-const DEFAULT_SESSION_ENV: &str = "OPENDAN_SESSION_ID";
 const EXIT_SUCCESS: i32 = agent_tool::CLI_EXIT_SUCCESS;
 const COMMAND_NOT_FOUND_PROXY: &str = agent_tool::CLI_COMMAND_NOT_FOUND_SUBCOMMAND;
 const MAIN_BINARY_NAME: &str = "agent_tool";
 const DEFAULT_AGENT_NAME: &str = "did:opendan:cli";
-const DEFAULT_TRACE_ID: &str = "cli-trace";
-const DEFAULT_SESSION_ID: &str = "cli-session";
 const DEFAULT_WAKEUP_ID: &str = "cli-wakeup";
 const DEFAULT_BEHAVIOR: &str = "cli";
 const SESSION_RECORD_FILE: &str = "session.json";
@@ -97,6 +83,7 @@ struct CliRuntimeEnv {
     has_agent_env: bool,
     current_dir: PathBuf,
     stdout_is_terminal: bool,
+    runtime_context: RuntimeContext,
     call_ctx: SessionRuntimeContext,
 }
 
@@ -107,30 +94,26 @@ impl CliRuntimeEnv {
             .map_err(|err| {
                 AgentToolError::ExecFailed(format!("resolve current dir failed: {err}"))
             })?;
-        let agent_env_root = first_path_env(&["OPENDAN_AGENT_ENV"], &current_dir);
-        let has_agent_env = agent_env_root.is_some();
-        let agent_env_root = agent_env_root.unwrap_or_else(|| current_dir.clone());
-        let step_idx = first_string_env(&["OPENDAN_STEP_IDX"])
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .unwrap_or(0);
+        let runtime_context = RuntimeContext::from_process_env(&current_dir, true)?;
+        let agent_env_root = runtime_context.agent_root.clone();
+        let has_agent_env = !runtime_context.is_dev_fallback();
+        let agent_name = resolve_runtime_agent_name(&runtime_context)?;
+        let trace_id = runtime_context.trace_id.clone();
+        let session_id = runtime_context.session_id.clone();
 
         Ok(Self {
             agent_env_root,
             has_agent_env,
             current_dir,
             stdout_is_terminal: std::io::stdout().is_terminal(),
+            runtime_context,
             call_ctx: SessionRuntimeContext {
-                trace_id: first_string_env(&["OPENDAN_TRACE_ID"])
-                    .unwrap_or_else(|| DEFAULT_TRACE_ID.to_string()),
-                agent_name: first_string_env(&["OPENDAN_AGENT_ID"])
-                    .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string()),
-                behavior: first_string_env(&["OPENDAN_BEHAVIOR"])
-                    .unwrap_or_else(|| DEFAULT_BEHAVIOR.to_string()),
-                step_idx,
-                wakeup_id: first_string_env(&["OPENDAN_WAKEUP_ID"])
-                    .unwrap_or_else(|| DEFAULT_WAKEUP_ID.to_string()),
-                session_id: first_string_env(&["OPENDAN_SESSION_ID"])
-                    .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string()),
+                trace_id,
+                agent_name,
+                behavior: DEFAULT_BEHAVIOR.to_string(),
+                step_idx: 0,
+                wakeup_id: DEFAULT_WAKEUP_ID.to_string(),
+                session_id,
             },
         })
     }
@@ -138,6 +121,29 @@ impl CliRuntimeEnv {
     fn use_plain_text_read_output(&self) -> bool {
         !self.has_agent_env && !self.stdout_is_terminal
     }
+
+    fn allow_dev_overrides(&self) -> bool {
+        self.runtime_context.is_dev_fallback()
+    }
+}
+
+fn resolve_runtime_agent_name(runtime_context: &RuntimeContext) -> Result<String, AgentToolError> {
+    if let Some(identity) = runtime_context.identity.as_ref() {
+        return Ok(identity.agent_id.clone());
+    }
+    if let Ok(Some((app_id, _owner_id))) = load_app_identity_from_env() {
+        let app_id = app_id.trim().to_string();
+        if !app_id.is_empty() {
+            return Ok(app_id);
+        }
+    }
+    if runtime_context.is_dev_fallback() {
+        return Ok(DEFAULT_AGENT_NAME.to_string());
+    }
+    Err(AgentToolError::ExecFailed(format!(
+        "missing Agent RootFS identity metadata under {}; expected owner_user_id and agent_id",
+        runtime_context.agent_root.display()
+    )))
 }
 
 /// What the parser produced. The dispatcher resolves the tool against
@@ -1036,15 +1042,120 @@ fn parse_agent_memory_compact(rest: &[String]) -> Result<AgentMemoryVerb, AgentT
     Ok(AgentMemoryVerb::Compact)
 }
 
-/// Resolve `--root` → env var `AGENT_MEMORY_ROOT` → `<state_root>/memory`.
 fn resolve_agent_memory_root(env: &CliRuntimeEnv, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return canonicalize_or_normalize(p, Some(env.current_dir.as_path()));
     }
-    if let Some(value) = first_path_env(&[AGENT_MEMORY_ROOT_ENV], &env.current_dir) {
-        return value;
+    if env.allow_dev_overrides() {
+        if let Some(value) = first_path_env(&[AGENT_MEMORY_ROOT_ENV], &env.current_dir) {
+            return value;
+        }
     }
     cli_state_root(env).join(AGENT_MEMORY_DIR_NAME)
+}
+
+fn resolve_agent_notebook_root(env: &CliRuntimeEnv, override_path: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = override_path {
+        return canonicalize_or_normalize(p, Some(env.current_dir.as_path()));
+    }
+    if env.allow_dev_overrides() {
+        if let Some(value) = first_path_env(&[AGENT_NOTEBOOK_ROOT_ENV], &env.current_dir) {
+            return value;
+        }
+    }
+    cli_state_root(env).join(AGENT_NOTEBOOK_DIR_NAME)
+}
+
+fn resolve_agent_notebook_owner_user(
+    env: &CliRuntimeEnv,
+    owner_user_id: Option<String>,
+) -> Result<String, String> {
+    if let Some(owner_id) = owner_user_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(owner_id);
+    }
+    if let Some(identity) = env.runtime_context.identity.as_ref() {
+        return Ok(identity.owner_user_id.clone());
+    }
+    if let Some(owner_id) = get_buckyos_api_runtime()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .get_owner_user_id()
+                .or_else(|| runtime.user_id.clone())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(owner_id);
+    }
+    match load_app_identity_from_env() {
+        Ok(Some((_app_id, owner_id))) => {
+            let owner_id = owner_id.trim().to_string();
+            if !owner_id.is_empty() {
+                return Ok(owner_id);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(format!(
+                "load owner user from app_instance_config failed: {err}"
+            ));
+        }
+    }
+    Err(format!(
+        "missing current owner user; configure Agent RootFS identity metadata under {} or pass --owner-user",
+        env.agent_env_root.display()
+    ))
+}
+
+fn resolve_agent_notebook_owner_agent(
+    env: &CliRuntimeEnv,
+    owner_agent_id: Option<String>,
+) -> Option<String> {
+    owner_agent_id
+        .or_else(|| {
+            env.runtime_context
+                .identity
+                .as_ref()
+                .map(|identity| identity.agent_id.clone())
+        })
+        .or_else(|| {
+            env.allow_dev_overrides()
+                .then(|| DEFAULT_AGENT_NAME.to_string())
+        })
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn resolve_agent_notebook_session_id(
+    env: &CliRuntimeEnv,
+    session_id: Option<String>,
+) -> Option<String> {
+    session_id
+        .or_else(|| Some(env.runtime_context.session_id.clone()))
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn require_runtime_token_for_rpc(env: &CliRuntimeEnv) -> Result<(), AgentToolError> {
+    env.runtime_context
+        .require_appclient_session_token()
+        .map(|_| ())
+}
+
+fn resolve_dev_task_manager_client() -> Option<TaskManagerClient> {
+    let url = first_string_env(&[
+        "OPENDAN_TASK_MANAGER_URL",
+        "OPENDAN_TASK_MANAGER_RPC",
+        "TASK_MANAGER_URL",
+        "TASK_MANAGER_RPC",
+    ])?;
+    let session_token = first_string_env(&["OPENDAN_SESSION_TOKEN", "SESSION_TOKEN"]);
+    Some(TaskManagerClient::new(kRPC::new(
+        url.as_str(),
+        session_token,
+    )))
 }
 
 fn agent_memory_exit_code(err: &AgentMemoryError) -> i32 {
@@ -1259,8 +1370,8 @@ fn format_verify_report(report: &agent_tool::VerifyReport) -> String {
 
 const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NOTEBOOK_ROOT] \
 [--owner-user <user_id> | current agent owner] \
-[--owner-agent <agent> | env OPENDAN_AGENT_ID] \
-[--session <id> | env OPENDAN_SESSION_ID] \
+[--owner-agent <agent> | current agent id] \
+[--session <id> | current session id] \
 <list|read|append|status|promote|create-notebook|registry-context|\
 system-context|hints|remarks> [...]";
 const DEFAULT_AGENT_NOTEBOOK_ID: &str = "user/actions";
@@ -2418,16 +2529,6 @@ fn parse_notebook_kind(raw: &str) -> Result<NotebookKind, AgentToolError> {
     })
 }
 
-fn resolve_agent_notebook_root(env: &CliRuntimeEnv, override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return canonicalize_or_normalize(p, Some(env.current_dir.as_path()));
-    }
-    if let Some(value) = first_path_env(&[AGENT_NOTEBOOK_ROOT_ENV], &env.current_dir) {
-        return value;
-    }
-    cli_state_root(env).join(AGENT_NOTEBOOK_DIR_NAME)
-}
-
 fn agent_notebook_exit_code(err: &NotebookError) -> i32 {
     match err {
         NotebookError::NotFound(_) => 3,
@@ -2454,52 +2555,6 @@ fn agent_notebook_error_output(err: NotebookError) -> CliRunOutput {
     }
 }
 
-fn resolve_agent_notebook_owner_user(owner_user_id: Option<String>) -> Result<String, String> {
-    if let Some(owner_id) = owner_user_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(owner_id);
-    }
-    if let Some(owner_id) = first_string_env(&[
-        DEFAULT_OWNER_USER_ENV,
-        AGENT_OWNER_ENV,
-        BUCKYOS_OWNER_USER_ENV,
-    ]) {
-        return Ok(owner_id);
-    }
-    if let Some(owner_id) = get_buckyos_api_runtime()
-        .ok()
-        .and_then(|runtime| {
-            runtime
-                .get_owner_user_id()
-                .or_else(|| runtime.user_id.clone())
-        })
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(owner_id);
-    }
-    match load_app_identity_from_env() {
-        Ok(Some((_app_id, owner_id))) => {
-            let owner_id = owner_id.trim().to_string();
-            if !owner_id.is_empty() {
-                return Ok(owner_id);
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            return Err(format!(
-                "load owner user from app_instance_config failed: {err}"
-            ));
-        }
-    }
-    Err(format!(
-        "missing current owner user; pass --owner-user or set ${}, ${}, or ${}",
-        DEFAULT_OWNER_USER_ENV, AGENT_OWNER_ENV, BUCKYOS_OWNER_USER_ENV
-    ))
-}
-
 async fn dispatch_agent_notebook(
     env: &CliRuntimeEnv,
     _tool_name: &str,
@@ -2514,7 +2569,7 @@ async fn dispatch_agent_notebook(
         verb,
     } = invocation;
 
-    let owner_user_id = match resolve_agent_notebook_owner_user(owner_user_id) {
+    let owner_user_id = match resolve_agent_notebook_owner_user(env, owner_user_id) {
         Ok(owner_user_id) => owner_user_id,
         Err(message) => {
             return CliRunOutput {
@@ -2531,12 +2586,8 @@ async fn dispatch_agent_notebook(
             };
         }
     };
-    let owner_agent_id = owner_agent_id
-        .or_else(|| first_string_env(&[DEFAULT_OWNER_AGENT_ENV]))
-        .filter(|v| !v.trim().is_empty());
-    let session_id = session_id
-        .or_else(|| first_string_env(&[DEFAULT_SESSION_ENV]))
-        .filter(|v| !v.trim().is_empty());
+    let owner_agent_id = resolve_agent_notebook_owner_agent(env, owner_agent_id);
+    let session_id = resolve_agent_notebook_session_id(env, session_id);
 
     let root = resolve_agent_notebook_root(env, root_override);
 
@@ -3709,7 +3760,7 @@ fn sanitize_cli_workspace_dir_name(workspace_name: &str) -> String {
 }
 
 async fn build_task_manager_client(
-    _env: &CliRuntimeEnv,
+    env: &CliRuntimeEnv,
 ) -> Result<TaskManagerClient, AgentToolError> {
     if let Ok(runtime) = get_buckyos_api_runtime() {
         return runtime.get_task_mgr_client().await.map_err(|err| {
@@ -3719,19 +3770,13 @@ async fn build_task_manager_client(
         });
     }
 
-    if let Some(url) = first_string_env(&[
-        "OPENDAN_TASK_MANAGER_URL",
-        "OPENDAN_TASK_MANAGER_RPC",
-        "TASK_MANAGER_URL",
-        "TASK_MANAGER_RPC",
-    ]) {
-        let session_token = first_string_env(&["OPENDAN_SESSION_TOKEN", "SESSION_TOKEN"]);
-        return Ok(TaskManagerClient::new(kRPC::new(
-            url.as_str(),
-            session_token,
-        )));
+    if env.allow_dev_overrides() {
+        if let Some(client) = resolve_dev_task_manager_client() {
+            return Ok(client);
+        }
     }
 
+    require_runtime_token_for_rpc(env)?;
     let runtime = init_buckyos_api_runtime("opendan", None, BuckyOSRuntimeType::FrameService)
         .await
         .map_err(|err| {
@@ -4009,6 +4054,7 @@ mod tests {
 
     use std::sync::Mutex;
 
+    use agent_tool::RuntimeContextSource;
     use tempfile::tempdir;
     use tokio::fs;
 
@@ -4024,11 +4070,48 @@ mod tests {
     }
 
     fn test_env(agent_env_root: PathBuf, current_dir: PathBuf) -> CliRuntimeEnv {
+        let agent_env_root = canonicalize_or_normalize(agent_env_root, None);
+        let runtime_context = RuntimeContext::from_agent_root(
+            agent_env_root.clone(),
+            "session-test".to_string(),
+            Some("test-token".to_string()),
+            "trace-test".to_string(),
+            RuntimeContextSource::StableEnv,
+        )
+        .expect("runtime context");
         CliRuntimeEnv {
-            agent_env_root: canonicalize_or_normalize(agent_env_root, None),
+            agent_env_root,
             has_agent_env: true,
             current_dir: canonicalize_or_normalize(current_dir, None),
             stdout_is_terminal: true,
+            runtime_context,
+            call_ctx: SessionRuntimeContext {
+                trace_id: "trace-test".to_string(),
+                agent_name: "did:example:agent".to_string(),
+                behavior: "cli".to_string(),
+                step_idx: 0,
+                wakeup_id: "wakeup-test".to_string(),
+                session_id: "session-test".to_string(),
+            },
+        }
+    }
+
+    fn dev_test_env(agent_env_root: PathBuf, current_dir: PathBuf) -> CliRuntimeEnv {
+        let agent_env_root = canonicalize_or_normalize(agent_env_root, None);
+        let runtime_context = RuntimeContext::from_agent_root(
+            agent_env_root.clone(),
+            "session-test".to_string(),
+            None,
+            "trace-test".to_string(),
+            RuntimeContextSource::DevFallback,
+        )
+        .expect("runtime context");
+        CliRuntimeEnv {
+            agent_env_root,
+            has_agent_env: false,
+            current_dir: canonicalize_or_normalize(current_dir, None),
+            stdout_is_terminal: true,
+            runtime_context,
             call_ctx: SessionRuntimeContext {
                 trace_id: "trace-test".to_string(),
                 agent_name: "did:example:agent".to_string(),
@@ -4066,6 +4149,18 @@ mod tests {
         save_session_json(agent_env_root, session_id, &session)
             .await
             .expect("save session");
+    }
+
+    fn seed_agent_identity(agent_root: &Path, owner_user_id: &str, agent_id: &str) {
+        std::fs::create_dir_all(agent_root).expect("create agent root");
+        std::fs::write(
+            agent_root.join("agent.toml"),
+            format!(
+                "[identity]\nowner_user_id = \"{}\"\nagent_id = \"{}\"\n",
+                owner_user_id, agent_id
+            ),
+        )
+        .expect("write agent identity");
     }
 
     #[tokio::test]
@@ -4435,7 +4530,7 @@ mod tests {
                 OsString::from("/user/k"),
                 OsString::from("v"),
             ],
-            test_env(root, cwd),
+            dev_test_env(root, cwd),
             None,
         )
         .await;
@@ -4620,20 +4715,7 @@ mod tests {
                 OsString::from("/tmp/read_file"),
                 OsString::from(outside.join("demo.txt")),
             ],
-            CliRuntimeEnv {
-                agent_env_root: canonicalize_or_normalize(temp.path().join("cwd"), None),
-                has_agent_env: false,
-                current_dir: canonicalize_or_normalize(temp.path().join("cwd"), None),
-                stdout_is_terminal: true,
-                call_ctx: SessionRuntimeContext {
-                    trace_id: "trace-test".to_string(),
-                    agent_name: "did:example:agent".to_string(),
-                    behavior: "cli".to_string(),
-                    step_idx: 0,
-                    wakeup_id: "wakeup-test".to_string(),
-                    session_id: "session-test".to_string(),
-                },
-            },
+            dev_test_env(temp.path().join("cwd"), temp.path().join("cwd")),
             None,
         )
         .await
@@ -4755,19 +4837,10 @@ mod tests {
                 OsString::from("/tmp/read_file"),
                 OsString::from(outside.join("demo.txt")),
             ],
-            CliRuntimeEnv {
-                agent_env_root: canonicalize_or_normalize(temp.path().join("cwd"), None),
-                has_agent_env: false,
-                current_dir: canonicalize_or_normalize(temp.path().join("cwd"), None),
-                stdout_is_terminal: false,
-                call_ctx: SessionRuntimeContext {
-                    trace_id: "trace-test".to_string(),
-                    agent_name: "did:example:agent".to_string(),
-                    behavior: "cli".to_string(),
-                    step_idx: 0,
-                    wakeup_id: "wakeup-test".to_string(),
-                    session_id: "session-test".to_string(),
-                },
+            {
+                let mut env = dev_test_env(temp.path().join("cwd"), temp.path().join("cwd"));
+                env.stdout_is_terminal = false;
+                env
             },
             None,
         )
@@ -5312,7 +5385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_owner_user_defaults_to_agent_owner_env() {
+    async fn agent_notebook_owner_user_defaults_to_agent_root_identity() {
         let _lock = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
@@ -5320,26 +5393,18 @@ mod tests {
         fs::create_dir_all(&cwd)
             .await
             .expect("create workspace dir");
-
-        struct EnvGuard(&'static str);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
-        std::env::set_var(AGENT_OWNER_ENV, "alice");
-        let _guard = EnvGuard(AGENT_OWNER_ENV);
+        seed_agent_identity(&root, "alice", "did:opendan:test");
 
         let output = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
                 OsString::from("list"),
             ],
-            test_env(root, cwd),
+            dev_test_env(root, cwd),
             None,
         )
         .await
-        .expect("run agent-notebook list with agent owner env");
+        .expect("run agent-notebook list with agent identity");
         assert_eq!(output.exit_code, EXIT_SUCCESS);
         let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse list json");
         assert_eq!(payload["status"], "ok");
@@ -5480,15 +5545,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_env_fallbacks_replace_cli_flags() {
-        // --owner-user / --owner-agent / --session / --root all come from env.
+    async fn agent_notebook_identity_and_root_override_replace_cli_flags() {
+        // --owner-user / --owner-agent come from Agent RootFS identity; --root
+        // comes from the dev-only notebook root override.
         // Env vars are process-global, so hold ENV_TEST_LOCK to keep other
         // notebook tests from seeing them.
         let _lock = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let nb_root = temp.path().join("nb-root");
+        let agent_root = temp.path().join("agent-env");
         let cwd = temp.path().join("cwd");
         fs::create_dir_all(&cwd).await.expect("create cwd");
+        seed_agent_identity(&agent_root, "alice", "did:opendan:test");
 
         struct EnvGuard(&'static str);
         impl Drop for EnvGuard {
@@ -5497,13 +5565,7 @@ mod tests {
             }
         }
         std::env::set_var(AGENT_NOTEBOOK_ROOT_ENV, &nb_root);
-        std::env::set_var(DEFAULT_OWNER_USER_ENV, "alice");
-        std::env::set_var(DEFAULT_OWNER_AGENT_ENV, "did:opendan:test");
-        std::env::set_var(DEFAULT_SESSION_ENV, "env-session");
         let _g1 = EnvGuard(AGENT_NOTEBOOK_ROOT_ENV);
-        let _g2 = EnvGuard(DEFAULT_OWNER_USER_ENV);
-        let _g3 = EnvGuard(DEFAULT_OWNER_AGENT_ENV);
-        let _g4 = EnvGuard(DEFAULT_SESSION_ENV);
 
         // Append with zero CLI flags beyond verb-specific ones.
         let out = execute(
@@ -5521,7 +5583,7 @@ mod tests {
                 OsString::from("--tags"),
                 OsString::from("env-test"),
             ],
-            test_env(temp.path().join("agent-env"), cwd.clone()),
+            dev_test_env(agent_root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -5529,7 +5591,7 @@ mod tests {
         assert_eq!(out.exit_code, EXIT_SUCCESS, "stdout={:?}", out.stdout);
         assert!(nb_root.join("notebook.sqlite").exists());
 
-        // Read also picks env session / owner up.
+        // Read also picks the identity/root up.
         let read = execute(
             vec![
                 OsString::from("/tmp/agent-notebook"),
@@ -5539,7 +5601,7 @@ mod tests {
                 OsString::from("--tags"),
                 OsString::from("env-test"),
             ],
-            test_env(temp.path().join("agent-env"), cwd),
+            dev_test_env(agent_root, cwd),
             None,
         )
         .await

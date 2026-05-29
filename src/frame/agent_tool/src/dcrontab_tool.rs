@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as Json};
 use sha2::{Digest, Sha256};
 
-use crate::{AgentToolError, CallingConventions, CliInvocation, ToolCtx, TypedTool};
+use crate::{
+    AgentToolError, CallingConventions, CliInvocation, RuntimeContext, ToolCtx, TypedTool,
+};
 
 pub const TOOL_DCRONTAB: &str = "dcrontab";
 
@@ -472,19 +474,24 @@ async fn workflow_client() -> Result<WorkflowServiceClient, AgentToolError> {
         });
     }
 
-    if let Some(url) = first_env(&[
-        "OPENDAN_WORKFLOW_URL",
-        "OPENDAN_WORKFLOW_RPC",
-        "WORKFLOW_SERVICE_URL",
-        "WORKFLOW_SERVICE_RPC",
-    ]) {
-        let session_token = first_env(&["OPENDAN_SESSION_TOKEN", "SESSION_TOKEN"]);
-        return Ok(WorkflowServiceClient::new(kRPC::new(
-            url.as_str(),
-            session_token,
-        )));
+    let runtime_context = process_runtime_context()?;
+
+    if runtime_context.is_dev_fallback() {
+        if let Some(url) = first_env(&[
+            "OPENDAN_WORKFLOW_URL",
+            "OPENDAN_WORKFLOW_RPC",
+            "WORKFLOW_SERVICE_URL",
+            "WORKFLOW_SERVICE_RPC",
+        ]) {
+            let session_token = first_env(&["OPENDAN_SESSION_TOKEN", "SESSION_TOKEN"]);
+            return Ok(WorkflowServiceClient::new(kRPC::new(
+                url.as_str(),
+                session_token,
+            )));
+        }
     }
 
+    runtime_context.require_appclient_session_token()?;
     let runtime = init_buckyos_api_runtime("agent_tool", None, BuckyOSRuntimeType::AppClient)
         .await
         .map_err(|err| {
@@ -1135,15 +1142,22 @@ fn resolve_owner(ctx: &ToolCtx<'_>, owner: Option<&str>, agent: Option<&str>) ->
     let runtime = get_buckyos_api_runtime().ok();
     let user_id = owner
         .map(str::to_string)
-        .or_else(|| first_env(&["OPENDAN_OWNER_USER_ID", "BUCKYOS_OWNER_USER_ID"]))
         .or_else(|| runtime.and_then(|rt| rt.get_owner_user_id().or_else(|| rt.user_id.clone())))
         .unwrap_or_else(|| "devtest".to_string());
     let app_id = agent
         .map(str::to_string)
-        .or_else(|| first_env(&["OPENDAN_AGENT_ID"]))
         .or_else(|| get_buckyos_api_runtime().ok().map(|rt| rt.get_app_id()))
         .unwrap_or_else(|| ctx.session().agent_name.clone());
     WorkflowOwner { user_id, app_id }
+}
+
+/// Build the unified `RuntimeContext` from process env. dev fallback is allowed
+/// here: when `OPENDAN_AGENT_ROOT` is absent the context is marked
+/// `DevFallback`, which is what gates the dev-only workflow-service overrides.
+fn process_runtime_context() -> Result<RuntimeContext, AgentToolError> {
+    let current_dir = env::current_dir().ok();
+    let current_dir = current_dir.as_deref().unwrap_or_else(|| Path::new("."));
+    RuntimeContext::from_process_env(current_dir, true)
 }
 
 fn first_env(keys: &[&str]) -> Option<String> {

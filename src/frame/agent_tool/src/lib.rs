@@ -35,6 +35,7 @@ pub mod local_llm_context;
 pub mod path_utils;
 pub mod read_tool;
 pub mod run_local_llm;
+pub mod runtime_context;
 pub mod todo_tools;
 pub mod tool;
 pub mod workspace;
@@ -71,6 +72,10 @@ pub use path_utils::{
     MAX_SESSION_ID_LEN,
 };
 pub use read_tool::{ReadTool, TOOL_READ};
+pub use runtime_context::{
+    AgentIdentity, RuntimeContext, RuntimeContextSource, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV,
+    OPENDAN_AGENT_ROOT_ENV, OPENDAN_SESSION_ID_ENV, OPENDAN_TRACE_ID_ENV,
+};
 pub use todo_tools::{
     DelegateTaskArgs, DelegateTaskOutput, DelegateTaskTool, StubTaskDelegator, TaskDelegator,
     TaskEntry, TaskListItem, TodoArgs, TodoListItem, TodoOutput, TodoRecord, TodoStatus, TodoTool,

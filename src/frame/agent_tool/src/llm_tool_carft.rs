@@ -9,10 +9,9 @@
 //
 // 当 behavior cfg 在某条 exec_bash 上打开了意图旁路：
 // 1. `opendan::agent_bash::build_exec_script` 注入 `command_not_found_handle`
-//    (gate 是 `OPENDAN_AGENT_TOOL` 环境变量存在 —— behavior cfg 负责把
-//    agent_tool 绝对路径塞进 ExecBashTool 的 env)。
+//    并由 runtime 按路径规则直接写入 agent_tool 绝对路径。
 // 2. tmux pane 里跑 `missing-cmd args...` 触发 hook,bash 改调
-//    `"$OPENDAN_AGENT_TOOL" __command_not_found__ missing-cmd args...`。
+//    `agent_tool __command_not_found__ missing-cmd args...`。
 // 3. agent_tool_cli_dev 的 `ParsedCommand::CommandNotFound` 分支把
 //    `(command, argv)` 打包成 [`CommandNotFoundRequest`],转手交给
 //    [`run_subcommand`] —— 也就是本模块。
@@ -60,7 +59,7 @@ pub struct CommandNotFoundRequest {
     /// shell hook 当时的 PWD。step 2 搜 PATH / step 4 跑构造产物时
     /// 需要它做 cwd。
     pub current_dir: PathBuf,
-    /// `OPENDAN_AGENT_ENV` 解析到的 agent state 根。step 1 读 behavior
+    /// RuntimeContext 解析到的 agent state 根。step 1 读 behavior
     /// cfg、step 3 把新造工具写到 `<agent_root>/tools/` 都靠它。
     /// `None` 表示 CLI 在裸进程模式下被调起 (dev / test),意图旁路
     /// 此时按 "skip" 处理 —— 没有 agent context 谈不上"造工具"。

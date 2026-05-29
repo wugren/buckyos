@@ -34,13 +34,8 @@ const WORKLOG_DB_ENV: &str = "OPENDAN_WORKLOG_DB";
 const DEFAULT_WORKLOG_DB: &str = "/opt/buckyos/opendan/worklog.db";
 const AGENT_ROOT_ENV: &str = "OPENDAN_AGENT_ROOT";
 const DEFAULT_AGENT_ROOT: &str = "/opt/buckyos/opendan/agent";
-const OPENDAN_APPID_ENV: [&str; 3] = ["OPENDAN_APPID", "BUCKYOS_APP_ID", "OPENDAN_AGENT_ID"];
-const OPENDAN_OWNER_ENV: [&str; 2] = ["OPENDAN_AGENT_OWNER", "BUCKYOS_OWNER_USER_ID"];
-const OPENDAN_AGENT_BIN_ENV: [&str; 3] = [
-    "OPENDAN_AGENT_BIN",
-    "BUCKYOS_PKG_DIR",
-    "BUCKYOS_PKG_SOURCE_DIR",
-];
+const OPENDAN_APPID_ENV: [&str; 2] = ["OPENDAN_APPID", "BUCKYOS_APP_ID"];
+const PACKAGE_ROOT_ENVS: [&str; 2] = ["BUCKYOS_PKG_DIR", "BUCKYOS_PKG_SOURCE_DIR"];
 const ROOTFS_SYNC_MANIFEST: &str = ".meta/rootfs_sync.json";
 const ROOTFS_SYNC_VERSION: u32 = 1;
 
@@ -259,9 +254,6 @@ fn resolve_owner_id(startup: &StartupArgs) -> Result<Option<String>> {
     {
         return Ok(Some(owner_id.to_string()));
     }
-    if let Some(owner_id) = first_env(&OPENDAN_OWNER_ENV) {
-        return Ok(Some(owner_id));
-    }
     Ok(load_app_identity_from_env()
         .map_err(|err| anyhow!("load app identity from app_instance_config failed: {err}"))?
         .map(|(_appid, owner_id)| owner_id))
@@ -297,7 +289,7 @@ fn resolve_agent_package_root(startup: &StartupArgs, appid: &str) -> Option<Path
     if let Some(path) = startup.agent_bin.clone() {
         return Some(path);
     }
-    if let Some(path) = first_env(&OPENDAN_AGENT_BIN_ENV).map(PathBuf::from) {
+    if let Some(path) = first_env(&PACKAGE_ROOT_ENVS).map(PathBuf::from) {
         return Some(path);
     }
     for path in [
