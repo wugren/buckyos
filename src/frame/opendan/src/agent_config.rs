@@ -807,7 +807,12 @@ fn default_self_check_driver() -> SessionDriverCfg {
             load_background_hits: LoadBackgroundHintsPolicy::None,
         },
         on_behavior_step_ob: HookPointCfg::default(),
-        on_wakeup: HookPointCfg::default(),
+        on_wakeup: HookPointCfg {
+            filter: BehaviorFilter::Top,
+            pull_msg: PullMsgPolicy::None,
+            pull_event: PullEventPolicy::Filter("timer.*".to_string()),
+            load_background_hits: LoadBackgroundHintsPolicy::None,
+        },
         ..SessionDriverCfg::default()
     }
 }
@@ -1080,6 +1085,10 @@ mod tests {
         assert_eq!(self_check.kind, SessionKind::SelfCheck);
         assert_eq!(
             self_check.driver.on_behavior_switch.pull_event,
+            PullEventPolicy::Filter("timer.*".to_string())
+        );
+        assert_eq!(
+            self_check.driver.on_wakeup.pull_event,
             PullEventPolicy::Filter("timer.*".to_string())
         );
         let self_improve = cfg.session_class("self_improve").unwrap();

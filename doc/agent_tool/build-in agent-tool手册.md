@@ -1350,9 +1350,11 @@ CLI-only，由 prompt 模板里的 notebook 章节驱动。
 
 `usage`（节选）：
 ```text
-agent-notebook [--root <path>] [--owner-user <did>] [--owner-agent <did>] \
+agent-notebook [--root <path>] [--owner-user <did> | current agent owner] [--owner-agent <did>] \
   <create|update|append|read|list|build-system-context|build-registry-context|hints|mark-status|promote> [...]
 ```
+
+`--owner-user` 可省略；省略时按 `OPENDAN_OWNER_USER_ID`、`OPENDAN_AGENT_OWNER`、`BUCKYOS_OWNER_USER_ID`、当前 BuckyOS runtime / `app_instance_config` 的顺序解析当前 Agent 的 owner。
 
 ### Bash 支持
 

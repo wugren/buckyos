@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use buckyos_api::get_buckyos_api_runtime;
 use log::warn;
 use tokio::fs;
 use tokio::process::Command;
@@ -69,6 +70,7 @@ const TMUX_BANNER_COMMAND_PREVIEW_CHARS: usize = 512;
 pub const OPENDAN_AGENT_TOOL_ENV: &str = "OPENDAN_AGENT_TOOL";
 const OPENDAN_AGENT_ENV_ENV: &str = "OPENDAN_AGENT_ENV";
 const OPENDAN_AGENT_ID_ENV: &str = "OPENDAN_AGENT_ID";
+const OPENDAN_OWNER_USER_ID_ENV: &str = "OPENDAN_OWNER_USER_ID";
 const OPENDAN_SESSION_ID_ENV: &str = "OPENDAN_SESSION_ID";
 const OPENDAN_TRACE_ID_ENV: &str = "OPENDAN_TRACE_ID";
 const OPENDAN_BEHAVIOR_ENV: &str = "OPENDAN_BEHAVIOR";
@@ -504,6 +506,9 @@ fn session_exec_base_env(
         (OPENDAN_AGENT_ID_ENV.to_string(), agent_id.to_string()),
         (OPENDAN_SESSION_ID_ENV.to_string(), session_id.to_string()),
     ];
+    if let Some(owner_id) = current_owner_user_id() {
+        env.push((OPENDAN_OWNER_USER_ID_ENV.to_string(), owner_id));
+    }
     if let Some(agent_tool) = resolve_agent_tool_cli_path() {
         env.push((
             OPENDAN_AGENT_TOOL_ENV.to_string(),
@@ -516,6 +521,18 @@ fn session_exec_base_env(
         );
     }
     env
+}
+
+fn current_owner_user_id() -> Option<String> {
+    get_buckyos_api_runtime()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .get_owner_user_id()
+                .or_else(|| runtime.user_id.clone())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn resolve_agent_tool_cli_path() -> Option<PathBuf> {

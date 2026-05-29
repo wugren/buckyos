@@ -7,7 +7,7 @@
 - 知道同一份工具实现如何同时服务 CLI、Action、LLM tool call、bash namespace
 - 知道 `TypedTool` 与 `AgentTool` 的边界，新增工具时该放在哪里注册
 - 知道 CLI stdout 的 `AgentToolResult` 协议、纯文本例外和 exit code 语义
-- 知道如何用 `OPENDAN_*` 环境变量定位 Agent 环境，避免重复传 `--agent-env` / `--session-id`
+- 知道 AgentTool 的最小环境变量契约，以及其它上下文如何从 Agent RootFS / session 路径推导
 - 知道当前内置 CLI 工具、Runtime 工具、MCP 工具扩展机制的真实状态
 
 ---
@@ -28,8 +28,8 @@ OpenDAN 当前 AgentTool 实现遵循以下基线：
 4. **CLI 默认 stdout 输出 `AgentToolResult` JSON**
    自有 AgentTool 的标准 stdout 是单行 JSON，带 `agent_tool_protocol: "1"`。当前唯一明确的纯文本例外是 `read_file` 在非 Agent 环境且 stdout 非 TTY 时输出文件内容，便于管道使用。
 
-5. **上下文来自环境变量，不来自重复 CLI 参数**
-   CLI 通过 `OPENDAN_AGENT_ENV`、`OPENDAN_SESSION_ID`、`OPENDAN_AGENT_ID` 等变量还原 `SessionRuntimeContext`。缺少 `OPENDAN_AGENT_ENV` 时，开发态回退到当前工作目录。
+5. **环境变量只承载最小启动契约**
+   目标设计中，AgentTool 进程只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID`、`BUCKYOS_APPCLIENT_SESSION_TOKEN` 和可选 `OPENDAN_TRACE_ID`。`agent_id`、owner、tool bin、workspace、memory、notebook 等上下文都应从 Agent RootFS、session state 或 BuckyOS runtime 推导，不再通过一组 `OPENDAN_*` 变量重复注入。
 
 ---
 
@@ -49,7 +49,7 @@ Runtime 调用 ExecBashTool::call
 prepare_session_tool_env 刷新当前 session 的工具软链接目录
   |
   v
-build_exec_env_vars 注入 PATH 与 OPENDAN_* 环境变量
+build_exec_env_vars 注入 PATH 与 AgentTool 最小环境变量契约
   |
   v
 tmux pane 中的 bash 执行命令
@@ -151,23 +151,29 @@ EXEC_BASH_ALWAYS_AVAILABLE_CLI_TOOL_NAMES = [
 
 ### 2.3 注入到 tmux 的环境变量
 
-`build_exec_env_vars()` 会合并用户传入 env，再写入 OpenDAN 上下文变量。关键变量：
+目标设计下，`exec` / tmux 只注入最小启动契约：
 
-| 变量 | 含义 |
-|------|------|
-| `PATH` | 前置 session 工具软链接目录 |
-| `OPENDAN_AGENT_BIN` | `agent_tool` 所在目录 |
-| `OPENDAN_AGENT_TOOL` | `agent_tool` 主二进制绝对路径 |
-| `OPENDAN_SESSION_TOOL_PATH` | 当前 session 工具软链接目录 |
-| `OPENDAN_AGENT_ENV` | 当前 agent env root |
-| `OPENDAN_AGENT_ID` | 当前 agent DID / name |
-| `OPENDAN_SESSION_ID` | 当前 session id |
-| `OPENDAN_BEHAVIOR` | 当前 behavior 名 |
-| `OPENDAN_STEP_IDX` | 当前 step 序号 |
-| `OPENDAN_WAKEUP_ID` | 当前 wakeup id |
-| `OPENDAN_TRACE_ID` | 当前 trace id |
+| 变量 | 必需 | 含义 |
+|------|------|------|
+| `PATH` | 是 | 前置 session 工具软链接目录。它是进程执行环境，不作为 AgentTool 上下文来源。 |
+| `OPENDAN_AGENT_ROOT` | 是 | 当前 Agent RootFS / state root。 |
+| `OPENDAN_SESSION_ID` | 是 | 当前 session id。沿用现有变量名，不新增 `OPENDAN_AGENT_SESSIONID`。 |
+| `BUCKYOS_APPCLIENT_SESSION_TOKEN` | 是 | AgentTool 作为 AppClient 访问 BuckyOS runtime / kRPC 服务的 token。 |
+| `OPENDAN_TRACE_ID` | 否 | trace id。缺失时由调用端或工具侧生成默认值。 |
 
-CLI 侧 `CliRuntimeEnv::from_process()` 只读取 `OPENDAN_AGENT_ENV`、`OPENDAN_AGENT_ID`、`OPENDAN_SESSION_ID`、`OPENDAN_BEHAVIOR`、`OPENDAN_STEP_IDX`、`OPENDAN_WAKEUP_ID`、`OPENDAN_TRACE_ID` 来构造调用上下文。
+其它历史变量不再作为外部契约：
+
+| 历史变量 | 新规则 |
+|----------|--------|
+| `OPENDAN_AGENT_ENV` | 由 `OPENDAN_AGENT_ROOT` 取代。 |
+| `OPENDAN_AGENT_ID` | 从 Agent RootFS identity metadata 或 BuckyOS runtime 推导。 |
+| `OPENDAN_OWNER_USER_ID` / `OPENDAN_AGENT_OWNER` / `BUCKYOS_OWNER_USER_ID` | 从 Agent RootFS identity metadata、`app_instance_config` 或 BuckyOS runtime 推导。 |
+| `OPENDAN_AGENT_TOOL` / `OPENDAN_AGENT_BIN` / `OPENDAN_SESSION_TOOL_PATH` | 由 runtime 根据路径规则计算，并通过 `PATH` 或 generated shell hook 使用，不要求工具进程读取。 |
+| `OPENDAN_BEHAVIOR` / `OPENDAN_STEP_IDX` / `OPENDAN_WAKEUP_ID` | 运行时 step 上下文，写入 session state；需要时由工具按 `OPENDAN_AGENT_ROOT + OPENDAN_SESSION_ID` 读取。 |
+| `AGENT_MEMORY_ROOT` / `AGENT_NOTEBOOK_ROOT` | 降级为 dev-only CLI override；生产 AgentTool 从 Agent RootFS 固定路径推导。 |
+| `OPENDAN_WORKFLOW_URL` / `OPENDAN_TASK_MANAGER_URL` 等服务 URL fallback | 降级为 dev-only fallback；生产环境通过 BuckyOS runtime client 发现服务。 |
+
+当前代码仍处于多变量兼容状态，`CliRuntimeEnv::from_process()` 还会读取旧 `OPENDAN_*` 变量。实现迁移时应先新增统一的 runtime context resolver，再逐步删除旧变量读取点。
 
 ### 2.4 `exec` 如何识别 AgentTool JSON
 
@@ -496,38 +502,98 @@ read_file ./demo.txt | wc -l
 
 ## 6. 环境变量与 Agent RootFS
 
-CLI 启动时通过 `CliRuntimeEnv::from_process()` 构造：
+AgentTool 环境变量的目标设计是“少传上下文，多按路径和 runtime 推导”。生产运行时只承认下面几个变量为稳定契约：
 
-| env | 用途 | 缺失回退 |
-|-----|------|----------|
-| `OPENDAN_AGENT_ENV` | agent env root / CLI state root | 当前 `cwd` |
-| `OPENDAN_AGENT_ID` | `SessionRuntimeContext.agent_name` | `did:opendan:cli` |
-| `OPENDAN_SESSION_ID` | session id | `cli-session` |
-| `OPENDAN_BEHAVIOR` | behavior 名 | `cli` |
-| `OPENDAN_STEP_IDX` | step 序号 | `0` |
-| `OPENDAN_WAKEUP_ID` | wakeup id | `cli-wakeup` |
-| `OPENDAN_TRACE_ID` | trace id | `cli-trace` |
+| env | 必需 | 用途 | 缺失处理 |
+|-----|------|------|----------|
+| `OPENDAN_AGENT_ROOT` | 是 | 当前 Agent RootFS / state root | 生产环境报错；CLI dev 可回退到当前 `cwd` |
+| `OPENDAN_SESSION_ID` | 是 | 当前 session id | 生产环境报错；CLI dev 可回退到 `cli-session` |
+| `BUCKYOS_APPCLIENT_SESSION_TOKEN` | 是 | 访问 BuckyOS runtime / kRPC 服务 | 需要 RPC 的工具报错；纯文件 dev 工具可不要求 |
+| `OPENDAN_TRACE_ID` | 否 | trace id / 日志关联 | 缺失时生成或使用默认 trace |
 
-CLI state root 规则：
+命名约定：
 
-- 有 `OPENDAN_AGENT_ENV`：state root 就是 `agent_env_root`
-- 没有 `OPENDAN_AGENT_ENV`：state root 是 `<cwd>/.opendan-cli`
-- 文件工具在无 Agent 环境时会清空读写 root 限制，方便本地调试
+- session id 继续使用现有 `OPENDAN_SESSION_ID`，不新增 `OPENDAN_AGENT_SESSIONID`。
+- `OPENDAN_AGENT_ROOT` 取代旧 `OPENDAN_AGENT_ENV`。迁移期间 CLI 可以同时接受旧变量，但新代码只应写入 / 文档化 `OPENDAN_AGENT_ROOT`。
+- 除上表外，其它 `OPENDAN_*` 变量都不是 AgentTool 的生产契约。
+
+### 6.1 RuntimeContext 推导规则
+
+AgentTool CLI 启动时应先构造统一的 `RuntimeContext`：
+
+```text
+OPENDAN_AGENT_ROOT
+  + OPENDAN_SESSION_ID
+  + BUCKYOS_APPCLIENT_SESSION_TOKEN
+  + optional OPENDAN_TRACE_ID
+  -> RuntimeContext
+```
+
+推导规则：
+
+| 上下文 | 推导来源 |
+|--------|----------|
+| `agent_root` | `OPENDAN_AGENT_ROOT` |
+| `session_id` | `OPENDAN_SESSION_ID` |
+| `trace_id` | `OPENDAN_TRACE_ID`，缺失时生成默认值 |
+| `agent_id` / app id | Agent RootFS identity metadata；缺失时通过 BuckyOS runtime 或 `app_instance_config` 推导 |
+| owner user id | Agent RootFS identity metadata；缺失时通过 BuckyOS runtime 或 `app_instance_config` 推导 |
+| session root | `<agent_root>/sessions/<session_id>/` |
+| behavior / step / wakeup | session state / last step record，不再从进程 env 读取 |
+| tool bin / session tool path | BuckyOS tools 路径规则和 `agent_id + session_id` 计算 |
+| memory / notebook / todo / workspace | Agent RootFS 固定目录规则 |
+
+为保证 `OPENDAN_AGENT_ROOT` 能可靠推导身份，Agent RootFS 必须满足以下条件之一：
+
+- 使用规范路径：`$BUCKYOS_ROOT/data/home/<owner>/.local/share/<agent_id>/`。
+- 或包含身份 metadata，例如 `<agent_root>/.meta/agent_identity.json`，至少记录 `owner_user_id` 和 `agent_id`。
+
+不允许只从任意 override 路径字符串猜测身份。例如 `OPENDAN_AGENT_ROOT=/tmp/foo` 时，必须依赖 metadata 或 runtime。
+
+### 6.2 Agent RootFS 常用路径
 
 Agent RootFS 布局以 [../opendan/Agent RootFS.md](../opendan/Agent%20RootFS.md) 为准。常用路径：
 
 | 资源 | 路径 |
 |------|------|
-| todo DB | `<agent_env_root>/todo/todo.db` |
-| worklog DB | `<agent_env_root>/worklog/worklog.db` |
-| session 记录 | `<agent_env_root>/sessions/<session_id>/session.json` |
-| workspace index | `<agent_env_root>/index.json` |
-| session workspace 绑定 | `<agent_env_root>/workspaces/session_workspace_bindings.json` |
-| local workspace | `<agent_env_root>/workspaces/<workspace_id>/` |
+| todo DB | `<agent_root>/todo/todo.db` |
+| worklog DB | `<agent_root>/worklog/worklog.db` |
+| session 记录 | `<agent_root>/sessions/<session_id>/session.json` |
+| workspace index | `<agent_root>/index.json` |
+| session workspace 绑定 | `<agent_root>/workspaces/session_workspace_bindings.json` |
+| local workspace | `<agent_root>/workspaces/<workspace_id>/` |
 | local workspace worklog DB | `<local_workspace_root>/worklog/worklog.db` |
-| memory 根 | `<agent_env_root>/memory/` |
+| memory 根 | `<agent_root>/memory/` |
 
-新工具不要通过 `--agent-env` / `--session-id` / `--agent-id` 重复传上下文参数。命令行参数应只表达业务语义。
+### 6.3 Dev-only override
+
+以下变量只保留为本地调试 / CLI dev override，不进入生产 AgentTool 契约：
+
+| env | 用途 |
+|-----|------|
+| `AGENT_MEMORY_ROOT` | 覆盖 memory root |
+| `AGENT_NOTEBOOK_ROOT` | 覆盖 notebook root |
+| `OPENDAN_WORKFLOW_URL` / `WORKFLOW_SERVICE_URL` | 直连 workflow service |
+| `OPENDAN_TASK_MANAGER_URL` / `TASK_MANAGER_URL` | 直连 task-manager |
+| `OPENDAN_SESSION_TOKEN` / `SESSION_TOKEN` | dev 直连 RPC token |
+
+新工具不要通过 `--agent-env` / `--session-id` / `--agent-id` 重复传上下文参数。命令行参数应只表达业务语义。需要上下文时从统一 `RuntimeContext` 读取。
+
+### 6.4 TODO: 环境变量契约迁移
+
+后续 Code Agent 修正实现时，按下面顺序收敛：
+
+1. 新增统一 `RuntimeContext` resolver，输入只使用 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID`、`BUCKYOS_APPCLIENT_SESSION_TOKEN`、可选 `OPENDAN_TRACE_ID`。
+2. 为 Agent RootFS 确认 identity metadata，例如 `<agent_root>/agent.toml`，至少包含 `owner_user_id`、`agent_id`。不要从任意 dev override 路径字符串猜身份。
+3. 修改 `exec` / tmux 环境注入，只把最小契约和 `PATH` 写入子进程。`OPENDAN_AGENT_TOOL` 这类内部路径应由 runtime 直接写入 generated shell hook 或从路径规则计算，不暴露为工具进程契约。
+4. 修改 `agent_tool_cli_dev::CliRuntimeEnv::from_process()`，优先走 `RuntimeContext` resolver；旧 `OPENDAN_AGENT_ENV`、`OPENDAN_AGENT_ID`、`OPENDAN_BEHAVIOR`、`OPENDAN_STEP_IDX`、`OPENDAN_WAKEUP_ID` 只保留迁移期兼容分支，并标注废弃。
+5. 将 `AGENT_MEMORY_ROOT`、`AGENT_NOTEBOOK_ROOT`、`OPENDAN_WORKFLOW_URL`、`OPENDAN_TASK_MANAGER_URL`、`OPENDAN_SESSION_TOKEN` 等变量移动到 dev-only 代码路径，生产工具通过 Agent RootFS 路径和 BuckyOS runtime client 获取资源。
+6. 更新 `src/frame/agent_tool/create_tmux_debug_session.sh`，让调试 session 默认注入最小契约；如保留旧变量，只作为兼容验证项。
+7. 补测试覆盖：
+   - 最小契约能构造完整 `RuntimeContext`。
+   - `OPENDAN_AGENT_ROOT=/tmp/foo` 且无 metadata 时不会静默猜 identity。
+   - 旧变量兼容路径仍能工作，但新路径优先。
+   - 需要 RPC 的工具缺少 `BUCKYOS_APPCLIENT_SESSION_TOKEN` 时给出明确错误。
 
 ---
 
@@ -607,14 +673,14 @@ read_file ./demo.txt
 write_file ./demo.txt --mode write --content "hello"
 ```
 
-没有 `OPENDAN_AGENT_ENV` 时，CLI 使用当前目录和 `.opendan-cli` 作为开发态 state root。
+没有 `OPENDAN_AGENT_ROOT` 时，CLI dev 可以使用当前目录作为开发态 state root；生产 AgentTool 不应依赖这个回退。
 
 ### 8.3 tmux 调试 session
 
 仓库提供：
 
 ```bash
-src/frame/agent_tool/create_tmux_debug_session.sh <agent_tool_binary> [session_name] [agent_env_root]
+src/frame/agent_tool/create_tmux_debug_session.sh <agent_tool_binary> [session_name] [agent_root]
 ```
 
 示例：
@@ -627,7 +693,7 @@ src/frame/agent_tool/create_tmux_debug_session.sh /opt/buckyos/bin/opendan/agent
 
 - 创建临时工具软链接目录
 - 给 `agent_tool`、`read_file`、`write_file`、`edit_file` 等命令建软链接
-- 注入 `OPENDAN_*` 环境变量
+- 注入调试所需环境变量。脚本在迁移完成前可能仍包含旧 `OPENDAN_*` 变量，但新实现应以第 6 节的最小契约为准。
 - 前置 PATH
 - attach 到 tmux session
 
@@ -643,7 +709,7 @@ src/frame/agent_tool/create_tmux_debug_session.sh /opt/buckyos/bin/opendan/agent
 - 在 `agent_tool_cli_dev` 的 dispatcher 中堆工具专用解析分支，而不是让工具覆写 `parse_cli_args()`。
 - 只把工具注册进 `AgentToolManager`，却误以为它会自动变成 `$PATH` 里的 CLI 命令。
 - 把 MCP 工具当成自动可见的 CLI 软链接工具。
-- 通过向上扫描目录、检查 `todo.db` / `worklog.db` 是否存在来猜 `agent_env_root`。
+- 通过向上扫描目录、检查 `todo.db` / `worklog.db` 是否存在来猜 `agent_root`。
 - 输出不带 `agent_tool_protocol: "1"` 的自有工具 JSON。
 - 新增工具后只改代码，不更新 [builtin_agent_tools.md](builtin_agent_tools.md)。
 

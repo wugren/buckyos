@@ -1,6 +1,6 @@
 use buckyos_api::{
-    parse_typed_task_data, CreateTaskOptions, TaskFilter, TaskManagerClient, TaskStatus,
-    TypedTaskData, WorkflowScheduleTaskData, WorkflowScheduleTaskRequest,
+    parse_typed_task_data, CreateTaskOptions, TaskFilter, TaskManagerClient, TaskPermissions,
+    TaskScope, TaskStatus, TypedTaskData, WorkflowScheduleTaskData, WorkflowScheduleTaskRequest,
     WorkflowScheduleTaskResult,
 };
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
@@ -456,7 +456,11 @@ impl ScheduleTaskMirrorClient {
                 Some(schedule_task_data(schedule)),
                 self.user_id.as_str(),
                 self.app_id.as_str(),
-                Some(CreateTaskOptions::with_root_id(root_id.clone())),
+                Some(CreateTaskOptions {
+                    root_id: Some(root_id.clone()),
+                    permissions: Some(schedule_root_task_permissions()),
+                    ..Default::default()
+                }),
             )
             .await
             .map_err(|err| err.to_string())?;
@@ -507,12 +511,32 @@ impl ScheduleTaskMirrorClient {
                 Some(CreateTaskOptions {
                     runner: rendered.runner.clone(),
                     parent_id: Some(parent_id),
-                    root_id: Some(root_id),
+                    root_id: Some(root_id.clone()),
                     ..Default::default()
                 }),
             )
-            .await
-            .map_err(|err| err.to_string())?;
+            .await;
+        let task = match task {
+            Ok(task) => task,
+            Err(err) if is_create_subtask_permission_error(err.to_string().as_str()) => self
+                .client
+                .create_task(
+                    rendered.name.as_str(),
+                    rendered.task_type.as_str(),
+                    Some(rendered.data.clone()),
+                    self.user_id.as_str(),
+                    self.app_id.as_str(),
+                    Some(CreateTaskOptions {
+                        runner: rendered.runner.clone(),
+                        parent_id: Some(parent_id),
+                        root_id: Some(root_id),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+            Err(err) => return Err(err.to_string()),
+        };
         Ok(task.id)
     }
 
@@ -571,6 +595,17 @@ impl ScheduleTaskMirrorClient {
             })
             .map(|task| task.id))
     }
+}
+
+fn schedule_root_task_permissions() -> TaskPermissions {
+    TaskPermissions {
+        read: TaskScope::User,
+        write: TaskScope::User,
+    }
+}
+
+fn is_create_subtask_permission_error(message: &str) -> bool {
+    message.contains("No permission to create subtasks")
 }
 
 fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {

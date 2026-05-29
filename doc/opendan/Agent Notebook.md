@@ -1172,6 +1172,8 @@ Notebook selector 约定：
 4. CLI 在调用底层接口前必须得到 concrete `notebook_id`；底层 read cache、subscription、event、返回 JSON 都使用解析后的 id；
 5. `status` / `promote` 这类以 `item_id` 定位既有条目的命令，不要求 `--id`，其 notebook 归属由 item 元数据确定。
 
+Owner selector 约定：`--owner-user <user_id>` 可省略；省略时 CLI 使用当前 Agent owner（解析顺序为 `OPENDAN_OWNER_USER_ID`、`OPENDAN_AGENT_OWNER`、`BUCKYOS_OWNER_USER_ID`、当前 BuckyOS runtime / `app_instance_config`）。
+
 ### 9.1 list
 
 ```bash

@@ -1516,7 +1516,7 @@ mod tests {
     use crate::{ExecutorRegistry, InMemoryObjectStore, InMemoryThunkDispatcher};
     use buckyos_api::{
         CreateTaskOptions, Task, TaskFilter, TaskManagerClient, TaskManagerHandler, TaskNote,
-        TaskPermissions, TaskStatus,
+        TaskPermissions, TaskScope, TaskStatus,
     };
     use std::collections::HashMap;
     use std::ops::Range;
@@ -1568,6 +1568,26 @@ mod tests {
             let mut inner = self.inner.lock().await;
             let id = inner.next_id;
             inner.next_id += 1;
+            if let Some(parent_id) = opts.parent_id {
+                if let Some(parent) = inner.tasks.get(&parent_id) {
+                    let allowed = if parent.user_id.is_empty() {
+                        parent.app_id.is_empty() || parent.app_id == app_id
+                    } else {
+                        match parent.permissions.write {
+                            TaskScope::Private => {
+                                parent.user_id == user_id && parent.app_id == app_id
+                            }
+                            TaskScope::User => parent.user_id == user_id,
+                            TaskScope::System => app_id == "kernel" || app_id == "system",
+                        }
+                    };
+                    if !allowed {
+                        return Err(RPCErrors::NoPermission(
+                            "No permission to create subtasks".to_string(),
+                        ));
+                    }
+                }
+            }
             let root_id = if let Some(parent_id) = opts.parent_id {
                 inner
                     .tasks
@@ -2368,6 +2388,60 @@ mod tests {
         assert_eq!(task.parent_id, Some(root_task_id));
         assert_eq!(task.root_id, schedule_id);
         assert_eq!(task.data["send_message"]["text"], "drink water");
+    }
+
+    #[tokio::test]
+    async fn fire_remind_handles_legacy_private_schedule_root() {
+        let (handler, tasks) = make_handler_with_tasks();
+        let run_at = Utc::now().timestamp() + 3600;
+        let create = handler
+            .handle_rpc_call(
+                make_req(
+                    "create_scheduled_task",
+                    json!({
+                        "owner": {"user_id": "u", "app_id": "agent-a"},
+                        "name": "legacy-remind-once",
+                        "schedule": {"kind": "once", "run_at": run_at},
+                        "target": {"kind": "remind", "text": "drink water", "to": "self"},
+                    }),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = match create.result {
+            RPCResult::Success(v) => v,
+            RPCResult::Failed(err) => panic!("create schedule failed: {:?}", err),
+        };
+        let schedule_id = created["schedule_id"].as_str().unwrap().to_string();
+        let root_task_id = created["schedule"]["task_mirror"]["root_task_id"]
+            .as_i64()
+            .unwrap();
+        {
+            let mut inner = tasks.inner.lock().await;
+            let root = inner.tasks.get_mut(&root_task_id).unwrap();
+            root.permissions = TaskPermissions::default();
+        }
+
+        let fire = handler
+            .handle_rpc_call(
+                make_req(
+                    "run_scheduled_task_now",
+                    json!({"schedule_id": schedule_id, "fire_time": run_at - 20}),
+                ),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let value = match fire.result {
+            RPCResult::Success(v) => v,
+            RPCResult::Failed(err) => panic!("run-now failed: {:?}", err),
+        };
+        let task_id = value["fire"]["task_id"].as_i64().unwrap();
+        let task = tasks.get(task_id).await.unwrap();
+        assert_eq!(task.task_type, "workflow.send_message");
+        assert_eq!(task.parent_id, Some(root_task_id));
+        assert_eq!(task.app_id, "workflow");
     }
 
     #[tokio::test]

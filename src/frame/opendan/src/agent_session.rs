@@ -77,6 +77,12 @@ const WORKSESSION_REPORT_EVENT_TYPE: &str = "worksession_report";
 const UI_IDLE_WORKER_RETIRE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_IDLE_WORKER_RETIRE_MS: u64 = 3 * 60 * 1000;
 const BACKGROUND_HINT_NON_EMPTY_INTERVAL_MS: u64 = 60 * 1000;
+static FLUSH_META_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn session_meta_tmp_path(dir: &Path) -> PathBuf {
+    let seq = FLUSH_META_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!("session.json.{}.{}.tmp", std::process::id(), seq))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorksessionReportPhase {
@@ -568,7 +574,7 @@ impl OpenDanStepResultHook {
         let bytes = serde_json::to_vec_pretty(&meta)
             .map_err(|err| anyhow!("session[{}]: serialize meta failed: {err}", self.session_id))?;
         let path = dir.join("session.json");
-        let tmp = path.with_extension("json.tmp");
+        let tmp = session_meta_tmp_path(&dir);
         tokio::fs::write(&tmp, &bytes).await.map_err(|err| {
             anyhow!(
                 "session[{}]: write {} failed: {err}",
@@ -754,7 +760,7 @@ impl AgentSession {
         let bytes = serde_json::to_vec_pretty(&meta)
             .map_err(|err| anyhow!("session[{}]: serialize meta failed: {err}", self.session_id))?;
         let path = dir.join("session.json");
-        let tmp = path.with_extension("json.tmp");
+        let tmp = session_meta_tmp_path(&dir);
         // tmp + rename for crash-consistency: a half-written session.json
         // would prevent `restore_active_sessions` from booting this session.
         tokio::fs::write(&tmp, &bytes).await.map_err(|err| {

@@ -184,6 +184,36 @@ Current Time:{{runtime.clock_text}}
 
 Continue Self-Check from PROCESS_RULES.
 """
+on_wakeup = """
+Current Time:{{runtime.clock_text}}
+
+{% if input.has_events %}
+## Trigger Events:
+{% for event in input.events %}
+- {{ event.event_id }} {{ event.data }}
+{% endfor %}
+{% endif %}
+
+{% if session.background_hint_changed %}
+<<background_environment>>
+{{ session.default_changed_background_hint_text }}
+<</background_environment>>
+{% endif %}
+
+## Schedule-Task Item Updates:
+
+{{runtime.last_schedule_task_list_text}}
+
+## Available Workspaces:
+{{ runtime.workspace_list_text }}
+
+## Recent Notebook Updates:
+
+{{ notebook.last_items_text }}
+
+
+Continue Self-Check from PROCESS_RULES.
+"""
 on_behavior_step_ob = """
 <<last_step_action_results>>
 {{ default_last_step_action_results_text }}

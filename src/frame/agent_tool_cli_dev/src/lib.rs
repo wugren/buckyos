@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, parse_typed_task_data, BuckyOSRuntimeType,
-    Task, TaskDataType, TaskManagerClient, TaskStatus, ToolExecBashTaskData, TypedTaskData,
+    get_buckyos_api_runtime, init_buckyos_api_runtime, load_app_identity_from_env,
+    parse_typed_task_data, BuckyOSRuntimeType, Task, TaskDataType, TaskManagerClient, TaskStatus,
+    ToolExecBashTaskData, TypedTaskData,
 };
 use kRPC::kRPC;
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,8 @@ const AGENT_NOTEBOOK_DIR_NAME: &str = "notebook";
 /// Fallback env when `--owner-user` is not passed. New name; no existing
 /// buckyos env for "the user this agent serves".
 const DEFAULT_OWNER_USER_ENV: &str = "OPENDAN_OWNER_USER_ID";
+const AGENT_OWNER_ENV: &str = "OPENDAN_AGENT_OWNER";
+const BUCKYOS_OWNER_USER_ENV: &str = "BUCKYOS_OWNER_USER_ID";
 /// Fallback env when `--owner-agent` is not passed. Reuses the existing
 /// harness env (the agent's own DID == the owner_agent for its own
 /// notebooks). Kept aligned with `CliRuntimeEnv::call_ctx.agent_name`.
@@ -1255,7 +1258,7 @@ fn format_verify_report(report: &agent_tool::VerifyReport) -> String {
 // =================================================================
 
 const AGENT_NOTEBOOK_USAGE: &str = "agent-notebook [--root <path> | env AGENT_NOTEBOOK_ROOT] \
-[--owner-user <user_id> | env OPENDAN_OWNER_USER_ID] \
+[--owner-user <user_id> | current agent owner] \
 [--owner-agent <agent> | env OPENDAN_AGENT_ID] \
 [--session <id> | env OPENDAN_SESSION_ID] \
 <list|read|append|status|promote|create-notebook|registry-context|\
@@ -2451,6 +2454,52 @@ fn agent_notebook_error_output(err: NotebookError) -> CliRunOutput {
     }
 }
 
+fn resolve_agent_notebook_owner_user(owner_user_id: Option<String>) -> Result<String, String> {
+    if let Some(owner_id) = owner_user_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(owner_id);
+    }
+    if let Some(owner_id) = first_string_env(&[
+        DEFAULT_OWNER_USER_ENV,
+        AGENT_OWNER_ENV,
+        BUCKYOS_OWNER_USER_ENV,
+    ]) {
+        return Ok(owner_id);
+    }
+    if let Some(owner_id) = get_buckyos_api_runtime()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .get_owner_user_id()
+                .or_else(|| runtime.user_id.clone())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(owner_id);
+    }
+    match load_app_identity_from_env() {
+        Ok(Some((_app_id, owner_id))) => {
+            let owner_id = owner_id.trim().to_string();
+            if !owner_id.is_empty() {
+                return Ok(owner_id);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(format!(
+                "load owner user from app_instance_config failed: {err}"
+            ));
+        }
+    }
+    Err(format!(
+        "missing current owner user; pass --owner-user or set ${}, ${}, or ${}",
+        DEFAULT_OWNER_USER_ENV, AGENT_OWNER_ENV, BUCKYOS_OWNER_USER_ENV
+    ))
+}
+
 async fn dispatch_agent_notebook(
     env: &CliRuntimeEnv,
     _tool_name: &str,
@@ -2465,10 +2514,9 @@ async fn dispatch_agent_notebook(
         verb,
     } = invocation;
 
-    let owner_user_id = match owner_user_id.or_else(|| first_string_env(&[DEFAULT_OWNER_USER_ENV]))
-    {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
+    let owner_user_id = match resolve_agent_notebook_owner_user(owner_user_id) {
+        Ok(owner_user_id) => owner_user_id,
+        Err(message) => {
             return CliRunOutput {
                 exit_code: 2,
                 stdout: format!(
@@ -2476,9 +2524,7 @@ async fn dispatch_agent_notebook(
                     json!({
                         "status": "error",
                         "code": "invalid_input",
-                        "message": format!(
-                            "missing --owner-user (or set ${})", DEFAULT_OWNER_USER_ENV
-                        ),
+                        "message": message,
                     })
                 ),
                 stderr: String::new(),
@@ -5266,7 +5312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_notebook_missing_owner_user_returns_error_json() {
+    async fn agent_notebook_owner_user_defaults_to_agent_owner_env() {
         let _lock = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
@@ -5274,6 +5320,15 @@ mod tests {
         fs::create_dir_all(&cwd)
             .await
             .expect("create workspace dir");
+
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+        std::env::set_var(AGENT_OWNER_ENV, "alice");
+        let _guard = EnvGuard(AGENT_OWNER_ENV);
 
         let output = execute(
             vec![
@@ -5284,11 +5339,17 @@ mod tests {
             None,
         )
         .await
-        .expect("run agent-notebook list without owner");
-        assert_eq!(output.exit_code, 2);
-        let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse error json");
-        assert_eq!(payload["status"], "error");
-        assert_eq!(payload["code"], "invalid_input");
+        .expect("run agent-notebook list with agent owner env");
+        assert_eq!(output.exit_code, EXIT_SUCCESS);
+        let payload: Json = serde_json::from_str(output.stdout.trim()).expect("parse list json");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(
+            payload["notebooks"]
+                .as_array()
+                .expect("notebooks array")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ tool_whitelist = [
   "try_create_worksession",
   "forward_msg",
   "update_session_topic",
+  "set_memroy",
   "read",
   "exec_bash",
   "llm_understand_media"

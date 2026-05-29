@@ -170,9 +170,9 @@ pull_msg = "none"
 pull_event = "none"
 
 [session.self_check.driver.on_wakeup]
-filter = "none"
+filter = "top"
 pull_msg = "none"
-pull_event = "none"
+pull_event = "timer.*"
 
 [session.self_improve]
 enabled = false
