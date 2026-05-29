@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use buckyos_api::{
-    match_event_patterns, normalize_patterns, validate_eventid, validate_pattern, Event,
-    KEventClient, KEventDaemonBridge, KEventError, KEventResult, TimerOptions,
+    match_event_patterns, normalize_patterns, validate_event_data_size, validate_eventid,
+    validate_pattern, Event, KEventClient, KEventDaemonBridge, KEventError, KEventResult,
+    TimerOptions,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -110,6 +111,34 @@ async fn local_pub_sub_timeout_and_dynamic_patterns() {
         .await
         .unwrap();
     assert!(reader.pull_event(Some(20)).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn local_pub_sub_accepts_large_data_within_sdk_limit() {
+    let client = KEventClient::new_local("node_a");
+    let reader = client
+        .create_event_reader(vec!["large_local_event".to_string()])
+        .await
+        .unwrap();
+    let data = json!({ "blob": "x".repeat(4096) });
+    validate_event_data_size(&data).unwrap();
+
+    client
+        .pub_event("large_local_event", data.clone())
+        .await
+        .unwrap();
+    let event = reader.pull_event(Some(50)).await.unwrap().unwrap();
+    assert_eq!(event.eventid, "large_local_event");
+    assert_eq!(event.data, data);
+}
+
+#[test]
+fn event_data_larger_than_sdk_limit_is_rejected() {
+    let data = json!({ "blob": "x".repeat(70 * 1024) });
+    assert!(matches!(
+        validate_event_data_size(&data),
+        Err(KEventError::InvalidEventId(_))
+    ));
 }
 
 #[tokio::test]

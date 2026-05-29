@@ -88,6 +88,36 @@ async fn reader_queue_overflow_drops_oldest_events() {
 }
 
 #[tokio::test]
+async fn unregister_reader_closes_update_path_and_drops_queue() {
+    let service = KEventService::new("node_a");
+    service
+        .register_reader("r1", vec!["/lifecycle/**".to_string()])
+        .await
+        .unwrap();
+    service
+        .publish_local_global("/lifecycle/queued", json!({"seq": 1}))
+        .await
+        .unwrap();
+
+    service.unregister_reader("r1").await;
+
+    assert!(service.pull_event("r1", Some(0)).await.unwrap().is_none());
+    assert!(matches!(
+        service
+            .update_reader("r1", vec!["/lifecycle/**".to_string()], vec![])
+            .await,
+        Err(KEventError::ReaderClosed(_))
+    ));
+
+    service.unregister_reader("r1").await;
+    service
+        .register_reader("r1", vec!["/lifecycle/**".to_string()])
+        .await
+        .unwrap();
+    assert!(service.pull_event("r1", Some(0)).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn peer_publish_delivers_once_and_does_not_rebroadcast_peer_events() {
     let service_a = Arc::new(KEventService::new("node_a"));
     let service_b = Arc::new(KEventService::new("node_b"));

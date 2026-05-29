@@ -332,3 +332,170 @@ async fn post_and_fetch_baseline() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore]
+async fn fetch_without_auto_commit_ack_baseline() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::TempDir::new()?;
+    let queue = SledMsgQueue::new_in_dir(temp.path())?;
+    let queue_urn = queue
+        .handle_create_queue(
+            Some("ack-baseline"),
+            "app",
+            "owner",
+            QueueConfig::default(),
+            RPCContext::default(),
+        )
+        .await?;
+
+    for seq in 0..10_000 {
+        queue
+            .handle_post_message(
+                &queue_urn,
+                Message::new(vec![seq as u8; 256]),
+                RPCContext::default(),
+            )
+            .await?;
+    }
+
+    let sub_id = queue
+        .handle_subscribe(
+            &queue_urn,
+            "user",
+            "app",
+            Some("ack-baseline-sub".to_string()),
+            SubPosition::Earliest,
+            RPCContext::default(),
+        )
+        .await?;
+    let start = Instant::now();
+    let mut fetched = 0usize;
+    let mut last_index = 0;
+    while fetched < 10_000 {
+        let batch = queue
+            .handle_fetch_messages(&sub_id, 100, false, RPCContext::default())
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        last_index = batch.last().unwrap().index;
+        queue
+            .handle_commit_ack(&sub_id, last_index, RPCContext::default())
+            .await?;
+        fetched += batch.len();
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(fetched, 10_000);
+    assert_eq!(last_index, 10_000);
+    eprintln!(
+        "{{\"kmsg_fetch_ack_10k_ms\":{},\"kmsg_fetch_ack_count\":{}}}",
+        elapsed.as_millis(),
+        fetched
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn concurrent_post_10k_baseline() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::TempDir::new()?;
+    let queue = Arc::new(SledMsgQueue::new_in_dir(temp.path())?);
+    let queue_urn = queue
+        .handle_create_queue(
+            Some("concurrent-baseline"),
+            "app",
+            "owner",
+            QueueConfig::default(),
+            RPCContext::default(),
+        )
+        .await?;
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for worker in 0..10 {
+        let queue = queue.clone();
+        let queue_urn = queue_urn.clone();
+        handles.push(tokio::spawn(async move {
+            let mut indexes = Vec::new();
+            for seq in 0..1000 {
+                let index = queue
+                    .handle_post_message(
+                        &queue_urn,
+                        make_message(&format!("worker-{}-{}", worker, seq)),
+                        RPCContext::default(),
+                    )
+                    .await?;
+                indexes.push(index);
+            }
+            Ok::<_, kRPC::RPCErrors>(indexes)
+        }));
+    }
+
+    let mut indexes = Vec::new();
+    for handle in handles {
+        indexes.extend(handle.await??);
+    }
+    let elapsed = start.elapsed();
+
+    indexes.sort_unstable();
+    assert_eq!(indexes.len(), 10_000);
+    assert_eq!(indexes.iter().copied().collect::<HashSet<_>>().len(), 10_000);
+    assert_eq!(indexes.first().copied(), Some(1));
+    assert_eq!(indexes.last().copied(), Some(10_000));
+
+    eprintln!(
+        "{{\"kmsg_concurrent_post_10k_ms\":{},\"kmsg_concurrent_post_count\":{}}}",
+        elapsed.as_millis(),
+        indexes.len()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore]
+async fn sync_write_post_cost_baseline() -> Result<(), Box<dyn std::error::Error>> {
+    let sync_false_ms = post_1k_with_sync_write(false).await?;
+    let sync_true_ms = post_1k_with_sync_write(true).await?;
+
+    eprintln!(
+        "{{\"kmsg_sync_write_false_post_1k_ms\":{},\"kmsg_sync_write_true_post_1k_ms\":{}}}",
+        sync_false_ms,
+        sync_true_ms
+    );
+
+    Ok(())
+}
+
+async fn post_1k_with_sync_write(sync_write: bool) -> Result<u128, Box<dyn std::error::Error>> {
+    let temp = tempfile::TempDir::new()?;
+    let queue = SledMsgQueue::new_in_dir(temp.path())?;
+    let config = QueueConfig {
+        sync_write,
+        ..QueueConfig::default()
+    };
+    let queue_urn = queue
+        .handle_create_queue(
+            Some(if sync_write { "sync-true" } else { "sync-false" }),
+            "app",
+            "owner",
+            config,
+            RPCContext::default(),
+        )
+        .await?;
+
+    let start = Instant::now();
+    for seq in 0..1000 {
+        queue
+            .handle_post_message(
+                &queue_urn,
+                Message::new(vec![seq as u8; 1024]),
+                RPCContext::default(),
+            )
+            .await?;
+    }
+
+    Ok(start.elapsed().as_millis())
+}

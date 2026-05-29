@@ -20,7 +20,6 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use tokio::sync::{OnceCell, RwLock};
 
-use ::kRPC::Result;
 use name_client::*;
 use name_lib::*;
 use named_store::NamedDataMgr;

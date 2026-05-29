@@ -1,11 +1,30 @@
-use buckyos_api::KEventDaemonRequest;
+use buckyos_api::{KEventDaemonRequest, SharedKEventRingBuffer, DEFAULT_RINGBUFFER_PATH_ENV};
 use bytes::Bytes;
 use http::StatusCode;
 use http_body_util::{combinators::BoxBody, BodyExt};
 use kevent::{KEventHttpServer, KEventService};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
+
+static RING_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn set_unique_ring_path(test_name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "buckyos_http_{}_{}_{}.shm",
+        test_name,
+        std::process::id(),
+        nanos
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var(DEFAULT_RINGBUFFER_PATH_ENV, &path);
+    path
+}
 
 async fn response_json(response: http::Response<BoxBody<Bytes, buckyos_http_server::ServerError>>) -> Value {
     let collected = response.into_body().collect().await.unwrap();
@@ -106,6 +125,42 @@ async fn publish_endpoint_sets_global_event_metadata_and_rejects_local_eventid()
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let value = response_json(response).await;
     assert_eq!(value["status"], "err");
+}
+
+#[tokio::test]
+async fn publish_endpoint_reports_shared_ring_large_event_failure() {
+    let _guard = RING_ENV_LOCK.lock().unwrap();
+    let path = set_unique_ring_path("large_publish");
+
+    let service = Arc::new(KEventService::new("node_a"));
+    service
+        .set_shared_ring(Arc::new(SharedKEventRingBuffer::open().unwrap()))
+        .await;
+    service
+        .register_reader("r1", vec!["/taskmgr/**".to_string()])
+        .await
+        .unwrap();
+    let server = KEventHttpServer::new(service.clone());
+
+    let response = server
+        .handle_http_request(
+            "/kapi/kevent/publish",
+            serde_json::to_vec(&json!({
+                "eventid": "/taskmgr/large",
+                "data": { "blob": "x".repeat(4096) }
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let value = response_json(response).await;
+    assert_eq!(value["status"], "err");
+    assert_eq!(value["code"], "INTERNAL");
+    assert!(service.pull_event("r1", Some(0)).await.unwrap().is_none());
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
