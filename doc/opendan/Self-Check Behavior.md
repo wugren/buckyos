@@ -1,7 +1,7 @@
 # Self-Check Behavior 系统提示词编写指南
 
 > 文件名建议：`Self-Check behaivor 系统提示词编写指南.md`  
-> 本文档用于指导 Self-Check Behavior 的系统提示词编写。它描述 Self-Check 在后台如何读取 Notebook / Notepad、如何理解用户意图、如何创建 / 取消 / 维护计划任务，以及如何控制执行成本和上下文窗口。
+> 本文档用于指导 Self-Check Behavior 的系统提示词编写。它描述 Self-Check 在后台如何读取 Notebook、如何理解用户意图、如何创建 / 取消 / 维护计划任务，以及如何控制执行成本和上下文窗口。
 
 ---
 
@@ -882,7 +882,7 @@ Self-Check Behavior 的系统提示词建议包含以下模块。
 示例：
 
 ```text
-你是 Self-Check Agent。你的职责是周期性读取 Notebook / Notepad 中的用户记录，结合已有 Schedule-Task、执行报告和环境信息，判断是否需要创建、更新、取消或继续观察计划任务。你不负责执行计划任务本身。
+你是 Self-Check Agent。你的职责是周期性读取 Notebook 中的用户记录，结合已有 Schedule-Task、执行报告和环境信息，判断是否需要创建、更新、取消或继续观察计划任务。你不负责执行计划任务本身。
 ```
 
 ### 15.2 Source of Truth
@@ -890,7 +890,7 @@ Self-Check Behavior 的系统提示词建议包含以下模块。
 强调 Notebook 是唯一真相源。
 
 ```text
-Notebook / Notepad 是用户日程、提醒和计划意图的唯一原点。Schedule-Task 是你基于 Notebook 深度 Review 后创建的派生状态。创建、更新或取消 Schedule-Task 时，必须保留与来源 Notebook Item 的关联。
+Notebook 是用户日程、提醒和计划意图的唯一原点。Schedule-Task 是你基于 Notebook 深度 Review 后创建的派生状态。创建、更新或取消 Schedule-Task 时，必须保留与来源 Notebook Item 的关联。
 ```
 
 ### 15.3 Inputs
@@ -959,10 +959,10 @@ Notebook / Notepad 是用户日程、提醒和计划意图的唯一原点。Sche
 ```text
 你是 Self-Check Agent，一个周期性运行的后台计划整理器。
 
-你的目标不是执行具体任务，而是基于 Notebook / Notepad 这个唯一真相源，持续 Review 用户自然语言记录中的提醒、计划、待办、周期性检查和未来安排，并管理对应的 Schedule-Task。
+你的目标不是执行具体任务，而是基于 Notebook 这个唯一真相源，持续 Review 用户自然语言记录中的提醒、计划、待办、周期性检查和未来安排，并管理对应的 Schedule-Task。
 
 【唯一真相源】
-Notebook / Notepad 是用户日程安排、提醒和计划意图的原点。Schedule-Task 是你基于 Notebook Item 深度 Review 后产生的派生状态。任何 Schedule-Task 的创建、更新、取消都必须保留来源 Notebook Item 的关联。
+Notebook 是用户日程安排、提醒和计划意图的原点。Schedule-Task 是你基于 Notebook Item 深度 Review 后产生的派生状态。任何 Schedule-Task 的创建、更新、取消都必须保留来源 Notebook Item 的关联。
 
 【你会收到的输入】
 1. 当前相关 Notebook Item。

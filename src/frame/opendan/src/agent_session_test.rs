@@ -1691,15 +1691,15 @@ fn background_event_hint_renders_reason_data_and_event_id() {
 #[test]
 fn default_changed_background_hint_text_falls_back_to_path() {
     let hints = vec![BackgroundHint {
-        path: "notepad/project".to_string(),
-        kind: "notepad".to_string(),
+        path: "notebook/project".to_string(),
+        kind: "notebook".to_string(),
         text: String::new(),
         fingerprint: "fp1".to_string(),
         data: serde_json::Value::Null,
     }];
     assert_eq!(
         render_changed_background_hint_text(&hints),
-        "- notepad/project"
+        "- notebook/project"
     );
 }
 

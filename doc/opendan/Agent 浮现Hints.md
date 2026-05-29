@@ -111,11 +111,11 @@ OpenDAN 中，这个浮现机制的核心是：
 
 > Agent 不需要一开始就知道所有事实，但它需要知道“可能有这么一件相关的事”。
 
-### 3.1 Notepad 与 Memory 的本质区分
+### 3.1 Notebook 与 Memory 的本质区分
 
 主流 memory 方案常把两种不同的东西混成一个系统，导致两边都不到位。OpenDAN 把它们分开看待：
 
-| 维度 | Notepad | Memory |
+| 维度 | Notebook | Memory |
 |---|---|---|
 | 写入语义 | “请记下来”（显式） | “刚才发生了”（沉淀） |
 | 内容形态 | 事实 / 规则 / 提醒 | 经历 / 感觉 / 线索 |
@@ -124,11 +124,11 @@ OpenDAN 中，这个浮现机制的核心是：
 | Prompt 位置 | system prompt | 紧贴 user msg |
 | 失败模式 | 漏掉 = 灾难 | 没浮现 = 可接受 |
 
-`update_session_topic` **属于 Notepad 子系统的工具** —— 由 Agent 显式调用、写入精确的事实条目（本 Session 当前在谈什么）。但它写入的内容会被 **Memory 浮现层** 消费：未来 Session 在合适时机浮现“昨天讨论过 X (session: …)”时，topic 行就是浮现产物的来源。
+`update_session_topic` **属于 Notebook 子系统的工具** —— 由 Agent 显式调用、写入精确的事实条目（本 Session 当前在谈什么）。但它写入的内容会被 **Memory 浮现层** 消费：未来 Session 在合适时机浮现“昨天讨论过 X (session: …)”时，topic 行就是浮现产物的来源。
 
 简言之：
 
-> **写入是 Notepad 语义，消费是 Memory 语义。**
+> **写入是 Notebook 语义，消费是 Memory 语义。**
 
 这条工具是把“事实级 topic”和“启发式浮现”对接的桥。
 
@@ -1421,14 +1421,14 @@ Tag 淘汰、权重衰减、基础召回应尽量机械、可预测。
 4. **当前 Session Tag 可读**：浮现层（含 `RecallService`）能读取 `tag_set.json`；
 5. **订阅可读**：呈现层能读取 `subscriptions.json`。
 
-“工具可见性也是被浮现的对象”（即一个无浮现内容的 Session 应当看不到任何 memory 相关 prompt 段）由浮现层自己实现；`update_session_topic` 本身**始终可见**（它是 Notepad 工具，不参与浮现）。
+“工具可见性也是被浮现的对象”（即一个无浮现内容的 Session 应当看不到任何 memory 相关 prompt 段）由浮现层自己实现；`update_session_topic` 本身**始终可见**（它是 Notebook 工具，不参与浮现）。
 
 ### 22.3 明确不做的事
 
 记录已识别但**不在本机制范围内**的事情，避免将来误把功能塞进来：
 
 - **不做 Session Summary**：那是另一种产物，篇幅更长、面向人类阅读；
-- **不做自动 topic 抽取**：让模型自己判断什么时候写、写什么 —— 这是 Notepad 的语义；
+- **不做自动 topic 抽取**：让模型自己判断什么时候写、写什么 —— 这是 Notebook 的语义；
 - **不做跨 Session 的 topic 合并 / 去重**：浮现层的职责；
 - **不做 embedding / 向量索引**：浮现层若需要，自己读 `topic.md` 建；
 - **不实现浮现层的索引、检索、注入逻辑**：那些是另一个工单；

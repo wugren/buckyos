@@ -26,7 +26,7 @@ description, or a compact review note.
 - Focus on new/changed notebook items; do not re-review all old notes.
 - Create schedule-task only when intent, action, time/trigger, recipient/result, and type are clear.
 - Check duplicates first; link/update existing equivalent or broader schedules.
-- Notebook / Notepad 是用户计划意图的唯一真相源；Schedule-Task 是派生状态。创建、更新、取消 Schedule-Task 时，必须保留来源 Notebook Item 的 id/title 关联。
+- Notebook 是用户计划意图的唯一真相源；Schedule-Task 是派生状态。创建、更新、取消 Schedule-Task 时，必须保留来源 Notebook Item 的 id/title 关联。
 - 如果 Notebook Item 的执行条件是确定时间条件，先结合当前时间、时区和相关上下文判断前提是否已经满足；未过期且动作明确时，创建一次性计划任务。
 - Remove/pause only for explicit cancel, expiry, invalid premise, replacement, or repeated unrecoverable failure.
 - Never cancel for weak wording, lower priority, one failure, or temporary missing context.
@@ -162,14 +162,17 @@ dcrontab "0 14 * * *" --timezone America/Los_Angeles task --title "Daily email t
 """
 
 on_behavior_switch = """
-Current Time:{{runtime.clock_text}}
 
+"""
+
+
+on_wakeup = """
+Current Time:{{runtime.clock_text}}
 {% if session.background_hint_changed %}
 <<background_environment>>
 {{ session.default_changed_background_hint_text }}
 <</background_environment>>
 {% endif %}
-
 ## Schedule-Task Item Updates:
 
 {{runtime.last_schedule_task_list_text}}
@@ -181,39 +184,19 @@ Current Time:{{runtime.clock_text}}
 
 {{ notebook.last_items_text }}
 
-
-Continue Self-Check from PROCESS_RULES.
-"""
-on_wakeup = """
-Current Time:{{runtime.clock_text}}
-
-{% if input.has_events %}
-## Trigger Events:
-{% for event in input.events %}
-- {{ event.event_id }} {{ event.data }}
+{% if input.has_msgs %}
+## New User Messages
+{% for msg in input.msgs %}
+<message>
+{{msg.text}}
+</message>
 {% endfor %}
 {% endif %}
 
-{% if session.background_hint_changed %}
-<<background_environment>>
-{{ session.default_changed_background_hint_text }}
-<</background_environment>>
-{% endif %}
-
-## Schedule-Task Item Updates:
-
-{{runtime.last_schedule_task_list_text}}
-
-## Available Workspaces:
-{{ runtime.workspace_list_text }}
-
-## Recent Notebook Updates:
-
-{{ notebook.last_items_text }}
-
-
+---
 Continue Self-Check from PROCESS_RULES.
 """
+
 on_behavior_step_ob = """
 <<last_step_action_results>>
 {{ default_last_step_action_results_text }}

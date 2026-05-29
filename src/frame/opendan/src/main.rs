@@ -338,7 +338,7 @@ async fn ensure_agent_rootfs_layout(agent_root: &Path) -> Result<()> {
         ".meta",
         "users",
         "memory",
-        "notepads",
+        "notebook",
         "skills",
         "tools",
         "behaviors",

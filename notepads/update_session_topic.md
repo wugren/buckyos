@@ -4,11 +4,11 @@
 
 ---
 
-## 1. 背景：Notepad 与 Memory 的本质区分
+## 1. 背景：Notebook 与 Memory 的本质区分
 
 主流 memory 方案把两种不同的东西混成一个系统，导致两边都不到位。我们要分开：
 
-| 维度 | Notepad | Memory |
+| 维度 | Notebook | Memory |
 |---|---|---|
 | 写入语义 | "请记下来"（显式） | "刚才发生了"（沉淀） |
 | 内容形态 | 事实 / 规则 / 提醒 | 经历 / 感觉 / 线索 |
@@ -17,9 +17,9 @@
 | Prompt 位置 | system prompt | 紧贴 user msg |
 | 失败模式 | 漏掉 = 灾难 | 没浮现 = 可接受 |
 
-`update_session_topic` **属于 Notepad 子系统的工具**——由 Agent 显式调用、写入精确的事实条目（本 session 当前在谈什么）。但它写入的内容会被 **Memory 浮现层** 消费：未来 session 在合适时机浮现"昨天讨论过 X (session: …)"时，**topic 行就是浮现产物的来源**。
+`update_session_topic` **属于 Notebook 子系统的工具**——由 Agent 显式调用、写入精确的事实条目（本 session 当前在谈什么）。但它写入的内容会被 **Memory 浮现层** 消费：未来 session 在合适时机浮现"昨天讨论过 X (session: …)"时，**topic 行就是浮现产物的来源**。
 
-简言之：**写入是 Notepad 语义，消费是 Memory 语义**。这条工具是把"事实级 topic"和"启发式浮现"对接的桥。
+简言之：**写入是 Notebook 语义，消费是 Memory 语义**。这条工具是把"事实级 topic"和"启发式浮现"对接的桥。
 
 此外，`update_session_topic` 本身也是当前 session 内**浮现机制的唯一触发入口**（详见 §5），它同时承担"写入题眼"和"驱动浮现"两类职责。
 
@@ -158,7 +158,7 @@ enum RecallStatus {
 | 子系统 | 职责 | 何时执行 |
 |---|---|---|
 | **A. Topic / Tag 更新** | 维护 Session Tag 集合（增删 + 淘汰） | `update_session_topic` 调用时 |
-| **B. 基于 Topic 的召回** | 以当前 Tag 为背景信息，从 Memory/Notepad 中检索条目 | **任意触发点**（当前仅 update_session_topic，但接口开放） |
+| **B. 基于 Topic 的召回** | 以当前 Tag 为背景信息，从 Memory/Notebook 中检索条目 | **任意触发点**（当前仅 update_session_topic，但接口开放） |
 | **C. 召回信息的呈现** | 决定召回结果以何种形式、在何时进入 LLM 上下文 | 立即返回 / 背景注入 / 状态订阅触发 |
 
 > **关键约束**：三者通过定义良好的数据交换协议解耦。CodeAgent 实现时，B 子系统必须抽象为独立的 `RecallService`，**不得**把召回逻辑直接耦合到 `update_session_topic` 工具实现内部。
@@ -248,7 +248,7 @@ else:
 
 | | 机械召回 | LLM 召回 |
 |---|---|---|
-| **实现** | 对 Memory/Notepad 索引做基于 Tag 的文本/向量检索 | 旁路 LLM 基于 Tag + 全局状态做语义召回 |
+| **实现** | 对 Memory/Notebook 索引做基于 Tag 的文本/向量检索 | 旁路 LLM 基于 Tag + 全局状态做语义召回 |
 | **耗时预期** | <100ms | 1-5s |
 | **能力** | 文本级匹配 | 语义级匹配 + 可声明状态订阅 |
 | **副作用** | 无 | 可能注册环境状态订阅（见 §5.4） |
@@ -403,7 +403,7 @@ enum RecallResult {
 4. **当前 session Tag 可读**：浮现层（含 RecallService）能读取 `tag_set.json`，作为机械召回的查询输入
 5. **订阅可读**：呈现层（含通道二/三的注入逻辑）能读取 `subscriptions.json`
 
-浮现层"工具可见性也是被浮现的对象"（即一个无浮现内容的 session 应当看不到任何 memory 相关 prompt 段）由浮现层自己实现；本工具**始终可见**（它是 Notepad 工具，不参与浮现）。
+浮现层"工具可见性也是被浮现的对象"（即一个无浮现内容的 session 应当看不到任何 memory 相关 prompt 段）由浮现层自己实现；本工具**始终可见**（它是 Notebook 工具，不参与浮现）。
 
 ---
 
@@ -480,7 +480,7 @@ enum RecallResult {
 ## 9. 非目标（明确不做）
 
 - 不做 session summary（那是另一种产物，篇幅更长、面向人类阅读）
-- 不做自动 topic 抽取（让模型自己判断什么时候写、写什么——这是 Notepad 的语义）
+- 不做自动 topic 抽取（让模型自己判断什么时候写、写什么——这是 Notebook 的语义）
 - 不做跨 session 的 topic 合并 / 去重（浮现层的职责）
 - 不做 embedding / 向量索引（浮现层若需要，自己读 topic.md 建）
 - 不实现浮现层的索引、检索、注入逻辑——那些是另一个工单

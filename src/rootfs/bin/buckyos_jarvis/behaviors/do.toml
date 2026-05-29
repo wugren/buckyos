@@ -77,7 +77,7 @@ __INCLUDE(./step_record_rule.inc)__
 - Current session root: `{{ paths.session_root }}`. Session-local state lives here, including `todos.json` and `.meta/state.snap`.
 - Current workspace directory: `{{ paths.workspace_root }}`. This worksession's deliverables belong here.
 - Memory root: `{{ paths.agent_root }}/memory/`. AgentMemory stores durable memory here, including `memory.sqlite` and `.meta/` logs. Prefer memory tools over direct edits.
-- Notepads root: `{{ paths.agent_root }}/notepads/`. Use for durable human-readable Agent notes.
+- Notebook root: `{{ paths.agent_root }}/notebook/`. Use for durable human-readable Agent notes.
 - Skills root: `{{ paths.agent_root }}/skills/`. Agent-provided skills live here.
 
 Read global state only when it can change execution. Do not dump large state into the report; include only the facts needed to explain the result.

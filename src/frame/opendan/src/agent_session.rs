@@ -3858,7 +3858,7 @@ impl AgentSession {
         let topic_tags = load_session_topic_tags(&self.session_dir);
         let mut candidates = Vec::new();
         candidates.extend(build_background_event_hints(&bg_events));
-        candidates.extend(self.build_notepad_hints(&topic_tags, &owner).await);
+        candidates.extend(self.build_notebook_background_hints(&topic_tags, &owner).await);
         candidates.extend(self.build_memory_hints(&topic_tags).await);
 
         let mut next_fingerprints = BTreeMap::new();
@@ -3889,25 +3889,29 @@ impl AgentSession {
         changed
     }
 
-    async fn build_notepad_hints(&self, topic_tags: &[String], owner: &str) -> Vec<BackgroundHint> {
+    async fn build_notebook_background_hints(
+        &self,
+        topic_tags: &[String],
+        owner: &str,
+    ) -> Vec<BackgroundHint> {
         let owner = owner.trim();
-        if owner.is_empty() || !self.agent_config.layout.notepads_dir.exists() {
+        if owner.is_empty() || !self.agent_config.layout.notebook_dir.exists() {
             return Vec::new();
         }
 
         let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
-            self.agent_config.layout.notepads_dir.clone(),
+            self.agent_config.layout.notebook_dir.clone(),
         )) {
             Ok(notebook) => notebook,
             Err(err) => {
                 warn!(
-                    "opendan.session[{}]: open notepads for background hints failed: {err}",
+                    "opendan.session[{}]: open notebook for background hints failed: {err}",
                     self.session_id
                 );
                 return Vec::new();
             }
         };
-        let candidate_notebook_ids = load_subscribed_notepad_ids(&self.session_dir);
+        let candidate_notebook_ids = load_subscribed_notebook_ids(&self.session_dir);
         let scope = OwnerScope::new(owner.to_string()).with_agent(self.agent_name.clone());
         let hints = match notebook.build_notebook_hints(BuildHintsInput {
             scope,
@@ -3923,7 +3927,7 @@ impl AgentSession {
             Ok(hints) => hints,
             Err(err) => {
                 warn!(
-                    "opendan.session[{}]: build notepad background hints failed: {err}",
+                    "opendan.session[{}]: build notebook background hints failed: {err}",
                     self.session_id
                 );
                 return Vec::new();
@@ -3937,8 +3941,8 @@ impl AgentSession {
                 let data = serde_json::to_value(&hint).unwrap_or(serde_json::Value::Null);
                 let fingerprint = stable_json_fingerprint(&data);
                 BackgroundHint {
-                    path: format!("notepad/{}", hint.notebook_id),
-                    kind: "notepad".to_string(),
+                    path: format!("notebook/{}", hint.notebook_id),
+                    kind: "notebook".to_string(),
                     text: hint.text,
                     fingerprint,
                     data,
@@ -6403,7 +6407,7 @@ fn build_notebook_prompt_texts(
     agent_name: &str,
     recent_since_secs: u64,
 ) -> (String, String) {
-    if owner.is_empty() || !agent_config.layout.notepads_dir.exists() {
+    if owner.is_empty() || !agent_config.layout.notebook_dir.exists() {
         return (
             "Available notebooks: 0 total.\n".to_string(),
             "Recent notebook items: none.\n".to_string(),
@@ -6411,11 +6415,11 @@ fn build_notebook_prompt_texts(
     }
 
     let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
-        agent_config.layout.notepads_dir.clone(),
+        agent_config.layout.notebook_dir.clone(),
     )) {
         Ok(notebook) => notebook,
         Err(err) => {
-            warn!("opendan.session: open notepads for prompt env failed: {err}");
+            warn!("opendan.session: open notebook for prompt env failed: {err}");
             return (String::new(), String::new());
         }
     };
@@ -6567,7 +6571,7 @@ fn parse_topic_doc_tags(text: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn load_subscribed_notepad_ids(session_dir: &Path) -> Option<Vec<String>> {
+fn load_subscribed_notebook_ids(session_dir: &Path) -> Option<Vec<String>> {
     let path = session_dir.join(".meta").join("subscriptions.json");
     let value = read_json_file(&path).ok()?;
     let subscriptions = value.get("subscriptions")?.as_array()?;
@@ -6579,7 +6583,7 @@ fn load_subscribed_notepad_ids(session_dir: &Path) -> Option<Vec<String>> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        if kind != "notepad" && kind != "notebook" {
+        if kind != "notebook" {
             continue;
         }
         let Some(id) = subscription

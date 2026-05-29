@@ -590,11 +590,23 @@ fn msgs_array(env: &AgentSessionEnv) -> Json {
 }
 
 fn events_array(env: &AgentSessionEnv) -> Json {
-    serde_json::to_value(&env.llm_context.events).unwrap_or(Json::Array(Vec::new()))
+    Json::Array(
+        env.llm_context
+            .events
+            .iter()
+            .map(event_prompt_value)
+            .collect(),
+    )
 }
 
 fn bg_events_array(env: &AgentSessionEnv) -> Json {
-    serde_json::to_value(&env.llm_context.bg_events).unwrap_or(Json::Array(Vec::new()))
+    Json::Array(
+        env.llm_context
+            .bg_events
+            .iter()
+            .map(bg_event_prompt_value)
+            .collect(),
+    )
 }
 
 fn background_hints_array(env: &AgentSessionEnv) -> Json {
@@ -606,10 +618,7 @@ fn first_or_null(values: &[Json]) -> Json {
 }
 
 fn first_event_or_null(events: &[EventRef]) -> Option<Json> {
-    events
-        .first()
-        .and_then(|event| serde_json::to_value(event).ok())
-        .or(Some(Json::Null))
+    events.first().map(event_prompt_value).or(Some(Json::Null))
 }
 
 fn is_timer_event(event: &EventRef) -> bool {
@@ -624,9 +633,38 @@ fn filtered_events_array(env: &AgentSessionEnv, predicate: impl Fn(&EventRef) ->
             .events
             .iter()
             .filter(|event| predicate(event))
-            .filter_map(|event| serde_json::to_value(event).ok())
+            .map(event_prompt_value)
             .collect(),
     )
+}
+
+fn event_prompt_value(event: &EventRef) -> Json {
+    let mut value = serde_json::to_value(event).unwrap_or(Json::Null);
+    add_event_data_text(&mut value, &event.data);
+    value
+}
+
+fn bg_event_prompt_value(event: &BgEventSnapshot) -> Json {
+    let mut value = serde_json::to_value(event).unwrap_or(Json::Null);
+    add_event_data_text(&mut value, &event.data);
+    value
+}
+
+fn add_event_data_text(value: &mut Json, data: &Json) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "data_text".to_string(),
+            Json::String(json_template_text(data)),
+        );
+    }
+}
+
+fn json_template_text(value: &Json) -> String {
+    if value.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+    }
 }
 
 fn input_text(env: &AgentSessionEnv) -> String {
@@ -1071,6 +1109,7 @@ mod tests {
             Some(json!([{
                 "event_id": "timer.reminder_check",
                 "data": {"target_id": "r1"},
+                "data_text": "{\"target_id\":\"r1\"}",
                 "reason": "reminder",
                 "observed_at_ms": 121
             }]))
@@ -1125,6 +1164,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alias, XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn event_data_text_renders_map_payload() {
+        let env = sample_env();
+        let out = render_template(
+            "{% for event in input.events %}{{ event.event_id }} {{ event.data_text }}{% endfor %}",
+            &env,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "timer.reminder_check {\"target_id\":\"r1\"}");
     }
 
     #[tokio::test]
@@ -1349,10 +1401,10 @@ notebook={{ notebook.list_text }}|{{ notebook.last_items_text }}
 input_msg={{ input.msg.record_id }}|{{ input.msg.from }}|{{ input.msg.from_did }}|{{ input.msg.tunnel_did }}|{{ input.msg.received_at_ms }}|{{ input.msg.raw_text }}|{{ input.msg.text }}|{{ input.msg.content.0.text }}|{{ input.msg.content.1.attachment.text_marker }}
 {% for msg in input.msgs %}msg={{ msg.record_id }}|{{ msg.attachments.0.kind }}|{{ msg.attachments.0.source.type }}|{{ msg.attachments.0.source.url }}|{{ msg.attachments.0.mime }}|{{ msg.attachments.0.title }}|{{ msg.attachments.0.text_marker }}
 {% endfor %}
-input_event={{ input.event.event_id }}|{{ input.event.reason }}|{{ input.event.observed_at_ms }}|{{ input.event.data.target_id }}
-{% for event in input.events %}event={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}
+input_event={{ input.event.event_id }}|{{ input.event.reason }}|{{ input.event.observed_at_ms }}|{{ input.event.data.target_id }}|{{ input.event.data_text }}
+{% for event in input.events %}event={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}|{{ event.data_text }}
 {% endfor %}
-{% for event in input.bg_events %}bg={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}|{{ event.data.online }}
+{% for event in input.bg_events %}bg={{ event.event_id }}|{{ event.reason }}|{{ event.observed_at_ms }}|{{ event.data.online }}|{{ event.data_text }}
 {% endfor %}
 {% for event in input.timer_events %}timer={{ event.event_id }}|{{ event.data.trigger_type }}
 {% endfor %}
@@ -1405,9 +1457,9 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
             "if_bg=yes",
             "input_msg=msg-image|alice|did:example:alice|did:example:tunnel|42|look|look\n[image: screenshot.png]|look|[image: screenshot.png]",
             "msg=msg-image|image|url|https://example.test/screenshot.png|image/png|screenshot.png|[image: screenshot.png]",
-            "input_event=timer.reminder_check|reminder subscription|101|r1",
-            "event=timer.hard_barrier|barrier subscription|102",
-            "bg=presence.changed|presence subscription|105|true",
+            "input_event=timer.reminder_check|reminder subscription|101|r1|{",
+            "event=timer.hard_barrier|barrier subscription|102|{",
+            "bg=presence.changed|presence subscription|105|true|{\"online\":true}",
             "timer=timer.scheduled_task_check|precise_trigger",
             "reminder=r1|drink water",
             "hard=all|daily scan",

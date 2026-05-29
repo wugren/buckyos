@@ -39,7 +39,7 @@ pub struct AgentLayout {
     pub sessions_dir: PathBuf,
     pub workspaces_dir: PathBuf,
     pub memory_dir: PathBuf,
-    pub notepads_dir: PathBuf,
+    pub notebook_dir: PathBuf,
     pub tools_dir: PathBuf,
     pub tool_plans_dir: PathBuf,
     pub skills_dir: PathBuf,
@@ -54,7 +54,7 @@ impl AgentLayout {
             sessions_dir: root.join("sessions"),
             workspaces_dir: root.join("workspace"),
             memory_dir: root.join("memory"),
-            notepads_dir: root.join("notepads"),
+            notebook_dir: root.join("notebook"),
             tools_dir: root.join("tools"),
             tool_plans_dir: root.join("tool_plans"),
             skills_dir: root.join("skills"),
@@ -809,7 +809,7 @@ fn default_self_check_driver() -> SessionDriverCfg {
         on_behavior_step_ob: HookPointCfg::default(),
         on_wakeup: HookPointCfg {
             filter: BehaviorFilter::Top,
-            pull_msg: PullMsgPolicy::None,
+            pull_msg: PullMsgPolicy::All,
             pull_event: PullEventPolicy::Filter("timer.*".to_string()),
             load_background_hits: LoadBackgroundHintsPolicy::None,
         },
@@ -894,6 +894,13 @@ mod tests {
                 .pull_event,
             PullEventPolicy::None
         );
+    }
+
+    #[test]
+    fn layout_uses_agent_notebook_root() {
+        let root = PathBuf::from("/tmp/agent-root");
+        let layout = AgentLayout::from_root(root.clone());
+        assert_eq!(layout.notebook_dir, root.join("notebook"));
     }
 
     #[test]
@@ -1091,6 +1098,7 @@ mod tests {
             self_check.driver.on_wakeup.pull_event,
             PullEventPolicy::Filter("timer.*".to_string())
         );
+        assert_eq!(self_check.driver.on_wakeup.pull_msg, PullMsgPolicy::All);
         let self_improve = cfg.session_class("self_improve").unwrap();
         assert!(!self_improve.enabled);
         assert_eq!(self_improve.kind, SessionKind::SelfImprove);
