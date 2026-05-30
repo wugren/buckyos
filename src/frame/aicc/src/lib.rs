@@ -6,6 +6,7 @@ pub mod complete_request_queue;
 pub mod default_logical_tree;
 pub mod fal;
 pub mod gimini;
+pub mod metadata_resolver;
 pub mod minimax;
 pub mod model_registry;
 pub mod model_router;

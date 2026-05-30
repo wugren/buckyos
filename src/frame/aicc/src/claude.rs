@@ -1,9 +1,10 @@
 use crate::aicc::{
-    llm_logical_mounts, logical_mount_segment, provider_model_metadata,
-    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
-    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    llm_logical_mounts, provider_model_metadata, provider_type_from_settings, redacted_json_log,
+    AIComputeCenter, Provider, ProviderError, ProviderInstance, ProviderStartResult,
+    ResolvedRequest, TaskEventSink,
 };
 use crate::claude_protocol::convert_complete_request;
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
     ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
     ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
@@ -128,47 +129,20 @@ impl ClaudeProvider {
         provider_type: ProviderType,
         provider_driver: &str,
         models: &[String],
-        features: &[Feature],
+        _features: &[Feature],
         inventory_revision: Option<String>,
     ) -> ProviderInventory {
-        let mut metadata_list = Vec::with_capacity(models.len());
-        for model in models.iter() {
-            let model_features = effective_features_for_claude_model(model.as_str(), features);
-            let mut metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::LlmChat,
-                llm_logical_mounts(provider_driver, model.as_str()),
-                model_features.as_slice(),
-                Some(0.01),
-                Some(1800),
-            );
-            if claude_model_supports_vision(model.as_str()) {
-                metadata.api_types.push(ApiType::VisionCaption);
-                metadata.api_types.push(ApiType::VisionOcr);
-                metadata
-                    .logical_mounts
-                    .extend(claude_vision_mounts(ApiType::VisionCaption, model.as_str()));
-                metadata
-                    .logical_mounts
-                    .extend(claude_vision_mounts(ApiType::VisionOcr, model.as_str()));
-            }
-            metadata.capabilities.max_context_tokens =
-                Some(claude_model_max_context_tokens(model.as_str()));
-            metadata_list.push(metadata);
-        }
-        ProviderInventory {
-            provider_instance_name: provider_instance_name.to_string(),
+        let requests = models
+            .iter()
+            .map(|model| DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat]))
+            .collect::<Vec<_>>();
+        resolve_driver_inventory(
+            provider_instance_name,
             provider_type,
-            provider_driver: provider_driver.to_string(),
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: None,
+            provider_driver,
+            requests.as_slice(),
             inventory_revision,
-            models: metadata_list,
-        }
+        )
     }
 
     pub fn start_inventory_refresh(self: Arc<Self>) {
@@ -922,19 +896,6 @@ fn claude_inventory_revision_from_metadata(models: &[ModelMetadata]) -> String {
     format!("claude-inventory-{}-{:x}", models.len(), hasher.finish())
 }
 
-fn claude_vision_mounts(api_type: ApiType, model: &str) -> Vec<String> {
-    let base = match api_type {
-        ApiType::VisionOcr => "vision.ocr",
-        ApiType::VisionCaption => "vision.caption",
-        _ => "vision",
-    };
-    vec![
-        base.to_string(),
-        format!("{}.claude", base),
-        format!("{}.{}", base, logical_mount_segment(model)),
-    ]
-}
-
 #[cfg(test)]
 #[allow(dead_code)]
 fn json_text_len(value: &Value) -> usize {
@@ -1056,13 +1017,6 @@ fn claude_model_supports_vision(model_id: &str) -> bool {
     let id = model_id.trim().to_ascii_lowercase();
     // Claude 3.5 Haiku is text-only per Anthropic docs.
     !id.starts_with("claude-3-5-haiku")
-}
-
-fn claude_model_max_context_tokens(_model_id: &str) -> u64 {
-    // All currently shipping Claude models advertise a 200K-token context
-    // window. Sonnet 4's 1M-token window requires the `context-1m-2025-08-07`
-    // beta header and is not enabled by default.
-    200_000
 }
 
 fn effective_features_for_claude_model(model_id: &str, base: &[Feature]) -> Vec<Feature> {

@@ -1,8 +1,9 @@
 use crate::aicc::{
-    llm_logical_mounts, provider_model_metadata, provider_type_from_settings, AIComputeCenter,
-    Provider, ProviderError, ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    llm_logical_mounts, provider_type_from_settings, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
 use crate::claude_protocol::{convert_complete_request_with_dialect, ProtocolDialect};
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
     ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
     ProviderTypeTrustedSource, QuotaState,
@@ -77,33 +78,23 @@ impl MiniMaxProvider {
             endpoint: Some(cfg.base_url.clone()),
             plugin_key: None,
         };
-        let models = cfg
+        let requests = cfg
             .models
             .iter()
             .map(|model| {
-                provider_model_metadata(
-                    provider_instance_name.as_str(),
-                    provider_type.clone(),
-                    model.as_str(),
-                    ApiType::LlmChat,
-                    llm_logical_mounts(provider_driver.as_str(), model.as_str()),
-                    &cfg.features,
-                    Some(0.01),
-                    Some(1400),
-                )
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat])
+                    .with_mounts(llm_logical_mounts(provider_driver.as_str(), model.as_str()))
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(1400))
             })
             .collect::<Vec<_>>();
-        let inventory = ProviderInventory {
-            provider_instance_name,
+        let inventory = resolve_driver_inventory(
+            provider_instance_name.as_str(),
             provider_type,
-            provider_driver,
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: None,
-            inventory_revision: Some("settings-v1".to_string()),
-            models,
-        };
+            provider_driver.as_str(),
+            requests.as_slice(),
+            Some("settings-v1".to_string()),
+        );
 
         Ok(Self {
             instance,

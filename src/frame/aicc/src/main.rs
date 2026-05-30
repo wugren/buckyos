@@ -6,6 +6,7 @@ mod complete_request_queue;
 mod default_logical_tree;
 mod fal;
 mod gimini;
+mod metadata_resolver;
 mod minimax;
 mod model_registry;
 mod model_router;

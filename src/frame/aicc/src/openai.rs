@@ -1,8 +1,9 @@
 use crate::aicc::{
-    exact_model_name, image_logical_mounts, logical_mount_segment, provider_model_metadata,
-    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
-    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    exact_model_name, image_logical_mounts, logical_mount_segment, provider_type_from_settings,
+    redacted_json_log, AIComputeCenter, Provider, ProviderError, ProviderInstance,
+    ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
     ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, PrivacyClass,
     ProviderInventory, ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
@@ -401,108 +402,29 @@ impl OpenAIProvider {
         tts_models: &[String],
         revision: Option<String>,
     ) -> ProviderInventory {
-        let features = default_features();
-        let mut metadata = Vec::new();
-        for model in models
-            .iter()
-            .filter(|model| !is_text2image_model_name(model))
-        {
-            let mut model_metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::LlmChat,
-                openai_llm_logical_mounts(provider_driver, model.as_str()),
-                features.as_slice(),
-                Some(0.01),
-                Some(1200),
-            );
-            add_unique_api_type(&mut model_metadata.api_types, ApiType::LlmCompletion);
-            add_unique_api_type(&mut model_metadata.api_types, ApiType::Rerank);
-            add_unique_mount(&mut model_metadata.logical_mounts, "rerank".to_string());
-            add_unique_mount(
-                &mut model_metadata.logical_mounts,
-                "rerank.openai".to_string(),
-            );
-            metadata.push(model_metadata);
+        let mut requests = Vec::<DriverModelResolveRequest>::new();
+        for model in models.iter() {
+            requests.push(DriverModelResolveRequest::new(model.clone(), vec![]));
         }
         for model in image_models.iter() {
-            let mut api_types = vec![ApiType::ImageTextToImage];
-            let mut mounts = image_logical_mounts(provider_driver, model.as_str());
-            if supports_openai_image_edit(model.as_str()) {
-                api_types.push(ApiType::ImageToImage);
-                api_types.push(ApiType::ImageInpaint);
-                mounts.extend(openai_method_mounts(
-                    ApiType::ImageToImage,
-                    provider_driver,
-                    model,
-                ));
-                mounts.extend(openai_method_mounts(
-                    ApiType::ImageInpaint,
-                    provider_driver,
-                    model,
-                ));
-            }
-            metadata.push(provider_model_metadata_multi(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                api_types,
-                dedupe_strings(mounts),
-                features.as_slice(),
-                Some(0.04),
-                Some(5000),
-            ));
+            requests.push(DriverModelResolveRequest::new(model.clone(), vec![]));
         }
         for model in embedding_models.iter() {
-            metadata.push(provider_model_metadata_multi(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                vec![ApiType::Embedding],
-                openai_method_mounts(ApiType::Embedding, provider_driver, model),
-                features.as_slice(),
-                Some(0.0001),
-                Some(800),
-            ));
+            requests.push(DriverModelResolveRequest::new(model.clone(), vec![]));
         }
         for model in asr_models.iter() {
-            metadata.push(provider_model_metadata_multi(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                vec![ApiType::AudioAsr],
-                openai_method_mounts(ApiType::AudioAsr, provider_driver, model),
-                features.as_slice(),
-                Some(0.006),
-                Some(5000),
-            ));
+            requests.push(DriverModelResolveRequest::new(model.clone(), vec![]));
         }
         for model in tts_models.iter() {
-            metadata.push(provider_model_metadata_multi(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                vec![ApiType::AudioTts],
-                openai_method_mounts(ApiType::AudioTts, provider_driver, model),
-                features.as_slice(),
-                Some(0.015),
-                Some(3000),
-            ));
+            requests.push(DriverModelResolveRequest::new(model.clone(), vec![]));
         }
-        apply_openai_latest_llm_mounts(provider_driver, &mut metadata);
-
-        ProviderInventory {
-            provider_instance_name: provider_instance_name.to_string(),
+        resolve_driver_inventory(
+            provider_instance_name,
             provider_type,
-            provider_driver: provider_driver.to_string(),
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: None,
-            inventory_revision: revision,
-            models: metadata,
-        }
+            provider_driver,
+            requests.as_slice(),
+            revision,
+        )
     }
 
     fn parse_auth_mode(auth_mode: &str, openai_api_token: &str) -> Result<OpenAIAuthMode> {
@@ -3603,48 +3525,6 @@ fn add_unique_mount(mounts: &mut Vec<String>, mount: String) {
     }
 }
 
-fn add_unique_api_type(api_types: &mut Vec<ApiType>, api_type: ApiType) {
-    if !api_types.iter().any(|item| item == &api_type) {
-        api_types.push(api_type);
-    }
-}
-
-fn dedupe_strings(values: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::<String>::new();
-    let mut deduped = Vec::new();
-    for value in values.into_iter() {
-        if seen.insert(value.clone()) {
-            deduped.push(value);
-        }
-    }
-    deduped
-}
-
-fn provider_model_metadata_multi(
-    provider_instance_name: &str,
-    provider_type: ProviderType,
-    provider_model_id: &str,
-    api_types: Vec<ApiType>,
-    logical_mounts: Vec<String>,
-    features: &[buckyos_api::Feature],
-    estimated_cost_usd: Option<f64>,
-    estimated_latency_ms: Option<u64>,
-) -> ModelMetadata {
-    let first_api_type = api_types.first().cloned().unwrap_or(ApiType::LlmChat);
-    let mut metadata = provider_model_metadata(
-        provider_instance_name,
-        provider_type,
-        provider_model_id,
-        first_api_type,
-        logical_mounts,
-        features,
-        estimated_cost_usd,
-        estimated_latency_ms,
-    );
-    metadata.api_types = api_types;
-    metadata
-}
-
 fn openai_method_mounts(
     api_type: ApiType,
     provider_driver: &str,
@@ -3755,10 +3635,6 @@ fn default_features() -> Vec<String> {
 fn is_text2image_model_name(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized.starts_with("dall-e") || normalized == "gpt-image-1"
-}
-
-fn supports_openai_image_edit(model: &str) -> bool {
-    model.trim().eq_ignore_ascii_case("gpt-image-1")
 }
 
 fn is_supported_llm_model_name(model: &str) -> bool {

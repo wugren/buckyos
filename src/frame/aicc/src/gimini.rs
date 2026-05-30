@@ -1,8 +1,9 @@
 use crate::aicc::{
-    image_logical_mounts, llm_logical_mounts, logical_mount_segment, provider_model_metadata,
-    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
-    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    image_logical_mounts, llm_logical_mounts, logical_mount_segment, provider_type_from_settings,
+    redacted_json_log, AIComputeCenter, Provider, ProviderError, ProviderInstance,
+    ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
     ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
     ProviderType, ProviderTypeTrustedSource, QuotaState,
@@ -245,121 +246,81 @@ impl GoogleGiminiProvider {
         provider_type: ProviderType,
         provider_driver: &str,
         buckets: &GiminiModelBuckets,
-        features: &[Feature],
+        _features: &[Feature],
         inventory_revision: Option<String>,
     ) -> ProviderInventory {
-        let mut models = Vec::new();
+        let mut requests = Vec::<DriverModelResolveRequest>::new();
         for model in buckets.llm.iter() {
-            let mut metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::LlmChat,
-                llm_logical_mounts(provider_driver, model.as_str()),
-                features,
-                Some(0.01),
-                Some(1400),
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat])
+                    .with_mounts(llm_logical_mounts(provider_driver, model.as_str()))
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(1400)),
             );
-            for api_type in [
-                ApiType::VisionOcr,
-                ApiType::VisionCaption,
-                ApiType::VisionDetect,
-                ApiType::VisionSegment,
-            ] {
-                metadata.api_types.push(api_type.clone());
-                metadata
-                    .logical_mounts
-                    .extend(gimini_method_mounts(api_type, model.as_str()));
-            }
-            metadata.capabilities.vision = true;
-            metadata.logical_mounts = dedupe_strings(metadata.logical_mounts);
-            models.push(metadata);
         }
         for model in buckets.image.iter() {
-            let mut metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::ImageTextToImage,
-                image_logical_mounts(provider_driver, model.as_str()),
-                features,
-                Some(0.04),
-                Some(6000),
+            let mut mounts = image_logical_mounts(provider_driver, model.as_str());
+            mounts.extend(gimini_method_mounts(ApiType::ImageToImage, model.as_str()));
+            requests.push(
+                DriverModelResolveRequest::new(
+                    model.clone(),
+                    vec![ApiType::ImageTextToImage, ApiType::ImageToImage],
+                )
+                .with_mounts(dedupe_strings(mounts))
+                .with_cost(Some(0.04))
+                .with_latency(Some(6000)),
             );
-            metadata.api_types.push(ApiType::ImageToImage);
-            metadata
-                .logical_mounts
-                .extend(gimini_method_mounts(ApiType::ImageToImage, model.as_str()));
-            metadata.logical_mounts = dedupe_strings(metadata.logical_mounts);
-            models.push(metadata);
         }
         for model in buckets.embedding.iter() {
-            let mut metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::Embedding,
-                gimini_method_mounts(ApiType::Embedding, model.as_str()),
-                features,
-                Some(0.0001),
-                Some(800),
-            );
-            metadata.api_types.push(ApiType::EmbeddingMultimodal);
-            metadata.logical_mounts.extend(gimini_method_mounts(
+            let mut mounts = gimini_method_mounts(ApiType::Embedding, model.as_str());
+            mounts.extend(gimini_method_mounts(
                 ApiType::EmbeddingMultimodal,
                 model.as_str(),
             ));
-            metadata.logical_mounts = dedupe_strings(metadata.logical_mounts);
-            models.push(metadata);
+            requests.push(
+                DriverModelResolveRequest::new(
+                    model.clone(),
+                    vec![ApiType::Embedding, ApiType::EmbeddingMultimodal],
+                )
+                .with_mounts(dedupe_strings(mounts))
+                .with_cost(Some(0.0001))
+                .with_latency(Some(800)),
+            );
         }
         for model in buckets.tts.iter() {
-            models.push(provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::AudioTts,
-                gimini_method_mounts(ApiType::AudioTts, model.as_str()),
-                features,
-                Some(0.01),
-                Some(3000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioTts])
+                    .with_mounts(gimini_method_mounts(ApiType::AudioTts, model.as_str()))
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(3000)),
+            );
         }
         for model in buckets.music.iter() {
-            models.push(provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::AudioMusic,
-                gimini_method_mounts(ApiType::AudioMusic, model.as_str()),
-                features,
-                Some(0.10),
-                Some(60_000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioMusic])
+                    .with_mounts(gimini_method_mounts(ApiType::AudioMusic, model.as_str()))
+                    .with_cost(Some(0.10))
+                    .with_latency(Some(60_000)),
+            );
         }
         for model in buckets.video.iter() {
-            let metadata = provider_model_metadata(
-                provider_instance_name,
-                provider_type.clone(),
-                model.as_str(),
-                ApiType::VideoTextToVideo,
-                gimini_method_mounts(ApiType::VideoTextToVideo, model.as_str()),
-                features,
-                Some(0.50),
-                Some(120_000),
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::VideoTextToVideo])
+                    .with_mounts(gimini_method_mounts(
+                        ApiType::VideoTextToVideo,
+                        model.as_str(),
+                    ))
+                    .with_cost(Some(0.50))
+                    .with_latency(Some(120_000)),
             );
-            models.push(metadata);
         }
-        ProviderInventory {
-            provider_instance_name: provider_instance_name.to_string(),
+        resolve_driver_inventory(
+            provider_instance_name,
             provider_type,
-            provider_driver: provider_driver.to_string(),
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: None,
+            provider_driver,
+            requests.as_slice(),
             inventory_revision,
-            models,
-        }
+        )
     }
 
     pub fn start_inventory_refresh(self: Arc<Self>) {

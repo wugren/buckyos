@@ -190,14 +190,14 @@ provider /models reported ids
 
 ### 3.2 TODO
 
-- [ ] 定义 driver metadata schema 文档。
-- [ ] 按 driver 拆分本地 metadata 文件：
+- [x] 定义 driver metadata schema 文档。
+- [x] 按 driver 拆分本地 metadata 文件：
   - `openai.json`
   - `claude.json`
   - `gemini.json`
   - `fal.json`
   - `minimax.json`
-- [ ] schema 至少包含：
+- [x] schema 至少包含：
   - `schema_version`
   - `provider_driver`
   - `revision`
@@ -206,26 +206,26 @@ provider /models reported ids
   - `defaults`
   - `variants`
   - `signature`
-- [ ] 明确匹配优先级：
+- [x] 明确匹配优先级：
   - exact `models`
   - `patterns`
   - `defaults`
   - conservative fallback
-- [ ] 明确 override 优先级：
+- [x] 明确 override 优先级：
   - builtin
   - remote cache
   - local override
   - system-config override
-- [ ] 新增 `metadata_resolver` 模块。
-- [ ] OpenAI inventory 改为 `/models` + resolver。
-- [ ] Claude classifier 收编为 resolver 规则或 metadata。
-- [ ] Gemini / Minimax / Fal 迁移到 resolver。
-- [ ] unknown model fallback 不默认声明高风险能力：
+- [x] 新增 `metadata_resolver` 模块。
+- [x] OpenAI inventory 改为 `/models` + resolver。
+- [x] Claude classifier 收编为 resolver 规则或 metadata。
+- [x] Gemini / Minimax / Fal 迁移到 resolver。
+- [x] unknown model fallback 不默认声明高风险能力：
   - 不默认 tool_call
   - 不默认 web_search
   - 不默认 vision
   - 不默认 json_schema
-- [ ] metadata 文件缺失、损坏时 AICC 仍能以 conservative fallback 启动。
+- [x] metadata 文件缺失、损坏时 AICC 仍能以 conservative fallback 启动。
 
 ## 4. Reasoning Variant 与 Provider Options Lowering
 

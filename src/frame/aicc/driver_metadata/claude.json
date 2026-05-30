@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "provider_driver": "claude",
+  "revision": "builtin-2026-05-30",
+  "models": [],
+  "patterns": [
+    {
+      "pattern": "claude-3-5-haiku*",
+      "api_types": ["llm.chat"],
+      "logical_mounts": ["llm.chat", "llm.claude", "llm.haiku", "llm.claude.{model}"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": false,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800,
+      "latency_class": "normal",
+      "cost_class": "low"
+    },
+    {
+      "pattern": "claude-3-5-*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    },
+    {
+      "pattern": "claude-3-7-*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.sonnet",
+        "llm.reason",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    },
+    {
+      "pattern": "claude-opus-4*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.reason",
+        "llm.code",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    },
+    {
+      "pattern": "claude-sonnet-4*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.reason",
+        "llm.code",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    },
+    {
+      "pattern": "claude-haiku-4*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.reason",
+        "llm.code",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    },
+    {
+      "pattern": "claude-*",
+      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "logical_mounts": [
+        "llm.chat",
+        "llm.claude",
+        "llm.claude.{model}",
+        "vision.caption",
+        "vision.caption.claude",
+        "vision.caption.{model}",
+        "vision.ocr",
+        "vision.ocr.claude",
+        "vision.ocr.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": false,
+        "vision": true,
+        "max_context_tokens": 200000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1800
+    }
+  ],
+  "defaults": {
+    "api_types": ["llm.chat"],
+    "logical_mounts": ["llm.chat", "llm.claude", "llm.claude.{model}"],
+    "capabilities": {
+      "streaming": false,
+      "tool_call": false,
+      "json_schema": false,
+      "web_search": false,
+      "vision": false
+    },
+    "estimated_cost_usd": 0.01,
+    "estimated_latency_ms": 1800
+  },
+  "variants": [
+    {
+      "name": "thinking",
+      "mount_suffix": "thinking",
+      "provider_options": { "thinking": { "type": "enabled" } }
+    }
+  ],
+  "signature": null
+}

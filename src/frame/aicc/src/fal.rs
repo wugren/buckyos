@@ -1,11 +1,11 @@
 use crate::aicc::{
-    exact_model_name, provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider,
-    ProviderError, ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
-    ApiType, CostClass, CostEstimateInput, CostEstimateOutput, HealthStatus, LatencyClass,
-    ModelAttributes, ModelCapabilities, ModelHealth, ModelMetadata, ModelPricing, PricingMode,
-    PrivacyClass, ProviderInventory, ProviderOrigin, ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
+    ProviderTypeTrustedSource, QuotaState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -83,63 +83,59 @@ impl FalProvider {
             plugin_key: None,
         };
 
-        let mut models = Vec::<ModelMetadata>::new();
+        let mut requests = Vec::<DriverModelResolveRequest>::new();
         for model_id in cfg.image_upscale_models.iter() {
-            models.push(build_model_metadata(
-                provider_instance_name.as_str(),
-                provider_type.clone(),
-                model_id.as_str(),
-                ApiType::ImageUpscale,
-                logical_mounts_for_api(ApiType::ImageUpscale, model_id.as_str()),
-                Some(0.05),
-                Some(8000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageUpscale])
+                    .with_mounts(logical_mounts_for_api(
+                        ApiType::ImageUpscale,
+                        model_id.as_str(),
+                    ))
+                    .with_cost(Some(0.05))
+                    .with_latency(Some(8000)),
+            );
         }
         for model_id in cfg.image_bg_remove_models.iter() {
-            models.push(build_model_metadata(
-                provider_instance_name.as_str(),
-                provider_type.clone(),
-                model_id.as_str(),
-                ApiType::ImageBgRemove,
-                logical_mounts_for_api(ApiType::ImageBgRemove, model_id.as_str()),
-                Some(0.01),
-                Some(4000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageBgRemove])
+                    .with_mounts(logical_mounts_for_api(
+                        ApiType::ImageBgRemove,
+                        model_id.as_str(),
+                    ))
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(4000)),
+            );
         }
         for model_id in cfg.audio_enhance_models.iter() {
-            models.push(build_model_metadata(
-                provider_instance_name.as_str(),
-                provider_type.clone(),
-                model_id.as_str(),
-                ApiType::AudioEnhance,
-                logical_mounts_for_api(ApiType::AudioEnhance, model_id.as_str()),
-                Some(0.02),
-                Some(20_000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::AudioEnhance])
+                    .with_mounts(logical_mounts_for_api(
+                        ApiType::AudioEnhance,
+                        model_id.as_str(),
+                    ))
+                    .with_cost(Some(0.02))
+                    .with_latency(Some(20_000)),
+            );
         }
         for model_id in cfg.video_upscale_models.iter() {
-            models.push(build_model_metadata(
-                provider_instance_name.as_str(),
-                provider_type.clone(),
-                model_id.as_str(),
-                ApiType::VideoUpscale,
-                logical_mounts_for_api(ApiType::VideoUpscale, model_id.as_str()),
-                Some(0.50),
-                Some(120_000),
-            ));
+            requests.push(
+                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::VideoUpscale])
+                    .with_mounts(logical_mounts_for_api(
+                        ApiType::VideoUpscale,
+                        model_id.as_str(),
+                    ))
+                    .with_cost(Some(0.50))
+                    .with_latency(Some(120_000)),
+            );
         }
 
-        let inventory = ProviderInventory {
-            provider_instance_name,
+        let inventory = resolve_driver_inventory(
+            provider_instance_name.as_str(),
             provider_type,
-            provider_driver,
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: None,
-            inventory_revision: Some("settings-v1".to_string()),
-            models,
-        };
+            provider_driver.as_str(),
+            requests.as_slice(),
+            Some("settings-v1".to_string()),
+        );
 
         Ok(Self {
             instance,
@@ -483,51 +479,6 @@ impl Provider for FalProvider {
         _task_id: &str,
     ) -> std::result::Result<(), ProviderError> {
         Ok(())
-    }
-}
-
-fn build_model_metadata(
-    provider_instance_name: &str,
-    provider_type: crate::model_types::ProviderType,
-    provider_model_id: &str,
-    api_type: ApiType,
-    logical_mounts: Vec<String>,
-    estimated_cost_usd: Option<f64>,
-    estimated_latency_ms: Option<u64>,
-) -> ModelMetadata {
-    ModelMetadata {
-        provider_model_id: provider_model_id.to_string(),
-        exact_model: exact_model_name(provider_model_id, provider_instance_name),
-        parameter_scale: None,
-        api_types: vec![api_type],
-        logical_mounts,
-        capabilities: ModelCapabilities {
-            streaming: false,
-            tool_call: false,
-            json_schema: false,
-            web_search: false,
-            vision: false,
-            max_context_tokens: None,
-            max_output_tokens: None,
-        },
-        attributes: ModelAttributes {
-            provider_type: provider_type.clone(),
-            local: false,
-            privacy: PrivacyClass::Cloud,
-            quality_score: Some(0.75),
-            latency_class: LatencyClass::Normal,
-            cost_class: CostClass::Medium,
-        },
-        pricing: ModelPricing {
-            estimated_cost_usd,
-            ..Default::default()
-        },
-        health: ModelHealth {
-            status: HealthStatus::Available,
-            p95_latency_ms: estimated_latency_ms,
-            quota_state: QuotaState::Normal,
-            ..Default::default()
-        },
     }
 }
 

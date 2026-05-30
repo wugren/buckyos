@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "provider_driver": "openai",
+  "revision": "builtin-2026-05-30",
+  "models": [
+    {
+      "id": "gpt-image-1",
+      "api_types": ["image.txt2img", "image.img2img", "image.inpaint"],
+      "logical_mounts": [
+        "image.txt2img.{driver}",
+        "image.txt2img.gpt_image",
+        "image.txt2img.{model}",
+        "image.img2img",
+        "image.img2img.{driver}",
+        "image.img2img.{model}",
+        "image.inpaint",
+        "image.inpaint.{driver}",
+        "image.inpaint.{model}"
+      ],
+      "estimated_cost_usd": 0.04,
+      "estimated_latency_ms": 5000,
+      "quality_score": 0.9
+    },
+    {
+      "id": "dall-e-3",
+      "api_types": ["image.txt2img"],
+      "logical_mounts": ["image.txt2img.{driver}", "image.txt2img.dalle", "image.txt2img.{model}"],
+      "estimated_cost_usd": 0.04,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "id": "dall-e-2",
+      "api_types": ["image.txt2img"],
+      "logical_mounts": ["image.txt2img.{driver}", "image.txt2img.dalle", "image.txt2img.{model}"],
+      "estimated_cost_usd": 0.02,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "id": "text-embedding-3-large",
+      "api_types": ["embedding.text"],
+      "logical_mounts": ["embedding.text", "embedding.text.{driver}", "embedding.text.{model}"],
+      "estimated_cost_usd": 0.0001,
+      "estimated_latency_ms": 800
+    },
+    {
+      "id": "text-embedding-3-small",
+      "api_types": ["embedding.text"],
+      "logical_mounts": ["embedding.text", "embedding.text.{driver}", "embedding.text.{model}"],
+      "estimated_cost_usd": 0.0001,
+      "estimated_latency_ms": 800
+    },
+    {
+      "id": "whisper-1",
+      "api_types": ["audio.asr"],
+      "logical_mounts": ["audio.asr", "audio.asr.{driver}", "audio.asr.{model}"],
+      "estimated_cost_usd": 0.006,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "id": "gpt-4o-mini-transcribe",
+      "api_types": ["audio.asr"],
+      "logical_mounts": ["audio.asr", "audio.asr.{driver}", "audio.asr.{model}"],
+      "estimated_cost_usd": 0.006,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "id": "tts-1",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts", "audio.tts.{driver}", "audio.tts.{model}"],
+      "estimated_cost_usd": 0.015,
+      "estimated_latency_ms": 3000
+    },
+    {
+      "id": "gpt-4o-mini-tts",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts", "audio.tts.{driver}", "audio.tts.{model}"],
+      "estimated_cost_usd": 0.015,
+      "estimated_latency_ms": 3000
+    }
+  ],
+  "patterns": [
+    {
+      "pattern": "*transcribe*",
+      "api_types": ["audio.asr"],
+      "logical_mounts": ["audio.asr", "audio.asr.{driver}", "audio.asr.{model}"],
+      "estimated_cost_usd": 0.006,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "pattern": "*-tts*",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts", "audio.tts.{driver}", "audio.tts.{model}"],
+      "estimated_cost_usd": 0.015,
+      "estimated_latency_ms": 3000
+    },
+    {
+      "pattern": "*audio*",
+      "exclude": true
+    },
+    {
+      "pattern": "*realtime*",
+      "exclude": true
+    },
+    {
+      "pattern": "dall-e-*",
+      "api_types": ["image.txt2img"],
+      "logical_mounts": ["image.txt2img.{driver}", "image.txt2img.dalle", "image.txt2img.{model}"],
+      "estimated_cost_usd": 0.04,
+      "estimated_latency_ms": 5000
+    },
+    {
+      "pattern": "text-embedding-*",
+      "api_types": ["embedding.text"],
+      "logical_mounts": ["embedding.text", "embedding.text.{driver}", "embedding.text.{model}"],
+      "estimated_cost_usd": 0.0001,
+      "estimated_latency_ms": 800
+    },
+    {
+      "pattern": "gpt-*",
+      "api_types": ["llm.chat", "llm.completion", "rerank"],
+      "logical_mounts": [
+        "llm.{driver}",
+        "llm.openai.{model}",
+        "rerank",
+        "rerank.openai",
+        "rerank.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "max_context_tokens": 128000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1200,
+      "quality_score": 0.9,
+      "latency_class": "normal",
+      "cost_class": "medium"
+    },
+    {
+      "pattern": "chatgpt-*",
+      "api_types": ["llm.chat", "llm.completion"],
+      "logical_mounts": ["llm.{driver}", "llm.openai.{model}"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "max_context_tokens": 128000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1200
+    },
+    {
+      "pattern": "o*",
+      "api_types": ["llm.chat", "llm.completion"],
+      "logical_mounts": ["llm.{driver}", "llm.gpt", "llm.openai.{model}"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "max_context_tokens": 128000,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1200
+    }
+  ],
+  "defaults": {
+    "api_types": ["llm.chat"],
+    "logical_mounts": ["llm.chat", "llm.{driver}", "llm.{driver}.{model}"],
+    "capabilities": {
+      "streaming": false,
+      "tool_call": false,
+      "json_schema": false,
+      "web_search": false,
+      "vision": false
+    },
+    "estimated_cost_usd": 0.01,
+    "estimated_latency_ms": 1200
+  },
+  "variants": [
+    {
+      "name": "reasoning.low",
+      "mount_suffix": "reasoning-low",
+      "provider_options": { "reasoning": { "effort": "low" } }
+    },
+    {
+      "name": "reasoning.high",
+      "mount_suffix": "reasoning-high",
+      "provider_options": { "reasoning": { "effort": "high" } }
+    }
+  ],
+  "signature": null
+}
