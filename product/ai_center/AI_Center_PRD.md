@@ -189,7 +189,7 @@ Provider 通过 **inventory** 声明自己提供哪些模型（`ProviderInventor
 
 ---
 
-## 3.4 Model（ModelMetadata 富对象）
+## 3.4 Model Metadata 富对象
 
 模型不是一个名字字符串，而是一个富对象。这些字段正是"模型聚合器"UI 最该展示、原 PRD 却完全没建模的东西：
 
