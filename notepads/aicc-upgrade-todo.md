@@ -142,7 +142,7 @@
 - [x] typed inference 的 primary exact model quota exhausted / unavailable 时，不 fallback 到其它模型。
 - [x] typed inference 失败后，由调用方重新 `route.resolve` 才能换模型。
 - [x] `helper.llm_chat` 展开后的行为等价于 `route.resolve + chat.completions.create`。
-- [ ] `helper.text_to_image` 展开后的行为等价于 `route.resolve + images.generate`。
+- [x] `helper.text_to_image` 展开后的行为等价于 `route.resolve + images.generate`。
 
 ## 2. 命名与请求约束收敛
 
@@ -368,7 +368,7 @@ Base Logical Tree
 
 ### 7.2 TODO
 
-- [ ] Agent SDK 新增 helper：
+- [x] Agent SDK 新增 helper：
   - `llmChat()`
   - `textToImage()`
   - 内部执行 `route.resolve + typed inference`。
@@ -376,7 +376,7 @@ Base Logical Tree
   - resolve route
   - invoke exact model
   - helper call
-- [ ] workflow adapter 使用 helper 或显式两阶段调用，不直接把逻辑模型名传给数据面。
+- [x] workflow adapter 使用 helper 或显式两阶段调用，不直接把逻辑模型名传给数据面。
 - [ ] AI Center Routing UI 围绕逻辑模型名展示，不围绕 provider 参数面板展示。
 - [ ] 每个逻辑模型名展示：
   - min_line
@@ -453,9 +453,9 @@ Base Logical Tree
 
 ### Phase 2: SDK / Workflow 迁移
 
-- [ ] TypeScript Agent SDK 增加新 helper。
-- [ ] buckyos-agent 默认走 helper。
-- [ ] workflow adapter 迁移到 helper 或显式两阶段调用。
+- [x] TypeScript Agent SDK 增加新 helper。
+- [x] buckyos-agent 默认走 helper。
+- [x] workflow adapter 迁移到 helper 或显式两阶段调用。
 - [ ] CLI 增加 resolve / invoke / helper 调试命令。
 
 ### Phase 3: Metadata Resolver

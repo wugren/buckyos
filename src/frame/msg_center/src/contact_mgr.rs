@@ -310,8 +310,8 @@ impl ContactMgr {
             "account_type": account_type,
             "tunnel_id": tunnel_id,
         });
-        let endpoint = Self::message_tunnel_endpoint_did(account_id, Some(&hint))?
-            .ok_or_else(|| {
+        let endpoint =
+            Self::message_tunnel_endpoint_did(account_id, Some(&hint))?.ok_or_else(|| {
                 RPCErrors::ParseRequestError(
                     "account_type and tunnel_id are required to build endpoint did".to_string(),
                 )
@@ -357,7 +357,10 @@ impl ContactMgr {
             })
             .collect();
         // Prefer an exact tunnel_id match when both kinds are present.
-        if matches.iter().any(|b| b.tunnel_id.eq_ignore_ascii_case(selector)) {
+        if matches
+            .iter()
+            .any(|b| b.tunnel_id.eq_ignore_ascii_case(selector))
+        {
             matches.retain(|b| b.tunnel_id.eq_ignore_ascii_case(selector));
         }
 
@@ -2584,7 +2587,11 @@ mod tests {
         let did = DID::new("msgtunnel", "12345.user.tg-main");
         assert_eq!(
             ContactMgr::parse_msgtunnel_did(&did),
-            Some(("12345".to_string(), "user".to_string(), "tg-main".to_string()))
+            Some((
+                "12345".to_string(),
+                "user".to_string(),
+                "tg-main".to_string()
+            ))
         );
 
         // Special chars in the account id survive percent encode/decode.
@@ -2717,7 +2724,11 @@ mod tests {
 
         // Selector by tunnel_id resolves to the right endpoint DID.
         let resolved = mgr
-            .resolve_target(contact_did.clone(), "tg-main".to_string(), Some(owner.clone()))
+            .resolve_target(
+                contact_did.clone(),
+                "tg-main".to_string(),
+                Some(owner.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(resolved, tg_endpoint);
@@ -2731,7 +2742,11 @@ mod tests {
 
         // An unknown selector fails — no fallback.
         assert!(mgr
-            .resolve_target(contact_did.clone(), "signal".to_string(), Some(owner.clone()))
+            .resolve_target(
+                contact_did.clone(),
+                "signal".to_string(),
+                Some(owner.clone())
+            )
             .await
             .is_err());
     }
@@ -2741,7 +2756,12 @@ mod tests {
         let (mgr, _tmp) = new_test_mgr().await;
 
         let target = mgr
-            .resolve_did("telegram".to_string(), "keep-target".to_string(), None, None)
+            .resolve_did(
+                "telegram".to_string(),
+                "keep-target".to_string(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let source = mgr
@@ -2759,14 +2779,19 @@ mod tests {
             .unwrap();
 
         // The merged-away source DID still resolves to the canonical target.
-        let canonical = mgr.resolve_canonical_did(source.clone(), None).await.unwrap();
+        let canonical = mgr
+            .resolve_canonical_did(source.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(canonical, target);
 
         // And it is listed as an alias of the target. A non-merged DID is unchanged.
         let aliases = mgr.list_alias_dids(target.clone(), None).await.unwrap();
         assert!(aliases.contains(&source));
         assert_eq!(
-            mgr.resolve_canonical_did(target.clone(), None).await.unwrap(),
+            mgr.resolve_canonical_did(target.clone(), None)
+                .await
+                .unwrap(),
             target
         );
     }

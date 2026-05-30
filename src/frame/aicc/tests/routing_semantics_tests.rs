@@ -62,6 +62,33 @@ fn add_llm(
     provider
 }
 
+fn add_image(
+    registry: &Registry,
+    catalog: &ModelCatalog,
+    instance_id: &str,
+    provider_type: &str,
+    cost: f64,
+    latency_ms: u64,
+    result: std::result::Result<ProviderStartResult, aicc::ProviderError>,
+) -> Arc<MockProvider> {
+    catalog.set_mapping(
+        Capability::Image,
+        "image.txt2img.default",
+        provider_type,
+        "m",
+    );
+    let provider = Arc::new(MockProvider::new(
+        mock_instance(instance_id, provider_type, vec![Capability::Image], vec![]),
+        CostEstimate {
+            estimated_cost_usd: Some(cost),
+            estimated_latency_ms: Some(latency_ms),
+        },
+        vec![result],
+    ));
+    registry.add_provider(provider.clone());
+    provider
+}
+
 #[test]
 // 用例说明：
 // - 验证场景：`route_01_mapped_primary_with_fallback` 用例，覆盖回退策略分支。
@@ -653,6 +680,47 @@ async fn helper_llm_chat_expands_to_route_resolve_and_typed_inference() {
         .helper_llm_chat(request, Default::default())
         .await
         .expect("helper.llm_chat should succeed through two-stage flow");
+
+    assert_eq!(response.status, AiMethodStatus::Running);
+    assert_eq!(provider.start_calls(), 1);
+}
+
+#[tokio::test]
+async fn helper_text_to_image_expands_to_route_resolve_and_typed_inference() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let provider = add_image(
+        &registry,
+        &catalog,
+        "p-img",
+        "provider-img",
+        0.02,
+        300,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+    let request = AiMethodRequest::new(
+        Capability::Image,
+        ModelSpec::new("image.txt2img.default".to_string(), None),
+        Requirements::default(),
+        AiPayload::new(
+            Some("draw a cube".to_string()),
+            vec![],
+            vec![],
+            vec![],
+            Some(serde_json::json!({
+                "prompt": "draw a cube",
+                "size": "1024x1024"
+            })),
+            None,
+        ),
+        None,
+    );
+
+    let response = center
+        .helper_text_to_image(request, Default::default())
+        .await
+        .expect("helper.text_to_image should succeed through two-stage flow");
 
     assert_eq!(response.status, AiMethodStatus::Running);
     assert_eq!(provider.start_calls(), 1);

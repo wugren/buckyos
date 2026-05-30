@@ -24,10 +24,10 @@ import {
 } from "../lib/cli.ts";
 import { initRuntime } from "../lib/runtime.ts";
 import {
-  callAicc,
   commonPolicyOptions,
   describeFailure,
   requestNamedObjectOutput,
+  textToImage,
 } from "../lib/aicc.ts";
 import { pickArtifact, saveArtifactToPath, suffixPathByMime } from "../lib/io.ts";
 import {
@@ -138,10 +138,9 @@ export async function run(argv: string[]): Promise<never> {
   //   • 如果是 running，按 external_task_id 在 task-manager 里轮询到终态
   let call;
   try {
-    call = await callAicc(runtime, {
-      capability: "image",
-      method: METHOD,
+    call = await textToImage(runtime, {
       modelAlias: parsed.common.model ?? METHOD,
+      prompt,
       inputJson,
       ...commonPolicyOptions(parsed.common),
     });

@@ -14,8 +14,8 @@ use buckyos_api::{
     GroupUpdateCollectionPolicyReq, GroupUpdateMemberRoleReq, GroupUpdateProfileReq,
     GroupUpdateSubgroupReq, ImportContactEntry, ImportReport, IngressContext, KEventClient,
     MsgCenterHandler, MsgReceiptObj, MsgRecord, MsgRecordPage, MsgRecordWithObject, MsgState,
-    PostSendDelivery, PostSendResult, ReadReceiptState, RouteInfo,
-    SetGroupSubscribersResult, UiSessionStateEntry,
+    PostSendDelivery, PostSendResult, ReadReceiptState, RouteInfo, SetGroupSubscribersResult,
+    UiSessionStateEntry,
 };
 use kRPC::{RPCContext, RPCErrors};
 use log::{info, warn};
@@ -100,7 +100,13 @@ impl MessageCenter {
             return;
         }
         let mut registry = self.tunnel_registry.write().unwrap();
-        registry.insert(tunnel_id, TunnelRoute { tunnel_did, platform });
+        registry.insert(
+            tunnel_id,
+            TunnelRoute {
+                tunnel_did,
+                platform,
+            },
+        );
     }
 
     fn lookup_tunnel_route(&self, tunnel_id: &str) -> Option<TunnelRoute> {
@@ -725,7 +731,9 @@ impl MessageCenter {
         route_info.tunnel_did = Some(route.tunnel_did.clone());
         route_info.platform = Some(route.platform.clone());
         route_info.account_id = Some(account_id);
-        route_info.ext_ids.insert("account_type".to_string(), account_type);
+        route_info
+            .ext_ids
+            .insert("account_type".to_string(), account_type);
 
         Ok(DeliveryPlan {
             tunnel_did: route.tunnel_did,
@@ -1827,7 +1835,13 @@ impl MsgCenterHandler for MessageCenter {
         _ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
         self.contact_mgr
-            .resolve_endpoint_did(platform, account_id, account_type, tunnel_id, contact_mgr_owner)
+            .resolve_endpoint_did(
+                platform,
+                account_id,
+                account_type,
+                tunnel_id,
+                contact_mgr_owner,
+            )
             .await
     }
 

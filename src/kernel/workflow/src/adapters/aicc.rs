@@ -363,11 +363,7 @@ impl ExecutorAdapter for AiccAdapter {
             ))
         })?;
         let request = build_ai_request(&schema, input)?;
-        let response = self
-            .client
-            .call_method(method, request)
-            .await
-            .map_err(|err| WorkflowError::Dispatcher(format!("aicc {} failed: {}", method, err)))?;
+        let response = self.invoke_ai_method(method, request).await?;
         if response.status == AiMethodStatus::Failed {
             // 把 provider 侧失败抛回 orchestrator，让 retry/human-fallback 生效；
             // 否则会把没有 `text` 的伪成功结果写进 node_outputs 并污染缓存，
@@ -383,6 +379,19 @@ impl ExecutorAdapter for AiccAdapter {
 }
 
 impl AiccAdapter {
+    async fn invoke_ai_method(
+        &self,
+        method: &str,
+        request: AiMethodRequest,
+    ) -> WorkflowResult<AiMethodResponse> {
+        let result = match method {
+            ai_methods::LLM_CHAT => self.client.helper_llm_chat(request).await,
+            ai_methods::IMAGE_TXT2IMG => self.client.helper_text_to_image(request).await,
+            _ => self.client.call_method(method, request).await,
+        };
+        result.map_err(|err| WorkflowError::Dispatcher(format!("aicc {} failed: {}", method, err)))
+    }
+
     async fn invoke_cancel(&self, input: &Value) -> WorkflowResult<Value> {
         let task_id = input
             .get("task_id")
@@ -1161,6 +1170,40 @@ mod tests {
             request: AiMethodRequest,
             _ctx: RPCContext,
         ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.record(method, request)
+        }
+
+        async fn handle_cancel(
+            &self,
+            task_id: &str,
+            _ctx: RPCContext,
+        ) -> std::result::Result<buckyos_api::CancelResponse, RPCErrors> {
+            Ok(buckyos_api::CancelResponse::new(task_id.to_string(), true))
+        }
+
+        async fn handle_helper_llm_chat(
+            &self,
+            request: AiMethodRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.record(ai_methods::HELPER_LLM_CHAT, request)
+        }
+
+        async fn handle_helper_text_to_image(
+            &self,
+            request: AiMethodRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.record(ai_methods::HELPER_TEXT_TO_IMAGE, request)
+        }
+    }
+
+    impl EchoHandler {
+        fn record(
+            &self,
+            method: &str,
+            request: AiMethodRequest,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
             *self.last_method.lock().unwrap() = Some(method.to_string());
             *self.last_request.lock().unwrap() = Some(request);
             Ok(AiMethodResponse::new(
@@ -1183,14 +1226,6 @@ mod tests {
                 }),
                 Some("task://task-1/events".to_string()),
             ))
-        }
-
-        async fn handle_cancel(
-            &self,
-            task_id: &str,
-            _ctx: RPCContext,
-        ) -> std::result::Result<buckyos_api::CancelResponse, RPCErrors> {
-            Ok(buckyos_api::CancelResponse::new(task_id.to_string(), true))
         }
     }
 
@@ -1221,13 +1256,44 @@ mod tests {
         assert_eq!(output["event_ref"], "task://task-1/events");
 
         let last_method = handler.last_method.lock().unwrap().clone();
-        assert_eq!(last_method.as_deref(), Some(ai_methods::LLM_CHAT));
+        assert_eq!(last_method.as_deref(), Some(ai_methods::HELPER_LLM_CHAT));
         let request = handler.last_request.lock().unwrap().clone().unwrap();
         assert_eq!(request.model.alias, "llm.chat.test");
         assert_eq!(request.requirements.must_features, vec!["plan".to_string()]);
         assert_eq!(request.requirements.max_cost_usd, Some(0.01));
         assert_eq!(request.payload.messages.len(), 1);
         assert_eq!(request.payload.messages[0].text_content(), "hi");
+    }
+
+    #[tokio::test]
+    async fn image_txt2img_uses_helper() {
+        let handler = Arc::new(EchoHandler::default());
+        let client = Arc::new(AiccClient::new_in_process(Box::new(SharedHandler(
+            handler.clone(),
+        ))));
+        let adapter = AiccAdapter::new(client);
+        let executor = ExecutorRef::parse("service::aicc.image.txt2img").unwrap();
+        let input = json!({
+            "input_json": {
+                "prompt": "draw a cube",
+                "size": "1024x1024"
+            },
+            "model": "image.txt2img.default"
+        });
+        let output = adapter.invoke(&executor, &input).await.unwrap();
+        assert_eq!(output["task_id"], "task-1");
+
+        let last_method = handler.last_method.lock().unwrap().clone();
+        assert_eq!(
+            last_method.as_deref(),
+            Some(ai_methods::HELPER_TEXT_TO_IMAGE)
+        );
+        let request = handler.last_request.lock().unwrap().clone().unwrap();
+        assert_eq!(request.model.alias, "image.txt2img.default");
+        assert_eq!(
+            request.payload.input_json.as_ref().unwrap()["prompt"],
+            "draw a cube"
+        );
     }
 
     #[tokio::test]
@@ -1310,6 +1376,24 @@ mod tests {
         ) -> std::result::Result<buckyos_api::CancelResponse, RPCErrors> {
             Ok(buckyos_api::CancelResponse::new(task_id.to_string(), true))
         }
+
+        async fn handle_helper_llm_chat(
+            &self,
+            request: AiMethodRequest,
+            ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.handle_method(ai_methods::HELPER_LLM_CHAT, request, ctx)
+                .await
+        }
+
+        async fn handle_helper_text_to_image(
+            &self,
+            request: AiMethodRequest,
+            ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.handle_method(ai_methods::HELPER_TEXT_TO_IMAGE, request, ctx)
+                .await
+        }
     }
 
     struct SharedHandler(Arc<EchoHandler>);
@@ -1331,6 +1415,22 @@ mod tests {
             ctx: RPCContext,
         ) -> std::result::Result<buckyos_api::CancelResponse, RPCErrors> {
             self.0.handle_cancel(task_id, ctx).await
+        }
+
+        async fn handle_helper_llm_chat(
+            &self,
+            request: AiMethodRequest,
+            ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.0.handle_helper_llm_chat(request, ctx).await
+        }
+
+        async fn handle_helper_text_to_image(
+            &self,
+            request: AiMethodRequest,
+            ctx: RPCContext,
+        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+            self.0.handle_helper_text_to_image(request, ctx).await
         }
     }
 }

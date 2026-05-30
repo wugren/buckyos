@@ -3,6 +3,7 @@
 
 import {
   AiccMethodResponse,
+  AiMessage,
   AiResponse,
   Capability,
   JsonValue,
@@ -39,6 +40,9 @@ export interface CallOptions {
   capability: Capability;
   method: string;
   modelAlias?: string;
+  text?: string;
+  messages?: AiMessage[];
+  toolSpecs?: Record<string, unknown>[];
   inputJson?: Record<string, unknown>;
   resources?: ResourceRef[];
   options?: Record<string, unknown>;
@@ -124,6 +128,9 @@ function buildRequest(opts: CallOptions): Record<string, unknown> {
     requirements: opts.requirements ?? {},
     disable: opts.disable ?? {},
     payload: {
+      text: opts.text,
+      messages: opts.messages ?? [],
+      tool_specs: opts.toolSpecs ?? [],
       input_json: opts.inputJson ?? {},
       resources: opts.resources ?? [],
       options: opts.options ?? {},
@@ -133,6 +140,12 @@ function buildRequest(opts: CallOptions): Record<string, unknown> {
   if (opts.idempotencyKey) req.idempotency_key = opts.idempotencyKey;
   if (opts.traceId) req.trace_id = opts.traceId;
   return req;
+}
+
+function rpcMethodForCall(method: string): string {
+  if (method === "llm.chat") return "helper.llm_chat";
+  if (method === "image.txt2img") return "helper.text_to_image";
+  return method;
 }
 
 function normalizeTaskList(result: unknown): TaskRecord[] {
@@ -202,7 +215,7 @@ export async function callAicc(runtime: AiccRuntime, opts: CallOptions): Promise
 
   let response: AiccMethodResponse;
   try {
-    response = await aiccRpc.call(opts.method, request) as AiccMethodResponse;
+    response = await aiccRpc.call(rpcMethodForCall(opts.method), request) as AiccMethodResponse;
   } catch (err) {
     throw err instanceof Error ? err : new Error(String(err));
   }
@@ -253,6 +266,67 @@ export async function callAicc(runtime: AiccRuntime, opts: CallOptions): Promise
     rawResponse: response,
     finalTask,
   };
+}
+
+export interface LlmChatOptions extends Partial<CallOptions> {
+  modelAlias?: string;
+  messages: AiMessage[];
+  toolSpecs?: Record<string, unknown>[];
+  responseFormat?: "text" | "json";
+  temperature?: number;
+  maxOutputTokens?: number;
+}
+
+export function llmChat(runtime: AiccRuntime, opts: LlmChatOptions): Promise<CallResult> {
+  const options = {
+    ...(opts.options ?? {}),
+    ...(typeof opts.temperature === "number" ? { temperature: opts.temperature } : {}),
+    ...(typeof opts.maxOutputTokens === "number" ? { max_output_tokens: opts.maxOutputTokens } : {}),
+  };
+  return callAicc(runtime, {
+    ...opts,
+    capability: "llm",
+    method: "llm.chat",
+    modelAlias: opts.modelAlias ?? "llm.chat",
+    messages: opts.messages,
+    toolSpecs: opts.toolSpecs,
+    requirements: {
+      ...(opts.requirements ?? {}),
+      ...(opts.responseFormat === "json" ? { resp_format: "Json" } : {}),
+    },
+    options,
+  });
+}
+
+export interface TextToImageOptions extends Partial<CallOptions> {
+  modelAlias?: string;
+  prompt: string;
+  negativePrompt?: string;
+  size?: string;
+  quality?: string;
+  style?: string;
+  seed?: number;
+  output?: Record<string, unknown>;
+}
+
+export function textToImage(runtime: AiccRuntime, opts: TextToImageOptions): Promise<CallResult> {
+  return callAicc(runtime, {
+    ...opts,
+    capability: "image",
+    method: "image.txt2img",
+    modelAlias: opts.modelAlias ?? "image.txt2img",
+    text: opts.prompt,
+    inputJson: {
+      ...(opts.inputJson ?? {}),
+      prompt: opts.prompt,
+      ...(opts.negativePrompt ? { negative_prompt: opts.negativePrompt } : {}),
+      ...(opts.size ? { size: opts.size } : {}),
+      ...(opts.quality ? { quality: opts.quality } : {}),
+      ...(opts.style ? { style: opts.style } : {}),
+      ...(typeof opts.seed === "number" ? { seed: opts.seed } : {}),
+      ...(opts.output ? { output: opts.output } : {}),
+    },
+  });
 }
 
 export function describeFailure(result: CallResult): string {

@@ -2,8 +2,7 @@ use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use buckyos_api::{
     get_buckyos_api_runtime, AccessGroupLevel, BoxKind, Contact, ContactQuery, Event, KEventClient,
-    MsgCenterClient, MsgRecordWithObject, MsgState, UserType,
-    CONTROL_PANEL_SERVICE_NAME,
+    MsgCenterClient, MsgRecordWithObject, MsgState, UserType, CONTROL_PANEL_SERVICE_NAME,
 };
 use buckyos_http_server::{server_err, ServerError, ServerErrorCode, ServerResult};
 use bytes::Bytes;

@@ -799,7 +799,11 @@ async fn apply_tg_tunnel_settings(
     cfg.supports_egress = settings.telegram_tunnel.supports_egress;
     // Register the tunnel route so post_send can map a second-level DID's short
     // tunnel_id back to this tunnel box-owner DID.
-    center.register_tunnel(tunnel_id.clone(), tunnel_did.clone(), "telegram".to_string());
+    center.register_tunnel(
+        tunnel_id.clone(),
+        tunnel_did.clone(),
+        "telegram".to_string(),
+    );
     let tg_tunnel = Arc::new(build_tg_tunnel(cfg, &settings.telegram_tunnel)?);
 
     tg_tunnel

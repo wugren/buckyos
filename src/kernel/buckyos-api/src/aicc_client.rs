@@ -1705,6 +1705,67 @@ impl AiccClient {
         }
     }
 
+    pub async fn helper_llm_chat(
+        &self,
+        request: AiMethodRequest,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        request
+            .payload
+            .validate_all_messages()
+            .map_err(|err| RPCErrors::ParseRequestError(format!("invalid AiMessage: {err}")))?;
+
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_helper_llm_chat(request, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req_json = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize AiMethodRequest: {}",
+                        error
+                    ))
+                })?;
+                let result = client.call(ai_methods::HELPER_LLM_CHAT, req_json).await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse helper.llm_chat response: {}",
+                        error
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn helper_text_to_image(
+        &self,
+        request: AiMethodRequest,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_helper_text_to_image(request, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req_json = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize AiMethodRequest: {}",
+                        error
+                    ))
+                })?;
+                let result = client
+                    .call(ai_methods::HELPER_TEXT_TO_IMAGE, req_json)
+                    .await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse helper.text_to_image response: {}",
+                        error
+                    ))
+                })
+            }
+        }
+    }
+
     pub async fn cancel(&self, task_id: &str) -> std::result::Result<CancelResponse, RPCErrors> {
         match self {
             Self::InProcess(handler) => {

@@ -183,17 +183,18 @@ async fn dispatch_group_message_creates_group_and_agent_views() {
 async fn post_send_to_endpoint_did_creates_owner_and_tunnel_outbox_records() {
     let (center, _tmp) = new_center("post_send").await;
     let tunnel_did = DID::new("bns", "tg-tunnel-box");
-    center.register_tunnel("tg-main".to_string(), tunnel_did.clone(), "telegram".to_string());
+    center.register_tunnel(
+        "tg-main".to_string(),
+        tunnel_did.clone(),
+        "telegram".to_string(),
+    );
 
     let author = DID::new("bns", "author-b");
     // A determined second-level endpoint DID carries its own routing.
     let target = DID::new("msgtunnel", "12345.user.tg-main");
     let msg = make_msg(author.clone(), vec![target], MsgObjKind::Chat);
 
-    let post_send = center
-        .handle_post_send(msg, None, ctx())
-        .await
-        .unwrap();
+    let post_send = center.handle_post_send(msg, None, ctx()).await.unwrap();
     assert!(post_send.ok);
     assert_eq!(post_send.deliveries.len(), 1);
     assert_eq!(post_send.deliveries[0].tunnel_did, tunnel_did);

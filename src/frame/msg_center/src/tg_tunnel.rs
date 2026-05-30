@@ -1366,7 +1366,11 @@ impl GrammersTgGateway {
             .handle_resolve_did(
                 TELEGRAM_PLATFORM.to_string(),
                 account_id.clone(),
-                Some(Self::profile_hint_from_chat(chat, bot_account_id, tunnel_id)),
+                Some(Self::profile_hint_from_chat(
+                    chat,
+                    bot_account_id,
+                    tunnel_id,
+                )),
                 owner_scope,
                 RPCContext::default(),
             )

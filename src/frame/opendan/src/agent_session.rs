@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use buckyos_api::{
     get_buckyos_api_runtime, match_event_patterns, parse_typed_task_data, AiContent, AiMessage,
     AiRole, MsgCenterClient, Task, TaskFilter, TaskManagerClient, TaskNote, TaskStatus,
-    TypedTaskData, UI_SESSION_STATE_STATUS_LINE_KEY,
-    UI_SESSION_STATE_TYPING_KEY,
+    TypedTaskData, UI_SESSION_STATE_STATUS_LINE_KEY, UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
 use ndn_lib::{MsgContent, MsgObjKind, MsgObject};
@@ -1899,7 +1898,15 @@ impl AgentSession {
         let real_work = has_user_msg || has_non_heartbeat_event || notebook_changed;
 
         let (run, next_idle_heartbeats, reason) = if real_work {
-            (true, 0u32, if notebook_changed { "notebook_changed" } else { "input" })
+            (
+                true,
+                0u32,
+                if notebook_changed {
+                    "notebook_changed"
+                } else {
+                    "input"
+                },
+            )
         } else {
             // No change: only the periodic hard-barrier heartbeat keeps us
             // running. First gap after activity is 15min; once we've fired an
@@ -6639,7 +6646,9 @@ fn notebook_latest_active_update_secs(
     match notebook.latest_active_item_update_secs() {
         Ok(secs) => secs,
         Err(err) => {
-            warn!("opendan.session: query notebook latest update for self_check gate failed: {err}");
+            warn!(
+                "opendan.session: query notebook latest update for self_check gate failed: {err}"
+            );
             0
         }
     }
