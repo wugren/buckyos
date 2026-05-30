@@ -26,7 +26,7 @@ pub const TASK_MANAGER_SERVICE_PORT: u16 = 3380;
 pub const TASK_MANAGER_RDB_INSTANCE_ID: &str = "task-mgr-main";
 /// Version of the task table schema. Bump whenever the DDL below changes in a
 /// way that is not trivially re-idempotent, so the scheduler can detect drift.
-pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 4;
+pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 5;
 
 /// Sqlite DDL for the task-manager database. `CREATE TABLE IF NOT EXISTS` so
 /// the migration is safe to re-run on every process start.
@@ -34,7 +34,6 @@ pub const TASK_MANAGER_RDB_SCHEMA_SQLITE: &str = r#"
 CREATE TABLE IF NOT EXISTS task (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
-    title           TEXT,
     task_type       TEXT NOT NULL,
     runner          TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
@@ -54,7 +53,6 @@ CREATE TABLE IF NOT EXISTS task (
     message         TEXT,
     FOREIGN KEY(parent_id) REFERENCES task(id) ON DELETE CASCADE
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_task_name_scope ON task(app_id, user_id, name);
 CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
 CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);
@@ -85,7 +83,6 @@ pub const TASK_MANAGER_RDB_SCHEMA_POSTGRES: &str = r#"
 CREATE TABLE IF NOT EXISTS task (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL,
-    title           TEXT,
     task_type       TEXT NOT NULL,
     runner          TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
@@ -104,7 +101,6 @@ CREATE TABLE IF NOT EXISTS task (
     permissions     TEXT,
     message         TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_task_name_scope ON task(app_id, user_id, name);
 CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
 CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);

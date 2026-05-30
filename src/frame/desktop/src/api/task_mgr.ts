@@ -317,7 +317,9 @@ function normalizeSchedulePayload(
       ...request,
       schedule_id: scheduleId,
       name,
-      status: (asString(request.status) as WorkflowScheduleStatus | null) ?? toScheduleStatus(status),
+      // schedule 状态的唯一真相是 Task 的 status 列（后端已统一用 TaskStatus）。
+      // 不再读 request.status 字符串（它现在是 TaskStatus 词汇，非本 UI 的友好枚举）。
+      status: toScheduleStatus(status),
       schedule,
       target,
     },

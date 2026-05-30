@@ -146,9 +146,6 @@ pub async fn start_workflow_service() -> Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("workflow service login failed: {:?}", err))?;
     runtime.set_main_service_port(WORKFLOW_SERVICE_PORT).await;
-    let data_dir = runtime
-        .get_data_folder()
-        .map_err(|err| anyhow::anyhow!("workflow data folder unavailable: {:?}", err))?;
     let buckyos_root = runtime.buckyos_root_dir.clone();
 
     // §6.3：Run / Step / Map shard / Thunk 同步到 task_manager。客户端拿不到
@@ -204,7 +201,18 @@ pub async fn start_workflow_service() -> Result<()> {
 
     let definitions = Arc::new(DefinitionStore::new());
     let runs = Arc::new(RunStore::new());
-    let schedules = Arc::new(ScheduleStore::load(data_dir.join("schedules.json")));
+    // schedule 的唯一真相源是 Task DB（task_type=workflow/schedule 的 root task）。
+    // 这里只持有内存运行投影，启动时从 Task DB 重建；自身不落盘。
+    let schedule_mirror = task_mgr_client.clone().map(|client| {
+        Arc::new(ScheduleTaskMirrorClient::new(
+            client,
+            user_id.clone(),
+            app_id.clone(),
+        ))
+    });
+    // hydrate 不在 boot 时一次性做（task_mgr 可能尚未就绪）；交给 scan 循环
+    // 首个 tick 起持续重试直到成功，见 WorkflowRpcHandler::ensure_schedules_hydrated。
+    let schedules = Arc::new(ScheduleStore::new_memory());
     if let (Some(task_mgr), Some(msg_center)) = (task_mgr_client.clone(), msg_center_client) {
         SendMessageTaskExecutor::new(task_mgr, msg_center, schedules.clone(), buckyos_root).start();
         info!("workflow.send_message executor started");
@@ -235,12 +243,8 @@ pub async fn start_workflow_service() -> Result<()> {
     let mut rpc_handler = WorkflowRpcHandler::new(definitions, runs, orchestrator)
         .with_schedules(schedules)
         .with_subscriptions(subscriptions);
-    if let Some(client) = task_mgr_client.clone() {
-        rpc_handler = rpc_handler.with_schedule_mirror(Arc::new(ScheduleTaskMirrorClient::new(
-            client,
-            user_id.clone(),
-            app_id.clone(),
-        )));
+    if let Some(mirror) = schedule_mirror {
+        rpc_handler = rpc_handler.with_schedule_mirror(mirror);
     }
     let rpc = Arc::new(rpc_handler);
     start_schedule_loop(rpc.clone());

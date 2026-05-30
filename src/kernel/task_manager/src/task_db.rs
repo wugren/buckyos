@@ -97,6 +97,44 @@ impl TaskDb {
         for statement in split_sql_statements(ddl) {
             self.pool.execute(statement.as_str()).await?;
         }
+        self.cleanup_removed_task_schema().await?;
+        Ok(())
+    }
+
+    async fn cleanup_removed_task_schema(&self) -> DbResult<()> {
+        self.drop_task_name_scope_index().await?;
+        self.drop_task_title_column().await
+    }
+
+    async fn drop_task_name_scope_index(&self) -> DbResult<()> {
+        let sql = match self.backend {
+            RdbBackend::Sqlite => "DROP INDEX IF EXISTS idx_task_name_scope",
+            RdbBackend::Postgres => "DROP INDEX IF EXISTS idx_task_name_scope",
+        };
+        self.pool.execute(sql).await?;
+        Ok(())
+    }
+
+    async fn drop_task_title_column(&self) -> DbResult<()> {
+        match self.backend {
+            RdbBackend::Sqlite => {
+                let exists = sqlx::query("SELECT 1 FROM pragma_table_info('task') WHERE name = ?")
+                    .bind("title")
+                    .fetch_optional(self.pool())
+                    .await?
+                    .is_some();
+                if exists {
+                    self.pool
+                        .execute("ALTER TABLE task DROP COLUMN title")
+                        .await?;
+                }
+            }
+            RdbBackend::Postgres => {
+                self.pool
+                    .execute("ALTER TABLE task DROP COLUMN IF EXISTS title")
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -113,16 +151,15 @@ impl TaskDb {
 
         let sql = self.render_sql(
             "INSERT INTO task (
-                name, title, task_type, runner, status, progress,
+                name, task_type, runner, status, progress,
                 total_items, completed_items, error_message, data,
                 created_at, updated_at, user_id, app_id, session_id, parent_id,
                 root_id, permissions, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id",
         );
 
         let row = sqlx::query(&sql)
-            .bind(task.name.clone())
             .bind(task.name.clone())
             .bind(task.task_type.clone())
             .bind(task.runner.clone())
@@ -734,13 +771,68 @@ mod tests {
         assert!(id > 0);
 
         let task_1_again = create_test_task("task1");
-        let id2 = db.create_task(&task_1_again).await;
-        assert!(id2.is_err());
+        let id2 = db.create_task(&task_1_again).await.unwrap();
+        assert_ne!(id, id2);
 
         let retrieved_task = db.get_task(id).await.unwrap().unwrap();
         assert_eq!(retrieved_task.id, id);
         assert_eq!(retrieved_task.name, "task1");
         assert_eq!(retrieved_task.status, TaskStatus::Pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_open_cleans_removed_task_schema() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let conn = format!("sqlite://{}?mode=rwc", db_path.to_str().unwrap());
+        let old_schema = r#"
+CREATE TABLE IF NOT EXISTS task (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    title           TEXT,
+    task_type       TEXT NOT NULL,
+    runner          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL,
+    progress        REAL NOT NULL,
+    total_items     INTEGER NOT NULL DEFAULT 0,
+    completed_items INTEGER NOT NULL DEFAULT 0,
+    error_message   TEXT,
+    data            TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    user_id         TEXT NOT NULL DEFAULT '',
+    app_id          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    parent_id       INTEGER,
+    root_id         TEXT NOT NULL DEFAULT '',
+    permissions     TEXT,
+    message         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_name_scope ON task(app_id, user_id, name);
+"#;
+
+        let db = TaskDb::open(&conn, RdbBackend::Sqlite, Some(old_schema))
+            .await
+            .unwrap();
+
+        let title_column = sqlx::query("SELECT 1 FROM pragma_table_info('task') WHERE name = ?")
+            .bind("title")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+        assert!(title_column.is_none());
+
+        let name_scope_index =
+            sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?")
+                .bind("idx_task_name_scope")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        assert!(name_scope_index.is_none());
+
+        let id1 = db.create_task(&create_test_task("task1")).await.unwrap();
+        let id2 = db.create_task(&create_test_task("task1")).await.unwrap();
+        assert_ne!(id1, id2);
     }
 
     #[tokio::test(flavor = "current_thread")]

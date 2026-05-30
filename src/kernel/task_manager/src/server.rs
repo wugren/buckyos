@@ -109,15 +109,6 @@ fn request_context_from_source_or_rpc(
     request_ctx
 }
 
-fn unique_task_name_conflict(err: &RPCErrors) -> bool {
-    matches!(
-        err,
-        RPCErrors::ReasonError(message)
-            if message.contains("UNIQUE constraint failed")
-                || message.contains("idx_task_name_scope")
-    )
-}
-
 #[derive(Clone)]
 struct TaskManagerService {
     kevent_client: KEventClient,
@@ -607,7 +598,7 @@ impl TaskManagerHandler for TaskManagerService {
         let task_data =
             build_download_task_data(download_url, resolved_objid.as_ref(), download_options);
 
-        let task = match self
+        let task = self
             .handle_create_task(
                 task_name.as_str(),
                 DOWNLOAD_TASK_TYPE,
@@ -617,18 +608,7 @@ impl TaskManagerHandler for TaskManagerService {
                 app_id,
                 ctx.clone(),
             )
-            .await
-        {
-            Ok(task) => task,
-            Err(err) if unique_task_name_conflict(&err) => {
-                let scoped_tasks = self.list_download_tasks_for_request(&request_ctx).await?;
-                scoped_tasks
-                    .into_iter()
-                    .find(|task| task.name == task_name)
-                    .ok_or(err)?
-            }
-            Err(err) => return Err(err),
-        };
+            .await?;
 
         if let Some(spec) = spec_from_task(&task) {
             let _ = shared_download_executor()

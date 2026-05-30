@@ -18,7 +18,7 @@
 //! 形态调用方使用，后者由直连 HTTP 客户端使用——同 msg_center / aicc 的惯例。
 
 use ::kRPC::*;
-use buckyos_api::WorkflowDefinition;
+use buckyos_api::{TaskStatus, WorkflowDefinition};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -35,7 +35,7 @@ use crate::scheduled_task_manager::{
     due_fire_times, is_reboot_schedule, next_fire_after, next_fire_times, render_subtask_template,
     rfc3339, schedule_policy_from_value, schedule_spec_from_value, schedule_target_from_value,
     schedule_workflow_id, validate_subtask_template, FireStatus, MisfirePolicy, ScheduleFireRecord,
-    ScheduleSpec, ScheduleState, ScheduleStatus, ScheduleStore, ScheduleTarget, ScheduleTaskMirror,
+    ScheduleSpec, ScheduleState, ScheduleStore, ScheduleTarget, ScheduleTaskMirror,
     ScheduleTaskMirrorClient, WorkflowSchedule,
 };
 use crate::state::{
@@ -56,6 +56,11 @@ pub struct WorkflowRpcHandler {
     schedules: Arc<ScheduleStore>,
     orchestrator: Arc<ServiceOrchestrator>,
     schedule_mirror: Option<Arc<ScheduleTaskMirrorClient>>,
+    /// schedule 内存投影是否已从 Task DB 灌入。boot 时 task_mgr 可能尚未就绪，
+    /// 加载会失败；由 scan 循环每 tick 重试直到成功（对齐 kevent+sweep 兜底）。
+    schedules_hydrated: std::sync::atomic::AtomicBool,
+    /// 仅用于把 hydrate 失败的 WARN 节流成首次一条，避免每秒刷屏。
+    schedules_hydrate_warned: std::sync::atomic::AtomicBool,
     /// task_mgr 事件订阅管理器。tests / 不需要回灌 human_action 的部署可以为
     /// None；生产路径在 main.rs 里注入。
     subscriptions: Option<Arc<RunSubscriptionManager>>,
@@ -73,6 +78,8 @@ impl WorkflowRpcHandler {
             schedules: Arc::new(ScheduleStore::new_memory()),
             orchestrator,
             schedule_mirror: None,
+            schedules_hydrated: std::sync::atomic::AtomicBool::new(false),
+            schedules_hydrate_warned: std::sync::atomic::AtomicBool::new(false),
             subscriptions: None,
         }
     }
@@ -704,8 +711,8 @@ impl WorkflowRpcHandler {
         let policy = schedule_policy_from_value(params.get("policy"))
             .map_err(|err| RPCErrors::ParseRequestError(format!("invalid `policy`: {}", err)))?;
         let now = Utc::now().timestamp();
-        let status = optional_schedule_status(params).unwrap_or(ScheduleStatus::Enabled);
-        let next_fire_at = if status == ScheduleStatus::Enabled {
+        let status = optional_schedule_status(params).unwrap_or(TaskStatus::Running);
+        let next_fire_at = if status == TaskStatus::Running {
             initial_next_fire_at(&schedule, now)
         } else {
             None
@@ -753,7 +760,7 @@ impl WorkflowRpcHandler {
         }
         if params.get("schedule").is_some() {
             next_schedule.schedule = parse_schedule_spec(params)?;
-            if next_schedule.status == ScheduleStatus::Enabled {
+            if next_schedule.status == TaskStatus::Running {
                 next_schedule.state.next_fire_at =
                     initial_next_fire_at(&next_schedule.schedule, Utc::now().timestamp());
             }
@@ -810,8 +817,7 @@ impl WorkflowRpcHandler {
     }
 
     async fn pause_scheduled_task(&self, params: &Value) -> RpcResult<Value> {
-        self.set_schedule_status(params, ScheduleStatus::Paused)
-            .await
+        self.set_schedule_status(params, TaskStatus::Paused).await
     }
 
     async fn resume_scheduled_task(&self, params: &Value) -> RpcResult<Value> {
@@ -819,7 +825,7 @@ impl WorkflowRpcHandler {
         let updated = self
             .schedules
             .update(&schedule_id, |record| {
-                record.status = ScheduleStatus::Enabled;
+                record.status = TaskStatus::Running;
                 record.state.next_fire_at =
                     initial_next_fire_at(&record.schedule, Utc::now().timestamp());
                 record.state.last_error = None;
@@ -835,21 +841,16 @@ impl WorkflowRpcHandler {
     }
 
     async fn archive_scheduled_task(&self, params: &Value) -> RpcResult<Value> {
-        self.set_schedule_status(params, ScheduleStatus::Archived)
-            .await
+        self.set_schedule_status(params, TaskStatus::Canceled).await
     }
 
-    async fn set_schedule_status(
-        &self,
-        params: &Value,
-        status: ScheduleStatus,
-    ) -> RpcResult<Value> {
+    async fn set_schedule_status(&self, params: &Value, status: TaskStatus) -> RpcResult<Value> {
         let schedule_id = require_string(params, "schedule_id")?;
         let updated = self
             .schedules
             .update(&schedule_id, |record| {
                 record.status = status;
-                if status == ScheduleStatus::Archived {
+                if status == TaskStatus::Canceled {
                     record.state.next_fire_at = None;
                 }
             })
@@ -924,19 +925,63 @@ impl WorkflowRpcHandler {
         }))
     }
 
+    /// 把内存投影从 Task DB（唯一真相源）灌入。boot 时 task_mgr 可能未就绪 ⇒
+    /// 加载失败时不放弃，保持未 hydrate，由 scan 循环下个 tick 重试（sweep 兜底）。
+    /// 成功一次即停；hydrate 本身 insert-if-absent，不覆盖进程内已有的运行态。
+    async fn ensure_schedules_hydrated(&self) {
+        use std::sync::atomic::Ordering;
+        if self.schedules_hydrated.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(mirror) = self.schedule_mirror.as_ref() else {
+            // 没有 task_mgr（测试 / in-process）：无可加载，视为已 hydrate。
+            self.schedules_hydrated.store(true, Ordering::Relaxed);
+            return;
+        };
+        match mirror.load_schedules().await {
+            Ok(loaded) => {
+                let count = loaded.len();
+                self.schedules.hydrate(loaded).await;
+                self.schedules_hydrated.store(true, Ordering::Relaxed);
+                log::info!("workflow schedules hydrated from task db: {}", count);
+            }
+            Err(err) => {
+                if !self.schedules_hydrate_warned.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "hydrate workflow schedules from task db failed (will retry each scan tick): {}",
+                        err
+                    );
+                } else {
+                    log::debug!("hydrate workflow schedules retry failed: {}", err);
+                }
+            }
+        }
+    }
+
     pub async fn scan_due_schedules(&self) {
+        self.ensure_schedules_hydrated().await;
+        if !self
+            .schedules_hydrated
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // task_mgr 尚不可达，schedule 未加载，跳过本 tick，下个 tick 再重试。
+            return;
+        }
         let now = Utc::now().timestamp();
         let due = self.schedules.due(now).await;
         for schedule in due {
             let (fire_times, next_fire_at, missed_error) = due_fire_times(&schedule, now);
             if let Some(error) = missed_error {
-                let _ = self
+                let updated = self
                     .schedules
                     .update(&schedule.schedule_id, |record| {
                         record.state.last_error = Some(error);
                         record.state.next_fire_at = next_fire_at;
                     })
                     .await;
+                if let Some(record) = updated.as_ref() {
+                    self.update_scheduled_task_root_task(record).await;
+                }
                 continue;
             }
             for fire_time in fire_times {
@@ -972,7 +1017,7 @@ impl WorkflowRpcHandler {
             .get(schedule_id)
             .await
             .ok_or_else(|| not_found("schedule", schedule_id))?;
-        if !manual && schedule.status != ScheduleStatus::Enabled {
+        if !manual && schedule.status != TaskStatus::Running {
             return Err(json!({
                 "ok": false,
                 "error": "schedule_not_enabled",
@@ -1141,7 +1186,7 @@ impl WorkflowRpcHandler {
                     record.state.consecutive_failures = 0;
                     record.state.last_error = None;
                     if matches!(record.schedule, ScheduleSpec::Once { .. }) {
-                        record.status = ScheduleStatus::Archived;
+                        record.status = TaskStatus::Canceled;
                         record.state.next_fire_at = None;
                     } else if is_reboot_schedule(&record.schedule) {
                         record.state.next_fire_at = None;
@@ -1200,7 +1245,7 @@ impl WorkflowRpcHandler {
                 record.state.consecutive_failures = 0;
                 record.state.last_error = None;
                 if matches!(record.schedule, ScheduleSpec::Once { .. }) {
-                    record.status = ScheduleStatus::Archived;
+                    record.status = TaskStatus::Canceled;
                     record.state.next_fire_at = None;
                 } else if is_reboot_schedule(&record.schedule) {
                     record.state.next_fire_at = None;
@@ -1233,7 +1278,7 @@ impl WorkflowRpcHandler {
         let updated = self
             .schedules
             .update(&schedule.schedule_id, |record| {
-                record.status = ScheduleStatus::Error;
+                record.status = TaskStatus::Failed;
                 record.state.consecutive_failures =
                     record.state.consecutive_failures.saturating_add(1);
                 record.state.last_error = Some(error.clone());
@@ -1415,21 +1460,16 @@ fn parse_schedule_target(params: &Value) -> RpcResult<ScheduleTarget> {
         .map_err(|err| RPCErrors::ParseRequestError(format!("invalid `target`: {}", err)))
 }
 
-fn optional_schedule_status(params: &Value) -> Option<ScheduleStatus> {
+fn optional_schedule_status(params: &Value) -> Option<TaskStatus> {
     params
         .get("status")
         .and_then(Value::as_str)
         .and_then(parse_schedule_status)
 }
 
-fn parse_schedule_status(raw: &str) -> Option<ScheduleStatus> {
-    match raw {
-        "enabled" => Some(ScheduleStatus::Enabled),
-        "paused" => Some(ScheduleStatus::Paused),
-        "archived" => Some(ScheduleStatus::Archived),
-        "error" => Some(ScheduleStatus::Error),
-        _ => None,
-    }
+/// schedule status 直接用 TaskStatus 词汇（Running/Paused/Canceled/Failed）。
+fn parse_schedule_status(raw: &str) -> Option<TaskStatus> {
+    TaskStatus::from_str(raw).ok()
 }
 
 fn initial_next_fire_at(schedule: &ScheduleSpec, now: i64) -> Option<i64> {
@@ -2190,9 +2230,9 @@ mod tests {
         };
 
         for (method, expected) in [
-            ("pause_scheduled_task", "paused"),
-            ("resume_scheduled_task", "enabled"),
-            ("archive_scheduled_task", "archived"),
+            ("pause_scheduled_task", "Paused"),
+            ("resume_scheduled_task", "Running"),
+            ("archive_scheduled_task", "Canceled"),
         ] {
             let resp = handler
                 .handle_rpc_call(

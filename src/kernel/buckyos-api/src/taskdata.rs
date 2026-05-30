@@ -891,6 +891,34 @@ pub struct WorkflowScheduleTaskRequest {
     pub schedule: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<Value>,
+    // 下面三项让 Task DB 成为 schedule 的无损唯一真相源（owner/policy/description
+    // 不在 Task 列里，必须随 TaskData 落库，否则重启从 Task DB 重建会丢触发语义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<WorkflowScheduleOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<WorkflowSchedulePolicy>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowScheduleOwner {
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub app_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowSchedulePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub misfire: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_runs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_sec: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1518,6 +1546,8 @@ fn parse_workflow_schedule_legacy(
             status: legacy.schedule.status,
             schedule: legacy.schedule.schedule,
             target: legacy.schedule.target,
+            // 旧格式不带 owner/policy/description；留默认，由后续 update 回填。
+            ..Default::default()
         },
         progress: None,
         result: Some(WorkflowScheduleTaskResult {

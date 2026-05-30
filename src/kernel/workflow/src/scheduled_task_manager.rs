@@ -1,28 +1,20 @@
 use buckyos_api::{
-    parse_typed_task_data, CreateTaskOptions, TaskFilter, TaskManagerClient, TaskPermissions,
-    TaskScope, TaskStatus, TypedTaskData, WorkflowScheduleTaskData, WorkflowScheduleTaskRequest,
-    WorkflowScheduleTaskResult,
+    parse_typed_task_data, CreateTaskOptions, Task, TaskFilter, TaskManagerClient, TaskPermissions,
+    TaskScope, TaskStatus, TypedTaskData, WorkflowScheduleOwner, WorkflowSchedulePolicy,
+    WorkflowScheduleTaskData, WorkflowScheduleTaskRequest, WorkflowScheduleTaskResult,
 };
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
-use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::state::Owner;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleStatus {
-    Enabled,
-    Paused,
-    Archived,
-    Error,
-}
+// schedule 状态直接用 Task DB 的权威类型 TaskStatus，不再发明平行枚举。
+// 映射约定：Running=启用 / Paused=暂停 / Canceled=归档 / Failed=错误。
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -124,7 +116,7 @@ pub struct WorkflowSchedule {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    pub status: ScheduleStatus,
+    pub status: TaskStatus,
     pub schedule: ScheduleSpec,
     pub target: ScheduleTarget,
     pub state: ScheduleState,
@@ -192,12 +184,6 @@ impl ScheduleFireRecord {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ScheduleSnapshot {
-    schedules: Vec<WorkflowSchedule>,
-    fires: Vec<ScheduleFireRecord>,
-}
-
 #[derive(Default)]
 struct ScheduleInner {
     schedules: HashMap<String, WorkflowSchedule>,
@@ -205,28 +191,42 @@ struct ScheduleInner {
     fire_key_index: HashMap<String, String>,
 }
 
+/// 进程内的 schedule 运行投影。**不是真相源** —— schedule 的唯一真相落在
+/// Task Manager 的 Task DB（task_type=`workflow/schedule` 的 root task，其 TaskData
+/// 承载完整定义；触发记录是其子 task）。这里只持有「热扫描路径」需要的内存视图：
+/// schedule 定义缓存 + 派生的 `next_fire_at` + 进程内 fire 去重索引。重启时由
+/// `hydrate` 从 Task DB 灌入，自身不落盘（空闲 tick 因此零 I/O，写只发生在
+/// 真实状态跃迁，经 mirror 落到 Task DB）。
 pub struct ScheduleStore {
     inner: RwLock<ScheduleInner>,
-    path: Option<PathBuf>,
 }
 
 impl ScheduleStore {
     pub fn new_memory() -> Self {
         Self {
             inner: RwLock::new(ScheduleInner::default()),
-            path: None,
         }
     }
 
-    pub fn load(path: PathBuf) -> Self {
-        let inner = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<ScheduleSnapshot>(&raw).ok())
-            .map(snapshot_to_inner)
-            .unwrap_or_default();
-        Self {
-            inner: RwLock::new(inner),
-            path: Some(path),
+    /// 启动时把从 Task DB 读回的 schedule 灌进内存投影。reboot 类 schedule 在
+    /// 重启后立即重新 arm（对齐旧 snapshot 恢复语义）。不落盘。
+    ///
+    /// **insert-if-absent**：已在内存中的 schedule_id 不覆盖 —— 进程内的运行态
+    /// （可能含未回写 Task DB 的临时 next_fire_at）比 Task DB 快照更新鲜。配合
+    /// scan 循环的「失败重试」兜底，避免迟到的 hydrate clobber 掉新建/在跑的 schedule。
+    pub async fn hydrate(&self, schedules: Vec<WorkflowSchedule>) {
+        let now = Utc::now().timestamp();
+        let mut guard = self.inner.write().await;
+        for mut schedule in schedules {
+            if guard.schedules.contains_key(&schedule.schedule_id) {
+                continue;
+            }
+            if schedule.status == TaskStatus::Running && is_reboot_schedule(&schedule.schedule) {
+                schedule.state.next_fire_at = Some(now);
+            }
+            guard
+                .schedules
+                .insert(schedule.schedule_id.clone(), schedule);
         }
     }
 
@@ -235,7 +235,6 @@ impl ScheduleStore {
         guard
             .schedules
             .insert(schedule.schedule_id.clone(), schedule.clone());
-        self.persist_locked(&guard);
         schedule
     }
 
@@ -246,7 +245,7 @@ impl ScheduleStore {
     pub async fn list(
         &self,
         owner: Option<&Owner>,
-        status: Option<ScheduleStatus>,
+        status: Option<TaskStatus>,
         workflow_id: Option<&str>,
         name: Option<&str>,
     ) -> Vec<WorkflowSchedule> {
@@ -281,7 +280,6 @@ impl ScheduleStore {
             schedule.updated_at = Utc::now().timestamp();
             schedule.clone()
         };
-        self.persist_locked(&guard);
         Some(updated)
     }
 
@@ -291,7 +289,7 @@ impl ScheduleStore {
             .await
             .schedules
             .values()
-            .filter(|schedule| schedule.status == ScheduleStatus::Enabled)
+            .filter(|schedule| schedule.status == TaskStatus::Running)
             .filter(|schedule| {
                 schedule
                     .state
@@ -333,7 +331,6 @@ impl ScheduleStore {
         };
         guard.fire_key_index.insert(fire_key, fire.fire_id.clone());
         guard.fires_by_id.insert(fire.fire_id.clone(), fire.clone());
-        self.persist_locked(&guard);
         (fire, true)
     }
 
@@ -355,7 +352,6 @@ impl ScheduleStore {
             fire.updated_at = Utc::now().timestamp();
             fire.clone()
         };
-        self.persist_locked(&guard);
         Some(updated)
     }
 
@@ -373,50 +369,6 @@ impl ScheduleStore {
         out.truncate(limit);
         out
     }
-
-    fn persist_locked(&self, guard: &ScheduleInner) {
-        let Some(path) = self.path.as_ref() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                warn!("create workflow schedule store dir failed: {}", err);
-                return;
-            }
-        }
-        let snapshot = ScheduleSnapshot {
-            schedules: guard.schedules.values().cloned().collect(),
-            fires: guard.fires_by_id.values().cloned().collect(),
-        };
-        match serde_json::to_vec_pretty(&snapshot) {
-            Ok(bytes) => {
-                if let Err(err) = std::fs::write(path, bytes) {
-                    warn!("write workflow schedule store failed: {}", err);
-                }
-            }
-            Err(err) => warn!("serialize workflow schedule store failed: {}", err),
-        }
-    }
-}
-
-fn snapshot_to_inner(snapshot: ScheduleSnapshot) -> ScheduleInner {
-    let mut inner = ScheduleInner::default();
-    let now = Utc::now().timestamp();
-    for mut schedule in snapshot.schedules {
-        if schedule.status == ScheduleStatus::Enabled && is_reboot_schedule(&schedule.schedule) {
-            schedule.state.next_fire_at = Some(now);
-        }
-        inner
-            .schedules
-            .insert(schedule.schedule_id.clone(), schedule);
-    }
-    for fire in snapshot.fires {
-        inner
-            .fire_key_index
-            .insert(fire.fire_key.clone(), fire.fire_id.clone());
-        inner.fires_by_id.insert(fire.fire_id.clone(), fire);
-    }
-    inner
 }
 
 pub struct ScheduleTaskMirrorClient {
@@ -494,7 +446,7 @@ impl ScheduleTaskMirrorClient {
         self.client
             .update_task(
                 task_id,
-                Some(map_schedule_status(schedule.status)),
+                Some(schedule.status),
                 None,
                 Some(schedule_message(schedule)),
                 Some(schedule_task_data(schedule)),
@@ -636,6 +588,131 @@ impl ScheduleTaskMirrorClient {
             })
             .map(|task| task.id))
     }
+
+    /// 启动时从 Task DB 把全部 `workflow/schedule` root task 读回并解析成
+    /// WorkflowSchedule。这是「Task DB 是唯一真相源、内存只是投影」的入口：
+    /// 解析失败的脏行被跳过（不让一条坏数据挡住整批 hydrate）。
+    pub async fn load_schedules(&self) -> Result<Vec<WorkflowSchedule>, String> {
+        let tasks = self
+            .client
+            .list_tasks(
+                Some(TaskFilter {
+                    app_id: Some(self.app_id.clone()),
+                    task_type: Some("workflow/schedule".to_string()),
+                    ..Default::default()
+                }),
+                Some(self.user_id.as_str()),
+                Some(self.app_id.as_str()),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(tasks.iter().filter_map(schedule_from_task).collect())
+    }
+}
+
+/// Task（workflow/schedule root task）→ WorkflowSchedule 的无损反序列化。
+/// schedule_id / created_at / task_mirror 直接取自 Task 列；owner/policy/
+/// description 取自 TaskData（Task 列里没有）；schedule/target/state 取自 TaskData。
+fn schedule_from_task(task: &Task) -> Option<WorkflowSchedule> {
+    let data = match parse_typed_task_data(task.task_type.as_str(), task.data.clone()) {
+        Ok(TypedTaskData::WorkflowSchedule(data)) => data,
+        _ => return None,
+    };
+    let req = data.request;
+    let schedule: ScheduleSpec = req
+        .schedule
+        .and_then(|value| serde_json::from_value(value).ok())?;
+    let target: ScheduleTarget = req
+        .target
+        .and_then(|value| serde_json::from_value(value).ok())?;
+    // status 的权威来源是 Task 的 status 列（与 data.request.status 由同一次写入保持一致）。
+    let status = task.status;
+    let owner = req
+        .owner
+        .map(|o| Owner {
+            user_id: o.user_id,
+            app_id: o.app_id,
+        })
+        .unwrap_or_else(|| Owner {
+            user_id: task.user_id.clone(),
+            app_id: task.app_id.clone(),
+        });
+    let policy = req.policy.map(policy_from_typed).unwrap_or_default();
+    let result = data.result.unwrap_or_default();
+    let state = ScheduleState {
+        next_fire_at: result.next_fire_at,
+        last_fire_at: result.last_fire_at,
+        last_task_id: result.last_task_id,
+        last_run_id: result.last_run_id,
+        consecutive_failures: result.consecutive_failures as u32,
+        last_error: result.last_error.map(|value| match value {
+            Value::String(text) => text,
+            other => other.to_string(),
+        }),
+    };
+    let schedule_id = if req.schedule_id.trim().is_empty() {
+        task.root_id.clone()
+    } else {
+        req.schedule_id
+    };
+    Some(WorkflowSchedule {
+        schedule_id,
+        owner,
+        name: req.name.unwrap_or_else(|| task.name.clone()),
+        description: req.description,
+        status,
+        schedule,
+        target,
+        state,
+        policy,
+        task_mirror: ScheduleTaskMirror {
+            root_task_id: Some(task.id),
+            root_id: Some(task.root_id.clone()),
+        },
+        created_at: task.created_at as i64,
+        updated_at: task.updated_at as i64,
+    })
+}
+
+fn policy_from_typed(value: WorkflowSchedulePolicy) -> SchedulePolicy {
+    let mut policy = SchedulePolicy::default();
+    if let Some(misfire) = value.misfire.as_deref() {
+        policy.misfire = match misfire {
+            "skip" => MisfirePolicy::Skip,
+            "run_once" => MisfirePolicy::RunOnce,
+            "catch_up" => MisfirePolicy::CatchUp,
+            "manual" => MisfirePolicy::Manual,
+            _ => policy.misfire,
+        };
+    }
+    if let Some(value) = value.max_parallel_runs {
+        policy.max_parallel_runs = value;
+    }
+    if let Some(value) = value.catch_up_limit {
+        policy.catch_up_limit = value.max(1);
+    }
+    if let Some(value) = value.jitter_sec {
+        policy.jitter_sec = value;
+    }
+    policy
+}
+
+fn policy_to_typed(policy: &SchedulePolicy) -> WorkflowSchedulePolicy {
+    WorkflowSchedulePolicy {
+        misfire: Some(misfire_str(policy.misfire).to_string()),
+        max_parallel_runs: Some(policy.max_parallel_runs),
+        catch_up_limit: Some(policy.catch_up_limit),
+        jitter_sec: Some(policy.jitter_sec),
+    }
+}
+
+fn misfire_str(misfire: MisfirePolicy) -> &'static str {
+    match misfire {
+        MisfirePolicy::Skip => "skip",
+        MisfirePolicy::RunOnce => "run_once",
+        MisfirePolicy::CatchUp => "catch_up",
+        MisfirePolicy::Manual => "manual",
+    }
 }
 
 fn schedule_root_task_permissions() -> TaskPermissions {
@@ -661,9 +738,15 @@ fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {
         request: WorkflowScheduleTaskRequest {
             schedule_id: schedule.schedule_id.clone(),
             name: Some(schedule.name.clone()),
-            status: Some(schedule_status_value(schedule.status)),
+            status: Some(schedule.status.to_string()),
             schedule: serde_json::to_value(&schedule.schedule).ok(),
             target: serde_json::to_value(&schedule.target).ok(),
+            description: schedule.description.clone(),
+            owner: Some(WorkflowScheduleOwner {
+                user_id: schedule.owner.user_id.clone(),
+                app_id: schedule.owner.app_id.clone(),
+            }),
+            policy: Some(policy_to_typed(&schedule.policy)),
         },
         progress: None,
         result: Some(WorkflowScheduleTaskResult {
@@ -678,36 +761,21 @@ fn schedule_task_data(schedule: &WorkflowSchedule) -> Value {
     .unwrap_or_else(|_| Value::Object(Default::default()))
 }
 
-fn schedule_status_value(status: ScheduleStatus) -> String {
-    serde_json::to_value(status)
-        .ok()
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .unwrap_or_else(|| format!("{:?}", status))
-}
-
-fn map_schedule_status(status: ScheduleStatus) -> TaskStatus {
-    match status {
-        ScheduleStatus::Enabled => TaskStatus::Running,
-        ScheduleStatus::Paused => TaskStatus::Paused,
-        ScheduleStatus::Archived => TaskStatus::Canceled,
-        ScheduleStatus::Error => TaskStatus::Failed,
-    }
-}
-
 fn schedule_message(schedule: &WorkflowSchedule) -> String {
     match schedule.status {
-        ScheduleStatus::Enabled => schedule
+        TaskStatus::Running => schedule
             .state
             .next_fire_at
             .map(|ts| format!("next fire at {}", rfc3339(ts)))
             .unwrap_or_else(|| "enabled".to_string()),
-        ScheduleStatus::Paused => "paused".to_string(),
-        ScheduleStatus::Archived => "archived".to_string(),
-        ScheduleStatus::Error => schedule
+        TaskStatus::Paused => "paused".to_string(),
+        TaskStatus::Canceled => "archived".to_string(),
+        TaskStatus::Failed => schedule
             .state
             .last_error
             .clone()
             .unwrap_or_else(|| "schedule error".to_string()),
+        other => format!("{}", other),
     }
 }
 
