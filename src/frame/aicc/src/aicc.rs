@@ -1327,6 +1327,8 @@ pub struct RouteDecision {
     pub primary_instance_id: String,
     pub fallback_instance_ids: Vec<String>,
     pub provider_model: String,
+    enabled_capabilities: Vec<Feature>,
+    disabled_capabilities: Vec<Feature>,
     attempts: Vec<RouteAttempt>,
     route_trace: Arc<Mutex<RouteTrace>>,
     runtime_failover_enabled: bool,
@@ -1552,6 +1554,8 @@ impl Router {
             primary_instance_id: primary.instance_id.clone(),
             fallback_instance_ids,
             provider_model: primary.provider_model.clone(),
+            enabled_capabilities: Vec::new(),
+            disabled_capabilities: Vec::new(),
             attempts: final_attempts,
             route_trace: Arc::new(Mutex::new(legacy_route_trace(
                 req.model.alias.clone(),
@@ -1813,6 +1817,27 @@ fn lower_provider_model_options(provider_model: &str) -> (String, Option<Value>)
     )
 }
 
+fn enabled_capabilities(capabilities: &ModelCapabilities, disabled: &[Feature]) -> Vec<Feature> {
+    let mut enabled = Vec::new();
+    let mut push_if_enabled = |feature: &str, value: bool| {
+        if value && !disabled.iter().any(|item| item == feature) {
+            enabled.push(feature.to_string());
+        }
+    };
+    push_if_enabled("streaming", capabilities.streaming);
+    push_if_enabled(buckyos_api::features::TOOL_CALLING, capabilities.tool_call);
+    push_if_enabled(buckyos_api::features::JSON_OUTPUT, capabilities.json_schema);
+    push_if_enabled(buckyos_api::features::WEB_SEARCH, capabilities.web_search);
+    push_if_enabled(buckyos_api::features::VISION, capabilities.vision);
+    if let Some(tokens) = capabilities.max_context_tokens {
+        enabled.push(format!("max_context_tokens:{}", tokens));
+    }
+    if let Some(tokens) = capabilities.max_output_tokens {
+        enabled.push(format!("max_output_tokens:{}", tokens));
+    }
+    enabled
+}
+
 fn merge_provider_options(payload: &mut AiPayload, provider_options: Option<Value>) {
     let Some(provider_options) = provider_options else {
         return;
@@ -1830,6 +1855,103 @@ fn merge_provider_options(payload: &mut AiPayload, provider_options: Option<Valu
 fn exact_model_spec(exact_model: &str) -> std::result::Result<ModelSpec, RPCErrors> {
     ExactModelName::parse(exact_model).map_err(route_error_to_rpc)?;
     Ok(ModelSpec::new(exact_model.to_string(), None))
+}
+
+fn route_request_from_method_request(
+    method: &str,
+    request: &AiMethodRequest,
+) -> std::result::Result<RouteResolveRequest, RPCErrors> {
+    let api_type = api_type_for_method(method).ok_or_else(|| {
+        reason_error(
+            "invalid_method",
+            format!("method '{}' is not supported by route.resolve", method),
+        )
+    })?;
+    let (estimated_input_tokens, estimated_output_tokens) = estimate_request_tokens(request);
+    Ok(RouteResolveRequest {
+        request_id: None,
+        api_type: api_type_string(&api_type).to_string(),
+        logical_model: request.model.alias.clone(),
+        requirements: request.requirements.clone(),
+        disable: request.disable.clone(),
+        policy: request.policy.clone(),
+        estimated_input_tokens: Some(estimated_input_tokens),
+        estimated_output_tokens: Some(estimated_output_tokens),
+        session_id: extract_session_id_from_complete_request(request),
+        session_profile: request
+            .requirements
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("session_profile"))
+            .cloned(),
+    })
+}
+
+fn api_type_string(api_type: &ApiType) -> &'static str {
+    match api_type {
+        ApiType::LlmChat => "llm.chat",
+        ApiType::LlmCompletion => "llm.completion",
+        ApiType::ImageTextToImage => "image.txt2img",
+        ApiType::ImageToImage => "image.img2img",
+        ApiType::Embedding => "embedding.text",
+        ApiType::EmbeddingMultimodal => "embedding.multimodal",
+        ApiType::Rerank => "rerank",
+        ApiType::ImageInpaint => "image.inpaint",
+        ApiType::ImageUpscale => "image.upscale",
+        ApiType::ImageBgRemove => "image.bg_remove",
+        ApiType::VisionOcr => "vision.ocr",
+        ApiType::VisionCaption => "vision.caption",
+        ApiType::VisionDetect => "vision.detect",
+        ApiType::VisionSegment => "vision.segment",
+        ApiType::AudioTts => "audio.tts",
+        ApiType::AudioAsr => "audio.asr",
+        ApiType::AudioMusic => "audio.music",
+        ApiType::AudioEnhance => "audio.enhance",
+        ApiType::VideoTextToVideo => "video.txt2video",
+        ApiType::VideoImageToVideo => "video.img2video",
+        ApiType::VideoToVideo => "video.video2video",
+        ApiType::VideoExtend => "video.extend",
+        ApiType::VideoUpscale => "video.upscale",
+        ApiType::AgentComputerUse => "agent.computer_use",
+    }
+}
+
+fn ai_method_response_from_llm_chat(response: LlmChatInvokeResponse) -> AiMethodResponse {
+    let result = response.message.map(|message| AiResponse {
+        message,
+        usage: response.usage,
+        cost: response.cost,
+        finish_reason: response.finish_reason,
+        provider_task_ref: response.provider_task_ref,
+        extra: response
+            .route_trace
+            .map(|trace| json!({ "route_trace": trace })),
+    });
+    AiMethodResponse::new(
+        response.task_id,
+        response.status,
+        result,
+        response.event_ref,
+    )
+}
+
+fn ai_method_response_from_text_to_image(response: TextToImageInvokeResponse) -> AiMethodResponse {
+    let result = (!response.artifacts.is_empty()).then(|| AiResponse {
+        message: AiResponse::message_from_parts(None, Vec::new(), response.artifacts),
+        usage: response.usage,
+        cost: response.cost,
+        finish_reason: None,
+        provider_task_ref: response.provider_task_ref,
+        extra: response
+            .route_trace
+            .map(|trace| json!({ "route_trace": trace })),
+    });
+    AiMethodResponse::new(
+        response.task_id,
+        response.status,
+        result,
+        response.event_ref,
+    )
 }
 
 fn llm_chat_invoke_to_method_request(
@@ -2710,6 +2832,11 @@ impl AIComputeCenter {
             primary_instance_id: scheduled.selected.provider_instance_name,
             fallback_instance_ids,
             provider_model: selected_provider_model,
+            enabled_capabilities: enabled_capabilities(
+                &scheduled.selected.metadata.capabilities,
+                &disabled_capabilities(request),
+            ),
+            disabled_capabilities: disabled_capabilities(request),
             attempts,
             route_trace: Arc::new(Mutex::new(resolution.trace)),
             runtime_failover_enabled: policy.runtime_failover,
@@ -2760,6 +2887,8 @@ impl AIComputeCenter {
             provider_driver: inventory.as_ref().map(|item| item.provider_driver.clone()),
             provider_model_id,
             provider_options,
+            enabled_capabilities: decision.enabled_capabilities.clone(),
+            disabled_capabilities: decision.disabled_capabilities.clone(),
             fallback_attempts,
             route_trace: trace,
             inventory_revision: inventory.and_then(|item| item.inventory_revision),
@@ -2989,6 +3118,12 @@ impl AIComputeCenter {
         request: RouteResolveRequest,
         rpc_ctx: RPCContext,
     ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        if crate::model_types::is_exact_model_name(request.logical_model.as_str()) {
+            return Err(reason_error(
+                "bad_request",
+                "route.resolve logical_model must be a logical model name; exact model names are only valid for typed inference APIs",
+            ));
+        }
         let invoke_ctx = InvokeCtx::from_rpc(&rpc_ctx);
         let request_id = request
             .request_id
@@ -3081,6 +3216,120 @@ impl AIComputeCenter {
             .complete_with_method(ai_methods::IMAGE_TXT2IMG, method_request, rpc_ctx)
             .await?;
         Ok(response.into())
+    }
+
+    pub async fn helper_llm_chat(
+        &self,
+        request: AiMethodRequest,
+        rpc_ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        let route = self.resolve_route(
+            route_request_from_method_request(ai_methods::LLM_CHAT, &request)?,
+            rpc_ctx.clone(),
+        )?;
+        let typed_response = self
+            .create_chat_completion(
+                LlmChatInvokeRequest {
+                    exact_model: route.selected_exact_model,
+                    messages: request.payload.messages.clone(),
+                    tools: request.payload.tool_specs.clone(),
+                    response_format: Some(request.requirements.resp_format.clone()),
+                    temperature: request
+                        .payload
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.get("temperature"))
+                        .and_then(Value::as_f64),
+                    max_output_tokens: request
+                        .payload
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.get("max_output_tokens"))
+                        .and_then(Value::as_u64),
+                    payload: Some(request.payload),
+                    provider_options: route.provider_options,
+                    idempotency_key: request.idempotency_key,
+                    task_options: request.task_options,
+                },
+                rpc_ctx,
+            )
+            .await?;
+        Ok(ai_method_response_from_llm_chat(typed_response))
+    }
+
+    pub async fn helper_text_to_image(
+        &self,
+        request: AiMethodRequest,
+        rpc_ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        let route = self.resolve_route(
+            route_request_from_method_request(ai_methods::IMAGE_TXT2IMG, &request)?,
+            rpc_ctx.clone(),
+        )?;
+        let prompt = request.payload.text.clone().unwrap_or_else(|| {
+            request
+                .payload
+                .input_json
+                .as_ref()
+                .and_then(|value| value.get("prompt"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+        let typed_response = self
+            .generate_image(
+                TextToImageInvokeRequest {
+                    exact_model: route.selected_exact_model,
+                    prompt,
+                    negative_prompt: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("negative_prompt"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    size: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("size"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    quality: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("quality"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    style: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("style"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    seed: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("seed"))
+                        .and_then(Value::as_u64),
+                    output: request
+                        .payload
+                        .input_json
+                        .as_ref()
+                        .and_then(|value| value.get("output"))
+                        .cloned(),
+                    payload: Some(request.payload),
+                    provider_options: route.provider_options,
+                    idempotency_key: request.idempotency_key,
+                    task_options: request.task_options,
+                },
+                rpc_ctx,
+            )
+            .await?;
+        Ok(ai_method_response_from_text_to_image(typed_response))
     }
 
     pub async fn complete_with_method(
@@ -3508,11 +3757,15 @@ impl AIComputeCenter {
 
             self.registry.mark_start_begin(attempt.instance_id.as_str());
             let started_at = Instant::now();
+            let (provider_model, provider_options) =
+                lower_provider_model_options(attempt.provider_model.as_str());
+            let mut provider_req = req.clone();
+            merge_provider_options(&mut provider_req.request.payload, provider_options);
             let result = provider
                 .start(
                     ctx.clone(),
-                    attempt.provider_model.clone(),
-                    req.clone(),
+                    provider_model.clone(),
+                    provider_req,
                     sink.clone(),
                 )
                 .await;
@@ -3849,6 +4102,22 @@ impl AiccHandler for AIComputeCenter {
         ctx: RPCContext,
     ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
         self.generate_image(request, ctx).await
+    }
+
+    async fn handle_helper_llm_chat(
+        &self,
+        request: AiMethodRequest,
+        ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        self.helper_llm_chat(request, ctx).await
+    }
+
+    async fn handle_helper_text_to_image(
+        &self,
+        request: AiMethodRequest,
+        ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        self.helper_text_to_image(request, ctx).await
     }
 }
 

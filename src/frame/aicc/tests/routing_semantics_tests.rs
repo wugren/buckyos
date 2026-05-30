@@ -2,8 +2,9 @@ mod common;
 
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
 use buckyos_api::{
-    AiMessage, AiMethodStatus, AiRole, Capability, LlmChatInvokeRequest, RouteResolveRequest,
-    TaskFilter,
+    AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, Capability,
+    LlmChatInvokeRequest, ModelSpec, Requirements, RouteResolveRequest, TaskFilter,
+    TextToImageInvokeRequest,
 };
 use common::*;
 use std::sync::Arc;
@@ -395,6 +396,15 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
         100,
         Ok(ProviderStartResult::Started),
     );
+    add_llm(
+        &registry,
+        &catalog,
+        "p-b",
+        "provider-b",
+        0.02,
+        120,
+        Ok(ProviderStartResult::Started),
+    );
     let center = center_with_taskmgr(registry, catalog);
 
     let response = center
@@ -418,7 +428,52 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
     assert_eq!(response.selected_exact_model, "m@p-a");
     assert_eq!(response.provider_instance_name, "p-a");
     assert_eq!(response.provider_model_id, "m");
+    assert_eq!(response.fallback_attempts.len(), 1);
+    assert_eq!(response.fallback_attempts[0].exact_model, "m@p-b");
+    assert!(response
+        .enabled_capabilities
+        .iter()
+        .any(|capability| capability == buckyos_api::features::WEB_SEARCH));
+    assert!(response.disabled_capabilities.is_empty());
     assert_eq!(provider.start_calls(), 0);
+}
+
+#[test]
+fn route_resolve_rejects_exact_model_input() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    add_llm(
+        &registry,
+        &catalog,
+        "p-a",
+        "provider-a",
+        0.01,
+        100,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+
+    let err = center
+        .resolve_route(
+            RouteResolveRequest {
+                request_id: Some("route-test-exact".to_string()),
+                api_type: "llm.chat".to_string(),
+                logical_model: "m@p-a".to_string(),
+                requirements: Default::default(),
+                disable: Default::default(),
+                policy: None,
+                estimated_input_tokens: None,
+                estimated_output_tokens: None,
+                session_id: None,
+                session_profile: None,
+            },
+            Default::default(),
+        )
+        .expect_err("route.resolve should reject exact model names");
+
+    assert!(err
+        .to_string()
+        .contains("logical_model must be a logical model name"));
 }
 
 #[tokio::test]
@@ -467,4 +522,138 @@ async fn chat_completions_create_uses_exact_model_without_runtime_fallback() {
     assert_eq!(response.status, AiMethodStatus::Running);
     assert_eq!(primary.start_calls(), 1);
     assert_eq!(fallback.start_calls(), 0);
+}
+
+#[tokio::test]
+async fn chat_completions_create_rejects_logical_model_name() {
+    let center = center_with_taskmgr(Registry::default(), ModelCatalog::default());
+
+    let err = center
+        .create_chat_completion(
+            LlmChatInvokeRequest {
+                exact_model: "llm.plan.default".to_string(),
+                messages: vec![AiMessage::text(AiRole::User, "hello")],
+                tools: vec![],
+                response_format: None,
+                temperature: None,
+                max_output_tokens: None,
+                payload: None,
+                provider_options: None,
+                idempotency_key: None,
+                task_options: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect_err("chat.completions.create should reject logical model names");
+
+    assert!(err
+        .to_string()
+        .contains("exact model name must contain provider instance suffix"));
+}
+
+#[tokio::test]
+async fn images_generate_rejects_logical_model_name() {
+    let center = center_with_taskmgr(Registry::default(), ModelCatalog::default());
+
+    let err = center
+        .generate_image(
+            TextToImageInvokeRequest {
+                exact_model: "image.txt2img.default".to_string(),
+                prompt: "draw a cube".to_string(),
+                negative_prompt: None,
+                size: None,
+                quality: None,
+                style: None,
+                seed: None,
+                output: None,
+                payload: None,
+                provider_options: None,
+                idempotency_key: None,
+                task_options: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect_err("images.generate should reject logical model names");
+
+    assert!(err
+        .to_string()
+        .contains("exact model name must contain provider instance suffix"));
+}
+
+#[tokio::test]
+async fn typed_exact_unavailable_does_not_fallback_to_other_model() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let fallback = add_llm(
+        &registry,
+        &catalog,
+        "p-b",
+        "provider-b",
+        0.02,
+        90,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+
+    let response = center
+        .create_chat_completion(
+            LlmChatInvokeRequest {
+                exact_model: "missing@p-a".to_string(),
+                messages: vec![AiMessage::text(AiRole::User, "hello")],
+                tools: vec![],
+                response_format: None,
+                temperature: None,
+                max_output_tokens: None,
+                payload: None,
+                provider_options: None,
+                idempotency_key: None,
+                task_options: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("typed inference reports routing failure as failed task response");
+
+    assert_eq!(response.status, AiMethodStatus::Failed);
+    assert_eq!(fallback.start_calls(), 0);
+}
+
+#[tokio::test]
+async fn helper_llm_chat_expands_to_route_resolve_and_typed_inference() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let provider = add_llm(
+        &registry,
+        &catalog,
+        "p-a",
+        "provider-a",
+        0.01,
+        100,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+    let request = AiMethodRequest::new(
+        Capability::Llm,
+        ModelSpec::new("llm.plan.default".to_string(), None),
+        Requirements::default(),
+        AiPayload::new(
+            None,
+            vec![AiMessage::text(AiRole::User, "hello")],
+            vec![],
+            vec![],
+            None,
+            None,
+        ),
+        None,
+    );
+
+    let response = center
+        .helper_llm_chat(request, Default::default())
+        .await
+        .expect("helper.llm_chat should succeed through two-stage flow");
+
+    assert_eq!(response.status, AiMethodStatus::Running);
+    assert_eq!(provider.start_calls(), 1);
 }

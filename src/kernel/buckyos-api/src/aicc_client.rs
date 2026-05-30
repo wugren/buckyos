@@ -1339,6 +1339,10 @@ pub struct RouteResolveResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_capabilities: Vec<Feature>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_capabilities: Vec<Feature>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_attempts: Vec<RouteFallbackAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_trace: Option<Value>,
@@ -1775,6 +1779,26 @@ pub trait AiccHandler: Send + Sync {
             ai_methods::IMAGES_GENERATE.to_string(),
         ))
     }
+
+    async fn handle_helper_llm_chat(
+        &self,
+        _request: AiMethodRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::HELPER_LLM_CHAT.to_string(),
+        ))
+    }
+
+    async fn handle_helper_text_to_image(
+        &self,
+        _request: AiMethodRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::HELPER_TEXT_TO_IMAGE.to_string(),
+        ))
+    }
 }
 
 pub struct AiccServerHandler<T: AiccHandler>(pub T);
@@ -1830,18 +1854,12 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
             }
             ai_methods::HELPER_LLM_CHAT => {
                 let method_req = AiMethodRequest::from_json(req.params)?;
-                let result = self
-                    .0
-                    .handle_method(ai_methods::LLM_CHAT, method_req, ctx)
-                    .await?;
+                let result = self.0.handle_helper_llm_chat(method_req, ctx).await?;
                 RPCResult::Success(json!(result))
             }
             ai_methods::HELPER_TEXT_TO_IMAGE => {
                 let method_req = AiMethodRequest::from_json(req.params)?;
-                let result = self
-                    .0
-                    .handle_method(ai_methods::IMAGE_TXT2IMG, method_req, ctx)
-                    .await?;
+                let result = self.0.handle_helper_text_to_image(method_req, ctx).await?;
                 RPCResult::Success(json!(result))
             }
             method if ai_methods::is_ai_method(method) => {

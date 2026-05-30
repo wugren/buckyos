@@ -93,6 +93,7 @@ AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC
 
 - `model.alias` 可以是逻辑模型名，例如 `llm.plan`、`llm.chat`、`llm.gpt5`；也可以是精确模型名，例如 `gpt-5.2@openai-primary`。
 - 精确模型名格式是 `<provider_model_id>@<provider_instance_name>`，默认表达“强制指定 Provider”，默认不做精确模型 fallback。
+- 新 API 分层下，`route.resolve.logical_model` 只能传逻辑模型名；`chat.completions.create.exact_model` / `images.generate.exact_model` 只能传精确模型名。旧 `llm.chat` 的 all-in-one 形态仅作为 legacy/helper 兼容层保留。
 - `requirements.must_features` 是硬过滤条件，常见值包括 `plan`、`tool_calling`、`json_output`、`web_search`、`vision`。
 - `requirements.max_cost_usd` 会参与动态成本过滤。
 - `payload.options.session_id` 会启用同一 session 内的路由粘性。

@@ -119,29 +119,29 @@
 - [x] AICC service dispatch 新方法。
 - [x] typed inference 转换层校验 `exact_model`。
 - [x] typed inference 默认关闭 `allow_fallback` 和 `runtime_failover`。
-- [ ] 在协议文档中明确旧 `llm.chat`、`image.txt2img` 等 all-in-one 方法进入 legacy/helper 兼容层，不再作为 AICC 本体核心语义。
+- [x] 在协议文档中明确旧 `llm.chat`、`image.txt2img` 等 all-in-one 方法进入 legacy/helper 兼容层，不再作为 AICC 本体核心语义。
 - [ ] 明确 breaking change 后旧 all-in-one 方法的删除、保留或隐藏策略。
-- [ ] `route.resolve` 应禁止 `logical_model` 传 exact model；如需 exact 诊断，另设字段或另设方法，避免控制面语义混乱。
-- [ ] `RouteResolveResponse` 增加 `enabled_capabilities` / `disabled_capabilities`，表达本次 route 后实际启用/禁用的能力集合。
-- [ ] 明确 `fallback_attempts` 语义：
+- [x] `route.resolve` 应禁止 `logical_model` 传 exact model；如需 exact 诊断，另设字段或另设方法，避免控制面语义混乱。
+- [x] `RouteResolveResponse` 增加 `enabled_capabilities` / `disabled_capabilities`，表达本次 route 后实际启用/禁用的能力集合。
+- [x] 明确 `fallback_attempts` 语义：
   - 是 route 建议候选顺序，不是 lease。
   - 是否受 `runtime_failover` 和 `fallback_limit` 限制。
   - 是否包含 primary 之外所有同分候选、scheduler 后候选，还是只包含运行时 failover 候选。
 - [ ] `route_trace` 使用稳定结构而不是裸 `Value`，至少在 Rust API 层保留 typed struct，外部序列化为 JSON。
 - [ ] `provider_options` 的来源从 `lower_provider_model_options()` 迁移到 driver metadata / variant resolver。
-- [ ] typed inference 内部不再经过“逻辑 route”路径；短期可继续复用 `complete_with_method()`，但必须用测试锁定 exact-only 行为。
-- [ ] 如果 `helper.*` 继续保留在 AICC service，改为显式调用 `resolve_route()` + typed inference，而不是直接转发旧 all-in-one 方法。
+- [x] typed inference 内部不再经过“逻辑 route”路径；短期可继续复用 `complete_with_method()`，但必须用测试锁定 exact-only 行为。
+- [x] 如果 `helper.*` 继续保留在 AICC service，改为显式调用 `resolve_route()` + typed inference，而不是直接转发旧 all-in-one 方法。
 - [ ] Agent SDK / Web SDK / CLI 提供 helper API，并把默认调用迁移到 helper 或显式两阶段调用。
 
 ### 1.3 必补测试
 
-- [ ] `route.resolve` 输入 `llm.chat` 返回 `selected_exact_model`、provider 信息、trace。
-- [ ] `route.resolve` 输入 exact model 被拒绝，错误码明确。
-- [ ] `chat.completions.create` 输入逻辑模型名被拒绝。
-- [ ] `images.generate` 输入逻辑模型名被拒绝。
-- [ ] typed inference 的 primary exact model quota exhausted / unavailable 时，不 fallback 到其它模型。
-- [ ] typed inference 失败后，由调用方重新 `route.resolve` 才能换模型。
-- [ ] `helper.llm_chat` 展开后的行为等价于 `route.resolve + chat.completions.create`。
+- [x] `route.resolve` 输入 `llm.chat` 返回 `selected_exact_model`、provider 信息、trace。
+- [x] `route.resolve` 输入 exact model 被拒绝，错误码明确。
+- [x] `chat.completions.create` 输入逻辑模型名被拒绝。
+- [x] `images.generate` 输入逻辑模型名被拒绝。
+- [x] typed inference 的 primary exact model quota exhausted / unavailable 时，不 fallback 到其它模型。
+- [x] typed inference 失败后，由调用方重新 `route.resolve` 才能换模型。
+- [x] `helper.llm_chat` 展开后的行为等价于 `route.resolve + chat.completions.create`。
 - [ ] `helper.text_to_image` 展开后的行为等价于 `route.resolve + images.generate`。
 
 ## 2. 命名与请求约束收敛
@@ -158,8 +158,8 @@
 - [x] 保留 `must_features -> RequiredModelFeatures` 转换。
 - [x] 支持结构化 `disable`。
 - [x] legacy `disable_capabilities` 已能映射到结构化禁用逻辑。
-- [ ] 文档明确 `Feature` 不是 inventory 真相源，只是旧请求兼容表达。
-- [ ] 新逻辑禁止继续依赖 `ProviderInstance.features` 做 capability 判断。
+- [x] 文档明确 `Feature` 不是 inventory 真相源，只是旧请求兼容表达。
+- [x] 新逻辑禁止继续依赖 `ProviderInstance.features` 做 capability 判断。
 - [ ] `requirements` 只表达硬能力约束。
 - [ ] `disable` 只表达本次必须关闭的能力。
 - [ ] `options` 只表达本次 provider request lowering 参数。
@@ -258,8 +258,8 @@ provider_options.reasoning.effort = high
 - [ ] OpenAI metadata 中用 variants 表达 reasoning effort 档位。
 - [ ] AICC exact model 使用 variant 后的 model id。
 - [ ] route.resolve 输出 base provider model id + provider_options。
-- [ ] typed inference 若收到 variant exact model，应能按 metadata 自动 lower；不应要求调用方必须手动补 provider_options。
-- [ ] provider adapter 调用前统一把 AICC variant 还原成 provider base model + provider options。
+- [x] typed inference 若收到 variant exact model，应能按 metadata 自动 lower；不应要求调用方必须手动补 provider_options。
+- [x] provider adapter 调用前统一把 AICC variant 还原成 provider base model + provider options。
 - [ ] 用户传入的 provider_options 与 route provider_options 的 merge 规则放在 helper 层，不放在数据面协议里。
 - [ ] usage / trace / audit 使用 AICC exact model 聚合，避免不同 reasoning 档位混在一起。
 - [ ] audit 额外保留 provider actual model 和 provider options，便于复现。
@@ -444,12 +444,12 @@ Base Logical Tree
 
 ### Phase 1: 新 API 边界加固
 
-- [ ] 补协议文档，明确 route control plane / inference data plane / helper 三层。
-- [ ] 补 typed inference exact-only 测试。
-- [ ] `route.resolve` 禁止 exact model 输入。
-- [ ] `RouteResolveResponse` 补 capabilities 字段。
-- [ ] 明确并测试 `fallback_attempts` 语义。
-- [ ] `helper.*` 改为两阶段组合或从 service 核心协议中移出。
+- [x] 补协议文档，明确 route control plane / inference data plane / helper 三层。
+- [x] 补 typed inference exact-only 测试。
+- [x] `route.resolve` 禁止 exact model 输入。
+- [x] `RouteResolveResponse` 补 capabilities 字段。
+- [x] 明确并测试 `fallback_attempts` 语义。
+- [x] `helper.*` 改为两阶段组合或从 service 核心协议中移出。
 
 ### Phase 2: SDK / Workflow 迁移
 
@@ -489,12 +489,12 @@ Base Logical Tree
 
 ## 11. 最小验证集
 
-- [ ] `route.resolve(llm.chat)` 能返回 exact model、provider 信息、fallback attempts、route trace。
-- [ ] `route.resolve(exact_model)` 被拒绝。
-- [ ] `chat.completions.create(exact_model)` 能跑通。
-- [ ] `chat.completions.create(logical_model)` 被拒绝。
-- [ ] exact model unavailable 时 typed inference 不 fallback。
-- [ ] helper `llm_chat` 行为等价于 route + typed inference。
+- [x] `route.resolve(llm.chat)` 能返回 exact model、provider 信息、fallback attempts、route trace。
+- [x] `route.resolve(exact_model)` 被拒绝。
+- [x] `chat.completions.create(exact_model)` 能跑通。
+- [x] `chat.completions.create(logical_model)` 被拒绝。
+- [x] exact model unavailable 时 typed inference 不 fallback。
+- [x] helper `llm_chat` 行为等价于 route + typed inference。
 - [ ] OpenAI `/models` 返回 `gpt-5.1`，resolver 展开 base model 和 reasoning variants。
 - [ ] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
 - [ ] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。

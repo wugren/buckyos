@@ -27,7 +27,10 @@ POST /kapi/aicc
 
 | method | 语义 |
 |---|---|
-| `llm.chat` / `image.txt2img` / `audio.asr` / ... | 标准 AI 调用方法。method 同时决定 request / response schema。同步任务直接返回结果；异步任务返回 task id。 |
+| `route.resolve` | 控制面路由解析。输入逻辑模型名，输出一次确定的 exact model、Provider 信息、候选顺序和 trace。 |
+| `chat.completions.create` / `images.generate` | typed inference 数据面。只接受 `exact_model`，不接受逻辑模型名，不做逻辑 fallback。 |
+| `helper.llm_chat` / `helper.text_to_image` | helper 组合层。语义等价于 `route.resolve` + typed inference。 |
+| `llm.chat` / `image.txt2img` / `audio.asr` / ... | legacy all-in-one 调用方法。保留给旧 SDK、DV 用例和兼容调用；不再作为 AICC 本体核心语义。 |
 | `cancel` | best-effort 取消 AI 调用方法返回的 task。 |
 | `reload_settings` / `service.reload_settings` | 从 `services/aicc/settings` 重新加载 Provider 配置。 |
 | `quota.query` | 查询调用方在 capability / method 维度的剩余额度和预算状态。 |
@@ -74,7 +77,19 @@ pub struct AiMethodRequest {
 | `video` | `video.*` |
 | `agent` | `agent.*` |
 
-### 1.3 数据面复用 BuckyOS ResourceRef / FileObject Meta
+### 1.3 控制面 / 数据面 / Helper 分层
+
+新调用方应按三层语义接入：
+
+1. `route.resolve` 是控制面，只接受逻辑模型名，不接受 `<provider_model_id>@<provider_instance_name>` exact model。它返回 `selected_exact_model`、Provider driver / instance / model、`provider_options`、`fallback_attempts`、`route_trace`、`enabled_capabilities` 和 `disabled_capabilities`。
+2. typed inference 是数据面，例如 `chat.completions.create` 和 `images.generate`。请求字段必须是 `exact_model`，逻辑模型名会被拒绝；内部默认关闭 `allow_fallback` 和 `runtime_failover`，Provider 启动失败后只能由调用方重新 `route.resolve` 才能换模型。
+3. `helper.*` 是组合层，接受旧 `AiMethodRequest` 形态的逻辑请求，但实现上必须先 `route.resolve`，再把 selected exact model 交给 typed inference。helper 不拥有独立路由逻辑。
+
+`fallback_attempts` 表达路由建议的运行时 failover 候选顺序，不是 lease，也不保证候选在后续时刻仍可用。它不包含 primary；当前受 `runtime_failover` 和系统 `fallback_limit` 限制，排序来自 scheduler 之后的同 method 候选。
+
+`enabled_capabilities` / `disabled_capabilities` 表达本次路由后模型可用能力与请求禁用能力。`Feature` / `must_features` 只是旧请求兼容表达，不是 inventory 真相源；能力判断必须以 `ProviderInventory.models[].capabilities` 为准，不能继续依赖 legacy `ProviderInstance.features`。
+
+### 1.4 数据面复用 BuckyOS ResourceRef / FileObject Meta
 
 AICC 不引入私有 Object Store。非结构化数据通过当前 `ResourceRef` 传递：
 
@@ -99,7 +114,7 @@ pub struct FileObjectMeta {
 
 Router、policy、日志层只读取 `ObjId` 和 `FileObject.meta`，不读取 bytes。Provider Adapter 只能在最后执行阶段读取 `ResourceRef` 指向的内容。`Url` / `Base64` 只用于临时或小对象输入；需要稳定 metadata、权限和复用的资源应先写成 FileObject，再以 `NamedObject` 引用。
 
-### 1.4 任务生命周期复用 task-manager
+### 1.5 任务生命周期复用 task-manager
 
 AICC 不定义私有 Job API。长任务使用 `task-manager`：
 
@@ -1654,7 +1669,7 @@ Fallback：
 }
 ```
 
-调试或强制指定 Provider 时使用精确模型：
+legacy all-in-one 调试或强制指定 Provider 时可以使用精确模型：
 
 ```json
 {
@@ -1667,13 +1682,13 @@ Fallback：
 }
 ```
 
-精确模型默认不 fallback，除非 policy 明确允许。
+精确模型默认不 fallback。新 typed inference API 只接受精确模型，但它是数据面接口，不会重新展开逻辑目录或隐式 fallback。
 
 解析规则：
 
 1. `alias` 含 `@` 时视为 `exact_model`，按 `<provider_model_id>@<provider_instance_name>` 解析。
 2. `alias` 不含 `@` 时视为 logical path，由逻辑目录展开候选模型。
-3. exact_model 默认 strict，不做 parent fallback；只有 `policy.allow_fallback=true` 且 method 规则允许时才可 failover 到同 method 的其他 exact_model。
+3. exact_model 默认 strict，不做 parent fallback；typed inference 额外关闭 `runtime_failover`，Provider 启动失败会直接返回失败。
 4. logical path fallback 只能改变候选模型，不能改变 kRPC `method`。
 
 ---
