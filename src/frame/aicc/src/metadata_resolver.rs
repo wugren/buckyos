@@ -153,7 +153,7 @@ pub fn resolve_driver_inventory(
             request,
             sources.as_slice(),
         ) {
-            models.push(metadata);
+            models.extend(expand_model_variants(metadata, sources.as_slice()));
         }
     }
     apply_driver_post_rules(provider_driver, &mut models);
@@ -256,6 +256,8 @@ fn resolve_driver_model(
     Some(ModelMetadata {
         provider_model_id: provider_model_id.to_string(),
         exact_model: exact_model_name(provider_model_id, provider_instance_name),
+        provider_actual_model_id: None,
+        provider_options: None,
         parameter_scale,
         api_types,
         logical_mounts,
@@ -426,6 +428,86 @@ fn find_default_rule(sources: &[DriverMetadataSource]) -> Option<&DriverModelRul
         }
     }
     None
+}
+
+fn driver_variants(sources: &[DriverMetadataSource]) -> Vec<DriverModelVariant> {
+    for source in sources.iter().rev() {
+        if source.document.schema_version != DRIVER_METADATA_SCHEMA_VERSION {
+            continue;
+        }
+        if !source.document.variants.is_empty() {
+            return source.document.variants.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn expand_model_variants(
+    model: ModelMetadata,
+    sources: &[DriverMetadataSource],
+) -> Vec<ModelMetadata> {
+    let variants = driver_variants(sources);
+    if variants.is_empty() || !model_supports_variants(&model) {
+        return vec![model];
+    }
+
+    let mut models = vec![model.clone()];
+    for variant in variants {
+        let Some(suffix) = variant.mount_suffix.as_deref() else {
+            continue;
+        };
+        let suffix = suffix.trim();
+        if suffix.is_empty() || !is_valid_variant_suffix(suffix) {
+            continue;
+        }
+
+        let variant_provider_model_id = format!("{}:{}", model.provider_model_id, suffix);
+        let mut variant_model = model.clone();
+        variant_model.provider_model_id = variant_provider_model_id.clone();
+        let Ok(exact_name) = model.exact_name() else {
+            continue;
+        };
+        variant_model.exact_model = exact_model_name(
+            variant_provider_model_id.as_str(),
+            exact_name.provider_instance_name.as_str(),
+        );
+        variant_model.provider_actual_model_id = Some(model.provider_model_id.clone());
+        variant_model.provider_options =
+            (!variant.provider_options.is_null()).then(|| variant.provider_options.clone());
+        variant_model.logical_mounts =
+            variant_logical_mounts(model.logical_mounts.as_slice(), suffix);
+        models.push(variant_model);
+    }
+    models
+}
+
+fn model_supports_variants(model: &ModelMetadata) -> bool {
+    model
+        .api_types
+        .iter()
+        .any(|api_type| matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion))
+        && (model.capabilities.streaming
+            || model.capabilities.tool_call
+            || model.capabilities.json_schema
+            || model.capabilities.web_search
+            || model.capabilities.vision
+            || model.capabilities.max_context_tokens.is_some()
+            || model.capabilities.max_output_tokens.is_some())
+}
+
+fn is_valid_variant_suffix(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+}
+
+fn variant_logical_mounts(base_mounts: &[String], suffix: &str) -> Vec<String> {
+    dedupe_strings(
+        base_mounts
+            .iter()
+            .map(|mount| format!("{}.{}", mount, suffix))
+            .collect(),
+    )
 }
 
 fn wildcard_matches(pattern: &str, value: &str) -> bool {
@@ -638,6 +720,9 @@ fn apply_openai_latest_mounts(models: &mut [ModelMetadata]) {
     use std::cmp::Ordering;
     let mut latest = std::collections::HashMap::<GptTier, (usize, GptRank)>::new();
     for (index, model) in models.iter_mut().enumerate() {
+        if model.provider_actual_model_id.is_some() {
+            continue;
+        }
         if !model
             .api_types
             .iter()

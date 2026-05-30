@@ -46,7 +46,10 @@ Fields:
 - `models`: exact rules keyed by `id`.
 - `patterns`: wildcard rules keyed by `pattern`; `*` is the only wildcard.
 - `defaults`: default rule when no exact or pattern rule matches.
-- `variants`: optional provider option variants for later mount/lowering.
+- `variants`: optional provider option variants. The resolver expands each
+  matching base model into additional AICC exact models whose provider model id
+  is `<base>:<mount_suffix>`, while provider calls are lowered back to the base
+  provider model plus `provider_options`.
 - `signature`: optional signature envelope; verification is not enforced yet.
 
 ## Rule
@@ -65,3 +68,30 @@ Rules support these fields:
 
 Unknown fallback is intentionally conservative: it does not declare
 `tool_call`, `web_search`, `vision`, or `json_schema`.
+
+## Variants
+
+Variants describe provider options that must be part of the AICC exact model
+identity instead of ordinary request parameters. They currently apply to LLM
+models.
+
+```json
+{
+  "name": "reasoning.high",
+  "mount_suffix": "reasoning-high",
+  "provider_options": {
+    "reasoning": {
+      "effort": "high"
+    }
+  }
+}
+```
+
+For a discovered OpenAI model `gpt-5.1`, the resolver emits:
+
+- base exact model: `gpt-5.1@openai-primary`
+- variant exact model: `gpt-5.1:reasoning-high@openai-primary`
+
+Route output for the variant uses `provider_model_id = "gpt-5.1"` and returns
+the variant `provider_options`. Provider adapters receive the same lowered base
+model and options even when callers invoke the variant exact model directly.

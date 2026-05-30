@@ -1319,6 +1319,7 @@ pub struct ModelCatalogEntry {
 struct RouteAttempt {
     instance_id: String,
     provider_model: String,
+    provider_options: Option<Value>,
     exact_model: String,
 }
 
@@ -1530,6 +1531,7 @@ impl Router {
                 ),
                 instance_id: item.instance_id,
                 provider_model: item.provider_model,
+                provider_options: None,
             })
             .collect::<Vec<_>>();
 
@@ -1579,6 +1581,8 @@ fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
         resolved_logical_path: None,
         selected_exact_model: None,
         selected_provider_instance_name: None,
+        selected_provider_model_id: None,
+        provider_options: None,
         candidate_count_before_filter: 0,
         candidate_count_after_filter: 0,
         filtered_candidates: Vec::new(),
@@ -1795,26 +1799,18 @@ fn route_probe_payload(estimated_input_tokens: Option<u64>) -> AiPayload {
     )
 }
 
-fn lower_provider_model_options(provider_model: &str) -> (String, Option<Value>) {
-    let Some((model, variant)) = provider_model.split_once(':') else {
-        return (provider_model.to_string(), None);
-    };
-    if let Some(effort) = variant.strip_prefix("reasoning-") {
-        return (
-            model.to_string(),
-            Some(json!({
-                "reasoning": {
-                    "effort": effort
-                }
-            })),
-        );
-    }
+fn provider_call_from_metadata(metadata: &ModelMetadata) -> (String, Option<Value>) {
     (
-        model.to_string(),
-        Some(json!({
-            "aicc_variant": variant
-        })),
+        metadata
+            .provider_actual_model_id
+            .clone()
+            .unwrap_or_else(|| metadata.provider_model_id.clone()),
+        metadata.provider_options.clone(),
     )
+}
+
+fn provider_call_from_candidate(candidate: &ModelCandidate) -> (String, Option<Value>) {
+    provider_call_from_metadata(&candidate.metadata)
 }
 
 fn enabled_capabilities(capabilities: &ModelCapabilities, disabled: &[Feature]) -> Vec<Feature> {
@@ -1838,6 +1834,34 @@ fn enabled_capabilities(capabilities: &ModelCapabilities, disabled: &[Feature]) 
     enabled
 }
 
+fn merge_provider_options_values(base: Option<Value>, overlay: Option<Value>) -> Option<Value> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(mut base), Some(overlay)) => {
+            merge_json_value(&mut base, overlay);
+            Some(base)
+        }
+    }
+}
+
+fn merge_json_value(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, value) in overlay_map {
+                if let Some(base_value) = base_map.get_mut(&key) {
+                    merge_json_value(base_value, value);
+                } else {
+                    base_map.insert(key, value);
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
+    }
+}
+
 fn merge_provider_options(payload: &mut AiPayload, provider_options: Option<Value>) {
     let Some(provider_options) = provider_options else {
         return;
@@ -1847,9 +1871,24 @@ fn merge_provider_options(payload: &mut AiPayload, provider_options: Option<Valu
         options = json!({});
     }
     if let Some(object) = options.as_object_mut() {
-        object.insert("provider_options".to_string(), provider_options);
+        let existing = object.remove("provider_options");
+        if let Some(merged) = merge_provider_options_values(existing, Some(provider_options)) {
+            object.insert("provider_options".to_string(), merged);
+        }
     }
     payload.options = Some(options);
+}
+
+fn payload_provider_options(payload: &AiPayload) -> Option<Value> {
+    payload
+        .options
+        .as_ref()
+        .and_then(|options| options.get("provider_options"))
+        .cloned()
+}
+
+fn helper_provider_options(route_options: Option<Value>, payload: &AiPayload) -> Option<Value> {
+    merge_provider_options_values(route_options, payload_provider_options(payload))
 }
 
 fn exact_model_spec(exact_model: &str) -> std::result::Result<ModelSpec, RPCErrors> {
@@ -1952,6 +1991,25 @@ fn ai_method_response_from_text_to_image(response: TextToImageInvokeResponse) ->
         result,
         response.event_ref,
     )
+}
+
+fn append_provider_audit_to_summary(summary: &mut AiResponse, attempt: &RouteAttempt) {
+    let extra_value = summary
+        .extra
+        .get_or_insert_with(|| Value::Object(Map::new()));
+    if !extra_value.is_object() {
+        *extra_value = Value::Object(Map::new());
+    }
+    if let Value::Object(extra) = extra_value {
+        extra.insert(
+            "provider_audit".to_string(),
+            json!({
+                "aicc_exact_model": attempt.exact_model,
+                "provider_actual_model": attempt.provider_model,
+                "provider_options": attempt.provider_options,
+            }),
+        );
+    }
 }
 
 fn llm_chat_invoke_to_method_request(
@@ -2370,6 +2428,8 @@ pub fn provider_model_metadata(
     ModelMetadata {
         provider_model_id: provider_model_id.to_string(),
         exact_model: exact_model_name(provider_model_id, provider_instance_name),
+        provider_actual_model_id: None,
+        provider_options: None,
         parameter_scale: None,
         api_types: vec![api_type],
         logical_mounts,
@@ -2770,6 +2830,10 @@ impl AIComputeCenter {
         resolution.trace.selected_exact_model = Some(scheduled.selected.exact_model.clone());
         resolution.trace.selected_provider_instance_name =
             Some(scheduled.selected.provider_instance_name.clone());
+        let (selected_provider_model, mut selected_provider_options) =
+            provider_call_from_candidate(&scheduled.selected);
+        resolution.trace.selected_provider_model_id = Some(selected_provider_model.clone());
+        resolution.trace.provider_options = selected_provider_options.clone();
         resolution.trace.session_sticky_hit = scheduled.sticky_hit;
         resolution.trace.ranked_candidates = scheduled.ranked_candidates;
         resolution.trace.user_summary = Some(user_summary_for_route(
@@ -2791,10 +2855,17 @@ impl AIComputeCenter {
                 request.model.alias.as_str(),
                 scheduled.selected.provider_instance_name.as_str(),
             )
-            .unwrap_or_else(|| scheduled.selected.provider_model_id.clone());
+            .map(|provider_model| {
+                selected_provider_options = None;
+                resolution.trace.provider_options = None;
+                resolution.trace.selected_provider_model_id = Some(provider_model.clone());
+                provider_model
+            })
+            .unwrap_or(selected_provider_model);
         let mut attempts = vec![RouteAttempt {
             instance_id: scheduled.selected.provider_instance_name.clone(),
             provider_model: selected_provider_model.clone(),
+            provider_options: selected_provider_options.clone(),
             exact_model: scheduled.selected.exact_model.clone(),
         }];
         if policy.runtime_failover {
@@ -2806,6 +2877,9 @@ impl AIComputeCenter {
                 if attempts.len() > fallback_limit {
                     break;
                 }
+                let (candidate_provider_model, candidate_provider_options) =
+                    provider_call_from_candidate(candidate);
+                let mut provider_options = candidate_provider_options;
                 let provider_model = self
                     .legacy_catalog_provider_model(
                         tenant_id,
@@ -2813,10 +2887,15 @@ impl AIComputeCenter {
                         request.model.alias.as_str(),
                         candidate.provider_instance_name.as_str(),
                     )
-                    .unwrap_or_else(|| candidate.provider_model_id.clone());
+                    .map(|provider_model| {
+                        provider_options = None;
+                        provider_model
+                    })
+                    .unwrap_or(candidate_provider_model);
                 attempts.push(RouteAttempt {
                     instance_id: candidate.provider_instance_name.clone(),
                     provider_model,
+                    provider_options,
                     exact_model: candidate.exact_model.clone(),
                 });
             }
@@ -2863,21 +2942,15 @@ impl AIComputeCenter {
             .and_then(|trace| trace.get("session_config_revision"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let (provider_model_id, provider_options) =
-            lower_provider_model_options(primary.provider_model.as_str());
         let fallback_attempts = decision
             .attempts()
             .iter()
             .skip(1)
-            .map(|attempt| {
-                let (provider_model_id, provider_options) =
-                    lower_provider_model_options(attempt.provider_model.as_str());
-                RouteFallbackAttempt {
-                    exact_model: attempt.exact_model.clone(),
-                    provider_instance_name: attempt.instance_id.clone(),
-                    provider_model_id,
-                    provider_options,
-                }
+            .map(|attempt| RouteFallbackAttempt {
+                exact_model: attempt.exact_model.clone(),
+                provider_instance_name: attempt.instance_id.clone(),
+                provider_model_id: attempt.provider_model.clone(),
+                provider_options: attempt.provider_options.clone(),
             })
             .collect();
 
@@ -2885,8 +2958,8 @@ impl AIComputeCenter {
             selected_exact_model: primary.exact_model.clone(),
             provider_instance_name: primary.instance_id.clone(),
             provider_driver: inventory.as_ref().map(|item| item.provider_driver.clone()),
-            provider_model_id,
-            provider_options,
+            provider_model_id: primary.provider_model.clone(),
+            provider_options: primary.provider_options.clone(),
             enabled_capabilities: decision.enabled_capabilities.clone(),
             disabled_capabilities: decision.disabled_capabilities.clone(),
             fallback_attempts,
@@ -3227,6 +3300,7 @@ impl AIComputeCenter {
             route_request_from_method_request(ai_methods::LLM_CHAT, &request)?,
             rpc_ctx.clone(),
         )?;
+        let provider_options = helper_provider_options(route.provider_options, &request.payload);
         let typed_response = self
             .create_chat_completion(
                 LlmChatInvokeRequest {
@@ -3247,7 +3321,7 @@ impl AIComputeCenter {
                         .and_then(|options| options.get("max_output_tokens"))
                         .and_then(Value::as_u64),
                     payload: Some(request.payload),
-                    provider_options: route.provider_options,
+                    provider_options,
                     idempotency_key: request.idempotency_key,
                     task_options: request.task_options,
                 },
@@ -3266,6 +3340,7 @@ impl AIComputeCenter {
             route_request_from_method_request(ai_methods::IMAGE_TXT2IMG, &request)?,
             rpc_ctx.clone(),
         )?;
+        let provider_options = helper_provider_options(route.provider_options, &request.payload);
         let prompt = request.payload.text.clone().unwrap_or_else(|| {
             request
                 .payload
@@ -3322,7 +3397,7 @@ impl AIComputeCenter {
                         .and_then(|value| value.get("output"))
                         .cloned(),
                     payload: Some(request.payload),
-                    provider_options: route.provider_options,
+                    provider_options,
                     idempotency_key: request.idempotency_key,
                     task_options: request.task_options,
                 },
@@ -3475,7 +3550,11 @@ impl AIComputeCenter {
                 caller_app_id: invoke_ctx.caller_app_id.clone(),
                 capability: capability_name(&request.capability).to_string(),
                 request_model: request.model.alias.clone(),
-                provider_model: decision.provider_model.clone(),
+                provider_model: decision
+                    .attempts()
+                    .first()
+                    .map(|attempt| attempt.exact_model.clone())
+                    .unwrap_or_else(|| decision.provider_model.clone()),
                 idempotency_key: request.idempotency_key.clone(),
             };
             Arc::new(UsageLoggingSink::new(event_sink, db, context))
@@ -3738,6 +3817,8 @@ impl AIComputeCenter {
                     trace.runtime_failover_count = trace.runtime_failover_count.saturating_add(1);
                     trace.selected_exact_model = Some(attempt.exact_model.clone());
                     trace.selected_provider_instance_name = Some(attempt.instance_id.clone());
+                    trace.selected_provider_model_id = Some(attempt.provider_model.clone());
+                    trace.provider_options = attempt.provider_options.clone();
                     if let Some(summary) = trace.user_summary.as_mut() {
                         summary.display_name = attempt
                             .exact_model
@@ -3757,14 +3838,15 @@ impl AIComputeCenter {
 
             self.registry.mark_start_begin(attempt.instance_id.as_str());
             let started_at = Instant::now();
-            let (provider_model, provider_options) =
-                lower_provider_model_options(attempt.provider_model.as_str());
             let mut provider_req = req.clone();
-            merge_provider_options(&mut provider_req.request.payload, provider_options);
+            merge_provider_options(
+                &mut provider_req.request.payload,
+                attempt.provider_options.clone(),
+            );
             let result = provider
                 .start(
                     ctx.clone(),
-                    provider_model.clone(),
+                    attempt.provider_model.clone(),
                     provider_req,
                     sink.clone(),
                 )
@@ -3783,6 +3865,7 @@ impl AIComputeCenter {
                                 .as_str(),
                             summary,
                         );
+                        append_provider_audit_to_summary(summary, attempt);
                     }
                     self.registry
                         .record_start_success(attempt.instance_id.as_str(), elapsed_ms);
@@ -4310,10 +4393,14 @@ fn merge_route_decision_into_task_data(
     initial_status: &str,
 ) {
     let mut task_data = parse_aicc_task_data(data);
+    let primary = decision.attempts().first();
     task_data.request.route = Some(json!({
             "primary_instance_id": decision.primary_instance_id,
             "fallback_instance_ids": decision.fallback_instance_ids,
             "provider_model": decision.provider_model,
+            "selected_exact_model": primary.map(|attempt| attempt.exact_model.clone()),
+            "provider_actual_model": primary.map(|attempt| attempt.provider_model.clone()),
+            "provider_options": primary.and_then(|attempt| attempt.provider_options.clone()),
     }));
     let progress = task_data.progress.get_or_insert_with(Default::default);
     progress.status = Some(initial_status.to_string());

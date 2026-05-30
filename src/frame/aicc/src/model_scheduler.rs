@@ -342,6 +342,8 @@ mod tests {
         let metadata = ModelMetadata {
             provider_model_id: exact.to_string(),
             exact_model: format!("{}@{}", exact, provider),
+            provider_actual_model_id: None,
+            provider_options: None,
             parameter_scale: None,
             api_types: vec![ApiType::LlmChat],
             logical_mounts: vec!["llm.plan".to_string()],

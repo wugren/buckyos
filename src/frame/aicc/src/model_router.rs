@@ -57,6 +57,8 @@ impl<'a> ModelRouter<'a> {
             resolved_logical_path: None,
             selected_exact_model: None,
             selected_provider_instance_name: None,
+            selected_provider_model_id: None,
+            provider_options: None,
             candidate_count_before_filter: 0,
             candidate_count_after_filter: 0,
             filtered_candidates: Vec::new(),
@@ -518,6 +520,8 @@ mod tests {
         ModelMetadata {
             provider_model_id: model.to_string(),
             exact_model: format!("{}@{}", model, provider),
+            provider_actual_model_id: None,
+            provider_options: None,
             parameter_scale: None,
             api_types: vec![ApiType::LlmChat],
             logical_mounts: vec![mount.to_string()],

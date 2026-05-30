@@ -1,5 +1,7 @@
 mod common;
 
+use aicc::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
+use aicc::model_types::ProviderType;
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
 use buckyos_api::{
     AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, Capability,
@@ -724,4 +726,165 @@ async fn helper_text_to_image_expands_to_route_resolve_and_typed_inference() {
 
     assert_eq!(response.status, AiMethodStatus::Running);
     assert_eq!(provider.start_calls(), 1);
+}
+
+#[test]
+fn openai_resolver_expands_reasoning_variants() {
+    let inventory = resolve_driver_inventory(
+        "openai-primary",
+        ProviderType::CloudApi,
+        "openai",
+        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
+        Some("test".to_string()),
+    );
+
+    let high = inventory
+        .models
+        .iter()
+        .find(|model| model.provider_model_id == "gpt-5.1:reasoning-high")
+        .expect("reasoning-high variant should exist");
+
+    assert_eq!(high.exact_model, "gpt-5.1:reasoning-high@openai-primary");
+    assert_eq!(high.provider_actual_model_id.as_deref(), Some("gpt-5.1"));
+    assert_eq!(
+        high.provider_options
+            .as_ref()
+            .and_then(|options| options.pointer("/reasoning/effort"))
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert!(high
+        .logical_mounts
+        .iter()
+        .any(|mount| mount == "llm.openai.gpt-5-1.reasoning-high"));
+}
+
+#[test]
+fn route_resolve_outputs_base_provider_model_and_variant_options() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let instance = mock_instance(
+        "openai-primary",
+        "openai",
+        vec![Capability::Llm],
+        vec!["plan".to_string()],
+    );
+    let inventory = resolve_driver_inventory(
+        "openai-primary",
+        ProviderType::CloudApi,
+        "openai",
+        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
+        Some("test".to_string()),
+    );
+    let provider = Arc::new(MockProvider::with_inventory(
+        instance,
+        inventory,
+        CostEstimate {
+            estimated_cost_usd: Some(0.01),
+            estimated_latency_ms: Some(100),
+        },
+        vec![Ok(ProviderStartResult::Started)],
+    ));
+    registry.add_provider(provider);
+    let center = center_with_taskmgr(registry, catalog);
+
+    let response = center
+        .resolve_route(
+            RouteResolveRequest {
+                request_id: Some("test-route".to_string()),
+                api_type: "llm.chat".to_string(),
+                logical_model: "llm.openai.gpt-5-1.reasoning-high".to_string(),
+                requirements: Requirements::default(),
+                disable: Default::default(),
+                policy: None,
+                estimated_input_tokens: None,
+                estimated_output_tokens: None,
+                session_id: None,
+                session_profile: None,
+            },
+            Default::default(),
+        )
+        .expect("route.resolve should select variant logical mount");
+
+    assert_eq!(
+        response.selected_exact_model,
+        "gpt-5.1:reasoning-high@openai-primary"
+    );
+    assert_eq!(response.provider_model_id, "gpt-5.1");
+    assert_eq!(
+        response
+            .provider_options
+            .as_ref()
+            .and_then(|options| options.pointer("/reasoning/effort"))
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        response
+            .route_trace
+            .as_ref()
+            .and_then(|trace| trace.get("selected_provider_model_id"))
+            .and_then(|value| value.as_str()),
+        Some("gpt-5.1")
+    );
+}
+
+#[tokio::test]
+async fn typed_variant_exact_model_lowers_to_provider_base_and_options() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let instance = mock_instance(
+        "openai-primary",
+        "openai",
+        vec![Capability::Llm],
+        vec!["plan".to_string()],
+    );
+    let inventory = resolve_driver_inventory(
+        "openai-primary",
+        ProviderType::CloudApi,
+        "openai",
+        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
+        Some("test".to_string()),
+    );
+    let provider = Arc::new(MockProvider::with_inventory(
+        instance,
+        inventory,
+        CostEstimate {
+            estimated_cost_usd: Some(0.01),
+            estimated_latency_ms: Some(100),
+        },
+        vec![Ok(ProviderStartResult::Started)],
+    ));
+    registry.add_provider(provider.clone());
+    let center = center_with_taskmgr(registry, catalog);
+
+    let response = center
+        .create_chat_completion(
+            LlmChatInvokeRequest {
+                exact_model: "gpt-5.1:reasoning-high@openai-primary".to_string(),
+                messages: vec![AiMessage::text(AiRole::User, "hello")],
+                tools: vec![],
+                response_format: None,
+                temperature: None,
+                max_output_tokens: None,
+                payload: None,
+                provider_options: None,
+                idempotency_key: None,
+                task_options: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("typed exact variant should start");
+
+    assert_eq!(response.status, AiMethodStatus::Running);
+    assert_eq!(provider.last_provider_model().as_deref(), Some("gpt-5.1"));
+    assert_eq!(
+        provider
+            .last_request_options()
+            .as_ref()
+            .and_then(|options| options.pointer("/provider_options/reasoning/effort"))
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
 }

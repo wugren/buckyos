@@ -128,7 +128,7 @@
   - 是否受 `runtime_failover` 和 `fallback_limit` 限制。
   - 是否包含 primary 之外所有同分候选、scheduler 后候选，还是只包含运行时 failover 候选。
 - [ ] `route_trace` 使用稳定结构而不是裸 `Value`，至少在 Rust API 层保留 typed struct，外部序列化为 JSON。
-- [ ] `provider_options` 的来源从 `lower_provider_model_options()` 迁移到 driver metadata / variant resolver。
+- [x] `provider_options` 的来源从 `lower_provider_model_options()` 迁移到 driver metadata / variant resolver。
 - [x] typed inference 内部不再经过“逻辑 route”路径；短期可继续复用 `complete_with_method()`，但必须用测试锁定 exact-only 行为。
 - [x] 如果 `helper.*` 继续保留在 AICC service，改为显式调用 `resolve_route()` + typed inference，而不是直接转发旧 all-in-one 方法。
 - [ ] Agent SDK / Web SDK / CLI 提供 helper API，并把默认调用迁移到 helper 或显式两阶段调用。
@@ -254,15 +254,15 @@ provider_options.reasoning.effort = high
 
 ### 4.3 TODO
 
-- [ ] 在 driver metadata schema 中定义 `variants`。
-- [ ] OpenAI metadata 中用 variants 表达 reasoning effort 档位。
-- [ ] AICC exact model 使用 variant 后的 model id。
-- [ ] route.resolve 输出 base provider model id + provider_options。
+- [x] 在 driver metadata schema 中定义 `variants`。
+- [x] OpenAI metadata 中用 variants 表达 reasoning effort 档位。
+- [x] AICC exact model 使用 variant 后的 model id。
+- [x] route.resolve 输出 base provider model id + provider_options。
 - [x] typed inference 若收到 variant exact model，应能按 metadata 自动 lower；不应要求调用方必须手动补 provider_options。
 - [x] provider adapter 调用前统一把 AICC variant 还原成 provider base model + provider options。
-- [ ] 用户传入的 provider_options 与 route provider_options 的 merge 规则放在 helper 层，不放在数据面协议里。
-- [ ] usage / trace / audit 使用 AICC exact model 聚合，避免不同 reasoning 档位混在一起。
-- [ ] audit 额外保留 provider actual model 和 provider options，便于复现。
+- [x] 用户传入的 provider_options 与 route provider_options 的 merge 规则放在 helper 层，不放在数据面协议里。
+- [x] usage / trace / audit 使用 AICC exact model 聚合，避免不同 reasoning 档位混在一起。
+- [x] audit 额外保留 provider actual model 和 provider options，便于复现。
 
 ## 5. Logical Model Definition 与 Auto-Mount
 
@@ -495,8 +495,8 @@ Base Logical Tree
 - [x] `chat.completions.create(logical_model)` 被拒绝。
 - [x] exact model unavailable 时 typed inference 不 fallback。
 - [x] helper `llm_chat` 行为等价于 route + typed inference。
-- [ ] OpenAI `/models` 返回 `gpt-5.1`，resolver 展开 base model 和 reasoning variants。
-- [ ] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
+- [x] OpenAI `/models` 返回 `gpt-5.1`，resolver 展开 base model 和 reasoning variants。
+- [x] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
 - [ ] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。
 - [ ] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
 - [ ] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。

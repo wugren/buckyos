@@ -454,6 +454,10 @@ impl Default for ModelHealth {
 pub struct ModelMetadata {
     pub provider_model_id: String,
     pub exact_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_actual_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<serde_json::Value>,
     #[serde(default)]
     pub parameter_scale: Option<String>,
     #[serde(default)]
@@ -930,6 +934,10 @@ pub struct RouteTrace {
     #[serde(default)]
     pub selected_provider_instance_name: Option<String>,
     #[serde(default)]
+    pub selected_provider_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<serde_json::Value>,
+    #[serde(default)]
     pub candidate_count_before_filter: usize,
     #[serde(default)]
     pub candidate_count_after_filter: usize,
@@ -1083,6 +1091,8 @@ mod tests {
         let model = ModelMetadata {
             provider_model_id: "gpt-5.2".to_string(),
             exact_model: "gpt-5.2@openai_primary".to_string(),
+            provider_actual_model_id: None,
+            provider_options: None,
             parameter_scale: None,
             api_types: vec![ApiType::LlmChat],
             logical_mounts: vec!["llm.gpt5".to_string()],

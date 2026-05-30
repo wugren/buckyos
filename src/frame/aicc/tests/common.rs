@@ -128,6 +128,8 @@ pub struct MockProvider {
     cost: CostEstimate,
     start_results: Mutex<VecDeque<std::result::Result<ProviderStartResult, ProviderError>>>,
     start_calls: AtomicUsize,
+    last_provider_model: Mutex<Option<String>>,
+    last_request_options: Mutex<Option<Value>>,
     canceled: Mutex<Vec<String>>,
 }
 
@@ -139,12 +141,24 @@ impl MockProvider {
         start_results: Vec<std::result::Result<ProviderStartResult, ProviderError>>,
     ) -> Self {
         let inventory = mock_inventory(&instance, &cost);
+        Self::with_inventory(instance, inventory, cost, start_results)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_inventory(
+        instance: ProviderInstance,
+        inventory: ProviderInventory,
+        cost: CostEstimate,
+        start_results: Vec<std::result::Result<ProviderStartResult, ProviderError>>,
+    ) -> Self {
         Self {
             instance,
             inventory,
             cost,
             start_results: Mutex::new(start_results.into_iter().collect()),
             start_calls: AtomicUsize::new(0),
+            last_provider_model: Mutex::new(None),
+            last_request_options: Mutex::new(None),
             canceled: Mutex::new(vec![]),
         }
     }
@@ -152,6 +166,22 @@ impl MockProvider {
     #[allow(dead_code)]
     pub fn start_calls(&self) -> usize {
         self.start_calls.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn last_provider_model(&self) -> Option<String> {
+        self.last_provider_model
+            .lock()
+            .expect("last_provider_model lock")
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn last_request_options(&self) -> Option<Value> {
+        self.last_request_options
+            .lock()
+            .expect("last_request_options lock")
+            .clone()
     }
 
     #[allow(dead_code)]
@@ -183,11 +213,19 @@ impl Provider for MockProvider {
     async fn start(
         &self,
         _ctx: InvokeCtx,
-        _provider_model: String,
-        _req: ResolvedRequest,
+        provider_model: String,
+        req: ResolvedRequest,
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         self.start_calls.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_provider_model
+            .lock()
+            .expect("last_provider_model lock") = Some(provider_model);
+        *self
+            .last_request_options
+            .lock()
+            .expect("last_request_options lock") = req.request.payload.options.clone();
         let mut queue = self.start_results.lock().expect("start_results lock");
         queue
             .pop_front()

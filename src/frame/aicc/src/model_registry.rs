@@ -311,6 +311,8 @@ mod tests {
         ModelMetadata {
             provider_model_id: provider_model_id.to_string(),
             exact_model: format!("{}@{}", provider_model_id, provider),
+            provider_actual_model_id: None,
+            provider_options: None,
             parameter_scale: None,
             api_types: vec![ApiType::LlmChat],
             logical_mounts: vec![mount.to_string()],
