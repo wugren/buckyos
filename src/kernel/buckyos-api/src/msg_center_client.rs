@@ -378,6 +378,11 @@ const METHOD_UI_SESSION_GET_STATE: &str = "ui_session.get_state";
 const METHOD_UI_SESSION_LIST_STATE: &str = "ui_session.list_state";
 
 const METHOD_CONTACT_RESOLVE_DID: &str = "contact.resolve_did";
+const METHOD_CONTACT_RESOLVE_ENDPOINT_DID: &str = "contact.resolve_endpoint_did";
+const METHOD_CONTACT_RESOLVE_TARGET: &str = "contact.resolve_target";
+const METHOD_CONTACT_RESOLVE_CONTACT_FOR_ENDPOINT: &str = "contact.resolve_contact_for_endpoint";
+const METHOD_CONTACT_RESOLVE_CANONICAL_DID: &str = "contact.resolve_canonical_did";
+const METHOD_CONTACT_LIST_ALIAS_DIDS: &str = "contact.list_alias_dids";
 const METHOD_CONTACT_GET_PREFERRED_BINDING: &str = "contact.get_preferred_binding";
 const METHOD_CONTACT_CHECK_ACCESS_PERMISSION: &str = "contact.check_access_permission";
 const METHOD_CONTACT_GRANT_TEMPORARY_ACCESS: &str = "contact.grant_temporary_access";
@@ -496,21 +501,6 @@ pub struct IngressContext {
     // Owner scope used for contact-manager lookups while dispatching this ingress message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact_mgr_owner: Option<DID>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct SendContext {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_id: Option<String>,
-    // Owner scope used for contact-manager lookups while building delivery plan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contact_mgr_owner: Option<DID>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred_tunnel: Option<DID>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<Value>,
 }
@@ -740,7 +730,18 @@ pub struct AccountBinding {
     pub platform: String,
     pub account_id: String,
     pub display_id: String,
+    /// Stable short tunnel id (e.g. `tg-main`). This is NOT the tunnel box-owner
+    /// DID; the routing DID lives in `meta["message_tunnel_did"]`.
     pub tunnel_id: String,
+    /// Platform entity kind for the bound endpoint: `user`/`group`/`channel`/`addr`.
+    /// Empty for legacy/zone-user bindings that are not message-tunnel endpoints.
+    #[serde(default)]
+    pub account_type: String,
+    /// Second-level message-tunnel endpoint DID
+    /// (`did:msgtunnel:<encoded_account_id>.<account_type>.<tunnel_id>`).
+    /// `None` for bindings that do not project a tunnel endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_did: Option<DID>,
     pub last_active_at: u64,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub meta: HashMap<String, String>,
@@ -921,20 +922,13 @@ impl MsgCenterDispatchReq {
 pub struct MsgCenterPostSendReq {
     pub msg: MsgObject,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub send_ctx: Option<SendContext>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
 
 impl MsgCenterPostSendReq {
-    pub fn new(
-        msg: MsgObject,
-        send_ctx: Option<SendContext>,
-        idempotency_key: Option<String>,
-    ) -> Self {
+    pub fn new(msg: MsgObject, idempotency_key: Option<String>) -> Self {
         Self {
             msg,
-            send_ctx,
             idempotency_key,
         }
     }
@@ -1304,6 +1298,129 @@ impl MsgCenterResolveDidReq {
     }
 }
 
+/// Construct (or look up) the second-level endpoint DID for a platform account.
+/// Deterministic: same `(platform, account_id, account_type, tunnel_id)` always
+/// yields the same `did:msgtunnel:*`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgCenterResolveEndpointDidReq {
+    pub platform: String,
+    pub account_id: String,
+    pub account_type: String,
+    pub tunnel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_mgr_owner: Option<DID>,
+}
+
+impl MsgCenterResolveEndpointDidReq {
+    pub fn new(
+        platform: String,
+        account_id: String,
+        account_type: String,
+        tunnel_id: String,
+        contact_mgr_owner: Option<DID>,
+    ) -> Self {
+        Self {
+            platform,
+            account_id,
+            account_type,
+            tunnel_id,
+            contact_mgr_owner,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        parse_from_json(value, "MsgCenterResolveEndpointDidReq")
+    }
+}
+
+/// Construction-time target resolver: pick the endpoint DID for a canonical
+/// contact DID + selector (tunnel_id, then platform). Fails when the selector
+/// does not match exactly one binding — no fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgCenterResolveTargetReq {
+    pub contact_did: DID,
+    pub selector: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_mgr_owner: Option<DID>,
+}
+
+impl MsgCenterResolveTargetReq {
+    pub fn new(contact_did: DID, selector: String, contact_mgr_owner: Option<DID>) -> Self {
+        Self {
+            contact_did,
+            selector,
+            contact_mgr_owner,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        parse_from_json(value, "MsgCenterResolveTargetReq")
+    }
+}
+
+/// Reverse lookup: which canonical/contact DID owns this endpoint DID?
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgCenterResolveContactForEndpointReq {
+    pub endpoint_did: DID,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_mgr_owner: Option<DID>,
+}
+
+impl MsgCenterResolveContactForEndpointReq {
+    pub fn new(endpoint_did: DID, contact_mgr_owner: Option<DID>) -> Self {
+        Self {
+            endpoint_did,
+            contact_mgr_owner,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        parse_from_json(value, "MsgCenterResolveContactForEndpointReq")
+    }
+}
+
+/// Resolve a (possibly merged-away/alias) DID to its current canonical DID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgCenterResolveCanonicalDidReq {
+    pub did: DID,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_mgr_owner: Option<DID>,
+}
+
+impl MsgCenterResolveCanonicalDidReq {
+    pub fn new(did: DID, contact_mgr_owner: Option<DID>) -> Self {
+        Self {
+            did,
+            contact_mgr_owner,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        parse_from_json(value, "MsgCenterResolveCanonicalDidReq")
+    }
+}
+
+/// List all alias DIDs (merged-away sources) that now resolve to a canonical DID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgCenterListAliasDidsReq {
+    pub canonical_did: DID,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_mgr_owner: Option<DID>,
+}
+
+impl MsgCenterListAliasDidsReq {
+    pub fn new(canonical_did: DID, contact_mgr_owner: Option<DID>) -> Self {
+        Self {
+            canonical_did,
+            contact_mgr_owner,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        parse_from_json(value, "MsgCenterListAliasDidsReq")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgCenterGetPreferredBindingReq {
     pub did: DID,
@@ -1626,18 +1743,15 @@ impl MsgCenterClient {
     pub async fn post_send(
         &self,
         msg: MsgObject,
-        send_ctx: Option<SendContext>,
         idempotency_key: Option<String>,
     ) -> std::result::Result<PostSendResult, RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
-                handler
-                    .handle_post_send(msg, send_ctx, idempotency_key, ctx)
-                    .await
+                handler.handle_post_send(msg, idempotency_key, ctx).await
             }
             Self::KRPC(client) => {
-                let req = MsgCenterPostSendReq::new(msg, send_ctx, idempotency_key);
+                let req = MsgCenterPostSendReq::new(msg, idempotency_key);
                 let req_json = serialize_to_json(&req, "MsgCenterPostSendReq")?;
                 let result = client.call(METHOD_MSG_POST_SEND, req_json).await?;
                 parse_rpc_response(result, "PostSendResult")
@@ -1997,6 +2111,142 @@ impl MsgCenterClient {
                 let req_json = serialize_to_json(&req, "MsgCenterResolveDidReq")?;
                 let result = client.call(METHOD_CONTACT_RESOLVE_DID, req_json).await?;
                 parse_rpc_response(result, "DID")
+            }
+        }
+    }
+
+    /// Construct/look up the second-level endpoint DID for a platform account.
+    pub async fn resolve_endpoint_did(
+        &self,
+        platform: String,
+        account_id: String,
+        account_type: String,
+        tunnel_id: String,
+        contact_mgr_owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_resolve_endpoint_did(
+                        platform,
+                        account_id,
+                        account_type,
+                        tunnel_id,
+                        contact_mgr_owner,
+                        ctx,
+                    )
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = MsgCenterResolveEndpointDidReq::new(
+                    platform,
+                    account_id,
+                    account_type,
+                    tunnel_id,
+                    contact_mgr_owner,
+                );
+                let req_json = serialize_to_json(&req, "MsgCenterResolveEndpointDidReq")?;
+                let result = client
+                    .call(METHOD_CONTACT_RESOLVE_ENDPOINT_DID, req_json)
+                    .await?;
+                parse_rpc_response(result, "DID")
+            }
+        }
+    }
+
+    /// Construction-time resolver: canonical contact DID + selector -> endpoint DID.
+    pub async fn resolve_target(
+        &self,
+        contact_did: DID,
+        selector: String,
+        contact_mgr_owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_resolve_target(contact_did, selector, contact_mgr_owner, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = MsgCenterResolveTargetReq::new(contact_did, selector, contact_mgr_owner);
+                let req_json = serialize_to_json(&req, "MsgCenterResolveTargetReq")?;
+                let result = client.call(METHOD_CONTACT_RESOLVE_TARGET, req_json).await?;
+                parse_rpc_response(result, "DID")
+            }
+        }
+    }
+
+    /// Reverse lookup: endpoint DID -> owning canonical/contact DID (if any).
+    pub async fn resolve_contact_for_endpoint(
+        &self,
+        endpoint_did: DID,
+        contact_mgr_owner: Option<DID>,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_resolve_contact_for_endpoint(endpoint_did, contact_mgr_owner, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req =
+                    MsgCenterResolveContactForEndpointReq::new(endpoint_did, contact_mgr_owner);
+                let req_json = serialize_to_json(&req, "MsgCenterResolveContactForEndpointReq")?;
+                let result = client
+                    .call(METHOD_CONTACT_RESOLVE_CONTACT_FOR_ENDPOINT, req_json)
+                    .await?;
+                parse_optional_rpc_response(result, "DID")
+            }
+        }
+    }
+
+    /// Resolve a (possibly merged-away alias) DID to its current canonical DID.
+    pub async fn resolve_canonical_did(
+        &self,
+        did: DID,
+        contact_mgr_owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_resolve_canonical_did(did, contact_mgr_owner, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = MsgCenterResolveCanonicalDidReq::new(did, contact_mgr_owner);
+                let req_json = serialize_to_json(&req, "MsgCenterResolveCanonicalDidReq")?;
+                let result = client
+                    .call(METHOD_CONTACT_RESOLVE_CANONICAL_DID, req_json)
+                    .await?;
+                parse_rpc_response(result, "DID")
+            }
+        }
+    }
+
+    /// List all alias DIDs (merged-away sources) resolving to a canonical DID.
+    pub async fn list_alias_dids(
+        &self,
+        canonical_did: DID,
+        contact_mgr_owner: Option<DID>,
+    ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_list_alias_dids(canonical_did, contact_mgr_owner, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = MsgCenterListAliasDidsReq::new(canonical_did, contact_mgr_owner);
+                let req_json = serialize_to_json(&req, "MsgCenterListAliasDidsReq")?;
+                let result = client
+                    .call(METHOD_CONTACT_LIST_ALIAS_DIDS, req_json)
+                    .await?;
+                parse_rpc_response(result, "Vec<DID>")
             }
         }
     }
@@ -2655,7 +2905,6 @@ pub trait MsgCenterHandler: Send + Sync {
     async fn handle_post_send(
         &self,
         msg: MsgObject,
-        send_ctx: Option<SendContext>,
         idempotency_key: Option<String>,
         ctx: RPCContext,
     ) -> std::result::Result<PostSendResult, RPCErrors>;
@@ -2778,6 +3027,65 @@ pub trait MsgCenterHandler: Send + Sync {
         contact_mgr_owner: Option<DID>,
         ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors>;
+
+    async fn handle_resolve_endpoint_did(
+        &self,
+        _platform: String,
+        _account_id: String,
+        _account_type: String,
+        _tunnel_id: String,
+        _contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            "contact.resolve_endpoint_did".to_string(),
+        ))
+    }
+
+    async fn handle_resolve_target(
+        &self,
+        _contact_did: DID,
+        _selector: String,
+        _contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            "contact.resolve_target".to_string(),
+        ))
+    }
+
+    async fn handle_resolve_contact_for_endpoint(
+        &self,
+        _endpoint_did: DID,
+        _contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            "contact.resolve_contact_for_endpoint".to_string(),
+        ))
+    }
+
+    async fn handle_resolve_canonical_did(
+        &self,
+        _did: DID,
+        _contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            "contact.resolve_canonical_did".to_string(),
+        ))
+    }
+
+    async fn handle_list_alias_dids(
+        &self,
+        _canonical_did: DID,
+        _contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            "contact.list_alias_dids".to_string(),
+        ))
+    }
 
     async fn handle_get_preferred_binding(
         &self,
@@ -3083,12 +3391,7 @@ impl<T: MsgCenterHandler> RPCHandler for MsgCenterServerHandler<T> {
                 let post_send_req = MsgCenterPostSendReq::from_json(req.params)?;
                 let result = self
                     .0
-                    .handle_post_send(
-                        post_send_req.msg,
-                        post_send_req.send_ctx,
-                        post_send_req.idempotency_key,
-                        ctx,
-                    )
+                    .handle_post_send(post_send_req.msg, post_send_req.idempotency_key, ctx)
                     .await?;
                 RPCResult::Success(json!(result))
             }
@@ -3255,6 +3558,70 @@ impl<T: MsgCenterHandler> RPCHandler for MsgCenterServerHandler<T> {
                         resolve_req.account_id,
                         resolve_req.profile_hint,
                         resolve_req.contact_mgr_owner,
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_CONTACT_RESOLVE_ENDPOINT_DID | "resolve_endpoint_did" => {
+                let endpoint_req = MsgCenterResolveEndpointDidReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_resolve_endpoint_did(
+                        endpoint_req.platform,
+                        endpoint_req.account_id,
+                        endpoint_req.account_type,
+                        endpoint_req.tunnel_id,
+                        endpoint_req.contact_mgr_owner,
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_CONTACT_RESOLVE_TARGET | "resolve_target" => {
+                let target_req = MsgCenterResolveTargetReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_resolve_target(
+                        target_req.contact_did,
+                        target_req.selector,
+                        target_req.contact_mgr_owner,
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_CONTACT_RESOLVE_CONTACT_FOR_ENDPOINT | "resolve_contact_for_endpoint" => {
+                let endpoint_req = MsgCenterResolveContactForEndpointReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_resolve_contact_for_endpoint(
+                        endpoint_req.endpoint_did,
+                        endpoint_req.contact_mgr_owner,
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_CONTACT_RESOLVE_CANONICAL_DID | "resolve_canonical_did" => {
+                let canonical_req = MsgCenterResolveCanonicalDidReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_resolve_canonical_did(
+                        canonical_req.did,
+                        canonical_req.contact_mgr_owner,
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_CONTACT_LIST_ALIAS_DIDS | "list_alias_dids" => {
+                let alias_req = MsgCenterListAliasDidsReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_list_alias_dids(
+                        alias_req.canonical_did,
+                        alias_req.contact_mgr_owner,
                         ctx,
                     )
                     .await?;

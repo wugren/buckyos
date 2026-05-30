@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use buckyos_api::{
     get_buckyos_api_runtime, match_event_patterns, parse_typed_task_data, AiContent, AiMessage,
     AiRole, MsgCenterClient, Task, TaskFilter, TaskManagerClient, TaskNote, TaskStatus,
-    TypedTaskData, UI_SESSION_PLATFORM_TELEGRAM, UI_SESSION_STATE_STATUS_LINE_KEY,
+    TypedTaskData, UI_SESSION_STATE_STATUS_LINE_KEY,
     UI_SESSION_STATE_TYPING_KEY,
 };
 use log::{info, warn};
@@ -4934,11 +4934,7 @@ impl AgentSession {
             },
             ..ndn_lib::MsgObject::default()
         };
-        let send_ctx = buckyos_api::SendContext {
-            contact_mgr_owner: Some(agent_did),
-            ..Default::default()
-        };
-        match msg_center.post_send(msg, Some(send_ctx), None).await {
+        match msg_center.post_send(msg, None).await {
             Ok(result) if result.ok => {}
             Ok(result) => warn!(
                 "opendan.session[{}]: sendmsg rejected — reason={:?}",
@@ -5905,9 +5901,9 @@ impl AgentSession {
         let Some(msg_center) = self.runtime.msg_center.as_ref().cloned() else {
             return;
         };
-        let (peer_did_str, peer_tunnel_str) = {
+        let peer_did_str = {
             let meta = self.meta.lock().await;
-            (meta.peer_did.clone(), meta.peer_tunnel_did.clone())
+            meta.peer_did.clone()
         };
         let Some(peer_did_str) = peer_did_str else {
             return;
@@ -5939,9 +5935,9 @@ impl AgentSession {
             // sometimes set peer = owner = agent.
             return;
         }
-        let tunnel = peer_tunnel_str
-            .as_deref()
-            .and_then(|raw| name_lib::DID::from_str(raw).ok());
+        // `peer_did` is the session's stored peer DID — a determined target
+        // (second-level `did:msgtunnel:*` endpoint for tunnel traffic) that
+        // carries its own routing. No preferred_tunnel / route hint needed.
 
         let mut msg = ndn_lib::MsgObject {
             from: agent_did.clone(),
@@ -6016,14 +6012,7 @@ impl AgentSession {
             return;
         }
 
-        let send_ctx = buckyos_api::SendContext {
-            contact_mgr_owner: Some(agent_did),
-            preferred_tunnel: tunnel,
-            extra: tg_route_extra_for_session(&self.session_id),
-            ..Default::default()
-        };
-
-        match msg_center.post_send(msg, Some(send_ctx), None).await {
+        match msg_center.post_send(msg, None).await {
             Ok(result) if result.ok => {}
             Ok(result) => warn!(
                 "opendan.session[{}]: outbound rejected — reason={:?}",
@@ -6145,24 +6134,12 @@ impl AgentSession {
         if agent_did == peer_did {
             return Ok(false);
         }
-        let tunnel = target_meta
-            .peer_tunnel_did
-            .as_deref()
-            .and_then(|raw| name_lib::DID::from_str(raw).ok());
+        // `peer_did` (from the target session meta) is a determined endpoint DID
+        // that carries its own routing; the report content lives in `msg`.
         let msg = self
             .build_worksession_report_msg(&agent_did, &peer_did, target_session_id, data)
             .await;
-        let send_ctx = buckyos_api::SendContext {
-            contact_mgr_owner: Some(agent_did),
-            preferred_tunnel: tunnel,
-            context_id: Some(target_session_id.to_string()),
-            extra: Some(with_tg_route_chat_id(data.clone(), target_session_id)),
-            ..Default::default()
-        };
-        match msg_center
-            .post_send(msg, Some(send_ctx), idempotency_key)
-            .await
-        {
+        match msg_center.post_send(msg, idempotency_key).await {
             Ok(result) if result.ok => Ok(true),
             Ok(result) => {
                 warn!(
@@ -7204,53 +7181,6 @@ fn normalize_report_attachment_line(line: &str) -> String {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
     format!("{indent}<attachment>{}</attachment>", body.trim())
-}
-
-fn tg_route_extra_for_session(session_id: &str) -> Option<serde_json::Value> {
-    telegram_chat_id_from_ui_session_id(session_id)
-        .map(|chat_id| serde_json::json!({ "route": { "chat_id": chat_id } }))
-}
-
-fn with_tg_route_chat_id(mut extra: serde_json::Value, session_id: &str) -> serde_json::Value {
-    let Some(chat_id) = telegram_chat_id_from_ui_session_id(session_id) else {
-        return extra;
-    };
-    let Some(obj) = extra.as_object_mut() else {
-        return serde_json::json!({
-            "payload": extra,
-            "route": { "chat_id": chat_id },
-        });
-    };
-
-    match obj.get_mut("route").and_then(|route| route.as_object_mut()) {
-        Some(route) => {
-            route
-                .entry("chat_id".to_string())
-                .or_insert_with(|| serde_json::Value::String(chat_id));
-        }
-        None => {
-            obj.insert(
-                "route".to_string(),
-                serde_json::json!({ "chat_id": chat_id }),
-            );
-        }
-    }
-    extra
-}
-
-fn telegram_chat_id_from_ui_session_id(session_id: &str) -> Option<String> {
-    let mut parts = session_id.splitn(3, ':');
-    let platform = parts.next()?.trim();
-    if platform != UI_SESSION_PLATFORM_TELEGRAM {
-        return None;
-    }
-    parts.next()?;
-    let chat_id = parts.next()?.trim();
-    if chat_id.is_empty() {
-        None
-    } else {
-        Some(chat_id.to_string())
-    }
 }
 
 fn json_str(data: &serde_json::Value, key: &str) -> String {

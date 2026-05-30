@@ -18,7 +18,7 @@ to = did:msgtunnel:12345.user.tg-main
 to = did:msgtunnel:-100123456.group.tg-main
 ```
 
-不建议允许：
+不允许：
 
 ```text
 to = did:bns:bob/tg
@@ -36,8 +36,7 @@ A: 一级 DID 是 BuckyOS canonical identity；二级 DID 是 Message Tunnel 暴
 
 ```text
 did:bns:bob
-did:buckyos:user:alice
-did:buckyos:agent:jarvis
+did:web:alice.com
 ```
 
 二级 DID 示例：
@@ -124,16 +123,15 @@ Resolved DID belongs to MsgObject.
 
 ### Q5: 如果直接发给一级 DID，是否也是确定发送？
 
-A: `to = did:bns:bob` 是确定的 Message Object target，但 delivery route 不一定唯一。
+A: `to = did:bns:bob` 是确定的 Message Object target。
 
 一级 DID 本身可以收消息。理想情况下，一级 DID 可以通过自己的 Message Hub 接收消息，不需要 tunnel binding。
 
 但如果当前系统需要通过传统平台投递到这个人，那么发送前有两种选择：
 
 1. 调用方先通过 selector 解析出二级 DID，再构造消息。
-2. 调用方直接构造 `to = did:bns:bob`，由 delivery 层使用默认策略选择 route。
+2. selector有“last_active / default"这种逻辑名字，可以明确的绑定到另一个2级DID（或指向一级）
 
-第一种是确定性平台发送。第二种是确定性身份发送，但 route selection 可能由系统策略决定。
 
 ## 2. Target 解析与发送流程
 
@@ -162,7 +160,7 @@ post_send:
 
 ### Q7: `SendContext.preferred_tunnel` 的定位是什么？
 
-A: `preferred_tunnel` 只能是 delivery hint，不能改变 `MsgObject.to` 的身份语义。
+A: 按现在的设计，
 
 它可以用于：
 
@@ -218,16 +216,12 @@ A: 自动 DID 至少需要能区分平台实体和 owner scope。
 
 - platform，例如 `telegram`
 - entity kind，例如 `user`、`group`、`channel`
-- platform account id，例如 Telegram user id
-- chat id 或 channel id
-- tunnel DID 或 tunnel account id
-- contact manager owner scope
 
 核心待决策点：
 
 - 同一个 Telegram user 通过不同 bot/tunnel 进入时，是同一个二级 DID，还是不同二级 DID？
-- 自动 DID 是全局唯一，还是 owner scope 唯一？
-- tunnel DID 是否进入 DID 字符串，还是只进入 binding/route 元数据？
+- 自动 DID 是全局唯一
+
 
 ### Q12: 自动 DID 的字符串格式是否要成为稳定协议？
 
@@ -311,7 +305,7 @@ A: 产品上通常看到的是 session，但 session 需要能关联回 Contact 
 
 ### Q17: Shadow DID 合并到正式 Contact 后，旧消息是否要改写？
 
-A: 不建议改写旧 `MsgObject`。
+A: 不改写旧 `MsgObject`。
 
 旧消息里的 `from/to` 应保持当时的确定 DID。Contact 合并后，应通过 ContactMgr 建立 canonical DID、二级 DID、历史 alias DID 之间的关系。
 
@@ -319,59 +313,10 @@ A: 不建议改写旧 `MsgObject`。
 
 ### Q18: 合并后的 source DID 应该删除吗？
 
-A: 不应简单删除。
+A: 不应删除。
 
-source DID 至少需要保留为 alias、merged source 或 tombstone，否则旧消息、旧 session、旧授权和旧 route 都会失去解释能力。
 
-建议概念模型：
 
-```text
-canonical DID:
-  did:bns:bob
-
-bindings:
-  telegram -> did:msgtunnel:12345.user.tg-main
-  email    -> did:msgtunnel:bob%40example.com.addr.email-main
-
-aliases / merged sources:
-  did:bns:mc-alice-telegram-user-12345-7
-```
-
-### Q19: 旧 session 中保存的 peer DID 后续还能不能发送？
-
-A: 可以被接受，但发送前必须 canonicalize 或 resolve。
-
-如果旧 session 保存的是 shadow DID，后续发送时应该走：
-
-```text
-old peer DID -> ContactMgr.resolve_canonical_or_endpoint -> determined DID
-```
-
-如果 old peer DID 已经 merged 到正式 Contact，系统可以：
-
-- 发送给 canonical DID；
-- 或根据旧 session 绑定的 endpoint DID 发送给原二级 DID；
-- 或要求调用方显式选择。
-
-这三者需要在代码修改前确定默认策略。
-
-### Q20: 历史消息查询应如何处理 merge？
-
-A: 查询层需要支持 canonical DID + alias DID 集合。
-
-仅按：
-
-```text
-record.from == peer_did || record.to == peer_did
-```
-
-会导致合并前历史和合并后消息断裂。
-
-需要补充的能力：
-
-- 根据 canonical DID 查询所有 merged source DID。
-- 根据二级 endpoint DID 查询所属 canonical Contact。
-- UI session 聚合时同时考虑 canonical DID、endpoint DID、old shadow DID。
 
 ## 6. Contact、Binding、Route 的边界
 
@@ -396,21 +341,7 @@ Binding 至少需要表达：
 - priority / last_active_at
 - verified / inferred / user_confirmed 状态
 
-### Q23: RouteInfo 表示什么？
 
-A: RouteInfo 表示一次 record 级投递路径，不参与长期身份建模。
-
-RouteInfo 可以保存：
-
-- tunnel DID
-- platform
-- account id
-- address
-- chat id
-- external message id
-- retry / delivery metadata
-
-RouteInfo 不应成为 Contact 的唯一真相源。
 
 ### Q24: ContactMgr、MsgCenter、Tunnel 的职责如何划分？
 
@@ -434,118 +365,288 @@ OpenDAN / UI:
 
 ### Q25: ContactMgr owner scope 为什么是全局问题？
 
-A: 因为同一个平台账号在不同 owner scope 下可能对应不同联系人关系。
+A: 因为同一个平台账号在不同 owner scope 下可能对应不同联系人关系。根本上，每个人都有自己玩去独立的Contact Mgr
 
 需要明确：
 
-- owner scope 是 zone owner、当前 user、agent，还是 app？
-- OpenDAN agent 发消息时，使用 agent scope 还是 owner user scope？
-- Telegram tunnel 入站自动 DID 使用哪个 scope？
-- 同一个 Telegram user 在两个 owner scope 下是否共享二级 DID？
-- binding 的 verified/user_confirmed 状态是否跨 scope 共享？
+- owner scope 是当前 user
+- OpenDAN agent 发消息时，使用 owner user scope
+- 同一个 Telegram user 在两个 owner scope 共享二级 DID
+- binding 的 verified/user_confirmed 状态不跨 scope 共享
 
-如果 owner scope 不统一，Contact merge 和 deterministic send 都会出现跨模块不一致。
 
-## 8. 当前实现与目标设计差距
+## 8. 新的设计约束
 
-### Q26: 当前 `post_send` 的主要差距是什么？
 
-A: 当前 `post_send` 已经要求 `msg.to` 非空，但 target/binding 语义还没有完全对齐本设计。
-
-需要检查和调整：
-
-- `MsgObject.to` 是否允许任何 selector 形态。
-- `post_send` 是否把 `to = 一级 DID` 隐式按 `last_active_at` 选择 binding。
-- `SendContext.preferred_tunnel` 是否会被误解成 target selector。
-- delivery record 的 `RouteInfo.target_did` 应该记录 logical target 还是 resolved endpoint DID。
-- 找不到 route 时是失败、pending，还是 fallback 到 default tunnel。
-
-### Q27: 当前 ContactMgr 的主要差距是什么？
-
-A: 需要补齐 endpoint DID、canonical DID、binding、alias、merge 的明确模型。
-
-当前需要重点确认：
-
-- `resolve_did(platform, account_id, owner)` 生成的是二级 DID 还是 shadow contact DID。
-- `get_preferred_binding(target_did, owner)` 的输入是 canonical DID 还是 endpoint DID。
-- `merge_contacts` 是否保留 source DID alias。
-- Contact merge 后，历史查询是否能自动包含 old shadow DID。
-- binding 是否需要显式保存 endpoint DID。
-
-### Q28: 当前 OpenDAN 的主要差距是什么？
-
-A: OpenDAN session 中保存的 `peer_did` 可能是旧 shadow DID 或平台 endpoint DID。
-
-需要明确：
-
-- 收到入站消息后保存的是 sender endpoint DID，还是 canonical DID。
-- 回复旧 session 时是否需要先 resolve/canonicalize。
-- 如果 session 绑定了 Telegram `chat_id`，它是 session 维度还是 route hint。
-- OpenDAN 是否允许用 `SendContext.extra` 指定 route。
-
-### Q29: 当前 Control Panel / UI 的主要差距是什么？
-
-A: UI 查询如果只按单个 peer DID 匹配，会在 Contact merge 后断裂。
-
-需要补齐：
-
-- canonical DID + aliases 查询。
-- session 与 Contact 的映射。
-- endpoint DID 与正式 Contact 的展示关系。
-- 合并后旧消息流是否并入新 Contact 视图。
-
-## 9. 下一步代码修改建议
-
-### Q30: 第一阶段应该先改什么？
-
-A: 先把“Message Object 必须使用确定 DID”落实到接口边界。
-
-建议顺序：
-
-1. 在文档中明确禁止 `MsgObject.to` 使用 selector。
-2. 增加 target resolver API 或内部 helper：
-
-   ```text
-   resolve_target(canonical_did, selector, owner_scope) -> endpoint_did
-   ```
-
-3. 调整调用方，让“Bob via Telegram”在构造 MsgObject 前解析为 endpoint DID。
-4. 明确 `SendContext.preferred_tunnel` 只作为 delivery hint。
-5. 对 `post_send` 增加更严格校验和错误信息。
-
-### Q31: 第二阶段应该补什么？
-
-A: 补 Contact merge 和历史查询能力。
-
-建议顺序：
-
-1. ContactMgr 增加 canonical/alias/endpoint DID 查询能力。
-2. merge 时保留 source DID alias，而不是仅迁移 binding。
-3. UI 和 OpenDAN 查询消息时使用 canonical DID + alias DID 集合。
-4. 旧 session 发送前 resolve target，避免继续使用失效 shadow DID。
-
-### Q32: 第三阶段应该补什么？
-
-A: 补 route/session 的规范化。
-
-建议顺序：
-
-1. 明确 `session` 字段和 UI session id 的关系。
-2. 明确 Telegram group/topic/thread 的 DID 与 session 表达。
-3. schema 化 `SendContext.extra.route`。
-4. 明确 route fallback 策略和失败语义。
-
-## 10. 必须保持的设计约束
-
-### Q33: 哪些约束不能破？
-
-A:
 
 1. `MsgObject` 一旦构造完成，`from/to` 必须是确定 DID。
 2. selector/path/binding choice 只能发生在构造 `MsgObject` 之前。
-3. `SendContext` 不能改变 `MsgObject.to` 的身份语义。
+3. `SendContext` 删除
 4. 自动生成的平台身份 DID 是二级 DID，不等同于正式 Contact DID。
 5. Contact merge 不应改写历史 `MsgObject`。
 6. session 是消息流维度，不是身份维度。
 7. RouteInfo 是投递记录，不是身份真相源。
 8. owner scope 必须在 ContactMgr API 中显式且一致。
+
+## 9. TODO: 代码修改任务清单
+
+本节基于当前实现 review，供后续 Code Agent 执行 breaking change。目标是落实新的设计约束：`MsgObject.from/to` 只保存确定 DID，Message Tunnel 外部 endpoint 使用二级 DID，删除 `SendContext`，target/binding 选择必须发生在构造 `MsgObject` 之前。
+
+### T1: 删除 `SendContext` 并收窄 `post_send` API
+
+当前事实：
+
+- `SendContext` 定义在 `src/kernel/buckyos-api/src/msg_center_client.rs`，字段包括 `context_id/contact_mgr_owner/preferred_tunnel/priority/extra`。
+- `MsgCenter.post_send`、`MsgCenterHandler.handle_post_send`、RPC request/response 和多处调用方都依赖 `Option<SendContext>`。
+- 当前 `post_send_internal` 会从 `send_ctx.contact_mgr_owner` 推导 ContactMgr owner，并把 `send_ctx.priority/extra/preferred_tunnel` 写入 delivery route。
+
+修改目标：
+
+- 删除 `SendContext` 类型，或至少从 `post_send` API 中移除。
+- `post_send` 不再接受 target selection、binding selection、tunnel selection 或 route extra。
+- 如确实需要保留发送队列控制，新增窄类型，例如：
+
+```rust
+pub struct PostSendOptions {
+    pub priority: Option<i32>,
+}
+```
+
+但第一版优先考虑 `post_send(msg, idempotency_key)`，避免重新引入隐式 route 语义。
+
+需要修改：
+
+- `src/kernel/buckyos-api/src/msg_center_client.rs`
+- `src/frame/msg_center/src/msg_center.rs`
+- `src/frame/msg_center/src/test_msg_center.rs`
+- 所有 `.post_send(msg, Some(SendContext { ... }), ...)` 调用点。
+
+验收标准：
+
+- 仓库中不再存在业务代码构造 `SendContext`。
+- `post_send` 不再因为 context 改变 `MsgObject.to` 的投递目标。
+- `post_send` 对 `msg.to.is_empty()` 继续显式失败。
+
+### T2: 实现 Message Tunnel 二级 DID 生成规则
+
+当前事实：
+
+- `ContactMgr.resolve_did(platform, account_id, owner)` 当前生成 `did:bns:mc-<owner>-<platform>-<account_id>-<seq>`。
+- 该 DID 当前同时承担 shadow contact 和平台 endpoint 两种语义。
+- Telegram tunnel 入站通过 `handle_resolve_did("telegram", account_id, profile_hint, owner)` 获得 sender/chat DID。
+
+修改目标：
+
+- 新增统一 helper 生成二级 DID：
+
+```text
+did:msgtunnel:<encoded_account_id>.<account_type>.<tunnel_id>
+```
+
+- `encoded_account_id` 必须可逆编码。
+- `account_type` 使用稳定枚举：`user/group/channel/addr` 等。
+- `tunnel_id` 来自 tunnel 配置或 tunnel 实现注册信息，必须稳定且不可复用。
+- 当前 Telegram user/group/channel 入站应生成二级 DID，而不是 `did:bns:mc-*`。
+
+需要修改：
+
+- `src/frame/msg_center/src/contact_mgr.rs`
+- `src/frame/msg_center/src/tg_tunnel.rs`
+- `src/kernel/buckyos-api/src/msg_center_client.rs` 中 Contact/Binding 共享类型。
+
+验收标准：
+
+- Telegram user `account_id=user:12345`、`account_type=user`、`tunnel_id=tg-main` 能稳定生成类似 `did:msgtunnel:12345.user.tg-main` 的 DID。
+- 群组、频道、邮箱地址等包含特殊字符的 account id 能正确编码和反解。
+- 同一 `(account_id, account_type, tunnel_id)` 重复解析得到同一个 DID。
+
+### T3: 拆分 shadow contact DID 与 endpoint DID
+
+当前事实：
+
+- `Contact.did` 当前既可能是正式联系人 DID，也可能是 `AutoInferred` 的自动联系人 DID。
+- `AccountBinding` 当前只有 `platform/account_id/display_id/tunnel_id/last_active_at/meta`，没有明确的 `endpoint_did` 字段。
+- `binding_index` 当前按 `(platform, account_id)` 指向 contact DID。
+
+修改目标：
+
+- `Contact.did` 表示一级联系人或本地联系人投影，不再直接表示平台 endpoint。
+- `AccountBinding` 增加 `endpoint_did: DID`。
+- ContactMgr 增加 endpoint DID 索引：
+
+```text
+endpoint_did -> canonical/contact DID
+(platform, account_id, account_type, tunnel_id) -> endpoint_did
+```
+
+- `resolve_did` 的语义要拆清楚：解析平台 endpoint 时返回二级 DID；查联系人时返回 canonical/contact DID。
+
+建议 API：
+
+```text
+resolve_endpoint_did(platform, account_id, account_type, tunnel_id) -> endpoint_did
+bind_endpoint(contact_did, endpoint_did, owner_scope)
+resolve_contact_for_endpoint(endpoint_did, owner_scope) -> Option<contact_did>
+```
+
+验收标准：
+
+- 一个正式 Contact 可以绑定多个二级 DID。
+- 一个二级 DID 可以被反查到 endpoint metadata。
+- ContactMgr 不再需要通过 `did:bns:mc-*` 伪造平台 endpoint。
+
+### T4: 增加构造前 target resolver，替代 `preferred_tunnel`
+
+当前事实：
+
+- `MsgCenter.build_delivery_plan` 现在会对 `target_did` 调 `get_preferred_binding`，按 `last_active_at` 选择 binding。
+- `SendContext.preferred_tunnel` 只覆盖 route 的 `tunnel_did`，不能确定 binding。
+- 这会导致 `MsgObject` 构造后仍有 route selection 行为。
+
+修改目标：
+
+- target/binding 选择必须发生在构造 `MsgObject` 之前。
+- 增加 resolver API：
+
+```text
+resolve_target(contact_did, selector, owner_scope) -> endpoint_did
+```
+
+- selector 可以是 tunnel id、platform、binding alias 或更严格的枚举；第一版建议优先支持 `tunnel_id`。
+- selector 找不到唯一 binding 时必须失败，不做 fallback。
+
+验收标准：
+
+- “Bob via Telegram” 调用方先解析到 `did:msgtunnel:*`，再构造 `MsgObject.to`。
+- `post_send` 不再使用 `get_preferred_binding` 为一级 DID 隐式选路。
+- `get_preferred_binding` 如保留，只用于 UI 默认建议，不用于 `post_send` 的确定性投递。
+
+### T5: 重写 `post_send` delivery plan 逻辑
+
+当前事实：
+
+- `build_delivery_plan(target_did, send_ctx, contact_mgr_owner)` 会读取 ContactMgr binding，填充 `RouteInfo.platform/account_id/address/tunnel_did`。
+- 找不到 binding 时会 fallback 到 `did:bns:msg-center-default-tunnel`。
+- `RouteInfo.target_did` 当前记录传入的 target DID，但 target 可能是一级 DID。
+
+修改目标：
+
+- `post_send` 只接受已经确定的 `MsgObject.to`。
+- 如果 `to` 是 `did:msgtunnel:*`，从二级 DID 反解或查索引得到 `tunnel_id/account_id/account_type/platform`，生成 `TUNNEL_OUTBOX`。
+- 如果 `to` 是一级 DID，优先走 BuckyOS Message Hub 直达逻辑；没有直达能力时应失败或 pending，不能静默 fallback 到任意 tunnel。
+- 删除 default tunnel fallback，除非明确目标 DID 就是某个 default tunnel endpoint。
+
+验收标准：
+
+- `to=did:msgtunnel:*` 能生成确定的 tunnel delivery。
+- `to=did:bns:bob` 不会按 `last_active_at` 隐式投递到某个传统平台 binding。
+- 找不到 route 时返回明确错误或 failed delivery，不返回“看似成功但无确定目标”。
+
+### T6: 调整 Telegram tunnel 入站与回发路径
+
+当前事实：
+
+- Telegram tunnel 入站使用 `handle_resolve_did` 为 sender/chat 生成 DID。
+- OpenDAN 回发时可能使用 `SendContext.preferred_tunnel` 和 `SendContext.extra.route.chat_id`。
+- `tg_route_extra_for_session` / `with_tg_route_chat_id` 把 Telegram `chat_id` 塞进 `SendContext.extra.route`。
+
+修改目标：
+
+- Telegram 入站 sender/chat 直接解析为 `did:msgtunnel:*` 二级 DID。
+- 入站 `MsgObject.from/to` 使用二级 DID 或正式一级 DID，但必须确定。
+- Telegram chat_id/topic/thread 等会话信息放入 session/thread/RouteInfo，不再通过 `SendContext.extra` 影响 target。
+- 回发旧 session 时，如果 session 保存了 endpoint DID，则直接构造 `to=endpoint_did`。
+
+验收标准：
+
+- OpenDAN 回复 Telegram 消息时不再构造 `SendContext`。
+- Telegram 群、频道、私聊均能生成稳定二级 DID。
+- 群 topic/thread 仍作为 session/thread 维度，不混入 DID。
+
+### T7: 调整 OpenDAN、Control Panel 和 workflow 调用方
+
+当前调用点：
+
+- `src/frame/opendan/src/agent.rs`
+- `src/frame/opendan/src/agent_session.rs`
+- `src/frame/control_panel/src/message_hub.rs`
+- `src/kernel/workflow/src/send_message_executor.rs`
+
+修改目标：
+
+- 所有发送调用方先拿到确定 DID，再构造 `MsgObject`。
+- 删除 `SendContext` 构造。
+- Control Panel 如果用户选择某个 contact + channel，应先调用 target resolver。
+- OpenDAN session meta 中应保存 endpoint DID / canonical DID / session id 的清晰边界。
+
+验收标准：
+
+- `rg "SendContext \\{" src` 无业务调用点。
+- `rg "preferred_tunnel" src` 不再出现在发送路径。
+- OpenDAN 和 Control Panel 的发送路径不依赖 `extra.route.chat_id` 决定收件人。
+
+### T8: Contact merge 增加 alias 和历史查询支持
+
+当前事实：
+
+- `merge_contacts_in_store` 会删除 source contact，并迁移 bindings、grant、groups、tags。
+- 当前没有 alias/tombstone 结构。
+- 历史 `MsgObject` 不会改写，旧 DID 需要可解释。
+
+修改目标：
+
+- merge 后保留 source DID 为 alias / merged source / tombstone。
+- ContactMgr 提供：
+
+```text
+resolve_canonical_did(did, owner_scope) -> canonical_did
+list_alias_dids(canonical_did, owner_scope) -> Vec<DID>
+```
+
+- UI 和 OpenDAN 历史查询使用 canonical DID + aliases 聚合。
+
+验收标准：
+
+- 合并 shadow contact 到正式 contact 后，旧消息仍能在正式 contact 的会话视图中出现。
+- 旧 session 保存的 peer DID 可以 resolve 到当前可用 DID。
+- source DID 不会因为 merge 后删除而失去解释能力。
+
+### T9: 更新测试
+
+必须覆盖：
+
+- `post_send` 拒绝空 `to`。
+- `post_send` 不接受或不使用 `SendContext`。
+- `did:msgtunnel:*` 生成、解析、编码/解码。
+- Telegram user/group/channel endpoint DID 稳定性。
+- `to=did:msgtunnel:*` 生成确定 tunnel delivery。
+- `to=did:bns:bob` 不隐式选择 traditional platform binding。
+- selector 找不到唯一 binding 时失败。
+- Contact merge 保留 alias，历史查询可聚合 old DID。
+
+建议命令：
+
+```bash
+cd src
+cargo test -p buckyos-api msg_center
+cargo test -p msg_center
+cargo test -p opendan
+uv run buckyos-build.py --skip-web
+```
+
+### T10: 文档联动
+
+需要同步更新：
+
+- `doc/message_hub/Message Tunnel Design.md`
+- `doc/message_hub/Contact Mgr.md`
+- `doc/message_hub/Message Center.md`
+- `doc/message_hub/Message Tunnel Minimal Spec.md`
+
+重点保持一致：
+
+- 二级 DID 规则：`did:msgtunnel:<encoded_account_id>.<account_type>.<tunnel_id>`。
+- `MsgObject.from/to` 必须是确定 DID。
+- `SendContext` 删除。
+- selector 只属于 message construction 阶段。
+- Contact merge 不改写历史 `MsgObject`，通过 alias/canonical 查询解决。

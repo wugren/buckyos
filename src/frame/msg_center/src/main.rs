@@ -111,6 +111,9 @@ struct TelegramTunnelSettings {
     enabled: bool,
     #[serde(default = "default_tg_tunnel_did")]
     tunnel_did: String,
+    /// Stable short tunnel id embedded in second-level DIDs (e.g. `tg-main`).
+    #[serde(default = "default_tg_tunnel_id")]
+    tunnel_id: String,
     #[serde(default = "default_true")]
     supports_ingress: bool,
     #[serde(default = "default_true")]
@@ -126,6 +129,7 @@ impl Default for TelegramTunnelSettings {
         Self {
             enabled: default_tg_tunnel_enabled(),
             tunnel_did: default_tg_tunnel_did(),
+            tunnel_id: default_tg_tunnel_id(),
             supports_ingress: default_true(),
             supports_egress: default_true(),
             gateway: TelegramGatewaySettings::default(),
@@ -238,6 +242,10 @@ fn default_tg_tunnel_enabled() -> bool {
 
 fn default_tg_tunnel_did() -> String {
     MSG_CENTER_DEFAULT_TG_TUNNEL_DID.to_string()
+}
+
+fn default_tg_tunnel_id() -> String {
+    "tg-main".to_string()
 }
 
 fn default_tg_session_dir() -> PathBuf {
@@ -514,6 +522,8 @@ fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUs
                 account_id,
                 display_id,
                 tunnel_id,
+                account_type: String::new(),
+                endpoint_did: None,
                 last_active_at: now_ms(),
                 meta: binding.meta,
             });
@@ -666,6 +676,7 @@ fn build_tg_tunnel(cfg: TgTunnelConfig, settings: &TelegramTunnelSettings) -> Re
                 api_hash,
                 session_dir,
                 tunnel_did: Some(cfg.tunnel_did.clone()),
+                tunnel_id: Some(cfg.tunnel_id.clone()),
             };
             info!(
                 "telegram tunnel initialized with grammers gateway (session_dir={})",
@@ -776,9 +787,19 @@ async fn apply_tg_tunnel_settings(
     }
 
     let tunnel_did = resolve_tg_tunnel_did(&settings.telegram_tunnel)?;
+    let tunnel_id = settings.telegram_tunnel.tunnel_id.trim().to_string();
+    let tunnel_id = if tunnel_id.is_empty() {
+        default_tg_tunnel_id()
+    } else {
+        tunnel_id
+    };
     let mut cfg = TgTunnelConfig::new(tunnel_did.clone());
+    cfg.tunnel_id = tunnel_id.clone();
     cfg.supports_ingress = settings.telegram_tunnel.supports_ingress;
     cfg.supports_egress = settings.telegram_tunnel.supports_egress;
+    // Register the tunnel route so post_send can map a second-level DID's short
+    // tunnel_id back to this tunnel box-owner DID.
+    center.register_tunnel(tunnel_id.clone(), tunnel_did.clone(), "telegram".to_string());
     let tg_tunnel = Arc::new(build_tg_tunnel(cfg, &settings.telegram_tunnel)?);
 
     tg_tunnel

@@ -122,7 +122,7 @@ impl SendMessageTaskExecutor {
         let idempotency_key = Some(format!("{TASK_TYPE}:{task_id}"));
         let result = self
             .msg_center
-            .post_send(msg, None, idempotency_key)
+            .post_send(msg, idempotency_key)
             .await
             .map_err(|err| format!("msg_center.post_send failed: {err:?}"))?;
         if !result.ok {

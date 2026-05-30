@@ -14,7 +14,7 @@ use buckyos_api::{
     GroupUpdateCollectionPolicyReq, GroupUpdateMemberRoleReq, GroupUpdateProfileReq,
     GroupUpdateSubgroupReq, ImportContactEntry, ImportReport, IngressContext, KEventClient,
     MsgCenterHandler, MsgReceiptObj, MsgRecord, MsgRecordPage, MsgRecordWithObject, MsgState,
-    PostSendDelivery, PostSendResult, ReadReceiptState, RouteInfo, SendContext,
+    PostSendDelivery, PostSendResult, ReadReceiptState, RouteInfo,
     SetGroupSubscribersResult, UiSessionStateEntry,
 };
 use kRPC::{RPCContext, RPCErrors};
@@ -32,7 +32,6 @@ const MAX_LIST_LIMIT: usize = 500;
 const DEFAULT_READ_RECEIPT_LIMIT: usize = 100;
 const MAX_READ_RECEIPT_LIMIT: usize = 1000;
 const MAX_DELIVERY_RETRY: u32 = 5;
-const DEFAULT_FALLBACK_TUNNEL_SUBJECT: &str = "msg-center-default-tunnel";
 const MSG_CENTER_BOX_CHANGED_EVENT_NAME: &str = "changed";
 
 #[derive(Debug, Default)]
@@ -52,12 +51,23 @@ struct DeliveryPlan {
     priority: Option<i32>,
 }
 
+/// Routing entry for a registered message tunnel: maps the stable short
+/// `tunnel_id` (used inside second-level DIDs) to the tunnel box-owner DID
+/// (the `TUNNEL_OUTBOX` owner the egress pump polls) and its platform.
+#[derive(Clone, Debug)]
+struct TunnelRoute {
+    tunnel_did: DID,
+    platform: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct MessageCenter {
     state: Arc<RwLock<MessageCenterState>>,
     contact_mgr: ContactMgr,
     group_mgr: GroupMgr,
     msg_box_db: MsgBoxDbMgr,
+    /// short tunnel_id -> tunnel box-owner DID + platform.
+    tunnel_registry: Arc<RwLock<HashMap<String, TunnelRoute>>>,
 }
 
 impl MessageCenter {
@@ -77,7 +87,24 @@ impl MessageCenter {
             contact_mgr,
             group_mgr,
             msg_box_db,
+            tunnel_registry: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Register (or replace) a message-tunnel route so `post_send` can map a
+    /// second-level DID's short `tunnel_id` back to the tunnel box-owner DID.
+    /// Called by the service bootstrap when a tunnel is loaded from settings.
+    pub fn register_tunnel(&self, tunnel_id: String, tunnel_did: DID, platform: String) {
+        let tunnel_id = tunnel_id.trim().to_string();
+        if tunnel_id.is_empty() {
+            return;
+        }
+        let mut registry = self.tunnel_registry.write().unwrap();
+        registry.insert(tunnel_id, TunnelRoute { tunnel_did, platform });
+    }
+
+    fn lookup_tunnel_route(&self, tunnel_id: &str) -> Option<TunnelRoute> {
+        self.tunnel_registry.read().unwrap().get(tunnel_id).cloned()
     }
 
     /// Read-only accessor for the group manager. Used by tests and by the
@@ -376,22 +403,6 @@ impl MessageCenter {
         Self::extract_session_id_from_value(&payload)
     }
 
-    fn parse_or_build_did(raw: &str, fallback_prefix: &str) -> DID {
-        if let Ok(did) = DID::from_str(raw) {
-            return did;
-        }
-        let subject = format!(
-            "{}-{}",
-            Self::sanitize_token(fallback_prefix),
-            Self::sanitize_token(raw)
-        );
-        DID::new("bns", &subject)
-    }
-
-    fn default_tunnel_did() -> DID {
-        DID::new("bns", DEFAULT_FALLBACK_TUNNEL_SUBJECT)
-    }
-
     async fn store_message(
         msg_id: &ObjId,
         msg_json_str: &str,
@@ -679,49 +690,50 @@ impl MessageCenter {
         }
     }
 
-    async fn build_delivery_plan(
-        &self,
-        target_did: DID,
-        send_ctx: Option<&SendContext>,
-        contact_mgr_owner: Option<DID>,
-    ) -> DeliveryPlan {
-        let preferred_tunnel = send_ctx.and_then(|ctx| ctx.preferred_tunnel.clone());
-        let preferred_binding: Option<AccountBinding> = self
-            .contact_mgr
-            .get_preferred_binding(target_did.clone(), contact_mgr_owner)
-            .await
-            .ok();
+    /// Resolve a *determined* target DID into a tunnel delivery plan.
+    ///
+    /// `post_send` only accepts confirmed `MsgObject.to`. There is no implicit
+    /// route selection here: the target either carries its own routing identity
+    /// (a second-level `did:msgtunnel:*` endpoint DID), or it has no traditional
+    /// delivery and the caller must resolve an endpoint before sending.
+    ///
+    /// Returns `Err(reason)` when the target cannot be routed deterministically;
+    /// callers surface that as a failed delivery instead of a silent fallback.
+    fn build_delivery_plan(&self, target_did: DID) -> std::result::Result<DeliveryPlan, String> {
+        // First-level / non-tunnel DID: no implicit platform binding lookup.
+        let Some((account_id, account_type, tunnel_id)) =
+            ContactMgr::parse_msgtunnel_did(&target_did)
+        else {
+            return Err(format!(
+                "no direct delivery for non-tunnel target {}; resolve an endpoint DID \
+                 (resolve_target) before post_send",
+                target_did.to_string()
+            ));
+        };
 
-        let mut route = RouteInfo::default();
-        route.target_did = Some(target_did.clone());
-        route.mode = Some("direct".to_string());
-        route.priority = send_ctx.and_then(|ctx| ctx.priority);
-        route.extra = send_ctx.and_then(|ctx| ctx.extra.clone());
+        let route = self.lookup_tunnel_route(&tunnel_id).ok_or_else(|| {
+            format!(
+                "unknown tunnel_id '{}' for endpoint target {}; no tunnel registered",
+                tunnel_id,
+                target_did.to_string()
+            )
+        })?;
 
-        if let Some(binding) = preferred_binding {
-            route.platform = Some(binding.platform.clone());
-            route.account_id = Some(binding.account_id.clone());
-            route.address = Some(binding.display_id.clone());
-            route.tunnel_did = Some(Self::parse_or_build_did(&binding.tunnel_id, "tunnel"));
-        }
+        let mut route_info = RouteInfo::default();
+        route_info.target_did = Some(target_did.clone());
+        route_info.mode = Some("direct".to_string());
+        route_info.tunnel_did = Some(route.tunnel_did.clone());
+        route_info.platform = Some(route.platform.clone());
+        route_info.account_id = Some(account_id);
+        route_info.ext_ids.insert("account_type".to_string(), account_type);
 
-        if let Some(tunnel_did) = preferred_tunnel {
-            route.tunnel_did = Some(tunnel_did);
-        }
-
-        let tunnel_did = route
-            .tunnel_did
-            .clone()
-            .unwrap_or_else(Self::default_tunnel_did);
-        route.tunnel_did = Some(tunnel_did.clone());
-
-        DeliveryPlan {
-            tunnel_did,
+        Ok(DeliveryPlan {
+            tunnel_did: route.tunnel_did,
             target_did: Some(target_did),
-            mode: route.mode.clone(),
-            priority: route.priority,
-            route,
-        }
+            mode: route_info.mode.clone(),
+            priority: None,
+            route: route_info,
+        })
     }
 
     fn list_delivery_targets(msg: &MsgObject) -> Vec<DID> {
@@ -1029,7 +1041,6 @@ impl MessageCenter {
     async fn post_send_internal(
         &self,
         msg: MsgObject,
-        send_ctx: Option<SendContext>,
         idempotency_key: Option<String>,
     ) -> std::result::Result<PostSendResult, RPCErrors> {
         if msg.to.is_empty() {
@@ -1037,10 +1048,6 @@ impl MessageCenter {
                 "post_send requires at least one target in msg.to".to_string(),
             ));
         }
-
-        let send_contact_mgr_owner = send_ctx
-            .as_ref()
-            .and_then(|ctx| ctx.contact_mgr_owner.clone());
 
         enum PostSendPrepare {
             Done(PostSendResult),
@@ -1063,9 +1070,9 @@ impl MessageCenter {
             let stored_msg = Self::ensure_message(state, msg);
             let (stored_msg_id, stored_msg_json) = stored_msg.gen_obj_id();
             let author = stored_msg.from.clone();
-            let contact_mgr_owner = send_contact_mgr_owner
-                .clone()
-                .or_else(|| Some(author.clone()));
+            // Owner scope for contact-manager lookups is the message author;
+            // there is no longer a SendContext override.
+            let contact_mgr_owner = Some(author.clone());
 
             Ok(PostSendPrepare::Ready {
                 stored_msg,
@@ -1138,11 +1145,36 @@ impl MessageCenter {
         .await?;
 
         let delivery_targets = Self::list_delivery_targets(&stored_msg);
-        let mut deliveries = Vec::with_capacity(delivery_targets.len());
+        // Resolve every target up front so we never write a partial set of
+        // tunnel-outbox records. An unroutable target (e.g. a first-level DID
+        // with no Message Hub direct delivery, or an unknown tunnel) fails the
+        // whole post_send with a clear reason — never a silent fallback.
+        let mut plans = Vec::with_capacity(delivery_targets.len());
         for target in delivery_targets {
-            let plan = self
-                .build_delivery_plan(target.clone(), send_ctx.as_ref(), contact_mgr_owner.clone())
-                .await;
+            match self.build_delivery_plan(target) {
+                Ok(plan) => plans.push(plan),
+                Err(reason) => {
+                    let result = PostSendResult {
+                        ok: false,
+                        msg_id: stored_msg_id.clone(),
+                        deliveries: Vec::new(),
+                        reason: Some(reason),
+                    };
+                    if let Some(key) = idempotency_key.as_ref() {
+                        self.with_state_write(|state| {
+                            state
+                                .post_send_idempotency
+                                .insert(key.clone(), result.clone());
+                            Ok(())
+                        })?;
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+
+        let mut deliveries = Vec::with_capacity(plans.len());
+        for plan in plans {
             let variant = format!(
                 "{}-{}-{}-{}",
                 plan.tunnel_did.to_string(),
@@ -1613,12 +1645,10 @@ impl MsgCenterHandler for MessageCenter {
     async fn handle_post_send(
         &self,
         msg: MsgObject,
-        send_ctx: Option<SendContext>,
         idempotency_key: Option<String>,
         _ctx: RPCContext,
     ) -> std::result::Result<PostSendResult, RPCErrors> {
-        self.post_send_internal(msg, send_ctx, idempotency_key)
-            .await
+        self.post_send_internal(msg, idempotency_key).await
     }
 
     async fn handle_get_next(
@@ -1784,6 +1814,65 @@ impl MsgCenterHandler for MessageCenter {
     ) -> std::result::Result<DID, RPCErrors> {
         self.contact_mgr
             .resolve_did(platform, account_id, profile_hint, contact_mgr_owner)
+            .await
+    }
+
+    async fn handle_resolve_endpoint_did(
+        &self,
+        platform: String,
+        account_id: String,
+        account_type: String,
+        tunnel_id: String,
+        contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        self.contact_mgr
+            .resolve_endpoint_did(platform, account_id, account_type, tunnel_id, contact_mgr_owner)
+            .await
+    }
+
+    async fn handle_resolve_target(
+        &self,
+        contact_did: DID,
+        selector: String,
+        contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        self.contact_mgr
+            .resolve_target(contact_did, selector, contact_mgr_owner)
+            .await
+    }
+
+    async fn handle_resolve_contact_for_endpoint(
+        &self,
+        endpoint_did: DID,
+        contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        self.contact_mgr
+            .resolve_contact_for_endpoint(endpoint_did, contact_mgr_owner)
+            .await
+    }
+
+    async fn handle_resolve_canonical_did(
+        &self,
+        did: DID,
+        contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DID, RPCErrors> {
+        self.contact_mgr
+            .resolve_canonical_did(did, contact_mgr_owner)
+            .await
+    }
+
+    async fn handle_list_alias_dids(
+        &self,
+        canonical_did: DID,
+        contact_mgr_owner: Option<DID>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        self.contact_mgr
+            .list_alias_dids(canonical_did, contact_mgr_owner)
             .await
     }
 

@@ -61,6 +61,9 @@ const TG_BUILTIN_COMMANDS: &[(&str, &str)] = &[
 #[derive(Debug, Clone)]
 pub struct TgTunnelConfig {
     pub tunnel_did: DID,
+    /// Stable short tunnel id (e.g. `tg-main`) embedded in second-level DIDs.
+    /// Defaults to the tunnel DID subject when not set explicitly.
+    pub tunnel_id: String,
     pub name: String,
     pub supports_ingress: bool,
     pub supports_egress: bool,
@@ -70,6 +73,7 @@ impl TgTunnelConfig {
     pub fn new(tunnel_did: DID) -> Self {
         Self {
             name: format!("{}-tg-tunnel", tunnel_did.to_string()),
+            tunnel_id: tunnel_did.id.clone(),
             tunnel_did,
             supports_ingress: true,
             supports_egress: true,
@@ -1080,6 +1084,8 @@ pub struct GrammersTgGatewayConfig {
     pub api_hash: String,
     pub session_dir: PathBuf,
     pub tunnel_did: Option<DID>,
+    /// Stable short tunnel id embedded in second-level DIDs (e.g. `tg-main`).
+    pub tunnel_id: Option<String>,
 }
 
 impl GrammersTgGatewayConfig {
@@ -1107,6 +1113,7 @@ impl GrammersTgGatewayConfig {
             api_hash,
             session_dir: PathBuf::from(session_dir),
             tunnel_did: None,
+            tunnel_id: None,
         })
     }
 }
@@ -1327,7 +1334,7 @@ impl GrammersTgGateway {
     fn profile_hint_from_chat(
         chat: &TgPeer,
         bot_account_id: &str,
-        tunnel_did: Option<&DID>,
+        tunnel_id: Option<&str>,
     ) -> Value {
         let chat_id = chat.id().bot_api_dialog_id();
         let username = chat.username().map(|value| value.to_string());
@@ -1343,7 +1350,7 @@ impl GrammersTgGateway {
             "username": username,
             "display_id": display_id,
             "bot_account_id": bot_account_id,
-            "tunnel_id": tunnel_did.map(|did| did.to_string()).unwrap_or_default(),
+            "tunnel_id": tunnel_id.unwrap_or_default(),
         })
     }
 
@@ -1352,18 +1359,14 @@ impl GrammersTgGateway {
         owner_scope: Option<DID>,
         chat: &TgPeer,
         bot_account_id: &str,
-        tunnel_did: Option<&DID>,
+        tunnel_id: Option<&str>,
     ) -> AnyResult<(DID, String)> {
         let account_id = Self::chat_account_id(chat);
         let did = dispatcher
             .handle_resolve_did(
                 TELEGRAM_PLATFORM.to_string(),
                 account_id.clone(),
-                Some(Self::profile_hint_from_chat(
-                    chat,
-                    bot_account_id,
-                    tunnel_did,
-                )),
+                Some(Self::profile_hint_from_chat(chat, bot_account_id, tunnel_id)),
                 owner_scope,
                 RPCContext::default(),
             )
@@ -1378,6 +1381,7 @@ impl GrammersTgGateway {
         owner_did: DID,
         bot_account_id: String,
         tunnel_did: Option<DID>,
+        tunnel_id: Option<String>,
         message: TgMessage,
     ) -> AnyResult<()> {
         if message.outgoing() {
@@ -1398,13 +1402,14 @@ impl GrammersTgGateway {
         };
         let sender_chat = message.sender().cloned().unwrap_or_else(|| chat.clone());
         let owner_scope = Some(owner_did.clone());
+        let tunnel_id_ref = tunnel_id.as_deref();
 
         let (sender_did, sender_account_id) = Self::resolve_chat_did(
             &dispatcher,
             owner_scope.clone(),
             &sender_chat,
             &bot_account_id,
-            tunnel_did.as_ref(),
+            tunnel_id_ref,
         )
         .await
         .map_err(|error| {
@@ -1423,7 +1428,7 @@ impl GrammersTgGateway {
                 owner_scope.clone(),
                 &chat,
                 &bot_account_id,
-                tunnel_did.as_ref(),
+                tunnel_id_ref,
             )
             .await
             .map_err(|error| {
@@ -1554,6 +1559,7 @@ impl GrammersTgGateway {
         let dispatcher = self.dispatcher.clone();
         let ui_session_tracker = self.ui_session_tracker.clone();
         let tunnel_did = self.cfg.tunnel_did.clone();
+        let tunnel_id = self.cfg.tunnel_id.clone();
         tokio::spawn(async move {
             let mut updates = client.stream_updates(
                 updates_rx,
@@ -1590,6 +1596,7 @@ impl GrammersTgGateway {
                             owner_did.clone(),
                             bot_account_id.clone(),
                             tunnel_did.clone(),
+                            tunnel_id.clone(),
                             message,
                         )
                         .await
@@ -2240,11 +2247,12 @@ pub struct BotApiTgGateway {
     ui_session_tracker: Arc<Mutex<Option<Arc<TgUiSessionTracker>>>>,
     ingress_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     tunnel_did: Option<DID>,
+    tunnel_id: Option<String>,
     poll_timeout_secs: u64,
 }
 
 impl BotApiTgGateway {
-    pub fn new(tunnel_did: Option<DID>) -> Self {
+    pub fn new(tunnel_did: Option<DID>, tunnel_id: Option<String>) -> Self {
         Self {
             http: HttpClient::new(),
             runtimes: Mutex::new(HashMap::new()),
@@ -2252,6 +2260,7 @@ impl BotApiTgGateway {
             ui_session_tracker: Arc::new(Mutex::new(None)),
             ingress_tasks: Mutex::new(HashMap::new()),
             tunnel_did,
+            tunnel_id,
             poll_timeout_secs: 20,
         }
     }
@@ -2345,7 +2354,7 @@ impl BotApiTgGateway {
         display_name: Option<&str>,
         username: Option<&str>,
         bot_account_id: &str,
-        tunnel_did: Option<&DID>,
+        tunnel_id: Option<&str>,
     ) -> Value {
         let display_id = username
             .filter(|value| !value.trim().is_empty())
@@ -2359,7 +2368,7 @@ impl BotApiTgGateway {
             "username": username,
             "display_id": display_id,
             "bot_account_id": bot_account_id,
-            "tunnel_id": tunnel_did.map(|did| did.to_string()).unwrap_or_default(),
+            "tunnel_id": tunnel_id.unwrap_or_default(),
         })
     }
 
@@ -2616,8 +2625,10 @@ impl BotApiTgGateway {
         owner_did: DID,
         bot_account_id: String,
         tunnel_did: Option<DID>,
+        tunnel_id: Option<String>,
         message: TgBotApiMessage,
     ) -> AnyResult<()> {
+        let tunnel_id_ref = tunnel_id.as_deref();
         let chat_kind = Self::normalize_chat_kind(message.chat.kind.as_str());
         let chat_id = message.chat.id;
         let sender_kind;
@@ -2646,7 +2657,7 @@ impl BotApiTgGateway {
                     sender_name.as_deref(),
                     sender_username.as_deref(),
                     &bot_account_id,
-                    tunnel_did.as_ref(),
+                    tunnel_id_ref,
                 )),
                 Some(owner_did.clone()),
                 RPCContext::default(),
@@ -2674,7 +2685,7 @@ impl BotApiTgGateway {
                         Self::chat_name(&message.chat).as_deref(),
                         message.chat.username.as_deref(),
                         &bot_account_id,
-                        tunnel_did.as_ref(),
+                        tunnel_id_ref,
                     )),
                     Some(owner_did.clone()),
                     RPCContext::default(),
@@ -2945,6 +2956,7 @@ impl BotApiTgGateway {
         let dispatcher = self.dispatcher.clone();
         let ui_session_tracker = self.ui_session_tracker.clone();
         let tunnel_did = self.tunnel_did.clone();
+        let tunnel_id = self.tunnel_id.clone();
         let poll_timeout_secs = self.poll_timeout_secs;
         tokio::spawn(async move {
             let mut offset = 0_i64;
@@ -3005,6 +3017,7 @@ impl BotApiTgGateway {
                         runtime.owner_did.clone(),
                         runtime.bot_account_id.clone(),
                         tunnel_did.clone(),
+                        tunnel_id.clone(),
                         message,
                     )
                     .await
@@ -3408,6 +3421,9 @@ impl TgTunnel {
         if grammers_cfg.tunnel_did.is_none() {
             grammers_cfg.tunnel_did = Some(cfg.tunnel_did.clone());
         }
+        if grammers_cfg.tunnel_id.is_none() {
+            grammers_cfg.tunnel_id = Some(cfg.tunnel_id.clone());
+        }
         Self::with_gateway(cfg, Arc::new(GrammersTgGateway::new(grammers_cfg)))
     }
 
@@ -3420,7 +3436,8 @@ impl TgTunnel {
 
     pub fn with_bot_api_gateway(cfg: TgTunnelConfig) -> Self {
         let tunnel_did = Some(cfg.tunnel_did.clone());
-        Self::with_gateway(cfg, Arc::new(BotApiTgGateway::new(tunnel_did)))
+        let tunnel_id = Some(cfg.tunnel_id.clone());
+        Self::with_gateway(cfg, Arc::new(BotApiTgGateway::new(tunnel_did, tunnel_id)))
     }
 
     pub fn with_gateway(cfg: TgTunnelConfig, gateway: Arc<dyn TgGateway>) -> Self {
@@ -4400,13 +4417,13 @@ mod tests {
             Some("Ops"),
             Some("ops_channel"),
             "@jarvis_bot",
-            Some(&DID::new("web", "tg-tunnel.test.buckyos.io")),
+            Some("tg-main"),
         );
 
         assert_eq!(hint["account_type"], "channel");
         assert_eq!(hint["chat_type"], "channel");
         assert_eq!(hint["chat_id"], -10012345);
-        assert_eq!(hint["tunnel_id"], "did:web:tg-tunnel.test.buckyos.io");
+        assert_eq!(hint["tunnel_id"], "tg-main");
     }
 
     #[tokio::test]

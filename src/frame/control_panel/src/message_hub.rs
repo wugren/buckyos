@@ -2,7 +2,7 @@ use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use buckyos_api::{
     get_buckyos_api_runtime, AccessGroupLevel, BoxKind, Contact, ContactQuery, Event, KEventClient,
-    MsgCenterClient, MsgRecordWithObject, MsgState, SendContext, UserType,
+    MsgCenterClient, MsgRecordWithObject, MsgState, UserType,
     CONTROL_PANEL_SERVICE_NAME,
 };
 use buckyos_http_server::{server_err, ServerError, ServerErrorCode, ServerResult};
@@ -736,16 +736,7 @@ impl ControlPanelServer {
             );
         }
 
-        let result = msg_center
-            .post_send(
-                message.clone(),
-                Some(SendContext {
-                    contact_mgr_owner: Some(owner_did.clone()),
-                    ..Default::default()
-                }),
-                None,
-            )
-            .await?;
+        let result = msg_center.post_send(message.clone(), None).await?;
         if !result.ok {
             return Err(RPCErrors::ReasonError(result.reason.unwrap_or_else(|| {
                 "msg-center rejected the chat send request".to_string()

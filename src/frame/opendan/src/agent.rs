@@ -92,9 +92,10 @@ pub enum Inbound {
         /// record lands without one. Used in prompts so the LLM sees a
         /// human-readable name instead of a raw DID.
         from_name: Option<String>,
-        /// Preferred tunnel DID extracted from the msg-center route hint.
-        /// Passed through to `msg_center.post_send` as `preferred_tunnel`
-        /// so replies ride the same wire whenever possible.
+        /// Tunnel DID from the msg-center route hint. Retained for diagnostics
+        /// only: replies now target the inbound sender's determined endpoint DID
+        /// (`MsgObject.to`), which carries its own routing, so this is no longer
+        /// forwarded to `post_send`.
         tunnel_did: Option<String>,
         /// Optional explicit target. `None` ⇒ resolve via `from`.
         session_id: Option<String>,
@@ -1116,7 +1117,10 @@ impl AIAgent {
         if agent_did == peer_did {
             return;
         }
-        let tunnel = tunnel_did.and_then(|raw| name_lib::DID::from_str(raw).ok());
+        // `peer_did` is the inbound sender DID, already a determined target
+        // (a second-level `did:msgtunnel:*` endpoint DID for tunnel traffic),
+        // so it carries its own routing — no SendContext / preferred_tunnel.
+        let _ = tunnel_did;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1143,12 +1147,7 @@ impl AIAgent {
             serde_json::Value::String("Plain".to_string()),
         );
 
-        let send_ctx = buckyos_api::SendContext {
-            contact_mgr_owner: Some(agent_did),
-            preferred_tunnel: tunnel,
-            ..Default::default()
-        };
-        if let Err(err) = msg_center.post_send(msg, Some(send_ctx), None).await {
+        if let Err(err) = msg_center.post_send(msg, None).await {
             warn!(
                 "opendan.agent[{}]: command reply post_send failed: {err}",
                 self.agent_name

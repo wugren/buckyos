@@ -1328,34 +1328,6 @@ fn worksession_report_normalizes_attachment_markers() {
 }
 
 #[test]
-fn tg_route_extra_uses_chat_id_from_ui_session_id() {
-    let extra = tg_route_extra_for_session("tg:lzc_jarvis:-100123456").unwrap();
-    assert_eq!(
-        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
-        Some("-100123456")
-    );
-    assert!(tg_route_extra_for_session("ui-1").is_none());
-}
-
-#[test]
-fn worksession_report_extra_preserves_payload_and_adds_tg_route() {
-    let payload = serde_json::json!({
-        "type": "worksession_report",
-        "report_id": "report-1",
-        "report": "done"
-    });
-    let extra = with_tg_route_chat_id(payload, "tg:jarvis_bot:5397330802");
-    assert_eq!(
-        extra.get("report_id").and_then(|v| v.as_str()),
-        Some("report-1")
-    );
-    assert_eq!(
-        extra.pointer("/route/chat_id").and_then(|v| v.as_str()),
-        Some("5397330802")
-    );
-}
-
-#[test]
 fn pending_queue_limit_drops_events_then_non_mentions() {
     let mut pending = vec![
         PendingInput::Msg {

@@ -16,6 +16,8 @@ use tokio::sync::RwLock;
 
 const SYSTEM_OWNER_SCOPE: &str = "__system__";
 const METADATA_DID_SEQ_KEY: &str = "did_seq";
+/// `contact_metadata` key prefix for the per-owner alias (tombstone) index.
+const METADATA_ALIAS_INDEX_PREFIX: &str = "alias_index:";
 
 const DEFAULT_CONTACT_LIST_LIMIT: usize = 100;
 const MAX_CONTACT_LIST_LIMIT: usize = 1000;
@@ -27,6 +29,10 @@ struct ContactStore {
     contacts: HashMap<DID, Contact>,
     binding_index: HashMap<String, DID>,
     group_subscribers: HashMap<DID, Vec<DID>>,
+    /// Tombstone map: merged-away source DID -> current canonical DID. Lets old
+    /// `MsgObject.from/to` and old session peer DIDs still resolve after a merge
+    /// without rewriting history. See doc/message_hub/Contact Mgr.md (merge).
+    alias_index: HashMap<DID, DID>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +287,177 @@ impl ContactMgr {
                     did.to_string()
                 ))
             })
+    }
+
+    /// Deterministically construct the second-level endpoint DID for a platform
+    /// account. Does not require a pre-existing binding. Same inputs always
+    /// produce the same `did:msgtunnel:*`.
+    pub async fn resolve_endpoint_did(
+        &self,
+        platform: String,
+        account_id: String,
+        account_type: String,
+        tunnel_id: String,
+        _owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        let account_id = account_id.trim();
+        if platform.trim().is_empty() || account_id.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "platform and account_id are required".to_string(),
+            ));
+        }
+        let hint = serde_json::json!({
+            "account_type": account_type,
+            "tunnel_id": tunnel_id,
+        });
+        let endpoint = Self::message_tunnel_endpoint_did(account_id, Some(&hint))?
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError(
+                    "account_type and tunnel_id are required to build endpoint did".to_string(),
+                )
+            })?;
+        Ok(endpoint.did)
+    }
+
+    /// Construction-time target resolver. `selector` matches a binding's
+    /// `tunnel_id` first, then `platform`. Must match exactly one endpoint
+    /// binding — never falls back.
+    pub async fn resolve_target(
+        &self,
+        contact_did: DID,
+        selector: String,
+        owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "selector is required".to_string(),
+            ));
+        }
+        let owner_key = Self::owner_key(owner.as_ref());
+        self.ensure_store_loaded(&owner_key).await?;
+        let stores = self.stores.read().await;
+        let store = stores.get(&owner_key).ok_or_else(|| {
+            RPCErrors::ReasonError("contact store missing after load".to_string())
+        })?;
+        let contact = store.contacts.get(&contact_did).ok_or_else(|| {
+            RPCErrors::ReasonError(format!(
+                "contact not found for did {}",
+                contact_did.to_string()
+            ))
+        })?;
+
+        let mut matches: Vec<&AccountBinding> = contact
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.endpoint_did.is_some()
+                    && (binding.tunnel_id.eq_ignore_ascii_case(selector)
+                        || binding.platform.eq_ignore_ascii_case(selector))
+            })
+            .collect();
+        // Prefer an exact tunnel_id match when both kinds are present.
+        if matches.iter().any(|b| b.tunnel_id.eq_ignore_ascii_case(selector)) {
+            matches.retain(|b| b.tunnel_id.eq_ignore_ascii_case(selector));
+        }
+
+        match matches.as_slice() {
+            [] => Err(RPCErrors::ReasonError(format!(
+                "no endpoint binding for did {} matches selector '{}'",
+                contact_did.to_string(),
+                selector
+            ))),
+            [single] => single.endpoint_did.clone().ok_or_else(|| {
+                RPCErrors::ReasonError("matched binding has no endpoint did".to_string())
+            }),
+            _ => Err(RPCErrors::ReasonError(format!(
+                "selector '{}' matches multiple endpoint bindings for did {}; refine it",
+                selector,
+                contact_did.to_string()
+            ))),
+        }
+    }
+
+    /// Reverse lookup: which canonical/contact DID owns this endpoint DID?
+    pub async fn resolve_contact_for_endpoint(
+        &self,
+        endpoint_did: DID,
+        owner: Option<DID>,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        let owner_key = Self::owner_key(owner.as_ref());
+        self.ensure_store_loaded(&owner_key).await?;
+        let stores = self.stores.read().await;
+        let store = stores.get(&owner_key).ok_or_else(|| {
+            RPCErrors::ReasonError("contact store missing after load".to_string())
+        })?;
+
+        // A shadow contact's own DID can be the endpoint DID; otherwise scan
+        // bindings for a matching endpoint_did.
+        if store.contacts.contains_key(&endpoint_did) {
+            return Ok(Some(endpoint_did));
+        }
+        for contact in store.contacts.values() {
+            if contact
+                .bindings
+                .iter()
+                .any(|binding| binding.endpoint_did.as_ref() == Some(&endpoint_did))
+            {
+                return Ok(Some(contact.did.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a possibly merged-away (alias/tombstone) DID to its current
+    /// canonical DID. Returns the input unchanged when it is not an alias.
+    pub async fn resolve_canonical_did(
+        &self,
+        did: DID,
+        owner: Option<DID>,
+    ) -> std::result::Result<DID, RPCErrors> {
+        let owner_key = Self::owner_key(owner.as_ref());
+        self.ensure_store_loaded(&owner_key).await?;
+        let stores = self.stores.read().await;
+        let store = stores.get(&owner_key).ok_or_else(|| {
+            RPCErrors::ReasonError("contact store missing after load".to_string())
+        })?;
+        Ok(Self::canonical_did_in_store(store, &did))
+    }
+
+    /// List all alias DIDs (merged-away sources) that now resolve to `canonical_did`.
+    pub async fn list_alias_dids(
+        &self,
+        canonical_did: DID,
+        owner: Option<DID>,
+    ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        let owner_key = Self::owner_key(owner.as_ref());
+        self.ensure_store_loaded(&owner_key).await?;
+        let stores = self.stores.read().await;
+        let store = stores.get(&owner_key).ok_or_else(|| {
+            RPCErrors::ReasonError("contact store missing after load".to_string())
+        })?;
+        let mut aliases: Vec<DID> = store
+            .alias_index
+            .iter()
+            .filter(|(_, canonical)| *canonical == &canonical_did)
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        aliases.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        Ok(aliases)
+    }
+
+    /// Follow the alias chain to the terminal canonical DID (bounded).
+    fn canonical_did_in_store(store: &ContactStore, did: &DID) -> DID {
+        let mut current = did.clone();
+        let mut hops = 0;
+        while let Some(next) = store.alias_index.get(&current) {
+            if next == &current || hops > 32 {
+                break;
+            }
+            current = next.clone();
+            hops += 1;
+        }
+        current
     }
 
     pub async fn check_access_permission(
@@ -1140,11 +1317,46 @@ impl ContactMgr {
             group_subscribers.insert(group_did, Self::dedupe_dids(dids));
         }
 
+        let alias_index = self.load_alias_index(owner_key).await?;
+
         Ok(ContactStore {
             binding_index: Self::rebuild_binding_index(&contacts),
             contacts,
             group_subscribers,
+            alias_index,
         })
+    }
+
+    async fn load_alias_index(
+        &self,
+        owner_key: &str,
+    ) -> std::result::Result<HashMap<DID, DID>, RPCErrors> {
+        let key = format!("{}{}", METADATA_ALIAS_INDEX_PREFIX, owner_key);
+        let sql = self.render_sql("SELECT value FROM contact_metadata WHERE key = ?");
+        let row = sqlx::query(&sql)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("failed to query alias index: {}", error))
+            })?;
+
+        let Some(row) = row else {
+            return Ok(HashMap::new());
+        };
+        let value: String = row.try_get("value").map_err(|error| {
+            RPCErrors::ReasonError(format!("failed to decode alias index value: {}", error))
+        })?;
+        let raw: HashMap<String, String> = serde_json::from_str(&value).map_err(|error| {
+            RPCErrors::ReasonError(format!("failed to parse alias index: {}", error))
+        })?;
+        let mut alias_index = HashMap::with_capacity(raw.len());
+        for (alias, canonical) in raw {
+            let alias = Self::parse_did(&alias, "alias_index.alias")?;
+            let canonical = Self::parse_did(&canonical, "alias_index.canonical")?;
+            alias_index.insert(alias, canonical);
+        }
+        Ok(alias_index)
     }
 
     async fn save_owner_store(
@@ -1237,6 +1449,27 @@ impl ContactMgr {
                     ))
                 })?;
         }
+
+        let alias_key = format!("{}{}", METADATA_ALIAS_INDEX_PREFIX, owner_key);
+        let alias_raw: HashMap<String, String> = store
+            .alias_index
+            .iter()
+            .map(|(alias, canonical)| (alias.to_string(), canonical.to_string()))
+            .collect();
+        let alias_payload = serde_json::to_string(&alias_raw).map_err(|error| {
+            RPCErrors::ReasonError(format!("failed to serialize alias index: {}", error))
+        })?;
+        let upsert_alias = self.render_sql(
+            "INSERT INTO contact_metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        );
+        sqlx::query(&upsert_alias)
+            .bind(alias_key)
+            .bind(alias_payload)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("failed to persist alias index: {}", error))
+            })?;
 
         tx.commit().await.map_err(|error| {
             RPCErrors::ReasonError(format!("failed to commit contact store tx: {}", error))
@@ -1474,6 +1707,8 @@ impl ContactMgr {
             account_id,
             display_id,
             tunnel_id,
+            account_type: endpoint.account_type.clone(),
+            endpoint_did: Some(did.clone()),
             last_active_at: now_ms,
             meta: HashMap::new(),
         };
@@ -1487,6 +1722,11 @@ impl ContactMgr {
         endpoint: &MessageTunnelEndpointDid,
         did: &DID,
     ) {
+        // Promote the endpoint identity onto the typed binding fields so callers
+        // do not have to read `meta`. `tunnel_id` stays the stable short id.
+        binding.account_type = endpoint.account_type.clone();
+        binding.endpoint_did = Some(did.clone());
+        binding.tunnel_id = endpoint.tunnel_id.clone();
         binding
             .meta
             .insert("account_type".to_string(), endpoint.account_type.clone());
@@ -1529,6 +1769,49 @@ impl ContactMgr {
         output
     }
 
+    /// Reverse of `percent_encode_did_component`.
+    pub fn decode_did_component(raw: &str) -> String {
+        let bytes = raw.as_bytes();
+        let mut output: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    output.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            output.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    /// Decompose a second-level endpoint DID
+    /// `did:msgtunnel:<encoded_account_id>.<account_type>.<tunnel_id>`.
+    /// Returns `(account_id, account_type, tunnel_id)` with `account_id` /
+    /// `tunnel_id` percent-decoded. `None` if `did` is not a well-formed
+    /// `did:msgtunnel:*`.
+    pub fn parse_msgtunnel_did(did: &DID) -> Option<(String, String, String)> {
+        if did.method != "msgtunnel" {
+            return None;
+        }
+        let parts: Vec<&str> = did.id.splitn(3, '.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let account_id = Self::decode_did_component(parts[0]);
+        let account_type = parts[1].to_string();
+        let tunnel_id = Self::decode_did_component(parts[2]);
+        if account_id.is_empty() || account_type.is_empty() || tunnel_id.is_empty() {
+            return None;
+        }
+        Some((account_id, account_type, tunnel_id))
+    }
+
     fn blank_contact_with_source(did: DID, now_ms: u64, source: ContactSource) -> Contact {
         Contact {
             did,
@@ -1565,12 +1848,17 @@ impl ContactMgr {
             .unwrap_or_else(|| account_id.clone());
         let tunnel_id = Self::extract_hint_string(profile_hint, &["tunnel_id", "tunnel"])
             .unwrap_or_else(|| format!("{}-default", platform.to_ascii_lowercase()));
+        let account_type = Self::extract_hint_string(profile_hint, &["account_type"])
+            .map(|raw| Self::normalize_account_type(&raw))
+            .unwrap_or_default();
 
         let mut binding = AccountBinding {
             platform,
             account_id,
             display_id,
             tunnel_id,
+            account_type,
+            endpoint_did: None,
             last_active_at: now_ms,
             meta: HashMap::new(),
         };
@@ -1674,6 +1962,12 @@ impl ContactMgr {
                 existing.last_active_at = binding.last_active_at;
                 existing.display_id = binding.display_id;
                 existing.tunnel_id = binding.tunnel_id;
+            }
+            if !binding.account_type.is_empty() {
+                existing.account_type = binding.account_type;
+            }
+            if binding.endpoint_did.is_some() {
+                existing.endpoint_did = binding.endpoint_did;
             }
             for (key, value) in binding.meta {
                 existing.meta.insert(key, value);
@@ -1825,6 +2119,20 @@ impl ContactMgr {
             }
             *subscribers = Self::dedupe_dids(std::mem::take(subscribers));
         }
+
+        // Tombstone the source: keep it as an alias of the target so old
+        // MsgObjects / session peer DIDs still resolve. Do NOT delete it.
+        // Re-point any existing alias that pointed at the source.
+        for canonical in store.alias_index.values_mut() {
+            if canonical == source_did {
+                *canonical = target_did.clone();
+            }
+        }
+        store
+            .alias_index
+            .insert(source_did.clone(), target_did.clone());
+        // The target is canonical; it must never appear as an alias key.
+        store.alias_index.remove(target_did);
 
         Ok(target_snapshot)
     }
@@ -2019,6 +2327,8 @@ mod tests {
             account_id: account_id.to_string(),
             display_id: account_id.to_string(),
             tunnel_id: format!("{}-default", platform),
+            account_type: String::new(),
+            endpoint_did: None,
             last_active_at: 1,
             meta: HashMap::new(),
         }
@@ -2266,6 +2576,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, target);
+    }
+
+    #[test]
+    fn parse_msgtunnel_did_round_trips() {
+        // Plain numeric id.
+        let did = DID::new("msgtunnel", "12345.user.tg-main");
+        assert_eq!(
+            ContactMgr::parse_msgtunnel_did(&did),
+            Some(("12345".to_string(), "user".to_string(), "tg-main".to_string()))
+        );
+
+        // Special chars in the account id survive percent encode/decode.
+        let encoded = ContactMgr::percent_encode_did_component("bob@example.com");
+        let did = DID::new("msgtunnel", &format!("{}.addr.email-main", encoded));
+        assert_eq!(
+            ContactMgr::parse_msgtunnel_did(&did),
+            Some((
+                "bob@example.com".to_string(),
+                "addr".to_string(),
+                "email-main".to_string()
+            ))
+        );
+
+        // Non-tunnel DIDs are rejected.
+        assert!(ContactMgr::parse_msgtunnel_did(&DID::new("bns", "bob")).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn telegram_endpoint_dids_are_stable_short_id_and_typed() {
+        let (mgr, _tmp) = new_test_mgr().await;
+        let owner = DID::new("bns", "alice");
+
+        let cases = [
+            ("12345", "user", "did:msgtunnel:12345.user.tg-main"),
+            (
+                "-100123456",
+                "group",
+                "did:msgtunnel:-100123456.group.tg-main",
+            ),
+            (
+                "-100987654",
+                "channel",
+                "did:msgtunnel:-100987654.channel.tg-main",
+            ),
+        ];
+
+        for (account_id, account_type, expected) in cases {
+            let hint = json!({ "account_type": account_type, "tunnel_id": "tg-main" });
+            let first = mgr
+                .resolve_did(
+                    "telegram".to_string(),
+                    account_id.to_string(),
+                    Some(hint.clone()),
+                    Some(owner.clone()),
+                )
+                .await
+                .unwrap();
+            // Stable: same triple resolves to the same DID.
+            let second = mgr
+                .resolve_did(
+                    "telegram".to_string(),
+                    account_id.to_string(),
+                    Some(hint),
+                    Some(owner.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.to_string(), expected);
+            assert_eq!(first, second);
+
+            // The typed binding fields are populated.
+            let contact = mgr
+                .get_contact(first.clone(), Some(owner.clone()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(contact.bindings[0].account_type, account_type);
+            assert_eq!(contact.bindings[0].endpoint_did.as_ref(), Some(&first));
+            assert_eq!(contact.bindings[0].tunnel_id, "tg-main");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_requires_a_unique_endpoint_binding() {
+        let (mgr, _tmp) = new_test_mgr().await;
+        let owner = DID::new("bns", "alice");
+        let contact_did = DID::new("bns", "bob");
+
+        // Bind one telegram endpoint and one email endpoint to bob.
+        let tg_endpoint = mgr
+            .resolve_endpoint_did(
+                "telegram".to_string(),
+                "12345".to_string(),
+                "user".to_string(),
+                "tg-main".to_string(),
+                Some(owner.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tg_endpoint.to_string(), "did:msgtunnel:12345.user.tg-main");
+
+        mgr.upsert_zone_user_contacts(
+            vec![ZoneUserContactSeed {
+                did: contact_did.clone(),
+                name: "Bob".to_string(),
+                note: None,
+                bindings: vec![
+                    AccountBinding {
+                        platform: "telegram".to_string(),
+                        account_id: "12345".to_string(),
+                        display_id: "@bob".to_string(),
+                        tunnel_id: "tg-main".to_string(),
+                        account_type: "user".to_string(),
+                        endpoint_did: Some(tg_endpoint.clone()),
+                        last_active_at: 1,
+                        meta: HashMap::new(),
+                    },
+                    AccountBinding {
+                        platform: "email".to_string(),
+                        account_id: "bob@example.com".to_string(),
+                        display_id: "bob@example.com".to_string(),
+                        tunnel_id: "email-main".to_string(),
+                        account_type: "addr".to_string(),
+                        endpoint_did: Some(DID::new(
+                            "msgtunnel",
+                            "bob%40example.com.addr.email-main",
+                        )),
+                        last_active_at: 1,
+                        meta: HashMap::new(),
+                    },
+                ],
+                groups: vec!["zone_user".to_string()],
+                tags: vec![],
+            }],
+            Some(owner.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Selector by tunnel_id resolves to the right endpoint DID.
+        let resolved = mgr
+            .resolve_target(contact_did.clone(), "tg-main".to_string(), Some(owner.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resolved, tg_endpoint);
+
+        // Reverse lookup finds the owning contact.
+        let owner_contact = mgr
+            .resolve_contact_for_endpoint(tg_endpoint.clone(), Some(owner.clone()))
+            .await
+            .unwrap();
+        assert_eq!(owner_contact, Some(contact_did.clone()));
+
+        // An unknown selector fails — no fallback.
+        assert!(mgr
+            .resolve_target(contact_did.clone(), "signal".to_string(), Some(owner.clone()))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_keeps_source_as_resolvable_alias() {
+        let (mgr, _tmp) = new_test_mgr().await;
+
+        let target = mgr
+            .resolve_did("telegram".to_string(), "keep-target".to_string(), None, None)
+            .await
+            .unwrap();
+        let source = mgr
+            .resolve_did(
+                "email".to_string(),
+                "keep-source@example.com".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        mgr.merge_contacts(target.clone(), source.clone(), None)
+            .await
+            .unwrap();
+
+        // The merged-away source DID still resolves to the canonical target.
+        let canonical = mgr.resolve_canonical_did(source.clone(), None).await.unwrap();
+        assert_eq!(canonical, target);
+
+        // And it is listed as an alias of the target. A non-merged DID is unchanged.
+        let aliases = mgr.list_alias_dids(target.clone(), None).await.unwrap();
+        assert!(aliases.contains(&source));
+        assert_eq!(
+            mgr.resolve_canonical_did(target.clone(), None).await.unwrap(),
+            target
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

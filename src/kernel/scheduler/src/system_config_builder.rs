@@ -1087,6 +1087,7 @@ fn build_msg_center_settings(config: &StartConfigSummary) -> Result<Value> {
         "telegram_tunnel": {
             "enabled": true,
             "tunnel_did": tunnel_did,
+            "tunnel_id": "tg-main",
             "supports_ingress": true,
             "supports_egress": true,
             "gateway": {

@@ -2,7 +2,6 @@ use crate::msg_box_db::MsgBoxDbMgr;
 use crate::msg_center::MessageCenter;
 use buckyos_api::{
     BoxKind, DeliveryReportResult, IngressContext, MsgCenterHandler, MsgState, ReadReceiptState,
-    SendContext,
 };
 use kRPC::RPCContext;
 use name_lib::DID;
@@ -181,26 +180,23 @@ async fn dispatch_group_message_creates_group_and_agent_views() {
 }
 
 #[tokio::test]
-async fn post_send_creates_owner_and_tunnel_outbox_records() {
+async fn post_send_to_endpoint_did_creates_owner_and_tunnel_outbox_records() {
     let (center, _tmp) = new_center("post_send").await;
+    let tunnel_did = DID::new("bns", "tg-tunnel-box");
+    center.register_tunnel("tg-main".to_string(), tunnel_did.clone(), "telegram".to_string());
+
     let author = DID::new("bns", "author-b");
-    let target = DID::new("bns", "target-b");
+    // A determined second-level endpoint DID carries its own routing.
+    let target = DID::new("msgtunnel", "12345.user.tg-main");
     let msg = make_msg(author.clone(), vec![target], MsgObjKind::Chat);
 
     let post_send = center
-        .handle_post_send(
-            msg,
-            Some(SendContext {
-                priority: Some(5),
-                ..Default::default()
-            }),
-            None,
-            ctx(),
-        )
+        .handle_post_send(msg, None, ctx())
         .await
         .unwrap();
     assert!(post_send.ok);
     assert_eq!(post_send.deliveries.len(), 1);
+    assert_eq!(post_send.deliveries[0].tunnel_did, tunnel_did);
 
     let owner_outbox = center
         .handle_peek_box(author, BoxKind::Outbox, None, None, None, ctx())
@@ -209,10 +205,9 @@ async fn post_send_creates_owner_and_tunnel_outbox_records() {
     assert_eq!(owner_outbox.len(), 1);
     assert_eq!(owner_outbox[0].record.state, MsgState::Sent);
 
-    let tunnel = post_send.deliveries[0].tunnel_did.clone();
     let tunnel_outbox = center
         .handle_peek_box(
-            tunnel.clone(),
+            tunnel_did.clone(),
             BoxKind::TunnelOutbox,
             None,
             None,
@@ -223,13 +218,46 @@ async fn post_send_creates_owner_and_tunnel_outbox_records() {
         .unwrap();
     assert_eq!(tunnel_outbox.len(), 1);
     assert_eq!(tunnel_outbox[0].record.state, MsgState::Wait);
+    // The decoded chat account id rides RouteInfo.account_id so the egress
+    // pump can derive the platform chat_id without an extra route hint.
+    let route = tunnel_outbox[0].record.route.as_ref().unwrap();
+    assert_eq!(route.account_id.as_deref(), Some("12345"));
+    assert_eq!(route.platform.as_deref(), Some("telegram"));
 
     let next = center
-        .handle_get_next(tunnel, BoxKind::TunnelOutbox, None, None, None, ctx())
+        .handle_get_next(tunnel_did, BoxKind::TunnelOutbox, None, None, None, ctx())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(next.record.state, MsgState::Sending);
+}
+
+#[tokio::test]
+async fn post_send_to_first_level_did_fails_without_silent_fallback() {
+    let (center, _tmp) = new_center("post_send_first_level").await;
+    let author = DID::new("bns", "author-c");
+    let target = DID::new("bns", "bob");
+    let msg = make_msg(author.clone(), vec![target], MsgObjKind::Chat);
+
+    let post_send = center.handle_post_send(msg, None, ctx()).await.unwrap();
+    // No Message Hub direct delivery and no implicit binding selection: the
+    // post_send fails with a clear reason instead of routing to a default tunnel.
+    assert!(!post_send.ok);
+    assert!(post_send.deliveries.is_empty());
+    assert!(post_send.reason.is_some());
+}
+
+#[tokio::test]
+async fn post_send_to_unknown_tunnel_fails() {
+    let (center, _tmp) = new_center("post_send_unknown_tunnel").await;
+    let author = DID::new("bns", "author-d");
+    // Endpoint DID whose tunnel_id has no registered route.
+    let target = DID::new("msgtunnel", "12345.user.ghost-tunnel");
+    let msg = make_msg(author.clone(), vec![target], MsgObjKind::Chat);
+
+    let post_send = center.handle_post_send(msg, None, ctx()).await.unwrap();
+    assert!(!post_send.ok);
+    assert!(post_send.deliveries.is_empty());
 }
 
 #[tokio::test]
@@ -238,10 +266,7 @@ async fn post_send_rejects_message_without_target() {
     let author = DID::new("bns", "author-empty-target");
     let msg = make_msg(author.clone(), Vec::new(), MsgObjKind::Chat);
 
-    let err = center
-        .handle_post_send(msg, None, None, ctx())
-        .await
-        .unwrap_err();
+    let err = center.handle_post_send(msg, None, ctx()).await.unwrap_err();
 
     assert!(matches!(err, kRPC::RPCErrors::ParseRequestError(_)));
     let owner_outbox = center
@@ -254,12 +279,14 @@ async fn post_send_rejects_message_without_target() {
 #[tokio::test]
 async fn report_delivery_handles_success_and_failure_paths() {
     let (center, _tmp) = new_center("report_delivery").await;
+    let tunnel_did = DID::new("bns", "tg-tunnel-box");
+    center.register_tunnel("tg-main".to_string(), tunnel_did, "telegram".to_string());
     let sender = DID::new("bns", "sender-c");
-    let target = DID::new("bns", "target-c");
+    let target = DID::new("msgtunnel", "777.user.tg-main");
 
     let fail_msg = make_msg(sender.clone(), vec![target.clone()], MsgObjKind::Chat);
     let fail_post = center
-        .handle_post_send(fail_msg, None, None, ctx())
+        .handle_post_send(fail_msg, None, ctx())
         .await
         .unwrap();
     let fail_record_id = fail_post.deliveries[0].record_id.clone();
@@ -282,7 +309,7 @@ async fn report_delivery_handles_success_and_failure_paths() {
 
     let success_msg = make_msg(sender, vec![target], MsgObjKind::Chat);
     let success_post = center
-        .handle_post_send(success_msg, None, None, ctx())
+        .handle_post_send(success_msg, None, ctx())
         .await
         .unwrap();
     let success_record_id = success_post.deliveries[0].record_id.clone();
@@ -591,8 +618,11 @@ async fn read_receipt_can_be_set_and_queried() {
 #[tokio::test]
 async fn idempotency_key_prevents_duplicate_records() {
     let (center, _tmp) = new_center("idempotency").await;
+    let tunnel_did = DID::new("bns", "tg-tunnel-box");
+    center.register_tunnel("tg-main".to_string(), tunnel_did, "telegram".to_string());
     let sender = DID::new("bns", "sender-f");
     let recipient = DID::new("bns", "recipient-f");
+    let endpoint_target = DID::new("msgtunnel", "888.user.tg-main");
 
     center
         .handle_grant_temporary_access(
@@ -638,23 +668,17 @@ async fn idempotency_key_prevents_duplicate_records() {
         .unwrap();
     assert_eq!(inbox.len(), 1);
 
-    let send_msg = make_msg(sender, vec![recipient], MsgObjKind::Chat);
+    let send_msg = make_msg(sender, vec![endpoint_target], MsgObjKind::Chat);
     let first_post = center
         .handle_post_send(
             send_msg.clone(),
-            None,
             Some("post-idempotent-key".to_string()),
             ctx(),
         )
         .await
         .unwrap();
     let second_post = center
-        .handle_post_send(
-            send_msg,
-            None,
-            Some("post-idempotent-key".to_string()),
-            ctx(),
-        )
+        .handle_post_send(send_msg, Some("post-idempotent-key".to_string()), ctx())
         .await
         .unwrap();
     assert_eq!(first_post.deliveries.len(), 1);
