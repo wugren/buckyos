@@ -7,11 +7,11 @@ use crate::model_router::{ModelRouter, RouteRequest};
 use crate::model_scheduler::{ModelScheduler, StickyBindingKey, StickyBindingStore};
 use crate::model_session::{merge_session_config, SessionConfig, SessionConfigStore};
 use crate::model_types::{
-    ApiType, CostClass, CostEstimateInput, CostEstimateOutput, HealthStatus, LatencyClass,
-    ModelAttributes, ModelCandidate, ModelCapabilities, ModelHealth, ModelMetadata, ModelPricing,
-    PolicyConfig, PricingMode, PrivacyClass, ProviderInventory, ProviderOrigin, ProviderType,
-    ProviderTypeTrustedSource, QuotaState, RequiredModelFeatures, RoutePolicy, RouteTrace,
-    UserFacingProviderOrigin, UserFacingRouteSummary,
+    ApiType, CostClass, CostEstimateInput, CostEstimateOutput, ExactModelName, HealthStatus,
+    LatencyClass, ModelAttributes, ModelCandidate, ModelCapabilities, ModelHealth, ModelMetadata,
+    ModelPricing, PolicyConfig, PricingMode, PrivacyClass, ProviderInventory, ProviderOrigin,
+    ProviderType, ProviderTypeTrustedSource, QuotaState, RequiredModelFeatures, RoutePolicy,
+    RouteTrace, UserFacingProviderOrigin, UserFacingRouteSummary,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -19,9 +19,12 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, AiContent, AiMethodRequest, AiMethodResponse,
-    AiMethodStatus, AiResponse, AiccComputeProgress, AiccComputeTaskData, AiccComputeTaskRequest,
-    AiccHandler, AiccUsageEvent, CancelResponse, Capability, CreateTaskOptions, Feature,
-    ResourceRef, TaskManagerClient, TaskStatus, TypedTaskData, AICC_SERVICE_SERVICE_NAME,
+    AiMethodStatus, AiPayload, AiResponse, AiccComputeProgress, AiccComputeTaskData,
+    AiccComputeTaskRequest, AiccHandler, AiccUsageEvent, CancelResponse, Capability,
+    CreateTaskOptions, Feature, LlmChatInvokeRequest, LlmChatInvokeResponse, ModelSpec,
+    Requirements, ResourceRef, RouteFallbackAttempt, RouteResolveRequest, RouteResolveResponse,
+    TaskManagerClient, TaskStatus, TextToImageInvokeRequest, TextToImageInvokeResponse,
+    TypedTaskData, AICC_SERVICE_SERVICE_NAME,
 };
 use log::{debug, error, info, warn};
 use ndn_lib::{ChunkHasher, FileObject, NamedObject, ObjId};
@@ -1393,6 +1396,8 @@ impl Router {
         let mut alias_mapped = false;
         let mut scored = vec![];
         let (input_tokens, output_tokens) = estimate_request_tokens(req);
+        let request_policy = route_policy_from_request(req);
+        let required_features = req.requirements.effective_feature_names();
 
         for candidate in snapshot.candidates.iter() {
             let instance_id = candidate.inventory.provider_instance_name.as_str();
@@ -1415,7 +1420,7 @@ impl Router {
             }
 
             if let Some(instance) = legacy_instance {
-                if !instance.supports_features(&req.requirements.must_features) {
+                if !instance.supports_features(&required_features) {
                     continue;
                 }
             }
@@ -1441,7 +1446,7 @@ impl Router {
                 input_tokens,
                 estimated_output_tokens: Some(output_tokens),
                 cached_input_tokens: None,
-                request_features: req.requirements.must_features.clone(),
+                request_features: req.requirements.effective_feature_names(),
             });
             let compat_estimate = CostEstimate::from(&estimate);
             let effective_estimated_cost = compat_estimate.estimated_cost_usd.and_then(|cost| {
@@ -1449,7 +1454,7 @@ impl Router {
                     .and_then(|billing| billing.preview_billed_cost(tenant_id, provider_type, cost))
                     .or(Some(cost))
             });
-            if let Some(max_cost) = req.requirements.max_cost_usd {
+            if let Some(max_cost) = request_policy.max_estimated_cost_usd {
                 if let Some(estimated_cost) = effective_estimated_cost {
                     if estimated_cost > max_cost {
                         continue;
@@ -1463,7 +1468,7 @@ impl Router {
                 compat_estimate.estimated_latency_ms.unwrap_or(0) as f64
             };
 
-            if let Some(max_latency_ms) = req.requirements.max_latency_ms {
+            if let Some(max_latency_ms) = request_policy.max_latency_ms {
                 if predicted_latency_ms > max_latency_ms as f64 {
                     continue;
                 }
@@ -1678,6 +1683,26 @@ fn api_type_for_method(method: &str) -> Option<ApiType> {
     }
 }
 
+fn method_for_route_api_type(api_type: &str) -> std::result::Result<&'static str, RPCErrors> {
+    match api_type {
+        "llm.chat" | "chat.completions.create" => Ok(ai_methods::LLM_CHAT),
+        "llm.completion" | "completions.create" => Ok(ai_methods::LLM_COMPLETION),
+        "image.txt2img" | "images.generate" => Ok(ai_methods::IMAGE_TXT2IMG),
+        "image.img2img" | "images.edit" => Ok(ai_methods::IMAGE_IMG2IMG),
+        "image.inpaint" => Ok(ai_methods::IMAGE_INPAINT),
+        "image.upscale" => Ok(ai_methods::IMAGE_UPSCALE),
+        "embedding.text" | "embeddings.create" => Ok(ai_methods::EMBEDDING_TEXT),
+        "rerank" => Ok(ai_methods::RERANK),
+        "audio.asr" | "audio.transcriptions.create" => Ok(ai_methods::AUDIO_ASR),
+        "audio.tts" | "audio.speech.create" => Ok(ai_methods::AUDIO_TTS),
+        "video.txt2video" | "videos.generate" => Ok(ai_methods::VIDEO_TXT2VIDEO),
+        other => Err(reason_error(
+            "invalid_request",
+            format!("unsupported api_type '{}'", other),
+        )),
+    }
+}
+
 fn api_type_for_capability(capability: &Capability) -> Option<ApiType> {
     api_type_for_method(default_method_for_capability(capability))
 }
@@ -1699,11 +1724,39 @@ fn route_error_to_rpc(error: crate::model_types::RouteError) -> RPCErrors {
 }
 
 fn route_policy_from_request(request: &AiMethodRequest) -> RoutePolicy {
+    let request_policy = request.policy.as_ref();
     let mut policy = RoutePolicy {
-        required_features: required_model_features(&request.requirements.must_features),
-        max_estimated_cost_usd: request.requirements.max_cost_usd,
+        required_features: required_model_features(&request.requirements),
+        max_estimated_cost_usd: request_policy
+            .and_then(|policy| policy.max_cost_usd)
+            .or(request.requirements.max_cost_usd),
+        max_latency_ms: request_policy
+            .and_then(|policy| policy.max_latency_ms)
+            .or(request.requirements.max_latency_ms),
         ..Default::default()
     };
+    if let Some(request_policy) = request_policy {
+        policy.profile = match request_policy.profile {
+            buckyos_api::RoutePolicyProfile::Cheap => {
+                crate::model_types::SchedulerProfile::CostFirst
+            }
+            buckyos_api::RoutePolicyProfile::Fast => {
+                crate::model_types::SchedulerProfile::LatencyFirst
+            }
+            buckyos_api::RoutePolicyProfile::Balanced => {
+                crate::model_types::SchedulerProfile::Balanced
+            }
+            buckyos_api::RoutePolicyProfile::Quality => {
+                crate::model_types::SchedulerProfile::QualityFirst
+            }
+        };
+        policy.local_only = request_policy.local_only;
+        policy.allow_fallback = request_policy.allow_fallback;
+        policy.runtime_failover = request_policy.runtime_failover;
+        policy.explain = request_policy.explain;
+        policy.allowed_provider_instances = request_policy.allowed_provider_instances.clone();
+        policy.blocked_provider_instances = request_policy.blocked_provider_instances.clone();
+    }
     if let Some(extra) = request.requirements.extra.as_ref() {
         if let Some(local_only) = extra.get("local_only").and_then(Value::as_bool) {
             policy.local_only = local_only;
@@ -1725,12 +1778,183 @@ fn route_policy_from_request(request: &AiMethodRequest) -> RoutePolicy {
     policy
 }
 
+fn route_probe_payload(estimated_input_tokens: Option<u64>) -> AiPayload {
+    let text = estimated_input_tokens
+        .map(|tokens| "x".repeat(tokens.saturating_mul(4).min(32 * 1024) as usize));
+    AiPayload::new(
+        text,
+        vec![],
+        vec![],
+        vec![],
+        Some(json!({})),
+        Some(json!({})),
+    )
+}
+
+fn lower_provider_model_options(provider_model: &str) -> (String, Option<Value>) {
+    let Some((model, variant)) = provider_model.split_once(':') else {
+        return (provider_model.to_string(), None);
+    };
+    if let Some(effort) = variant.strip_prefix("reasoning-") {
+        return (
+            model.to_string(),
+            Some(json!({
+                "reasoning": {
+                    "effort": effort
+                }
+            })),
+        );
+    }
+    (
+        model.to_string(),
+        Some(json!({
+            "aicc_variant": variant
+        })),
+    )
+}
+
+fn merge_provider_options(payload: &mut AiPayload, provider_options: Option<Value>) {
+    let Some(provider_options) = provider_options else {
+        return;
+    };
+    let mut options = payload.options.take().unwrap_or_else(|| json!({}));
+    if !options.is_object() {
+        options = json!({});
+    }
+    if let Some(object) = options.as_object_mut() {
+        object.insert("provider_options".to_string(), provider_options);
+    }
+    payload.options = Some(options);
+}
+
+fn exact_model_spec(exact_model: &str) -> std::result::Result<ModelSpec, RPCErrors> {
+    ExactModelName::parse(exact_model).map_err(route_error_to_rpc)?;
+    Ok(ModelSpec::new(exact_model.to_string(), None))
+}
+
+fn llm_chat_invoke_to_method_request(
+    request: LlmChatInvokeRequest,
+) -> std::result::Result<AiMethodRequest, RPCErrors> {
+    let model = exact_model_spec(request.exact_model.as_str())?;
+    let mut payload = request.payload.unwrap_or_else(|| {
+        AiPayload::new(
+            None,
+            request.messages.clone(),
+            request.tools.clone(),
+            vec![],
+            Some(json!({})),
+            Some(json!({})),
+        )
+    });
+    if payload.messages.is_empty() {
+        payload.messages = request.messages;
+    }
+    if payload.tool_specs.is_empty() {
+        payload.tool_specs = request.tools;
+    }
+    if let Some(input_json) = payload.input_json.as_mut() {
+        if !input_json.is_object() {
+            *input_json = json!({ "value": input_json.clone() });
+        }
+        if let Some(object) = input_json.as_object_mut() {
+            if let Some(resp_format) = request.response_format {
+                object.insert("response_format".to_string(), json!(resp_format));
+            }
+            if let Some(temperature) = request.temperature {
+                object.insert("temperature".to_string(), json!(temperature));
+            }
+            if let Some(max_output_tokens) = request.max_output_tokens {
+                object.insert("max_output_tokens".to_string(), json!(max_output_tokens));
+            }
+        }
+    } else {
+        payload.input_json = Some(json!({}));
+    }
+    merge_provider_options(&mut payload, request.provider_options);
+    let mut policy = buckyos_api::RoutePolicy::default();
+    policy.allow_fallback = false;
+    policy.runtime_failover = false;
+    Ok(AiMethodRequest::new(
+        Capability::Llm,
+        model,
+        Requirements::default(),
+        payload,
+        request.idempotency_key,
+    )
+    .with_policy(Some(policy))
+    .with_task_options(request.task_options))
+}
+
+fn image_generate_to_method_request(
+    request: TextToImageInvokeRequest,
+) -> std::result::Result<AiMethodRequest, RPCErrors> {
+    let model = exact_model_spec(request.exact_model.as_str())?;
+    let mut payload = request.payload.unwrap_or_else(|| {
+        AiPayload::new(
+            Some(request.prompt.clone()),
+            vec![],
+            vec![],
+            vec![],
+            Some(json!({
+                "prompt": request.prompt.clone()
+            })),
+            Some(json!({})),
+        )
+    });
+    if payload.text.is_none() {
+        payload.text = Some(request.prompt.clone());
+    }
+    let mut input = payload.input_json.take().unwrap_or_else(|| json!({}));
+    if !input.is_object() {
+        input = json!({ "value": input });
+    }
+    if let Some(object) = input.as_object_mut() {
+        object
+            .entry("prompt".to_string())
+            .or_insert_with(|| json!(request.prompt));
+        if let Some(value) = request.negative_prompt {
+            object.insert("negative_prompt".to_string(), json!(value));
+        }
+        if let Some(value) = request.size {
+            object.insert("size".to_string(), json!(value));
+        }
+        if let Some(value) = request.quality {
+            object.insert("quality".to_string(), json!(value));
+        }
+        if let Some(value) = request.style {
+            object.insert("style".to_string(), json!(value));
+        }
+        if let Some(value) = request.seed {
+            object.insert("seed".to_string(), json!(value));
+        }
+        if let Some(value) = request.output {
+            object.insert("output".to_string(), value);
+        }
+    }
+    payload.input_json = Some(input);
+    merge_provider_options(&mut payload, request.provider_options);
+    let mut policy = buckyos_api::RoutePolicy::default();
+    policy.allow_fallback = false;
+    policy.runtime_failover = false;
+    Ok(AiMethodRequest::new(
+        Capability::Image,
+        model,
+        Requirements::default(),
+        payload,
+        request.idempotency_key,
+    )
+    .with_policy(Some(policy))
+    .with_task_options(request.task_options))
+}
+
 fn apply_default_features_for_method(method: &str, request: &mut AiMethodRequest) {
     apply_disabled_capabilities(request);
     if method == ai_methods::LLM_CHAT
         && !request_disables_capability(request, buckyos_api::features::WEB_SEARCH)
     {
-        ensure_must_feature(request, buckyos_api::features::WEB_SEARCH);
+        request
+            .requirements
+            .set_feature_required(buckyos_api::features::WEB_SEARCH);
     }
 }
 
@@ -1743,6 +1967,16 @@ fn apply_disabled_capabilities(request: &mut AiMethodRequest) {
         .requirements
         .must_features
         .retain(|feature| !disabled.iter().any(|item| item == feature));
+    for feature in disabled {
+        match feature.as_str() {
+            buckyos_api::features::TOOL_CALLING => request.requirements.required.tool_call = false,
+            buckyos_api::features::JSON_OUTPUT => request.requirements.required.json_schema = false,
+            buckyos_api::features::WEB_SEARCH => request.requirements.required.web_search = false,
+            buckyos_api::features::VISION => request.requirements.required.vision = false,
+            "streaming" => request.requirements.required.streaming = false,
+            _ => {}
+        }
+    }
 }
 
 fn request_disables_capability(request: &AiMethodRequest, feature: &str) -> bool {
@@ -1752,7 +1986,8 @@ fn request_disables_capability(request: &AiMethodRequest, feature: &str) -> bool
 }
 
 fn disabled_capabilities(request: &AiMethodRequest) -> Vec<String> {
-    request
+    let mut disabled = request.disable.feature_names();
+    let legacy_disabled: Vec<String> = request
         .requirements
         .extra
         .as_ref()
@@ -1766,18 +2001,13 @@ fn disabled_capabilities(request: &AiMethodRequest) -> Vec<String> {
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default()
-}
-
-fn ensure_must_feature(request: &mut AiMethodRequest, feature: &str) {
-    if !request
-        .requirements
-        .must_features
-        .iter()
-        .any(|item| item == feature)
-    {
-        request.requirements.must_features.push(feature.to_string());
+        .unwrap_or_default();
+    for feature in legacy_disabled {
+        if !disabled.iter().any(|item| item == &feature) {
+            disabled.push(feature);
+        }
     }
+    disabled
 }
 
 fn apply_policy_config_to_route_policy(policy: &mut RoutePolicy, config: &PolicyConfig) {
@@ -1813,9 +2043,15 @@ fn apply_policy_config_to_route_policy(policy: &mut RoutePolicy, config: &Policy
     }
 }
 
-fn required_model_features(features: &[Feature]) -> RequiredModelFeatures {
+fn required_model_features(requirements: &Requirements) -> RequiredModelFeatures {
     let mut required = RequiredModelFeatures::default();
-    for feature in features {
+    required.streaming = requirements.required.streaming;
+    required.tool_call = requirements.required.tool_call;
+    required.json_schema = requirements.required.json_schema;
+    required.web_search = requirements.required.web_search;
+    required.vision = requirements.required.vision;
+    required.min_context_tokens = requirements.required.min_context_tokens;
+    for feature in &requirements.must_features {
         match feature.as_str() {
             buckyos_api::features::TOOL_CALLING => required.tool_call = true,
             buckyos_api::features::JSON_OUTPUT => required.json_schema = true,
@@ -2481,6 +2717,56 @@ impl AIComputeCenter {
         })
     }
 
+    fn route_decision_response(
+        &self,
+        decision: &RouteDecision,
+    ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        let primary = decision
+            .attempts()
+            .first()
+            .ok_or_else(|| reason_error("no_provider_available", "route produced no attempts"))?;
+        let inventory = self.registry.inventory(primary.instance_id.as_str());
+        let trace = decision
+            .route_trace
+            .lock()
+            .ok()
+            .and_then(|trace| serde_json::to_value(&*trace).ok());
+        let session_config_revision = trace
+            .as_ref()
+            .and_then(|trace| trace.get("session_config_revision"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (provider_model_id, provider_options) =
+            lower_provider_model_options(primary.provider_model.as_str());
+        let fallback_attempts = decision
+            .attempts()
+            .iter()
+            .skip(1)
+            .map(|attempt| {
+                let (provider_model_id, provider_options) =
+                    lower_provider_model_options(attempt.provider_model.as_str());
+                RouteFallbackAttempt {
+                    exact_model: attempt.exact_model.clone(),
+                    provider_instance_name: attempt.instance_id.clone(),
+                    provider_model_id,
+                    provider_options,
+                }
+            })
+            .collect();
+
+        Ok(RouteResolveResponse {
+            selected_exact_model: primary.exact_model.clone(),
+            provider_instance_name: primary.instance_id.clone(),
+            provider_driver: inventory.as_ref().map(|item| item.provider_driver.clone()),
+            provider_model_id,
+            provider_options,
+            fallback_attempts,
+            route_trace: trace,
+            inventory_revision: inventory.and_then(|item| item.inventory_revision),
+            session_config_revision,
+        })
+    }
+
     fn resolve_request_session_config(
         &self,
         request: &AiMethodRequest,
@@ -2572,7 +2858,7 @@ impl AIComputeCenter {
                 input_tokens,
                 estimated_output_tokens: Some(output_tokens),
                 cached_input_tokens: None,
-                request_features: request.requirements.must_features.clone(),
+                request_features: request.requirements.effective_feature_names(),
             });
             let provider_driver = self
                 .registry
@@ -2619,6 +2905,16 @@ impl AIComputeCenter {
                     .map(|estimate| estimate.estimated_cost_usd)
                     .or(candidate.metadata.pricing.estimated_cost_usd);
                 if cost.map(|value| value > max_cost).unwrap_or(false) {
+                    return false;
+                }
+            }
+            if let Some(max_latency_ms) = policy.max_latency_ms {
+                let latency = candidate
+                    .dynamic_cost_estimate
+                    .as_ref()
+                    .and_then(|estimate| estimate.estimated_latency_ms)
+                    .or(candidate.metadata.health.p95_latency_ms);
+                if latency.map(|value| value > max_latency_ms).unwrap_or(false) {
                     return false;
                 }
             }
@@ -2686,6 +2982,105 @@ impl AIComputeCenter {
             rpc_ctx,
         )
         .await
+    }
+
+    pub fn resolve_route(
+        &self,
+        request: RouteResolveRequest,
+        rpc_ctx: RPCContext,
+    ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        let invoke_ctx = InvokeCtx::from_rpc(&rpc_ctx);
+        let request_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| self.generate_task_id());
+        let method = method_for_route_api_type(request.api_type.as_str())?;
+        let capability = capability_for_method(method).ok_or_else(|| {
+            reason_error(
+                "invalid_request",
+                format!("api_type '{}' is not supported", request.api_type),
+            )
+        })?;
+        let mut requirements = request.requirements.clone();
+        if let Some(input_tokens) = request.estimated_input_tokens {
+            let mut extra = requirements.extra.take().unwrap_or_else(|| json!({}));
+            if !extra.is_object() {
+                extra = json!({ "value": extra });
+            }
+            if let Some(object) = extra.as_object_mut() {
+                object.insert("estimated_input_tokens".to_string(), json!(input_tokens));
+                if let Some(output_tokens) = request.estimated_output_tokens {
+                    object.insert("estimated_output_tokens".to_string(), json!(output_tokens));
+                }
+                if let Some(session_profile) = request.session_profile.clone() {
+                    object.insert("session_profile".to_string(), session_profile);
+                }
+            }
+            requirements.extra = Some(extra);
+        }
+
+        let mut method_request = AiMethodRequest::new(
+            capability,
+            ModelSpec::new(request.logical_model.clone(), None),
+            requirements,
+            route_probe_payload(request.estimated_input_tokens),
+            None,
+        )
+        .with_policy(request.policy.clone());
+        method_request.disable = request.disable.clone();
+        if let Some(session_id) = request.session_id.as_ref() {
+            let mut options = method_request
+                .payload
+                .options
+                .take()
+                .unwrap_or_else(|| json!({}));
+            if !options.is_object() {
+                options = json!({});
+            }
+            if let Some(object) = options.as_object_mut() {
+                object.insert("session_id".to_string(), json!(session_id));
+            }
+            method_request.payload.options = Some(options);
+        }
+        apply_default_features_for_method(method, &mut method_request);
+
+        let route_cfg = self
+            .route_cfg
+            .read()
+            .map(|cfg| cfg.clone())
+            .unwrap_or_default();
+        let decision = self.route_request(
+            invoke_ctx.tenant_id.as_str(),
+            method,
+            &method_request,
+            &route_cfg,
+            request_id.as_str(),
+        )?;
+        self.route_decision_response(&decision)
+    }
+
+    pub async fn create_chat_completion(
+        &self,
+        request: LlmChatInvokeRequest,
+        rpc_ctx: RPCContext,
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        let method_request = llm_chat_invoke_to_method_request(request)?;
+        let response = self
+            .complete_with_method(ai_methods::LLM_CHAT, method_request, rpc_ctx)
+            .await?;
+        Ok(response.into())
+    }
+
+    pub async fn generate_image(
+        &self,
+        request: TextToImageInvokeRequest,
+        rpc_ctx: RPCContext,
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        let method_request = image_generate_to_method_request(request)?;
+        let response = self
+            .complete_with_method(ai_methods::IMAGE_TXT2IMG, method_request, rpc_ctx)
+            .await?;
+        Ok(response.into())
     }
 
     pub async fn complete_with_method(
@@ -2765,9 +3160,9 @@ impl AIComputeCenter {
             request.capability,
             request.model.alias,
             self.registry.provider_count(),
-            request.requirements.must_features,
-            request.requirements.max_cost_usd,
-            request.requirements.max_latency_ms
+            request.requirements.effective_feature_names(),
+            route_policy_from_request(&request).max_estimated_cost_usd,
+            route_policy_from_request(&request).max_latency_ms
         );
 
         let decision = match self.route_request(
@@ -3430,6 +3825,30 @@ impl AiccHandler for AIComputeCenter {
         ctx: RPCContext,
     ) -> std::result::Result<CancelResponse, RPCErrors> {
         self.cancel(task_id, ctx).await
+    }
+
+    async fn handle_route_resolve(
+        &self,
+        request: RouteResolveRequest,
+        ctx: RPCContext,
+    ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        self.resolve_route(request, ctx)
+    }
+
+    async fn handle_chat_completions_create(
+        &self,
+        request: LlmChatInvokeRequest,
+        ctx: RPCContext,
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        self.create_chat_completion(request, ctx).await
+    }
+
+    async fn handle_images_generate(
+        &self,
+        request: TextToImageInvokeRequest,
+        ctx: RPCContext,
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        self.generate_image(request, ctx).await
     }
 }
 
@@ -4561,15 +4980,7 @@ mod tests {
         apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
         apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
 
-        assert_eq!(
-            request
-                .requirements
-                .must_features
-                .iter()
-                .filter(|feature| feature.as_str() == buckyos_api::features::WEB_SEARCH)
-                .count(),
-            1
-        );
+        assert!(request.requirements.required.web_search);
         assert!(
             route_policy_from_request(&request)
                 .required_features
@@ -4580,17 +4991,11 @@ mod tests {
     #[test]
     fn llm_chat_default_web_search_can_be_disabled() {
         let mut request = base_request();
-        request.requirements.extra = Some(json!({
-            "disable_capabilities": ["web_search"]
-        }));
+        request.disable.web_search = true;
 
         apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
 
-        assert!(!request
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
+        assert!(!request.requirements.required.web_search);
         assert!(
             !route_policy_from_request(&request)
                 .required_features
@@ -4599,23 +5004,16 @@ mod tests {
     }
 
     #[test]
-    fn disabled_capabilities_remove_existing_must_feature() {
+    fn disable_removes_existing_required_feature() {
         let mut request = base_request();
         request
             .requirements
-            .must_features
-            .push(buckyos_api::features::WEB_SEARCH.to_string());
-        request.requirements.extra = Some(json!({
-            "disable_capabilities": ["web_search"]
-        }));
+            .set_feature_required(buckyos_api::features::WEB_SEARCH);
+        request.disable.web_search = true;
 
         apply_default_features_for_method(ai_methods::LLM_CHAT, &mut request);
 
-        assert!(!request
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
+        assert!(!request.requirements.required.web_search);
     }
 
     #[test]
@@ -4623,11 +5021,7 @@ mod tests {
         let mut request = base_request();
         apply_default_features_for_method(ai_methods::LLM_COMPLETION, &mut request);
 
-        assert!(!request
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == buckyos_api::features::WEB_SEARCH));
+        assert!(!request.requirements.required.web_search);
     }
 
     #[test]
@@ -4643,6 +5037,51 @@ mod tests {
                 .min_context_tokens,
             Some(128000)
         );
+    }
+
+    #[test]
+    fn route_policy_reads_structured_requirements() {
+        let mut request = base_request();
+        request.requirements.required.tool_call = true;
+        request.requirements.required.json_schema = true;
+        request.requirements.required.min_context_tokens = Some(64_000);
+
+        let policy = route_policy_from_request(&request);
+
+        assert!(policy.required_features.tool_call);
+        assert!(policy.required_features.json_schema);
+        assert_eq!(policy.required_features.min_context_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn route_policy_reads_request_policy_fields() {
+        let mut request = base_request();
+        let mut policy = buckyos_api::RoutePolicy::default();
+        policy.profile = buckyos_api::RoutePolicyProfile::Fast;
+        policy.local_only = true;
+        policy.allow_fallback = false;
+        policy.runtime_failover = false;
+        policy.explain = true;
+        policy.allowed_provider_instances = vec!["local-a".to_string()];
+        policy.blocked_provider_instances = vec!["cloud-b".to_string()];
+        policy.max_cost_usd = Some(0.25);
+        policy.max_latency_ms = Some(1500);
+        request.policy = Some(policy);
+
+        let route_policy = route_policy_from_request(&request);
+
+        assert_eq!(
+            route_policy.profile,
+            crate::model_types::SchedulerProfile::LatencyFirst
+        );
+        assert!(route_policy.local_only);
+        assert!(!route_policy.allow_fallback);
+        assert!(!route_policy.runtime_failover);
+        assert!(route_policy.explain);
+        assert_eq!(route_policy.allowed_provider_instances, vec!["local-a"]);
+        assert_eq!(route_policy.blocked_provider_instances, vec!["cloud-b"]);
+        assert_eq!(route_policy.max_estimated_cost_usd, Some(0.25));
+        assert_eq!(route_policy.max_latency_ms, Some(1500));
     }
 
     #[test]

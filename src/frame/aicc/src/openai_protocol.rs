@@ -511,11 +511,7 @@ pub(crate) fn merge_requirements_response_format(
     }
 
     let json_output_required = req.requirements.resp_format == RespFormat::Json
-        || req
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == features::JSON_OUTPUT);
+        || req.requirements.requires_feature(features::JSON_OUTPUT);
     if json_output_required {
         let _ = set_text_format(target, json!({ "type": "json_object" }));
     }

@@ -1,7 +1,10 @@
 mod common;
 
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
-use buckyos_api::{Capability, TaskFilter};
+use buckyos_api::{
+    AiMessage, AiMethodStatus, AiRole, Capability, LlmChatInvokeRequest, RouteResolveRequest,
+    TaskFilter,
+};
 use common::*;
 use std::sync::Arc;
 
@@ -29,6 +32,33 @@ fn setup_route_provider(
         vec![Ok(ProviderStartResult::Started)],
     ));
     registry.add_provider(provider);
+}
+
+fn add_llm(
+    registry: &Registry,
+    catalog: &ModelCatalog,
+    instance_id: &str,
+    provider_type: &str,
+    cost: f64,
+    latency_ms: u64,
+    result: std::result::Result<ProviderStartResult, aicc::ProviderError>,
+) -> Arc<MockProvider> {
+    catalog.set_mapping(Capability::Llm, "llm.plan.default", provider_type, "m");
+    let provider = Arc::new(MockProvider::new(
+        mock_instance(
+            instance_id,
+            provider_type,
+            vec![Capability::Llm],
+            vec!["plan".to_string()],
+        ),
+        CostEstimate {
+            estimated_cost_usd: Some(cost),
+            estimated_latency_ms: Some(latency_ms),
+        },
+        vec![result],
+    ));
+    registry.add_provider(provider.clone());
+    provider
 }
 
 #[test]
@@ -350,4 +380,91 @@ async fn route_08_tenant_mapping_override_global_on_complete() {
             .as_deref(),
         Some("tenant-model")
     , "assert_eq failed in route_08_tenant_mapping_override_global_on_complete: expected left == right; check this scenario's routing/status/error-code branch.");
+}
+
+#[test]
+fn route_resolve_returns_control_plane_selection_without_starting_provider() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let provider = add_llm(
+        &registry,
+        &catalog,
+        "p-a",
+        "provider-a",
+        0.01,
+        100,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+
+    let response = center
+        .resolve_route(
+            RouteResolveRequest {
+                request_id: Some("route-test-1".to_string()),
+                api_type: "llm.chat".to_string(),
+                logical_model: "llm.plan.default".to_string(),
+                requirements: Default::default(),
+                disable: Default::default(),
+                policy: None,
+                estimated_input_tokens: Some(12),
+                estimated_output_tokens: Some(24),
+                session_id: None,
+                session_profile: None,
+            },
+            Default::default(),
+        )
+        .expect("route.resolve should succeed");
+
+    assert_eq!(response.selected_exact_model, "m@p-a");
+    assert_eq!(response.provider_instance_name, "p-a");
+    assert_eq!(response.provider_model_id, "m");
+    assert_eq!(provider.start_calls(), 0);
+}
+
+#[tokio::test]
+async fn chat_completions_create_uses_exact_model_without_runtime_fallback() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let primary = add_llm(
+        &registry,
+        &catalog,
+        "p-a",
+        "provider-a",
+        0.01,
+        100,
+        Ok(ProviderStartResult::Started),
+    );
+    let fallback = add_llm(
+        &registry,
+        &catalog,
+        "p-b",
+        "provider-b",
+        0.02,
+        90,
+        Ok(ProviderStartResult::Started),
+    );
+    let center = center_with_taskmgr(registry, catalog);
+
+    let response = center
+        .create_chat_completion(
+            LlmChatInvokeRequest {
+                exact_model: "m@p-a".to_string(),
+                messages: vec![AiMessage::text(AiRole::User, "hello")],
+                tools: vec![],
+                response_format: None,
+                temperature: None,
+                max_output_tokens: None,
+                payload: None,
+                provider_options: None,
+                idempotency_key: None,
+                task_options: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("chat.completions.create should start exact provider");
+
+    assert_eq!(response.status, AiMethodStatus::Running);
+    assert_eq!(primary.start_calls(), 1);
+    assert_eq!(fallback.start_calls(), 0);
 }

@@ -781,6 +781,8 @@ pub struct RoutePolicy {
     #[serde(default)]
     pub max_estimated_cost_usd: Option<f64>,
     #[serde(default)]
+    pub max_latency_ms: Option<u64>,
+    #[serde(default)]
     pub fallback: Option<FallbackRule>,
 }
 
@@ -797,6 +799,7 @@ impl Default for RoutePolicy {
             blocked_provider_instances: Vec::new(),
             allowed_provider_instances: Vec::new(),
             max_estimated_cost_usd: None,
+            max_latency_ms: None,
             fallback: None,
             scheduler_profiles: None,
         }

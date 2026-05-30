@@ -1262,24 +1262,10 @@ fn match_global_segments(pattern: &[&str], event: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kevent_ringbuffer::DEFAULT_RINGBUFFER_PATH_ENV;
     use std::sync::Arc;
-    use std::sync::Once;
 
     struct MockBridge {
         published: Arc<Mutex<Vec<Event>>>,
-    }
-
-    fn init_test_ringbuffer_path() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let path = std::env::temp_dir().join(format!(
-                "buckyos_kevent_ringbuffer_test_{}.shm",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_file(&path);
-            std::env::set_var(DEFAULT_RINGBUFFER_PATH_ENV, &path);
-        });
     }
 
     #[async_trait]
@@ -1590,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_mode_global_process_short_circuit_without_bridge() {
-        init_test_ringbuffer_path();
+        let _ring_guard = crate::kevent_ringbuffer::test_support::lock_with_fresh_ring();
         let client = KEventClient::new_full("node_a", None);
         let reader = client
             .create_event_reader(vec!["/system/node/online".to_string()])
@@ -1609,7 +1595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_mode_shared_ring_short_circuit_between_clients() {
-        init_test_ringbuffer_path();
+        let _ring_guard = crate::kevent_ringbuffer::test_support::lock_with_fresh_ring();
         let publisher = KEventClient::new_full("node_a", None);
         let subscriber = KEventClient::new_full("node_a", None);
         let eventid = format!("/kevent/shared_ring/test_{}", now_millis());
@@ -1630,7 +1616,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_mode_shared_ring_first_event_from_late_producer() {
-        init_test_ringbuffer_path();
+        let _ring_guard = crate::kevent_ringbuffer::test_support::lock_with_fresh_ring();
         let subscriber = KEventClient::new_full("node_a", None);
         let eventid = format!("/kevent/shared_ring/late_producer_{}", now_millis());
         let reader = subscriber

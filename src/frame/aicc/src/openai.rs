@@ -2099,11 +2099,7 @@ impl OpenAIProvider {
         target: &mut Map<String, Value>,
         req: &AiMethodRequest,
     ) -> Result<(), ProviderError> {
-        let web_search_required = req
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == features::WEB_SEARCH);
+        let web_search_required = req.requirements.requires_feature(features::WEB_SEARCH);
         if !web_search_required {
             return Ok(());
         }

@@ -16,6 +16,25 @@ type RpcClient = { call: (method: string, params: Record<string, unknown>) => Pr
 
 export type { Profile };
 
+export interface ModelRequirement {
+  streaming?: boolean;
+  tool_call?: boolean;
+  json_schema?: boolean;
+  web_search?: boolean;
+  vision?: boolean;
+  min_context_tokens?: number;
+  [key: string]: unknown;
+}
+
+export interface ModelDisable {
+  streaming?: boolean;
+  tool_call?: boolean;
+  json_schema?: boolean;
+  web_search?: boolean;
+  vision?: boolean;
+  [key: string]: unknown;
+}
+
 export interface CallOptions {
   capability: Capability;
   method: string;
@@ -23,10 +42,14 @@ export interface CallOptions {
   inputJson?: Record<string, unknown>;
   resources?: ResourceRef[];
   options?: Record<string, unknown>;
-  requirements?: Record<string, unknown>;
+  requirements?: ModelRequirement;
+  disable?: ModelDisable;
   profile?: Profile;
   allowFallback?: boolean;
   runtimeFailover?: boolean;
+  localOnly?: boolean;
+  allowedProviderInstances?: string[];
+  blockedProviderInstances?: string[];
   maxCostUsd?: number;
   maxLatencyMs?: number;
   idempotencyKey?: string;
@@ -81,6 +104,13 @@ function buildPolicy(opts: CallOptions): Record<string, unknown> {
     allow_fallback: opts.allowFallback ?? true,
     runtime_failover: opts.runtimeFailover ?? true,
   };
+  if (opts.localOnly) policy.local_only = true;
+  if (opts.allowedProviderInstances?.length) {
+    policy.allowed_provider_instances = opts.allowedProviderInstances;
+  }
+  if (opts.blockedProviderInstances?.length) {
+    policy.blocked_provider_instances = opts.blockedProviderInstances;
+  }
   if (typeof opts.maxCostUsd === "number") policy.max_cost_usd = opts.maxCostUsd;
   if (typeof opts.maxLatencyMs === "number") policy.max_latency_ms = opts.maxLatencyMs;
   return policy;
@@ -92,6 +122,7 @@ function buildRequest(opts: CallOptions): Record<string, unknown> {
     capability: opts.capability,
     model: { alias: modelAlias },
     requirements: opts.requirements ?? {},
+    disable: opts.disable ?? {},
     payload: {
       input_json: opts.inputJson ?? {},
       resources: opts.resources ?? [],

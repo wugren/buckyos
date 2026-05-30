@@ -393,6 +393,18 @@ impl<'a> ModelRouter<'a> {
                         return None;
                     }
                 }
+                if let Some(max_latency_ms) = policy.max_latency_ms {
+                    if candidate
+                        .metadata
+                        .health
+                        .p95_latency_ms
+                        .map(|latency| latency > max_latency_ms)
+                        .unwrap_or(false)
+                    {
+                        trace_drop(trace, &candidate, "latency_exceeded");
+                        return None;
+                    }
+                }
                 if candidate.exact_model_weight <= 0.0 {
                     trace_drop(trace, &candidate, "exact_model_weight_zero");
                     return None;

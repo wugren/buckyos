@@ -14,6 +14,12 @@ pub const AICC_SERVICE_SERVICE_NAME: &str = "aicc";
 pub const AICC_SERVICE_SERVICE_PORT: u16 = 4040;
 
 pub mod ai_methods {
+    pub const ROUTE_RESOLVE: &str = "route.resolve";
+    pub const CHAT_COMPLETIONS_CREATE: &str = "chat.completions.create";
+    pub const IMAGES_GENERATE: &str = "images.generate";
+    pub const HELPER_LLM_CHAT: &str = "helper.llm_chat";
+    pub const HELPER_TEXT_TO_IMAGE: &str = "helper.text_to_image";
+
     pub const LLM_CHAT: &str = "llm.chat";
     pub const LLM_COMPLETION: &str = "llm.completion";
     pub const EMBEDDING_TEXT: &str = "embedding.text";
@@ -74,6 +80,17 @@ pub mod ai_methods {
                 | VIDEO_UPSCALE
                 | AGENT_COMPUTER_USE
         )
+    }
+
+    pub fn is_aicc_core_method(method: &str) -> bool {
+        matches!(
+            method,
+            ROUTE_RESOLVE
+                | CHAT_COMPLETIONS_CREATE
+                | IMAGES_GENERATE
+                | HELPER_LLM_CHAT
+                | HELPER_TEXT_TO_IMAGE
+        ) || is_ai_method(method)
     }
 }
 
@@ -164,7 +181,131 @@ impl ModelSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelRequirement {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json_schema: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_context_tokens: Option<u64>,
+}
+
+impl ModelRequirement {
+    pub fn set_feature_required(&mut self, feature: &str) {
+        match feature {
+            features::TOOL_CALLING => self.tool_call = true,
+            features::JSON_OUTPUT => self.json_schema = true,
+            features::WEB_SEARCH => self.web_search = true,
+            features::VISION => self.vision = true,
+            "streaming" => self.streaming = true,
+            _ => {}
+        }
+    }
+
+    pub fn requires_feature(&self, feature: &str) -> bool {
+        match feature {
+            features::TOOL_CALLING => self.tool_call,
+            features::JSON_OUTPUT => self.json_schema,
+            features::WEB_SEARCH => self.web_search,
+            features::VISION => self.vision,
+            "streaming" => self.streaming,
+            _ => false,
+        }
+    }
+
+    pub fn feature_names(&self) -> Vec<Feature> {
+        let mut features = Vec::new();
+        if self.streaming {
+            features.push("streaming".to_string());
+        }
+        if self.tool_call {
+            features.push(features::TOOL_CALLING.to_string());
+        }
+        if self.json_schema {
+            features.push(features::JSON_OUTPUT.to_string());
+        }
+        if self.web_search {
+            features.push(features::WEB_SEARCH.to_string());
+        }
+        if self.vision {
+            features.push(features::VISION.to_string());
+        }
+        features
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelDisable {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json_schema: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
+}
+
+impl ModelDisable {
+    pub fn set_feature_disabled(&mut self, feature: &str) {
+        match feature {
+            features::TOOL_CALLING => self.tool_call = true,
+            features::JSON_OUTPUT => self.json_schema = true,
+            features::WEB_SEARCH => self.web_search = true,
+            features::VISION => self.vision = true,
+            "streaming" => self.streaming = true,
+            _ => {}
+        }
+    }
+
+    pub fn disables_feature(&self, feature: &str) -> bool {
+        match feature {
+            features::TOOL_CALLING => self.tool_call,
+            features::JSON_OUTPUT => self.json_schema,
+            features::WEB_SEARCH => self.web_search,
+            features::VISION => self.vision,
+            "streaming" => self.streaming,
+            _ => false,
+        }
+    }
+
+    pub fn feature_names(&self) -> Vec<Feature> {
+        let mut features = Vec::new();
+        if self.streaming {
+            features.push("streaming".to_string());
+        }
+        if self.tool_call {
+            features.push(features::TOOL_CALLING.to_string());
+        }
+        if self.json_schema {
+            features.push(features::JSON_OUTPUT.to_string());
+        }
+        if self.web_search {
+            features.push(features::WEB_SEARCH.to_string());
+        }
+        if self.vision {
+            features.push(features::VISION.to_string());
+        }
+        features
+    }
+}
+
+fn is_default_model_disable(disable: &ModelDisable) -> bool {
+    disable == &ModelDisable::default()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Requirements {
+    #[serde(default, flatten)]
+    pub required: ModelRequirement,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_features: Vec<Feature>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,12 +326,32 @@ impl Requirements {
         extra: Option<Value>,
     ) -> Self {
         Self {
+            required: ModelRequirement::default(),
             must_features,
             max_latency_ms,
             max_cost_usd,
             resp_format: RespFormat::default(),
             extra,
         }
+    }
+
+    pub fn set_feature_required(&mut self, feature: &str) {
+        self.required.set_feature_required(feature);
+    }
+
+    pub fn requires_feature(&self, feature: &str) -> bool {
+        self.required.requires_feature(feature)
+            || self.must_features.iter().any(|item| item == feature)
+    }
+
+    pub fn effective_feature_names(&self) -> Vec<Feature> {
+        let mut features = self.required.feature_names();
+        for feature in &self.must_features {
+            if !features.iter().any(|item| item == feature) {
+                features.push(feature.clone());
+            }
+        }
+        features
     }
 }
 
@@ -216,12 +377,22 @@ fn is_false(value: &bool) -> bool {
 pub struct RoutePolicy {
     #[serde(default, skip_serializing_if = "is_default_route_policy_profile")]
     pub profile: RoutePolicyProfile,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_only: bool,
     #[serde(default = "default_allow_fallback")]
     pub allow_fallback: bool,
     #[serde(default = "default_runtime_failover")]
     pub runtime_failover: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub explain: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_provider_instances: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_provider_instances: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_latency_ms: Option<u64>,
 }
 
 fn default_allow_fallback() -> bool {
@@ -236,9 +407,14 @@ impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
             profile: RoutePolicyProfile::Balanced,
+            local_only: false,
             allow_fallback: true,
             runtime_failover: true,
             explain: false,
+            allowed_provider_instances: Vec::new(),
+            blocked_provider_instances: Vec::new(),
+            max_cost_usd: None,
+            max_latency_ms: None,
         }
     }
 }
@@ -1026,6 +1202,8 @@ pub struct AiMethodRequest {
     pub capability: Capability,
     pub model: ModelSpec,
     pub requirements: Requirements,
+    #[serde(default, skip_serializing_if = "is_default_model_disable")]
+    pub disable: ModelDisable,
     pub payload: AiPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<RoutePolicy>,
@@ -1053,6 +1231,7 @@ impl AiMethodRequest {
             capability,
             model,
             requirements,
+            disable: ModelDisable::default(),
             payload,
             policy: None,
             idempotency_key,
@@ -1107,6 +1286,236 @@ impl AiMethodResponse {
             status,
             result,
             event_ref,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteResolveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub api_type: String,
+    pub logical_model: String,
+    #[serde(default)]
+    pub requirements: Requirements,
+    #[serde(default, skip_serializing_if = "is_default_model_disable")]
+    pub disable: ModelDisable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RoutePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_profile: Option<Value>,
+}
+
+impl RouteResolveRequest {
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("Failed to parse RouteResolveRequest: {}", error))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteFallbackAttempt {
+    pub exact_model: String,
+    pub provider_instance_name: String,
+    pub provider_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteResolveResponse {
+    pub selected_exact_model: String,
+    pub provider_instance_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_driver: Option<String>,
+    pub provider_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_attempts: Vec<RouteFallbackAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_trace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_config_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmChatInvokeRequest {
+    pub exact_model: String,
+    #[serde(default)]
+    pub messages: Vec<AiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<AiToolSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<RespFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<AiPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_options: Option<AiTaskOptions>,
+}
+
+impl LlmChatInvokeRequest {
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("Failed to parse LlmChatInvokeRequest: {}", error))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmChatInvokeResponse {
+    pub task_id: String,
+    pub status: AiMethodStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<AiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<AiToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AiUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<AiCost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_trace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ref: Option<String>,
+}
+
+impl From<AiMethodResponse> for LlmChatInvokeResponse {
+    fn from(value: AiMethodResponse) -> Self {
+        let tool_calls = value
+            .result
+            .as_ref()
+            .map(|result| result.tool_calls())
+            .unwrap_or_default();
+        Self {
+            task_id: value.task_id,
+            status: value.status,
+            message: value.result.as_ref().map(|result| result.message.clone()),
+            tool_calls,
+            usage: value
+                .result
+                .as_ref()
+                .and_then(|result| result.usage.clone()),
+            cost: value.result.as_ref().and_then(|result| result.cost.clone()),
+            finish_reason: value
+                .result
+                .as_ref()
+                .and_then(|result| result.finish_reason.clone()),
+            provider_task_ref: value
+                .result
+                .as_ref()
+                .and_then(|result| result.provider_task_ref.clone()),
+            route_trace: value
+                .result
+                .as_ref()
+                .and_then(|result| result.extra.as_ref())
+                .and_then(|extra| extra.get("route_trace").cloned()),
+            event_ref: value.event_ref,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TextToImageInvokeRequest {
+    pub exact_model: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<AiPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_options: Option<AiTaskOptions>,
+}
+
+impl TextToImageInvokeRequest {
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TextToImageInvokeRequest: {}",
+                error
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TextToImageInvokeResponse {
+    pub task_id: String,
+    pub status: AiMethodStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<AiArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AiUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<AiCost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_trace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ref: Option<String>,
+}
+
+impl From<AiMethodResponse> for TextToImageInvokeResponse {
+    fn from(value: AiMethodResponse) -> Self {
+        Self {
+            task_id: value.task_id,
+            status: value.status,
+            artifacts: value
+                .result
+                .as_ref()
+                .map(|result| result.artifacts())
+                .unwrap_or_default(),
+            usage: value
+                .result
+                .as_ref()
+                .and_then(|result| result.usage.clone()),
+            cost: value.result.as_ref().and_then(|result| result.cost.clone()),
+            provider_task_ref: value
+                .result
+                .as_ref()
+                .and_then(|result| result.provider_task_ref.clone()),
+            route_trace: value
+                .result
+                .as_ref()
+                .and_then(|result| result.extra.as_ref())
+                .and_then(|extra| extra.get("route_trace").cloned()),
+            event_ref: value.event_ref,
         }
     }
 }
@@ -1204,6 +1613,94 @@ impl AiccClient {
         }
     }
 
+    pub async fn route_resolve(
+        &self,
+        request: RouteResolveRequest,
+    ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_route_resolve(request, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req_json = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize RouteResolveRequest: {}",
+                        error
+                    ))
+                })?;
+                let result = client.call(ai_methods::ROUTE_RESOLVE, req_json).await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse route.resolve response: {}",
+                        error
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn chat_completions_create(
+        &self,
+        request: LlmChatInvokeRequest,
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        request
+            .messages
+            .iter()
+            .try_for_each(AiMessage::validate)
+            .map_err(|err| RPCErrors::ParseRequestError(format!("invalid AiMessage: {err}")))?;
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_chat_completions_create(request, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req_json = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize LlmChatInvokeRequest: {}",
+                        error
+                    ))
+                })?;
+                let result = client
+                    .call(ai_methods::CHAT_COMPLETIONS_CREATE, req_json)
+                    .await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse chat.completions.create response: {}",
+                        error
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn images_generate(
+        &self,
+        request: TextToImageInvokeRequest,
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_images_generate(request, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req_json = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize TextToImageInvokeRequest: {}",
+                        error
+                    ))
+                })?;
+                let result = client.call(ai_methods::IMAGES_GENERATE, req_json).await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse images.generate response: {}",
+                        error
+                    ))
+                })
+            }
+        }
+    }
+
     pub async fn cancel(&self, task_id: &str) -> std::result::Result<CancelResponse, RPCErrors> {
         match self {
             Self::InProcess(handler) => {
@@ -1248,6 +1745,36 @@ pub trait AiccHandler: Send + Sync {
         task_id: &str,
         ctx: RPCContext,
     ) -> std::result::Result<CancelResponse, RPCErrors>;
+
+    async fn handle_route_resolve(
+        &self,
+        _request: RouteResolveRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::ROUTE_RESOLVE.to_string(),
+        ))
+    }
+
+    async fn handle_chat_completions_create(
+        &self,
+        _request: LlmChatInvokeRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::CHAT_COMPLETIONS_CREATE.to_string(),
+        ))
+    }
+
+    async fn handle_images_generate(
+        &self,
+        _request: TextToImageInvokeRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::IMAGES_GENERATE.to_string(),
+        ))
+    }
 }
 
 pub struct AiccServerHandler<T: AiccHandler>(pub T);
@@ -1274,6 +1801,47 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
             ai_methods::CANCEL => {
                 let cancel_req = CancelRequest::from_json(req.params)?;
                 let result = self.0.handle_cancel(&cancel_req.task_id, ctx).await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::ROUTE_RESOLVE => {
+                let route_req = RouteResolveRequest::from_json(req.params)?;
+                let result = self.0.handle_route_resolve(route_req, ctx).await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::CHAT_COMPLETIONS_CREATE => {
+                let invoke_req = LlmChatInvokeRequest::from_json(req.params)?;
+                invoke_req
+                    .messages
+                    .iter()
+                    .try_for_each(AiMessage::validate)
+                    .map_err(|err| {
+                        RPCErrors::ParseRequestError(format!("invalid AiMessage: {err}"))
+                    })?;
+                let result = self
+                    .0
+                    .handle_chat_completions_create(invoke_req, ctx)
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::IMAGES_GENERATE => {
+                let invoke_req = TextToImageInvokeRequest::from_json(req.params)?;
+                let result = self.0.handle_images_generate(invoke_req, ctx).await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::HELPER_LLM_CHAT => {
+                let method_req = AiMethodRequest::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_method(ai_methods::LLM_CHAT, method_req, ctx)
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::HELPER_TEXT_TO_IMAGE => {
+                let method_req = AiMethodRequest::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_method(ai_methods::IMAGE_TXT2IMG, method_req, ctx)
+                    .await?;
                 RPCResult::Success(json!(result))
             }
             method if ai_methods::is_ai_method(method) => {

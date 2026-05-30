@@ -807,6 +807,48 @@ fn is_process_alive(_pid: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Test support
+// ---------------------------------------------------------------------------
+
+/// Shared by every test (in this crate) that opens the shared-memory ring.
+///
+/// The ring file is selected through a process-global env var
+/// (`BUCKYOS_KEVENT_RINGBUFFER_PATH`). Tests run on parallel threads inside a
+/// single test binary, so two tests pointing that var at different files would
+/// clobber each other — a publisher and a subscriber could end up attached to
+/// different ring files and never exchange events. This module serializes such
+/// tests and hands each one a fresh, isolated ring file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::DEFAULT_RINGBUFFER_PATH_ENV;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    static SHM_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Acquire the shared-ring test lock and repoint the ring path at a fresh,
+    /// empty file unique to this test. Keep the returned guard alive until every
+    /// client has been constructed — the env var is only read at `open()` time,
+    /// but holding it for the whole test body keeps the invariant trivial.
+    pub(crate) fn lock_with_fresh_ring() -> MutexGuard<'static, ()> {
+        // Recover from a poisoned lock so one panicking test doesn't cascade
+        // into failures for every later shm test.
+        let guard = SHM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "buckyos_kevent_ringbuffer_test_{}_{}.shm",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var(DEFAULT_RINGBUFFER_PATH_ENV, &path);
+        guard
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -814,7 +856,6 @@ fn is_process_alive(_pid: u32) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::sync::Once;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct TestEvent {
@@ -911,18 +952,6 @@ mod tests {
         }
     }
 
-    fn init_test_ringbuffer_path() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let path = std::env::temp_dir().join(format!(
-                "buckyos_kevent_ringbuffer_core_test_{}.shm",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_file(&path);
-            std::env::set_var(DEFAULT_RINGBUFFER_PATH_ENV, &path);
-        });
-    }
-
     /// Verify that header_matches rejects mismatched parameters.
     #[test]
     fn test_header_mismatch() {
@@ -942,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_prime_cursors_keeps_first_event_from_new_ring() {
-        init_test_ringbuffer_path();
+        let _ring_guard = super::test_support::lock_with_fresh_ring();
 
         let consumer = SharedKEventRingBuffer::open().unwrap();
         consumer.prime_cursors();

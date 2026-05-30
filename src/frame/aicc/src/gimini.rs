@@ -1702,11 +1702,7 @@ impl GoogleGiminiProvider {
         let mut request_obj = Map::new();
         request_obj.insert("contents".to_string(), Value::Array(contents));
 
-        let json_output_required = req
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == features::JSON_OUTPUT);
+        let json_output_required = req.requirements.requires_feature(features::JSON_OUTPUT);
         let mut ignored_options = vec![];
         if let Some(input_json) = req.payload.input_json.as_ref() {
             ignored_options.extend(Self::merge_llm_options(

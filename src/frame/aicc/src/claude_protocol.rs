@@ -274,7 +274,7 @@ const CLAUDE_WEB_SEARCH_TOOL_NAME: &str = "web_search";
 /// requires the `web_search` feature.
 ///
 /// Mirrors `OpenAIProvider::merge_requirements_tools` — the router records
-/// `must_features: [web_search]` for `llm.chat`, and each provider is
+/// `requirements.web_search: true` for `llm.chat`, and each provider is
 /// responsible for translating that into its native server-tool wire format.
 pub(crate) fn merge_requirements_tools(
     target: &mut Map<String, Value>,
@@ -282,9 +282,7 @@ pub(crate) fn merge_requirements_tools(
 ) -> Result<(), ProviderError> {
     let web_search_required = req
         .requirements
-        .must_features
-        .iter()
-        .any(|feature| feature == buckyos_api::features::WEB_SEARCH);
+        .requires_feature(buckyos_api::features::WEB_SEARCH);
     if !web_search_required {
         return Ok(());
     }
