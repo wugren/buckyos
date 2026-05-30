@@ -1589,6 +1589,9 @@ fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
         ranked_candidates: Vec::new(),
         fallback_applied: false,
         fallback_chain: Vec::new(),
+        logical_item_sources: Vec::new(),
+        logical_admission: Vec::new(),
+        disabled_capability_sources: Vec::new(),
         session_sticky_hit: false,
         scheduler_profile: Default::default(),
         runtime_failover_count: 0,
@@ -2190,6 +2193,15 @@ fn disabled_capabilities(request: &AiMethodRequest) -> Vec<String> {
     disabled
 }
 
+fn merge_disabled_capabilities(mut base: Vec<String>, overlay: Vec<String>) -> Vec<String> {
+    for capability in overlay {
+        if !base.iter().any(|item| item == &capability) {
+            base.push(capability);
+        }
+    }
+    base
+}
+
 fn apply_policy_config_to_route_policy(policy: &mut RoutePolicy, config: &PolicyConfig) {
     if let Some(value) = config.profile.as_ref() {
         policy.profile = value.value.clone();
@@ -2531,6 +2543,14 @@ impl AIComputeCenter {
             .map(|item| item.to_string())
             .collect::<HashSet<_>>();
         let mut model_registry = ModelRegistry::new();
+        if let Err(err) = model_registry.set_logical_definitions(
+            crate::default_logical_tree::build_default_logical_definitions(),
+        ) {
+            warn!(
+                "aicc.model_registry.set_default_logical_definitions_failed err={}",
+                err
+            );
+        }
         for inventory in registry.inventories() {
             if let Err(err) = model_registry.apply_inventory(inventory) {
                 warn!("aicc.model_registry.apply_inventory_failed err={}", err);
@@ -2612,6 +2632,13 @@ impl AIComputeCenter {
     pub fn apply_default_logical_tree(&self) -> std::result::Result<usize, RPCErrors> {
         let config = crate::default_logical_tree::build_default_session_config();
         let node_count = crate::default_logical_tree::level2_node_count(&config);
+        if let Ok(mut registry) = self.model_registry.write() {
+            registry
+                .set_logical_definitions(
+                    crate::default_logical_tree::build_default_logical_definitions(),
+                )
+                .map_err(route_error_to_rpc)?;
+        }
         self.set_session_config(config);
         info!(
             "aicc.default_logical_tree.applied level2_nodes={}",
@@ -2800,9 +2827,16 @@ impl AIComputeCenter {
             session_config_revision,
             session_config_updated,
         });
-        drop(registry);
 
         let mut resolution = resolution.map_err(route_error_to_rpc)?;
+        let definition_disabled_capabilities = resolution
+            .trace
+            .resolved_logical_path
+            .as_deref()
+            .and_then(|path| registry.logical_definition(path))
+            .map(|definition| definition.disable_line.feature_names())
+            .unwrap_or_default();
+        drop(registry);
         self.apply_dynamic_cost_estimates(tenant_id, request, &mut resolution.candidates);
         self.apply_dynamic_budget_filters(&mut resolution, &policy)
             .map_err(route_error_to_rpc)?;
@@ -2906,6 +2940,10 @@ impl AIComputeCenter {
             .skip(1)
             .map(|item| item.instance_id.clone())
             .collect::<Vec<_>>();
+        let disabled_capabilities = merge_disabled_capabilities(
+            disabled_capabilities(request),
+            definition_disabled_capabilities,
+        );
 
         Ok(RouteDecision {
             primary_instance_id: scheduled.selected.provider_instance_name,
@@ -2913,9 +2951,9 @@ impl AIComputeCenter {
             provider_model: selected_provider_model,
             enabled_capabilities: enabled_capabilities(
                 &scheduled.selected.metadata.capabilities,
-                &disabled_capabilities(request),
+                &disabled_capabilities,
             ),
-            disabled_capabilities: disabled_capabilities(request),
+            disabled_capabilities,
             attempts,
             route_trace: Arc::new(Mutex::new(resolution.trace)),
             runtime_failover_enabled: policy.runtime_failover,

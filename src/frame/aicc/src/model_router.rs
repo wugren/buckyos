@@ -1,9 +1,10 @@
 use crate::model_registry::ModelRegistry;
 use crate::model_session::SessionConfig;
 use crate::model_types::{
-    ApiType, ExactModelName, FallbackMode, FallbackRule, FallbackTraceItem, FilteredCandidateTrace,
-    HealthStatus, ModelCandidate, ProviderType, RequestedModelType, RouteError, RouteErrorCode,
-    RoutePolicy, RouteTrace,
+    ApiType, DisabledCapabilityTrace, ExactModelName, FallbackMode, FallbackRule,
+    FallbackTraceItem, FilteredCandidateTrace, HealthStatus, LogicalItemSourceTrace,
+    ModelCandidate, ProviderType, RequestedModelType, RouteError, RouteErrorCode, RoutePolicy,
+    RouteTrace,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
@@ -65,6 +66,9 @@ impl<'a> ModelRouter<'a> {
             ranked_candidates: Vec::new(),
             fallback_applied: false,
             fallback_chain: Vec::new(),
+            logical_item_sources: Vec::new(),
+            logical_admission: Vec::new(),
+            disabled_capability_sources: Vec::new(),
             session_sticky_hit: false,
             scheduler_profile: request.policy.profile.clone(),
             runtime_failover_count: 0,
@@ -151,7 +155,8 @@ impl<'a> ModelRouter<'a> {
         policy: &RoutePolicy,
         trace: &mut RouteTrace,
     ) -> Result<Vec<ModelCandidate>, RouteError> {
-        let raw = self.resolve_logical_raw(logical_path, api_type)?;
+        let raw = self.resolve_logical_raw(logical_path, api_type, trace)?;
+        self.trace_disable_line(logical_path, trace);
         trace.candidate_count_before_filter += raw.len();
         let filtered = self.apply_hard_filters(raw, policy, trace);
         trace.candidate_count_after_filter += filtered.len();
@@ -202,7 +207,9 @@ impl<'a> ModelRouter<'a> {
             let raw = if crate::model_types::is_exact_model_name(next.as_str()) {
                 self.resolve_exact_raw(next.as_str(), api_type)
             } else {
-                self.resolve_logical_raw(next.as_str(), api_type)?
+                let raw = self.resolve_logical_raw(next.as_str(), api_type, trace)?;
+                self.trace_disable_line(next.as_str(), trace);
+                raw
             };
             trace.candidate_count_before_filter += raw.len();
             let filtered = self.apply_hard_filters(raw, policy, trace);
@@ -258,6 +265,7 @@ impl<'a> ModelRouter<'a> {
         &self,
         logical_path: &str,
         api_type: &ApiType,
+        trace: &mut RouteTrace,
     ) -> Result<Vec<ModelCandidate>, RouteError> {
         let mut visited = HashSet::<String>::new();
         self.expand_logical(
@@ -266,6 +274,7 @@ impl<'a> ModelRouter<'a> {
             api_type,
             Vec::new(),
             &mut visited,
+            trace,
         )
     }
 
@@ -276,6 +285,7 @@ impl<'a> ModelRouter<'a> {
         api_type: &ApiType,
         priority_path: Vec<f64>,
         visited: &mut HashSet<String>,
+        trace: &mut RouteTrace,
     ) -> Result<Vec<ModelCandidate>, RouteError> {
         if !visited.insert(logical_path.to_string()) {
             return Err(RouteError::new(
@@ -284,20 +294,41 @@ impl<'a> ModelRouter<'a> {
             ));
         }
 
-        let default_items = self.registry.default_items_for_path(logical_path);
+        let default_items = self
+            .registry
+            .default_items_with_trace_for_path(logical_path);
+        trace
+            .logical_admission
+            .extend(default_items.admission.clone());
         let node = self.session_config.node(logical_path);
-        if node.is_none() && default_items.is_empty() {
+        if node.is_none() && default_items.items.is_empty() {
             visited.remove(logical_path);
             return Ok(Vec::new());
         }
         let items = if let Some(node) = node {
-            node.effective_items(Some(&default_items))?
+            node.effective_items(Some(&default_items.items))?
         } else {
-            default_items
+            default_items.items.clone()
         };
 
         let mut candidates = Vec::new();
-        for item in items.values() {
+        for (item_name, item) in items.iter() {
+            let session_override = node
+                .and_then(|node| node.item_overrides.as_ref())
+                .map(|overrides| overrides.contains_key(item_name))
+                .unwrap_or(false);
+            trace.logical_item_sources.push(LogicalItemSourceTrace {
+                logical_path: logical_path.to_string(),
+                item_name: item_name.clone(),
+                target: item.target.clone(),
+                source: item_source(
+                    node.and_then(|node| node.source.as_deref()),
+                    session_override,
+                    item_name,
+                    &default_items.item_sources,
+                ),
+                weight: item.weight,
+            });
             if item.weight <= 0.0 {
                 continue;
             }
@@ -322,6 +353,7 @@ impl<'a> ModelRouter<'a> {
                     api_type,
                     next_priority,
                     visited,
+                    trace,
                 )?;
                 candidates.extend(nested);
             }
@@ -359,6 +391,22 @@ impl<'a> ModelRouter<'a> {
                 {
                     trace_drop(trace, &candidate, "feature_unsupported");
                     return None;
+                }
+                if let Some(logical_path) = candidate.resolved_logical_path.as_deref() {
+                    if let Some(definition) = self.registry.logical_definition(logical_path) {
+                        let reasons = candidate
+                            .metadata
+                            .capabilities
+                            .explain_missing_requirements(&definition.min_line);
+                        if !reasons.is_empty() {
+                            trace_drop(
+                                trace,
+                                &candidate,
+                                format!("min_line_unsatisfied:{}", reasons.join(",")).as_str(),
+                            );
+                            return None;
+                        }
+                    }
                 }
                 if policy.local_only
                     && candidate.metadata.attributes.provider_type != ProviderType::LocalInference
@@ -415,6 +463,48 @@ impl<'a> ModelRouter<'a> {
             })
             .collect()
     }
+
+    fn trace_disable_line(&self, logical_path: &str, trace: &mut RouteTrace) {
+        let Some(definition) = self.registry.logical_definition(logical_path) else {
+            return;
+        };
+        for capability in definition.disable_line.feature_names() {
+            let exists = trace.disabled_capability_sources.iter().any(|item| {
+                item.logical_path == logical_path
+                    && item.capability == capability
+                    && item.source == "builtin_definition"
+            });
+            if exists {
+                continue;
+            }
+            trace
+                .disabled_capability_sources
+                .push(DisabledCapabilityTrace {
+                    logical_path: logical_path.to_string(),
+                    capability,
+                    source: "builtin_definition".to_string(),
+                    reason: "disable_line".to_string(),
+                });
+        }
+    }
+}
+
+fn item_source(
+    node_source: Option<&str>,
+    session_override: bool,
+    item_name: &str,
+    default_sources: &BTreeMap<String, String>,
+) -> String {
+    if session_override {
+        if let Some(source) = node_source {
+            return source.to_string();
+        }
+        return "session_overlay".to_string();
+    }
+    default_sources
+        .get(item_name)
+        .cloned()
+        .unwrap_or_else(|| "manual_override".to_string())
 }
 
 fn trace_drop(trace: &mut RouteTrace, candidate: &ModelCandidate, reason: &str) {
@@ -507,8 +597,9 @@ mod tests {
     use crate::model_registry::ModelRegistry;
     use crate::model_session::{LogicalNode, SessionConfig};
     use crate::model_types::{
-        CostClass, FallbackRule, ModelAttributes, ModelCapabilities, ModelHealth, ModelItem,
-        ModelMetadata, ModelPricing, ProviderInventory, QuotaState, RoutePolicy,
+        CostClass, FallbackRule, LogicalModelDefinition, ModelAttributes, ModelCapabilities,
+        ModelDisable, ModelHealth, ModelItem, ModelMetadata, ModelPricing, ModelRequirement,
+        MountMode, ProviderInventory, QuotaState, RoutePolicy,
     };
 
     fn metadata(
@@ -609,6 +700,21 @@ mod tests {
             })
             .unwrap();
         registry
+    }
+
+    fn auto_definition(path: &str, min_line: ModelRequirement) -> LogicalModelDefinition {
+        LogicalModelDefinition {
+            path: path.to_string(),
+            api_type: ApiType::LlmChat,
+            min_line,
+            disable_line: ModelDisable::default(),
+            default_options: None,
+            mount_mode: MountMode::Auto,
+            scheduler_profile: None,
+            fallback: None,
+            route_policy: None,
+            user_visible_tier: None,
+        }
     }
 
     fn session_config() -> SessionConfig {
@@ -793,5 +899,171 @@ mod tests {
 
         let err = router.resolve(request("llm.empty", policy)).unwrap_err();
         assert_eq!(err.code, RouteErrorCode::NoCandidate);
+    }
+
+    #[test]
+    fn logical_definition_min_line_filters_auto_mounts_and_traces_reasons() {
+        let mut registry = ModelRegistry::new();
+        let mut good = metadata("openai_primary", "gpt-5.2", "", ProviderType::CloudApi);
+        good.logical_mounts = Vec::new();
+        good.capabilities.tool_call = true;
+        good.capabilities.json_schema = true;
+        good.capabilities.max_context_tokens = Some(128_000);
+        let mut weak = metadata("openai_primary", "gpt-4-small", "", ProviderType::CloudApi);
+        weak.logical_mounts = Vec::new();
+        weak.capabilities.tool_call = true;
+        weak.capabilities.json_schema = false;
+        weak.capabilities.max_context_tokens = Some(8_192);
+        registry
+            .set_logical_definitions(vec![auto_definition(
+                "llm.plan",
+                ModelRequirement {
+                    tool_call: true,
+                    json_schema: true,
+                    min_context_tokens: Some(32_768),
+                    ..Default::default()
+                },
+            )])
+            .unwrap();
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "openai_primary".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "openai".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![good, weak],
+            })
+            .unwrap();
+        let config = SessionConfig::default();
+        let router = ModelRouter::new(&registry, &config);
+
+        let resolved = router
+            .resolve(request("llm.plan", RoutePolicy::default()))
+            .unwrap();
+
+        assert_eq!(resolved.candidates.len(), 1);
+        assert_eq!(resolved.candidates[0].exact_model, "gpt-5.2@openai_primary");
+        assert!(resolved
+            .trace
+            .logical_admission
+            .iter()
+            .any(|item| item.exact_model == "gpt-4-small@openai_primary"
+                && !item.accepted
+                && item.reasons.iter().any(|reason| reason == "json_schema")
+                && item
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "min_context_tokens:32768")));
+    }
+
+    #[test]
+    fn session_override_can_disable_auto_item_weight() {
+        let mut registry = ModelRegistry::new();
+        let mut primary = metadata("openai_primary", "gpt-5.2", "", ProviderType::CloudApi);
+        primary.logical_mounts = Vec::new();
+        let mut backup = metadata("openai_backup", "gpt-5.2", "", ProviderType::CloudApi);
+        backup.logical_mounts = Vec::new();
+        registry
+            .set_logical_definitions(vec![auto_definition(
+                "llm.chat",
+                ModelRequirement::default(),
+            )])
+            .unwrap();
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "openai_primary".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "openai".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![primary],
+            })
+            .unwrap();
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "openai_backup".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "openai".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![backup],
+            })
+            .unwrap();
+        let config = SessionConfig {
+            logical_tree: [(
+                "llm".to_string(),
+                LogicalNode {
+                    children: [(
+                        "chat".to_string(),
+                        LogicalNode {
+                            item_overrides: Some(
+                                [(
+                                    "gpt-5_2_openai_primary".to_string(),
+                                    crate::model_types::ModelItemPatch {
+                                        target: None,
+                                        weight: Some(0.0),
+                                    },
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let router = ModelRouter::new(&registry, &config);
+
+        let resolved = router
+            .resolve(request("llm.chat", RoutePolicy::default()))
+            .unwrap();
+
+        assert_eq!(resolved.candidates.len(), 1);
+        assert_eq!(resolved.candidates[0].exact_model, "gpt-5.2@openai_backup");
+        assert!(resolved
+            .trace
+            .logical_item_sources
+            .iter()
+            .any(|item| item.item_name == "gpt-5_2_openai_primary"
+                && item.source == "session_overlay"));
+    }
+
+    #[test]
+    fn disable_line_is_recorded_in_route_trace() {
+        let mut registry = registry();
+        let mut definition = auto_definition("llm.gpt5", ModelRequirement::default());
+        definition.disable_line.web_search = true;
+        registry.set_logical_definitions(vec![definition]).unwrap();
+        let config = session_config();
+        let router = ModelRouter::new(&registry, &config);
+
+        let resolved = router
+            .resolve(request("llm.gpt5", RoutePolicy::default()))
+            .unwrap();
+
+        assert!(resolved
+            .trace
+            .disabled_capability_sources
+            .iter()
+            .any(|item| item.logical_path == "llm.gpt5"
+                && item.capability == "web_search"
+                && item.reason == "disable_line"));
     }
 }

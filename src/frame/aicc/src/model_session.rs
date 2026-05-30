@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 pub struct LogicalNode {
     #[serde(default)]
     pub children: BTreeMap<String, LogicalNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default)]
     pub items: Option<LogicalItems>,
     #[serde(default)]
@@ -181,6 +183,9 @@ fn merge_node(base: &mut LogicalNode, patch: &LogicalNode) -> Result<(), RouteEr
         let current = base.policy.get_or_insert_with(PolicyConfig::default);
         reject_locked_policy_patch(current, policy)?;
         merge_policy_config(current, policy);
+    }
+    if patch.source.is_some() {
+        base.source = patch.source.clone();
     }
     merge_tree(&mut base.children, &patch.children)?;
     Ok(())

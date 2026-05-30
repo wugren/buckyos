@@ -295,25 +295,25 @@ LogicalModelDefinition
 
 ### 5.3 TODO
 
-- [ ] 定义 `LogicalModelDefinition` schema。
-- [ ] 定义 `ModelRequirement` / `min_line` schema。
-- [ ] 定义 `ModelDisable` / `disable_line` schema，字段集合与 `ModelRequirement` 对称。
-- [ ] 定义 `mount_mode`：
+- [x] 定义 `LogicalModelDefinition` schema。
+- [x] 定义 `ModelRequirement` / `min_line` schema。
+- [x] 定义 `ModelDisable` / `disable_line` schema，字段集合与 `ModelRequirement` 对称。
+- [x] 定义 `mount_mode`：
   - `manual`
   - `auto`
   - `hybrid`
-- [ ] 实现 admission check：`ModelMetadata.capabilities` 是否满足 `min_line`。
-- [ ] 实现 auto-mount：扫描 `ProviderInventory.models`，满足 min_line 的模型自动生成 logical items。
-- [ ] manual override 可以覆盖 auto item 的 weight / enabled / blocked。
-- [ ] `default_logical_tree.rs` 从静态 item 模板逐步迁移为 logical definition + scheduler profile。
-- [ ] route trace 记录 item 来源：
+- [x] 实现 admission check：`ModelMetadata.capabilities` 是否满足 `min_line`。
+- [x] 实现 auto-mount：扫描 `ProviderInventory.models`，满足 min_line 的模型自动生成 logical items。
+- [x] manual override 可以覆盖 auto item 的 weight / enabled / blocked。
+- [x] `default_logical_tree.rs` 从静态 item 模板逐步迁移为 logical definition + scheduler profile。
+- [x] route trace 记录 item 来源：
   - builtin definition
   - driver metadata mount
   - auto admission
   - manual override
   - session overlay
-- [ ] route trace 解释模型不满足 min_line 的原因。
-- [ ] route trace 解释能力被 disable_line 禁用的原因。
+- [x] route trace 解释模型不满足 min_line 的原因。
+- [x] route trace 解释能力被 disable_line 禁用的原因。
 
 ## 6. Session Profile Overlay
 
@@ -497,8 +497,8 @@ Base Logical Tree
 - [x] helper `llm_chat` 行为等价于 route + typed inference。
 - [x] OpenAI `/models` 返回 `gpt-5.1`，resolver 展开 base model 和 reasoning variants。
 - [x] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
-- [ ] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。
-- [ ] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
+- [x] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。
+- [x] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
 - [ ] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。
 - [ ] session replace overlay 只保留指定模型，并在 quota exhausted 后失败。
 - [ ] unknown model 不默认声明高风险能力。

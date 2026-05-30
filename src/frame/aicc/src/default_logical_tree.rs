@@ -12,7 +12,8 @@
 
 use crate::model_session::{LogicalNode, SessionConfig};
 use crate::model_types::{
-    FallbackMode, FallbackRule, LockedValue, ModelItemPatch, SchedulerProfile,
+    ApiType, FallbackMode, FallbackRule, LockedValue, LogicalModelDefinition, ModelDisable,
+    ModelItemPatch, ModelRequirement, MountMode, SchedulerProfile,
 };
 use std::collections::BTreeMap;
 
@@ -36,6 +37,100 @@ struct Level2Template {
     items: &'static [Level2Item],
     fallback: FallbackPreset,
     profile: Option<SchedulerProfile>,
+    min_line: ModelRequirementTemplate,
+    disable_line: ModelDisableTemplate,
+    mount_mode: MountMode,
+    tier: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct ModelRequirementTemplate {
+    streaming: bool,
+    tool_call: bool,
+    json_schema: bool,
+    web_search: bool,
+    vision: bool,
+    min_context_tokens: Option<u64>,
+}
+
+impl ModelRequirementTemplate {
+    const fn empty() -> Self {
+        Self {
+            streaming: false,
+            tool_call: false,
+            json_schema: false,
+            web_search: false,
+            vision: false,
+            min_context_tokens: None,
+        }
+    }
+
+    const fn tool_json(min_context_tokens: u64) -> Self {
+        Self {
+            streaming: false,
+            tool_call: true,
+            json_schema: true,
+            web_search: false,
+            vision: false,
+            min_context_tokens: Some(min_context_tokens),
+        }
+    }
+
+    const fn vision(min_context_tokens: u64) -> Self {
+        Self {
+            streaming: false,
+            tool_call: false,
+            json_schema: false,
+            web_search: false,
+            vision: true,
+            min_context_tokens: Some(min_context_tokens),
+        }
+    }
+
+    fn to_model_requirement(self) -> ModelRequirement {
+        ModelRequirement {
+            streaming: self.streaming,
+            tool_call: self.tool_call,
+            json_schema: self.json_schema,
+            web_search: self.web_search,
+            vision: self.vision,
+            min_context_tokens: self.min_context_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModelDisableTemplate {
+    streaming: bool,
+    tool_call: bool,
+    json_schema: bool,
+    web_search: bool,
+    vision: bool,
+    min_context_tokens: Option<u64>,
+}
+
+impl ModelDisableTemplate {
+    const fn empty() -> Self {
+        Self {
+            streaming: false,
+            tool_call: false,
+            json_schema: false,
+            web_search: false,
+            vision: false,
+            min_context_tokens: None,
+        }
+    }
+
+    fn to_model_disable(self) -> ModelDisable {
+        ModelDisable {
+            streaming: self.streaming,
+            tool_call: self.tool_call,
+            json_schema: self.json_schema,
+            web_search: self.web_search,
+            vision: self.vision,
+            min_context_tokens: self.min_context_tokens,
+        }
+    }
 }
 
 const LLM_TEMPLATES: &[Level2Template] = &[
@@ -65,6 +160,10 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Parent,
         profile: Some(SchedulerProfile::QualityFirst),
+        min_line: ModelRequirementTemplate::tool_json(32_768),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "pro",
     },
     Level2Template {
         path: "llm.code",
@@ -102,6 +201,10 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Parent,
         profile: None,
+        min_line: ModelRequirementTemplate::tool_json(32_768),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "pro",
     },
     Level2Template {
         path: "llm.swift",
@@ -134,12 +237,23 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Parent,
         profile: Some(SchedulerProfile::LatencyFirst),
+        min_line: ModelRequirementTemplate::empty(),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "fast",
     },
     Level2Template {
         path: "llm.summarize",
         items: &[],
         fallback: FallbackPreset::Parent,
         profile: Some(SchedulerProfile::CostFirst),
+        min_line: ModelRequirementTemplate {
+            min_context_tokens: Some(16_384),
+            ..ModelRequirementTemplate::empty()
+        },
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "utility",
     },
     Level2Template {
         path: "llm.reason",
@@ -172,6 +286,13 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Disabled,
         profile: Some(SchedulerProfile::QualityFirst),
+        min_line: ModelRequirementTemplate {
+            min_context_tokens: Some(32_768),
+            ..ModelRequirementTemplate::empty()
+        },
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "reasoning",
     },
     Level2Template {
         path: "llm.vision",
@@ -199,6 +320,10 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Parent,
         profile: None,
+        min_line: ModelRequirementTemplate::vision(32_768),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "multimodal",
     },
     Level2Template {
         path: "llm.long",
@@ -221,6 +346,13 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Parent,
         profile: None,
+        min_line: ModelRequirementTemplate {
+            min_context_tokens: Some(128_000),
+            ..ModelRequirementTemplate::empty()
+        },
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "long_context",
     },
     Level2Template {
         path: "llm.fallback",
@@ -243,6 +375,10 @@ const LLM_TEMPLATES: &[Level2Template] = &[
         ],
         fallback: FallbackPreset::Disabled,
         profile: None,
+        min_line: ModelRequirementTemplate::empty(),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "fallback",
     },
 ];
 
@@ -296,6 +432,7 @@ pub fn build_default_session_config() -> SessionConfig {
             );
         }
         let node = descend_or_create(&mut tree, template.path);
+        node.source = Some("builtin_definition".to_string());
         node.item_overrides = Some(items);
         node.fallback = Some(fallback_to_rule(&template.fallback));
         if let Some(profile) = template.profile.clone() {
@@ -313,6 +450,38 @@ pub fn build_default_session_config() -> SessionConfig {
         DEFAULT_LOGICAL_TREE_REVISION, applied_nodes
     ));
     config
+}
+
+pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
+    let mut definitions = vec![LogicalModelDefinition {
+        path: "llm.chat".to_string(),
+        api_type: ApiType::LlmChat,
+        min_line: ModelRequirement::default(),
+        disable_line: ModelDisable::default(),
+        default_options: None,
+        mount_mode: MountMode::Auto,
+        scheduler_profile: Some(SchedulerProfile::Balanced),
+        fallback: Some(FallbackRule::parent()),
+        route_policy: None,
+        user_visible_tier: Some("general".to_string()),
+    }];
+
+    for template in LLM_TEMPLATES {
+        definitions.push(LogicalModelDefinition {
+            path: template.path.to_string(),
+            api_type: ApiType::LlmChat,
+            min_line: template.min_line.to_model_requirement(),
+            disable_line: template.disable_line.to_model_disable(),
+            default_options: None,
+            mount_mode: template.mount_mode.clone(),
+            scheduler_profile: template.profile.clone(),
+            fallback: Some(fallback_to_rule(&template.fallback)),
+            route_policy: None,
+            user_visible_tier: Some(template.tier.to_string()),
+        });
+    }
+
+    definitions
 }
 
 pub fn level2_node_count(config: &SessionConfig) -> usize {
@@ -441,6 +610,7 @@ mod tests {
             .get("llm")
             .and_then(|node| node.children.get("plan"))
             .expect("llm.plan node");
+        assert_eq!(plan_node.source.as_deref(), Some("builtin_definition"));
         let inherited: BTreeMap<String, ModelItem> = [(
             "gpt-5-5-pro-openai".to_string(),
             ModelItem::new("gpt-5.5-pro@openai".to_string(), 1.0),

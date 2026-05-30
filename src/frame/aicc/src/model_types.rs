@@ -359,6 +359,31 @@ impl ModelCapabilities {
                 .map(|min| self.max_context_tokens.unwrap_or(0) >= min)
                 .unwrap_or(true)
     }
+
+    pub fn explain_missing_requirements(&self, required: &ModelRequirement) -> Vec<String> {
+        let mut missing = Vec::new();
+        if required.streaming && !self.streaming {
+            missing.push("streaming".to_string());
+        }
+        if required.tool_call && !self.tool_call {
+            missing.push("tool_call".to_string());
+        }
+        if required.json_schema && !self.json_schema {
+            missing.push("json_schema".to_string());
+        }
+        if required.web_search && !self.web_search {
+            missing.push("web_search".to_string());
+        }
+        if required.vision && !self.vision {
+            missing.push("vision".to_string());
+        }
+        if let Some(min) = required.min_context_tokens {
+            if self.max_context_tokens.unwrap_or(0) < min {
+                missing.push(format!("min_context_tokens:{}", min));
+            }
+        }
+        missing
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -375,6 +400,105 @@ pub struct RequiredModelFeatures {
     pub vision: bool,
     #[serde(default)]
     pub min_context_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelRequirement {
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
+    pub tool_call: bool,
+    #[serde(default)]
+    pub json_schema: bool,
+    #[serde(default)]
+    pub web_search: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub min_context_tokens: Option<u64>,
+}
+
+impl ModelRequirement {
+    pub fn is_satisfied_by(&self, capabilities: &ModelCapabilities) -> bool {
+        capabilities.explain_missing_requirements(self).is_empty()
+    }
+
+    pub fn feature_names(&self) -> Vec<String> {
+        let mut features = Vec::new();
+        if self.streaming {
+            features.push("streaming".to_string());
+        }
+        if self.tool_call {
+            features.push("tool_calling".to_string());
+        }
+        if self.json_schema {
+            features.push("json_output".to_string());
+        }
+        if self.web_search {
+            features.push("web_search".to_string());
+        }
+        if self.vision {
+            features.push("vision".to_string());
+        }
+        if let Some(tokens) = self.min_context_tokens {
+            features.push(format!("min_context_tokens:{}", tokens));
+        }
+        features
+    }
+}
+
+impl From<&ModelRequirement> for RequiredModelFeatures {
+    fn from(value: &ModelRequirement) -> Self {
+        Self {
+            streaming: value.streaming,
+            tool_call: value.tool_call,
+            json_schema: value.json_schema,
+            web_search: value.web_search,
+            vision: value.vision,
+            min_context_tokens: value.min_context_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelDisable {
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
+    pub tool_call: bool,
+    #[serde(default)]
+    pub json_schema: bool,
+    #[serde(default)]
+    pub web_search: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub min_context_tokens: Option<u64>,
+}
+
+impl ModelDisable {
+    pub fn feature_names(&self) -> Vec<String> {
+        let mut features = Vec::new();
+        if self.streaming {
+            features.push("streaming".to_string());
+        }
+        if self.tool_call {
+            features.push("tool_calling".to_string());
+        }
+        if self.json_schema {
+            features.push("json_output".to_string());
+        }
+        if self.web_search {
+            features.push("web_search".to_string());
+        }
+        if self.vision {
+            features.push("vision".to_string());
+        }
+        if let Some(tokens) = self.min_context_tokens {
+            features.push(format!("min_context_tokens:{}", tokens));
+        }
+        features
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -738,6 +862,42 @@ pub struct SchedulerProfileWeights {
     pub local: f64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountMode {
+    Manual,
+    Auto,
+    Hybrid,
+}
+
+impl Default for MountMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogicalModelDefinition {
+    pub path: String,
+    pub api_type: ApiType,
+    #[serde(default)]
+    pub min_line: ModelRequirement,
+    #[serde(default)]
+    pub disable_line: ModelDisable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub mount_mode: MountMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_profile: Option<SchedulerProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<FallbackRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy: Option<PolicyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_visible_tier: Option<String>,
+}
+
 impl SchedulerProfileWeights {
     pub fn validate(&self) -> Result<(), RouteError> {
         for value in [
@@ -916,6 +1076,33 @@ pub struct FallbackTraceItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogicalItemSourceTrace {
+    pub logical_path: String,
+    pub item_name: String,
+    pub target: String,
+    pub source: String,
+    pub weight: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogicalAdmissionTrace {
+    pub logical_path: String,
+    pub exact_model: String,
+    pub source: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisabledCapabilityTrace {
+    pub logical_path: String,
+    pub capability: String,
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteTrace {
     pub request_id: String,
     #[serde(default)]
@@ -949,6 +1136,12 @@ pub struct RouteTrace {
     pub fallback_applied: bool,
     #[serde(default)]
     pub fallback_chain: Vec<FallbackTraceItem>,
+    #[serde(default)]
+    pub logical_item_sources: Vec<LogicalItemSourceTrace>,
+    #[serde(default)]
+    pub logical_admission: Vec<LogicalAdmissionTrace>,
+    #[serde(default)]
+    pub disabled_capability_sources: Vec<DisabledCapabilityTrace>,
     #[serde(default)]
     pub session_sticky_hit: bool,
     pub scheduler_profile: SchedulerProfile,

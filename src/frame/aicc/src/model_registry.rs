@@ -1,6 +1,6 @@
 use crate::model_types::{
-    ApiType, ExactModelName, LogicalItems, ModelCandidate, ModelItem, ProviderInventory,
-    RouteError, RouteErrorCode,
+    ApiType, ExactModelName, LogicalAdmissionTrace, LogicalItems, LogicalModelDefinition,
+    ModelCandidate, ModelItem, MountMode, ProviderInventory, RouteError, RouteErrorCode,
 };
 use log::warn;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,6 +15,7 @@ pub const DEFAULT_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(300
 pub struct ModelRegistry {
     inventories: HashMap<String, ProviderInventory>,
     exact_index: HashMap<(String, ApiType), ModelCandidate>,
+    logical_definitions: BTreeMap<String, LogicalModelDefinition>,
 }
 
 impl ModelRegistry {
@@ -59,6 +60,23 @@ impl ModelRegistry {
         self.exact_index.clear();
     }
 
+    pub fn set_logical_definitions(
+        &mut self,
+        definitions: Vec<LogicalModelDefinition>,
+    ) -> Result<(), RouteError> {
+        let mut next = BTreeMap::new();
+        for definition in definitions {
+            validate_logical_definition(&definition)?;
+            next.insert(definition.path.clone(), definition);
+        }
+        self.logical_definitions = next;
+        Ok(())
+    }
+
+    pub fn logical_definition(&self, path: &str) -> Option<&LogicalModelDefinition> {
+        self.logical_definitions.get(path)
+    }
+
     pub fn inventory_revision(&self, provider_instance_name: &str) -> Option<&str> {
         self.inventories
             .get(provider_instance_name)
@@ -76,7 +94,15 @@ impl ModelRegistry {
     }
 
     pub fn default_items_for_path(&self, logical_path: &str) -> LogicalItems {
-        default_items_from_inventories(self.inventories.values(), logical_path)
+        self.default_items_with_trace_for_path(logical_path).items
+    }
+
+    pub fn default_items_with_trace_for_path(&self, logical_path: &str) -> DefaultLogicalItems {
+        default_items_from_inventories(
+            self.inventories.values(),
+            logical_path,
+            self.logical_definitions.get(logical_path),
+        )
     }
 
     pub fn all_default_items(&self) -> BTreeMap<String, LogicalItems> {
@@ -84,12 +110,17 @@ impl ModelRegistry {
         for inventory in self.inventories.values() {
             for model in inventory.models.iter() {
                 for mount in model.logical_mounts.iter() {
-                    let item_name = default_item_name(model.exact_model.as_str());
-                    mounts
-                        .entry(mount.clone())
-                        .or_default()
-                        .insert(item_name, ModelItem::new(model.exact_model.clone(), 1.0));
+                    let items = self.default_items_for_path(mount);
+                    if !items.is_empty() {
+                        mounts.insert(mount.clone(), items);
+                    }
                 }
+            }
+        }
+        for path in self.logical_definitions.keys() {
+            let items = self.default_items_for_path(path);
+            if !items.is_empty() {
+                mounts.insert(path.clone(), items);
             }
         }
         mounts
@@ -99,6 +130,13 @@ impl ModelRegistry {
         self.exact_index = build_exact_index(self.inventories.values())?;
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DefaultLogicalItems {
+    pub items: LogicalItems,
+    pub item_sources: BTreeMap<String, String>,
+    pub admission: Vec<LogicalAdmissionTrace>,
 }
 
 fn build_exact_index<'a>(
@@ -226,21 +264,72 @@ impl InventoryRefreshScheduler {
 pub fn default_items_from_inventories<'a>(
     inventories: impl Iterator<Item = &'a ProviderInventory>,
     logical_path: &str,
-) -> LogicalItems {
+    definition: Option<&LogicalModelDefinition>,
+) -> DefaultLogicalItems {
     let mut items = BTreeMap::<String, ModelItem>::new();
+    let mut item_sources = BTreeMap::<String, String>::new();
+    let mut admission = Vec::new();
     for inventory in inventories {
         for model in inventory.models.iter() {
-            if model
+            let has_metadata_mount = model
                 .logical_mounts
                 .iter()
-                .any(|mount| mount.as_str() == logical_path)
-            {
+                .any(|mount| mount.as_str() == logical_path);
+            let mut mounted_by_metadata = false;
+            if has_metadata_mount {
+                let source = "driver_metadata_mount";
+                if let Some(definition) = definition {
+                    let reasons = admission_rejection_reasons(definition, model);
+                    admission.push(LogicalAdmissionTrace {
+                        logical_path: logical_path.to_string(),
+                        exact_model: model.exact_model.clone(),
+                        source: source.to_string(),
+                        accepted: reasons.is_empty(),
+                        reasons: reasons.clone(),
+                    });
+                    if !reasons.is_empty() {
+                        continue;
+                    }
+                }
                 let item_name = default_item_name(model.exact_model.as_str());
                 items.insert(item_name, ModelItem::new(model.exact_model.clone(), 1.0));
+                item_sources.insert(
+                    default_item_name(model.exact_model.as_str()),
+                    source.to_string(),
+                );
+                mounted_by_metadata = true;
+            }
+
+            let Some(definition) = definition else {
+                continue;
+            };
+            if mounted_by_metadata || definition.mount_mode == MountMode::Manual {
+                continue;
+            }
+            let source = "auto_admission";
+            let reasons = admission_rejection_reasons(definition, model);
+            admission.push(LogicalAdmissionTrace {
+                logical_path: logical_path.to_string(),
+                exact_model: model.exact_model.clone(),
+                source: source.to_string(),
+                accepted: reasons.is_empty(),
+                reasons: reasons.clone(),
+            });
+            if reasons.is_empty() {
+                let item_name = default_item_name(model.exact_model.as_str());
+                items.insert(
+                    item_name.clone(),
+                    ModelItem::new(model.exact_model.clone(), 1.0),
+                );
+                item_sources.insert(item_name, source.to_string());
             }
         }
     }
-    items
+    DefaultLogicalItems {
+        items,
+        item_sources,
+        admission,
+    }
 }
 
 pub fn default_item_name(exact_model: &str) -> String {
@@ -299,12 +388,48 @@ fn validate_inventory(inventory: &ProviderInventory) -> Result<(), RouteError> {
     Ok(())
 }
 
+fn validate_logical_definition(definition: &LogicalModelDefinition) -> Result<(), RouteError> {
+    if definition.path.trim().is_empty() || definition.path.contains('@') {
+        return Err(RouteError::new(
+            RouteErrorCode::SessionConfigInvalid,
+            "logical definition path must be a logical model path",
+        ));
+    }
+    if definition
+        .path
+        .split('.')
+        .any(|part| part.trim().is_empty())
+    {
+        return Err(RouteError::new(
+            RouteErrorCode::SessionConfigInvalid,
+            "logical definition path contains an empty segment",
+        ));
+    }
+    Ok(())
+}
+
+fn admission_rejection_reasons(
+    definition: &LogicalModelDefinition,
+    model: &crate::model_types::ModelMetadata,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !model.supports_api_type(&definition.api_type) {
+        reasons.push("api_type_mismatch".to_string());
+    }
+    reasons.extend(
+        model
+            .capabilities
+            .explain_missing_requirements(&definition.min_line),
+    );
+    reasons
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model_types::{
-        CostClass, HealthStatus, ModelAttributes, ModelCapabilities, ModelHealth, ModelMetadata,
-        ProviderType,
+        CostClass, HealthStatus, LogicalModelDefinition, ModelAttributes, ModelCapabilities,
+        ModelHealth, ModelMetadata, ModelRequirement, MountMode, ProviderType,
     };
 
     fn model(provider: &str, provider_model_id: &str, mount: &str) -> ModelMetadata {
@@ -342,6 +467,21 @@ mod tests {
             version: None,
             inventory_revision: Some(revision.to_string()),
             models,
+        }
+    }
+
+    fn logical_definition(path: &str, min_line: ModelRequirement) -> LogicalModelDefinition {
+        LogicalModelDefinition {
+            path: path.to_string(),
+            api_type: ApiType::LlmChat,
+            min_line,
+            disable_line: Default::default(),
+            default_options: None,
+            mount_mode: MountMode::Auto,
+            scheduler_profile: None,
+            fallback: None,
+            route_policy: None,
+            user_visible_tier: None,
         }
     }
 
@@ -467,18 +607,91 @@ mod tests {
             "r1",
             vec![model("openai_primary", "gpt-5.2", "llm.gpt5")],
         );
-        let first = default_items_from_inventories([&inv].into_iter(), "llm.gpt5");
-        let second = default_items_from_inventories([&inv].into_iter(), "llm.gpt5");
+        let first = default_items_from_inventories([&inv].into_iter(), "llm.gpt5", None);
+        let second = default_items_from_inventories([&inv].into_iter(), "llm.gpt5", None);
 
         assert_eq!(
-            serde_json::to_value(&first).unwrap(),
-            serde_json::to_value(&second).unwrap()
+            serde_json::to_value(&first.items).unwrap(),
+            serde_json::to_value(&second.items).unwrap()
         );
         assert_eq!(
             first
+                .items
                 .get("gpt-5_2_openai_primary")
                 .map(|item| item.target.as_str()),
             Some("gpt-5.2@openai_primary")
         );
+    }
+
+    #[test]
+    fn auto_mount_uses_min_line_admission() {
+        let mut accepted = model("openai_primary", "gpt-5.2", "");
+        accepted.logical_mounts = Vec::new();
+        accepted.capabilities = ModelCapabilities {
+            tool_call: true,
+            json_schema: true,
+            max_context_tokens: Some(128_000),
+            ..Default::default()
+        };
+        let mut missing_tool = model("openai_primary", "small", "");
+        missing_tool.logical_mounts = Vec::new();
+        missing_tool.capabilities = ModelCapabilities {
+            json_schema: true,
+            max_context_tokens: Some(128_000),
+            ..Default::default()
+        };
+        let mut registry = ModelRegistry::new();
+        registry
+            .set_logical_definitions(vec![logical_definition(
+                "llm.plan",
+                ModelRequirement {
+                    tool_call: true,
+                    json_schema: true,
+                    min_context_tokens: Some(32_768),
+                    ..Default::default()
+                },
+            )])
+            .unwrap();
+        registry
+            .apply_inventory(inventory(
+                "openai_primary",
+                "r1",
+                vec![accepted, missing_tool],
+            ))
+            .unwrap();
+
+        let defaults = registry.default_items_with_trace_for_path("llm.plan");
+        assert_eq!(defaults.items.len(), 1);
+        assert!(defaults
+            .items
+            .values()
+            .any(|item| item.target == "gpt-5.2@openai_primary"));
+        assert!(defaults
+            .admission
+            .iter()
+            .any(|item| item.exact_model == "small@openai_primary"
+                && !item.accepted
+                && item.reasons.iter().any(|reason| reason == "tool_call")));
+    }
+
+    #[test]
+    fn manual_mount_mode_disables_auto_mount() {
+        let mut auto_candidate = model("openai_primary", "gpt-5.2", "");
+        auto_candidate.logical_mounts = Vec::new();
+        auto_candidate.capabilities = ModelCapabilities {
+            tool_call: true,
+            json_schema: true,
+            max_context_tokens: Some(128_000),
+            ..Default::default()
+        };
+        let mut definition = logical_definition("llm.plan", ModelRequirement::default());
+        definition.mount_mode = MountMode::Manual;
+        let mut registry = ModelRegistry::new();
+        registry.set_logical_definitions(vec![definition]).unwrap();
+        registry
+            .apply_inventory(inventory("openai_primary", "r1", vec![auto_candidate]))
+            .unwrap();
+
+        assert!(registry.default_items_for_path("llm.plan").is_empty());
     }
 }
