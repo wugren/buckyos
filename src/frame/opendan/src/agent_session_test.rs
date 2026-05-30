@@ -159,7 +159,9 @@ fn notebook_prompt_texts_read_agent_scope_not_session_owner() {
     );
 
     assert!(list_text.contains("user/actions"));
-    assert!(recent_text.contains("Standing reminder schedule"));
+    // build_recent_items_text now renders item content (not the title) for each
+    // recent note (see AgentNotebook::build_recent_items_text_inner).
+    assert!(recent_text.contains("stand every 30 minutes"));
 }
 
 #[tokio::test]

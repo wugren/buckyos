@@ -30,6 +30,14 @@ struct ContactStore {
 }
 
 #[derive(Debug, Clone)]
+struct MessageTunnelEndpointDid {
+    did: DID,
+    account_type: String,
+    tunnel_id: String,
+    encoded_account_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ZoneUserContactSeed {
     pub did: DID,
     pub name: String,
@@ -97,6 +105,67 @@ impl ContactMgr {
 
         let owner_key = Self::owner_key(owner.as_ref());
         self.ensure_store_loaded(&owner_key).await?;
+
+        let endpoint_did = Self::message_tunnel_endpoint_did(&account_id, profile_hint.as_ref())?;
+
+        if let Some(endpoint_did) = endpoint_did {
+            let did = endpoint_did.did.clone();
+            let snapshot = {
+                let mut stores = self.stores.write().await;
+                let store = stores.get_mut(&owner_key).ok_or_else(|| {
+                    RPCErrors::ReasonError("contact store missing after load".to_string())
+                })?;
+                let now_ms = Self::now_ms();
+
+                if let Some(contact) = store.contacts.get_mut(&did) {
+                    if let Some(binding) = Self::find_binding_mut(contact, &platform, &account_id) {
+                        binding.last_active_at = now_ms;
+                        if let Some(display_id) = Self::extract_hint_string(
+                            profile_hint.as_ref(),
+                            &["display_id", "username"],
+                        ) {
+                            binding.display_id = display_id;
+                        }
+                        if let Some(tunnel_id) = Self::extract_hint_string(
+                            profile_hint.as_ref(),
+                            &["tunnel_id", "tunnel"],
+                        ) {
+                            binding.tunnel_id = tunnel_id;
+                        }
+                        Self::merge_hint_meta(binding, profile_hint.as_ref());
+                        Self::merge_endpoint_meta(binding, &endpoint_did, &did);
+                    } else {
+                        contact.bindings.push(Self::build_endpoint_binding(
+                            platform.clone(),
+                            account_id.clone(),
+                            profile_hint.as_ref(),
+                            now_ms,
+                            &endpoint_did,
+                            &did,
+                        ));
+                    }
+                    contact.updated_at = now_ms;
+                } else {
+                    let mut contact = Self::build_shadow_contact(
+                        did.clone(),
+                        platform.clone(),
+                        account_id.clone(),
+                        profile_hint.as_ref(),
+                        now_ms,
+                    );
+                    if let Some(binding) = contact.bindings.first_mut() {
+                        Self::merge_endpoint_meta(binding, &endpoint_did, &did);
+                    }
+                    store.contacts.insert(did.clone(), contact);
+                }
+
+                store.binding_index = Self::rebuild_binding_index(&store.contacts);
+                store.clone()
+            };
+
+            self.save_owner_store(&owner_key, &snapshot).await?;
+            return Ok(did);
+        }
 
         // Some paths allocate a new DID, which requires a DB round-trip that
         // cannot happen while the cache write guard is held.
@@ -1349,6 +1418,117 @@ impl ContactMgr {
         Ok(DID::new("bns", &subject))
     }
 
+    fn message_tunnel_endpoint_did(
+        account_id: &str,
+        profile_hint: Option<&Value>,
+    ) -> std::result::Result<Option<MessageTunnelEndpointDid>, RPCErrors> {
+        let Some(account_type) = Self::extract_hint_string(profile_hint, &["account_type"]) else {
+            return Ok(None);
+        };
+        let Some(tunnel_id) = Self::extract_hint_string(profile_hint, &["tunnel_id", "tunnel"])
+        else {
+            return Ok(None);
+        };
+
+        let account_type = Self::normalize_account_type(&account_type);
+        if account_type.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "account_type is required for message tunnel endpoint did".to_string(),
+            ));
+        }
+        let tunnel_id = tunnel_id.trim().to_string();
+        if tunnel_id.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "tunnel_id is required for message tunnel endpoint did".to_string(),
+            ));
+        }
+
+        let encoded_account_id = Self::percent_encode_did_component(account_id);
+        let encoded_tunnel_id = Self::percent_encode_did_component(&tunnel_id);
+        let subject = format!(
+            "{}.{}.{}",
+            encoded_account_id, account_type, encoded_tunnel_id
+        );
+        Ok(Some(MessageTunnelEndpointDid {
+            did: DID::new("msgtunnel", &subject),
+            account_type,
+            tunnel_id,
+            encoded_account_id,
+        }))
+    }
+
+    fn build_endpoint_binding(
+        platform: String,
+        account_id: String,
+        profile_hint: Option<&Value>,
+        now_ms: u64,
+        endpoint: &MessageTunnelEndpointDid,
+        did: &DID,
+    ) -> AccountBinding {
+        let display_id = Self::extract_hint_string(profile_hint, &["display_id", "username"])
+            .unwrap_or_else(|| account_id.clone());
+        let tunnel_id = Self::extract_hint_string(profile_hint, &["tunnel_id", "tunnel"])
+            .unwrap_or_else(|| endpoint.tunnel_id.clone());
+        let mut binding = AccountBinding {
+            platform,
+            account_id,
+            display_id,
+            tunnel_id,
+            last_active_at: now_ms,
+            meta: HashMap::new(),
+        };
+        Self::merge_hint_meta(&mut binding, profile_hint);
+        Self::merge_endpoint_meta(&mut binding, endpoint, did);
+        binding
+    }
+
+    fn merge_endpoint_meta(
+        binding: &mut AccountBinding,
+        endpoint: &MessageTunnelEndpointDid,
+        did: &DID,
+    ) {
+        binding
+            .meta
+            .insert("account_type".to_string(), endpoint.account_type.clone());
+        binding
+            .meta
+            .insert("message_tunnel_did".to_string(), did.to_string());
+        binding.meta.insert(
+            "message_tunnel_encoded_account_id".to_string(),
+            endpoint.encoded_account_id.clone(),
+        );
+        binding
+            .meta
+            .insert("message_tunnel_id".to_string(), endpoint.tunnel_id.clone());
+    }
+
+    fn normalize_account_type(raw: &str) -> String {
+        raw.trim()
+            .chars()
+            .filter_map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    Some(ch.to_ascii_lowercase())
+                } else if ch == '_' || ch == '-' {
+                    Some(ch)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn percent_encode_did_component(raw: &str) -> String {
+        let mut output = String::with_capacity(raw.len());
+        for byte in raw.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'~') {
+                output.push(*byte as char);
+            } else {
+                output.push_str(&format!("%{:02X}", byte));
+            }
+        }
+        output
+    }
+
     fn blank_contact_with_source(did: DID, now_ms: u64, source: ContactSource) -> Contact {
         Contact {
             did,
@@ -1524,6 +1704,20 @@ impl ContactMgr {
             binding
                 .meta
                 .insert("platform_uid".to_string(), platform_uid);
+        }
+
+        for key in [
+            "account_type",
+            "chat_type",
+            "chat_id",
+            "bot_account_id",
+            "message_tunnel_did",
+            "message_tunnel_encoded_account_id",
+            "message_tunnel_id",
+        ] {
+            if let Some(value) = object.get(key).and_then(Self::value_to_flat_string) {
+                binding.meta.insert(key.to_string(), value);
+            }
         }
     }
 
@@ -1816,6 +2010,7 @@ fn rewrite_placeholders_to_dollar(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn binding(platform: &str, account_id: &str) -> AccountBinding {
@@ -1857,6 +2052,117 @@ mod tests {
         assert_eq!(contact.source, ContactSource::AutoInferred);
         assert_eq!(contact.access_level, AccessGroupLevel::Stranger);
         assert_eq!(contact.bindings.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_did_uses_message_tunnel_endpoint_did_when_hint_is_present() {
+        let (mgr, _tmp) = new_test_mgr().await;
+        let owner = DID::new("web", "jarvis.test.buckyos.io");
+        let profile_hint = json!({
+            "account_type": "user",
+            "tunnel_id": "did:web:tg-tunnel.test.buckyos.io",
+            "display_id": "@alice",
+            "bot_account_id": "@jarvis_bot"
+        });
+
+        let first = mgr
+            .resolve_did(
+                "telegram".to_string(),
+                "alice.id/with:chars".to_string(),
+                Some(profile_hint.clone()),
+                Some(owner.clone()),
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .resolve_did(
+                "telegram".to_string(),
+                "alice.id/with:chars".to_string(),
+                Some(profile_hint),
+                Some(owner.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.to_string(),
+            "did:msgtunnel:alice%2Eid%2Fwith%3Achars.user.did%3Aweb%3Atg-tunnel%2Etest%2Ebuckyos%2Eio"
+        );
+
+        let contact = mgr
+            .get_contact(first.clone(), Some(owner))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contact.source, ContactSource::AutoInferred);
+        assert_eq!(contact.bindings.len(), 1);
+        assert_eq!(contact.bindings[0].platform, "telegram");
+        assert_eq!(contact.bindings[0].account_id, "alice.id/with:chars");
+        assert_eq!(
+            contact.bindings[0]
+                .meta
+                .get("account_type")
+                .map(String::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            contact.bindings[0]
+                .meta
+                .get("message_tunnel_did")
+                .map(String::as_str),
+            Some(first.to_string().as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn message_tunnel_endpoint_did_does_not_override_primary_contact_binding() {
+        let (mgr, _tmp) = new_test_mgr().await;
+        let owner = DID::new("web", "jarvis.test.buckyos.io");
+        let zone_user_did = DID::new("bns", "alice");
+
+        mgr.upsert_zone_user_contacts(
+            vec![ZoneUserContactSeed {
+                did: zone_user_did.clone(),
+                name: "Alice".to_string(),
+                note: None,
+                bindings: vec![binding("telegram", "12345")],
+                groups: vec!["zone_user".to_string()],
+                tags: vec![],
+            }],
+            Some(owner.clone()),
+        )
+        .await
+        .unwrap();
+
+        let primary = mgr
+            .resolve_did(
+                "telegram".to_string(),
+                "12345".to_string(),
+                None,
+                Some(owner.clone()),
+            )
+            .await
+            .unwrap();
+        let endpoint = mgr
+            .resolve_did(
+                "telegram".to_string(),
+                "12345".to_string(),
+                Some(json!({
+                    "account_type": "user",
+                    "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+                })),
+                Some(owner),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(primary, zone_user_did);
+        assert_eq!(
+            endpoint.to_string(),
+            "did:msgtunnel:12345.user.did%3Aweb%3Atg-tunnel%2Etest%2Ebuckyos%2Eio"
+        );
+        assert_ne!(endpoint, zone_user_did);
     }
 
     #[tokio::test(flavor = "current_thread")]

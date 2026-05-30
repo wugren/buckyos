@@ -1321,11 +1321,7 @@ impl GrammersTgGateway {
     }
 
     fn chat_account_id(chat: &TgPeer) -> String {
-        format!(
-            "{}:{}",
-            TgMessageConverter::chat_kind(chat),
-            chat.id().bot_api_dialog_id()
-        )
+        chat.id().bot_api_dialog_id().to_string()
     }
 
     fn profile_hint_from_chat(
@@ -1340,6 +1336,7 @@ impl GrammersTgGateway {
             .map(|value| format!("@{}", value))
             .unwrap_or_else(|| chat_id.to_string());
         json!({
+            "account_type": TgMessageConverter::chat_kind(chat),
             "chat_type": TgMessageConverter::chat_kind(chat),
             "chat_id": chat_id,
             "name": chat.name(),
@@ -2338,8 +2335,8 @@ impl BotApiTgGateway {
         Self::join_name(user.first_name.as_deref(), user.last_name.as_deref())
     }
 
-    fn chat_account_id(chat_kind: &str, id: i64) -> String {
-        format!("{}:{}", chat_kind, id)
+    fn chat_account_id(_chat_kind: &str, id: i64) -> String {
+        id.to_string()
     }
 
     fn profile_hint(
@@ -2355,6 +2352,7 @@ impl BotApiTgGateway {
             .map(|value| format!("@{}", value))
             .unwrap_or_else(|| chat_id.to_string());
         json!({
+            "account_type": chat_kind,
             "chat_type": chat_kind,
             "chat_id": chat_id,
             "name": display_name,
@@ -4386,6 +4384,29 @@ mod tests {
         tunnel.stop().await.unwrap();
         let removed = tunnel.unbind_bot(&owner).unwrap();
         assert!(removed.is_some());
+    }
+
+    #[test]
+    fn bot_api_account_id_is_raw_id_and_profile_hint_has_account_type() {
+        assert_eq!(BotApiTgGateway::chat_account_id("user", 12345), "12345");
+        assert_eq!(
+            BotApiTgGateway::chat_account_id("group", -10012345),
+            "-10012345"
+        );
+
+        let hint = BotApiTgGateway::profile_hint(
+            "channel",
+            -10012345,
+            Some("Ops"),
+            Some("ops_channel"),
+            "@jarvis_bot",
+            Some(&DID::new("web", "tg-tunnel.test.buckyos.io")),
+        );
+
+        assert_eq!(hint["account_type"], "channel");
+        assert_eq!(hint["chat_type"], "channel");
+        assert_eq!(hint["chat_id"], -10012345);
+        assert_eq!(hint["tunnel_id"], "did:web:tg-tunnel.test.buckyos.io");
     }
 
     #[tokio::test]

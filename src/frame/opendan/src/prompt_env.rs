@@ -1447,7 +1447,7 @@ switch={{ switch.from }}|{{ switch.to }}|{{ from_behavior }}|{{ switch.from_cont
             "runtime_workspace=- `ws-a` (ready) — Alpha",
             "runtime_schedule=- created task_id=task-1 task_title=\"daily mail check\" note=\"create from Notebook Item notebook=user/actions item=item-9\"",
             "notebook=Available notebooks: 1 total.",
-            "- [user/preferences] tone (item-1, created 2026-05-24T10:00:00Z, updated 2026-05-24T10:00:00Z)",
+            "- user/preferences: preferences, 2 records, last modified 2026-05-24T10:00:00Z",
             "if_session_title=hello",
             "if_background_hint=- Memory may be relevant: /user/preference/style",
             "hint=memory/user/preference/style|memory|Memory may be relevant: /user/preference/style",
