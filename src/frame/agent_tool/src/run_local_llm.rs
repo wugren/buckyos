@@ -544,6 +544,7 @@ impl LlmClient for AiccLlmClient {
         }
 
         let requirements = Requirements {
+            required: Default::default(),
             must_features,
             max_latency_ms: None,
             max_cost_usd: None,

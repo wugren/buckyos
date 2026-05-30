@@ -1,241 +1,279 @@
-# AICC 模型体系升级 TODO
+# AICC 新 API 与模型体系升级 TODO
 
-本文档整理 2026-05-30 关于 AICC 模型 metadata、逻辑模型名、auto-mount 与 session profile overlay 的讨论结论。目标是先统一边界和概念，再进入实现，避免把 provider 自发现、用户偏好、请求参数、运行时状态混在一起。
+本文档基于 `notepads/aicc-new-api.md` 的分层设计，并按当前仓库实现修订。目标不是从零设计，而是在已有第一版实现上收敛边界：把“逻辑模型路由”和“物理模型推理”真正拆开，同时继续推进模型 metadata、逻辑模型名、auto-mount 与 session profile overlay。
 
 ## 0. 当前实现基线
 
-- AICC 已经有模型级 `ModelMetadata`，包含 `provider_model_id`、`exact_model`、`api_types`、`logical_mounts`、`capabilities`、`attributes`、`pricing`、`health`。
-  - 入口：`src/frame/aicc/src/model_types.rs`
-- `ProviderInstance` 仍保留实例级 `capabilities/features`。
+### 0.1 已落地的新 API 雏形
+
+- `buckyos-api` 已定义新 API 方法常量：
+  - `route.resolve`
+  - `chat.completions.create`
+  - `images.generate`
+  - `helper.llm_chat`
+  - `helper.text_to_image`
+  - 入口：`src/kernel/buckyos-api/src/aicc_client.rs`
+- `buckyos-api` 已定义第一版请求/响应结构：
+  - `RouteResolveRequest` / `RouteResolveResponse`
+  - `LlmChatInvokeRequest` / `LlmChatInvokeResponse`
+  - `TextToImageInvokeRequest` / `TextToImageInvokeResponse`
+- `AiccServerHandler` 已能 dispatch 上述新方法。
+- `AIComputeCenter` 已实现：
+  - `resolve_route()`
+  - `create_chat_completion()`
+  - `generate_image()`
+  - `handle_route_resolve()`
+  - `handle_chat_completions_create()`
+  - `handle_images_generate()`
   - 入口：`src/frame/aicc/src/aicc.rs`
-- 请求侧 `requirements.must_features` 会转换成 `RequiredModelFeatures`，再参与路由过滤。
-  - 入口：`route_policy_from_request()` / `required_model_features()`
-- OpenAI 当前基本只从 `/models` 获取 model id，能力用 `default_features()` 粗略补齐。
-  - 风险：容易声明假阳性能力，比如所有 OpenAI LLM 默认都带 `plan/json_output/tool_calling/web_search`。
-- Claude 当前已有 per-model classifier，根据模型名规则修剪 `plan/web_search/vision` 等能力。
-  - 这更接近目标方向，但仍写死在 provider adapter 内。
 
-## 1. 概念分层
+### 0.2 当前语义差距
 
-### 1.1 Driver Model Metadata
+- 新 typed inference API 目前仍转换成旧 `AiMethodRequest`，再走 `complete_with_method()`。
+  - 好处：复用现有任务、事件、provider、usage、resource 处理。
+  - 风险：新 API 的“数据面只接受 exact model、不做逻辑路由”边界仍依赖转换层约束。
+- `chat.completions.create` / `images.generate` 会先用 `ExactModelName::parse()` 校验 `exact_model`，并设置 `allow_fallback=false`、`runtime_failover=false`。
+  - 这是正确方向。
+  - 仍需补测试，确保 exact model 不会因内部 route exact fallback 或 runtime failover 发生隐式切换。
+- `route.resolve` 已返回：
+  - `selected_exact_model`
+  - `provider_instance_name`
+  - `provider_driver`
+  - `provider_model_id`
+  - `provider_options`
+  - `fallback_attempts`
+  - `route_trace`
+  - `inventory_revision`
+  - `session_config_revision`
+  - 但尚未返回 `enabled_capabilities` / `disabled_capabilities`。
+- `provider_options` 目前由 `lower_provider_model_options()` 根据 `provider_model_id` 中的 `:variant` 临时推导。
+  - 这只适合作为过渡实现。
+  - 最终应由 driver metadata / variant resolver 产生。
+- `helper.llm_chat` / `helper.text_to_image` 当前在 service handler 内直接转发到旧 all-in-one 方法。
+  - 这与设计里的“helper 是 route.resolve + typed inference 的组合层”还不一致。
+- 旧 all-in-one `ai_methods::*` 仍是公开 service 方法，且 `src/tools/buckyos-agent/lib/aicc.ts` 仍使用旧请求形态。
+  - breaking change 版本需要给它们明确 legacy/helper 定位。
 
-描述“某个 provider driver 下的物理模型本身是什么、能什么”。
+### 0.3 当前模型与路由实现
 
-Key:
+- AICC 已有模型级 `ModelMetadata` / `ProviderInventory`：
+  - `provider_model_id`
+  - `exact_model`
+  - `api_types`
+  - `logical_mounts`
+  - `capabilities`
+  - `attributes`
+  - `pricing`
+  - `health`
+  - 入口：`src/frame/aicc/src/model_types.rs`
+- `ModelRegistry` 已按 inventory 构建 exact index，并能从 `logical_mounts` 生成默认 logical items。
+- `ModelRouter` 已支持：
+  - logical path 展开
+  - exact model 解析
+  - fallback chain
+  - hard filters：api type、health、quota、required features、local only、allow/blocked provider、cost、latency、weight
+  - route trace
+- `ModelScheduler` 已负责候选排序、sticky binding、scheduler profile。
+- `SessionConfig` 已支持：
+  - global logical tree
+  - per-session store
+  - `items` 覆盖
+  - `item_overrides`
+  - exact model weights
+  - policy merge / lock
+  - 但还没有显式 `SessionLogicalProfile` / `LogicalTreeOverlay` / `merge_mode=inherit|replace` 结构。
+- `default_logical_tree.rs` 已有内置二级逻辑目录，例如 `llm.plan`、`llm.code`、`llm.swift`、`llm.reason`。
+  - 当前主要是静态模板 + provider inventory `logical_mounts`。
+  - 还不是基于 `LogicalModelDefinition.min_line` 的 admission / auto-mount。
 
-```text
-provider_driver + provider_model_id
-```
+### 0.4 当前 provider metadata 状态
 
-典型内容：
+- OpenAI 当前仍以 `/models` 或配置模型列表为主，靠代码规则生成 metadata 和 mounts。
+  - `default_features()` 仍偏乐观，默认包含 `plan/json_output/tool_calling/web_search`。
+  - OpenAI GPT 分层、latest mount、音频/图像排除等已在代码里有规则，但不是独立 driver metadata。
+- Claude 已有更细的 per-model classifier，会按模型名修剪 `plan/web_search/vision/context/output` 等能力。
+  - 方向接近 driver metadata resolver，但仍写死在 provider adapter 内。
+- Gemini / Minimax / Fal 也都有各自代码内 metadata 构造逻辑。
+- 尚未有本地 per-driver metadata 文件、metadata resolver、remote sync cache、签名校验。
 
-- `api_types`
-- 固有 `capabilities`
-- context / output token limit
-- family / tier / quality hint / latency hint / cost hint
-- variant rules，例如 OpenAI reasoning effort 档位
-- default logical mounts
-- compatibility rules，例如某些参数是否可用、是否需要转换
-- pricing hints
+## 1. API 分层升级
 
-不应包含：
+### 1.1 目标语义
 
-- 某个账号的 endpoint / token
-- 某个实例的 quota / health / balance
-- 用户 session 偏好
-- 本次请求的 options
+- `route.resolve` 是控制面：
+  - 输入逻辑模型名和本次请求的 routing constraints。
+  - 输出确定的 AICC exact model、provider 信息、provider options、fallback candidates 和 trace。
+- typed inference API 是数据面：
+  - 只接受 `exact_model`。
+  - 不接受逻辑模型名。
+  - 不做逻辑 fallback。
+  - 不隐式重新 route。
+- helper 是客户端空间组合：
+  - `logical request -> route.resolve -> typed inference`
+  - helper 不拥有独立路由逻辑。
 
-### 1.2 Provider Instance
+### 1.2 TODO
 
-描述“某个实例如何提供模型”。
+- [x] 定义 `route.resolve` / `chat.completions.create` / `images.generate` 方法名。
+- [x] 定义第一版 Route / LLM Chat / Text-to-Image 请求响应结构。
+- [x] AICC service dispatch 新方法。
+- [x] typed inference 转换层校验 `exact_model`。
+- [x] typed inference 默认关闭 `allow_fallback` 和 `runtime_failover`。
+- [ ] 在协议文档中明确旧 `llm.chat`、`image.txt2img` 等 all-in-one 方法进入 legacy/helper 兼容层，不再作为 AICC 本体核心语义。
+- [ ] 明确 breaking change 后旧 all-in-one 方法的删除、保留或隐藏策略。
+- [ ] `route.resolve` 应禁止 `logical_model` 传 exact model；如需 exact 诊断，另设字段或另设方法，避免控制面语义混乱。
+- [ ] `RouteResolveResponse` 增加 `enabled_capabilities` / `disabled_capabilities`，表达本次 route 后实际启用/禁用的能力集合。
+- [ ] 明确 `fallback_attempts` 语义：
+  - 是 route 建议候选顺序，不是 lease。
+  - 是否受 `runtime_failover` 和 `fallback_limit` 限制。
+  - 是否包含 primary 之外所有同分候选、scheduler 后候选，还是只包含运行时 failover 候选。
+- [ ] `route_trace` 使用稳定结构而不是裸 `Value`，至少在 Rust API 层保留 typed struct，外部序列化为 JSON。
+- [ ] `provider_options` 的来源从 `lower_provider_model_options()` 迁移到 driver metadata / variant resolver。
+- [ ] typed inference 内部不再经过“逻辑 route”路径；短期可继续复用 `complete_with_method()`，但必须用测试锁定 exact-only 行为。
+- [ ] 如果 `helper.*` 继续保留在 AICC service，改为显式调用 `resolve_route()` + typed inference，而不是直接转发旧 all-in-one 方法。
+- [ ] Agent SDK / Web SDK / CLI 提供 helper API，并把默认调用迁移到 helper 或显式两阶段调用。
 
-Key:
+### 1.3 必补测试
 
-```text
-provider_instance_name
-```
+- [ ] `route.resolve` 输入 `llm.chat` 返回 `selected_exact_model`、provider 信息、trace。
+- [ ] `route.resolve` 输入 exact model 被拒绝，错误码明确。
+- [ ] `chat.completions.create` 输入逻辑模型名被拒绝。
+- [ ] `images.generate` 输入逻辑模型名被拒绝。
+- [ ] typed inference 的 primary exact model quota exhausted / unavailable 时，不 fallback 到其它模型。
+- [ ] typed inference 失败后，由调用方重新 `route.resolve` 才能换模型。
+- [ ] `helper.llm_chat` 展开后的行为等价于 `route.resolve + chat.completions.create`。
+- [ ] `helper.text_to_image` 展开后的行为等价于 `route.resolve + images.generate`。
 
-典型内容：
+## 2. 命名与请求约束收敛
 
-- `provider_type`
-- `provider_driver`
-- endpoint / base_url
-- auth 状态
-- origin / trusted source
-- instance-level enable / disable
-- operator override
+### 2.1 当前实现
 
-### 1.3 Runtime State
-
-描述“当前运行状态如何”。
-
-典型内容：
-
-- health
-- quota
-- balance
-- p50 / p95 latency
-- error rate
-- queue depth
-- last refresh time
-- inventory revision
-
-Runtime state 可以出现在最终 inventory 输出里，但不应写进静态 Driver Model Metadata。
-
-### 1.4 Per Request
-
-描述“这次调用要什么、开不开、准不准”。
-
-应继续拆成四类：
-
-- `requirements`：本次调用必须满足什么，例如 tool_call、web_search、json_schema、vision、min_context。
-- `disable`：本次调用必须确保不开启什么，字段集合应与 `requirements` 对称，例如禁用 web_search、tool_call、vision。
-- `options`：本次怎么调用，例如 tools、response_format、temperature、reasoning effort。
-- `policy` / `route_policy`：路由策略语义，例如 local_only、allow_fallback、runtime_failover、allowed / blocked provider、max_cost。
-
-其中 `requirements` / `disable` 是相反方向的能力约束：前者要求模型和调用链必须具备并启用，后者要求即使模型具备也不能启用。`policy` 不再承担“禁用某能力”的表达，避免和能力约束混在一起。
-
-## 2. 命名收敛
-
-### 2.1 建议语义
-
-- `capabilities`：模型“能不能”，是 inventory / metadata 的真相源。
-- `requirements`：调用“必须满足什么”，用于路由硬过滤。
-- `disable`：调用“必须关闭什么”，用于从本次请求中移除或禁止对应能力。
-- `options`：调用“怎么开”，用于 provider request lowering。
-- `policy` / `route_policy`：路由策略，用于 provider 范围、fallback、failover、local only、成本上限等调度限制。
-- `features`：保留为兼容旧请求的字符串表达，内部尽快转换成结构化 `requirements` / `disable`。
+- `ModelCapabilities` 是模型能力真相源。
+- `Requirements` 已包含结构化 `ModelRequirement`，同时保留 `must_features` 字符串兼容层。
+- `ModelDisable` 已存在，并且 `apply_disabled_capabilities()` 会同时处理结构化 `disable` 和 legacy `requirements.extra.disable_capabilities`。
+- `RoutePolicy` 已表达 profile、local only、fallback、runtime failover、allowed/blocked provider、cost、latency。
 
 ### 2.2 TODO
 
-- [ ] 文档明确 `Feature` 不是 inventory 真相源。
-- [ ] 保留 `must_features -> RequiredModelFeatures` 转换，但把它定位为兼容层。
-- [ ] 将旧的 `disable_capabilities` 迁移/映射为结构化 `disable`。
-- [ ] UI / AI Center 文案避免让用户区分 feature / capability，改用“模型能力 / 路由要求 / 本次禁用 / 本次启用 / 路由策略”。
-- [ ] 代码里逐步减少新逻辑对 `ProviderInstance.features` 的依赖。
+- [x] 保留 `must_features -> RequiredModelFeatures` 转换。
+- [x] 支持结构化 `disable`。
+- [x] legacy `disable_capabilities` 已能映射到结构化禁用逻辑。
+- [ ] 文档明确 `Feature` 不是 inventory 真相源，只是旧请求兼容表达。
+- [ ] 新逻辑禁止继续依赖 `ProviderInstance.features` 做 capability 判断。
+- [ ] `requirements` 只表达硬能力约束。
+- [ ] `disable` 只表达本次必须关闭的能力。
+- [ ] `options` 只表达本次 provider request lowering 参数。
+- [ ] `policy` 只表达路由策略，不再承担“禁用能力”的表达。
+- [ ] UI / AI Center 文案避免 feature/capability 混用，统一展示为：
+  - 模型能力
+  - 路由要求
+  - 本次禁用
+  - 本次启用
+  - 路由策略
 
-## 3. Driver Metadata 本地文件
+## 3. Driver Metadata Resolver
 
 ### 3.1 目标
 
-Provider 自发现只负责发现物理模型名。AICC 通过 Driver Metadata 把物理模型名映射成 AICC 模型 metadata。
+Provider 自发现只负责发现 provider model id。AICC 通过 driver metadata resolver 把 provider model id 转成 AICC model metadata。
 
-流程：
+目标流程：
 
 ```text
 provider /models reported ids
-+ driver metadata
-+ provider instance overrides
-+ runtime state
++ builtin driver metadata
++ local override / system-config override
++ optional remote cache
++ provider instance runtime state
 = final ProviderInventory.models
 ```
 
-### 3.2 本地优先
-
-运行期获取 metadata 的核心以本地文件为主：
-
-```text
-builtin driver metadata
--> local override / system-config override
--> optional remote per-driver sync cache
--> provider code conservative fallback
-```
-
-要求：
-
-- [ ] 本地文件是核心真相源。
-- [ ] 远端同步不能成为启动依赖。
-- [ ] 本地缺失或损坏时，AICC 仍能用 conservative fallback 启动。
-
-### 3.3 文件粒度
-
-按 driver 拆分，不做全局大 JSON：
-
-```text
-openai.json
-claude.json
-gemini.json
-fal.json
-minimax.json
-```
-
-建议 schema：
-
-```json
-{
-  "schema_version": 1,
-  "provider_driver": "openai",
-  "revision": "2026-05-30.1",
-  "models": {},
-  "patterns": [],
-  "defaults": {},
-  "signature": null
-}
-```
-
-### 3.4 TODO
+### 3.2 TODO
 
 - [ ] 定义 driver metadata schema 文档。
-- [ ] 明确 `models` 精确匹配与 `patterns` 规则匹配的优先级。
-- [ ] 明确 unknown model fallback 策略。
-- [ ] 明确 metadata override 策略：builtin < remote cache < local override < system-config override。
+- [ ] 按 driver 拆分本地 metadata 文件：
+  - `openai.json`
+  - `claude.json`
+  - `gemini.json`
+  - `fal.json`
+  - `minimax.json`
+- [ ] schema 至少包含：
+  - `schema_version`
+  - `provider_driver`
+  - `revision`
+  - `models`
+  - `patterns`
+  - `defaults`
+  - `variants`
+  - `signature`
+- [ ] 明确匹配优先级：
+  - exact `models`
+  - `patterns`
+  - `defaults`
+  - conservative fallback
+- [ ] 明确 override 优先级：
+  - builtin
+  - remote cache
+  - local override
+  - system-config override
+- [ ] 新增 `metadata_resolver` 模块。
+- [ ] OpenAI inventory 改为 `/models` + resolver。
+- [ ] Claude classifier 收编为 resolver 规则或 metadata。
+- [ ] Gemini / Minimax / Fal 迁移到 resolver。
+- [ ] unknown model fallback 不默认声明高风险能力：
+  - 不默认 tool_call
+  - 不默认 web_search
+  - 不默认 vision
+  - 不默认 json_schema
+- [ ] metadata 文件缺失、损坏时 AICC 仍能以 conservative fallback 启动。
 
-## 4. Reasoning Variant
+## 4. Reasoning Variant 与 Provider Options Lowering
 
-### 4.1 产品结论
+### 4.1 目标语义
 
-Reasoning effort 不应作为普通用户调的参数。对用户来说，“同一 base model + 不同 reasoning 档位”本质上是不同体验的模型。
-
-普通用户优先通过逻辑模型名表达需求：
-
-```text
-llm.swift  -> 快速 / 低成本 / minimal 或 none reasoning
-llm.chat   -> 默认聊天 / balanced
-llm.plan   -> 重要规划 / high reasoning / quality first
-llm.reason -> 深度推理 / reasoning first
-```
-
-底层 exact model 可以表达为：
-
-```text
-gpt-5.1:reasoning-high@openai
-```
-
-Provider request lowering 时再还原：
-
-```text
-model = gpt-5.1
-reasoning.effort = high
-```
-
-### 4.2 TODO
-
-- [ ] 在 driver metadata schema 中定义 `variants`。
-- [ ] OpenAI metadata 中用 variants 表达 reasoning effort 档位。
-- [ ] AICC exact model 使用 variant 后的 `provider_model_id`。
-- [ ] Provider adapter 调用前把 AICC variant 还原成 provider base model + provider options。
-- [ ] usage / trace / audit 使用 AICC exact model，不把不同 reasoning 档位混在一起。
-
-## 5. 逻辑模型名 = 需求组合
-
-### 5.1 产品定义
-
-逻辑模型名不是简单 alias，而是使用侧的需求组合。它抽象了真正有价值的“模型能力 + feature/option 组合 + 调度策略”。
+对用户来说，“同一 base model + 不同 reasoning effort”应表现为不同 AICC exact model，而不是普通请求参数。
 
 示例：
 
 ```text
-llm.chat  = 普通聊天需求组合
-llm.plan  = 重要规划需求组合
-llm.code  = 代码任务需求组合
-llm.swift = 快速响应需求组合
+gpt-5.1:reasoning-high@openai-primary
 ```
 
-用户不应频繁手动调模型参数，而应优先选择或调整逻辑模型名。
+route output lowering：
 
-### 5.2 LogicalModelDefinition
+```text
+provider_model_id = gpt-5.1
+provider_options.reasoning.effort = high
+```
 
-建议定义：
+### 4.2 当前实现
+
+- `lower_provider_model_options()` 已能把 `provider_model_id` 中的 `:reasoning-*` 转成 `provider_options.reasoning.effort`。
+- 该 lowering 主要用于 `RouteResolveResponse`。
+- typed inference 仍依赖调用方把 `provider_options` 传入第二段请求；provider adapter 本身尚未统一处理 AICC variant exact model。
+
+### 4.3 TODO
+
+- [ ] 在 driver metadata schema 中定义 `variants`。
+- [ ] OpenAI metadata 中用 variants 表达 reasoning effort 档位。
+- [ ] AICC exact model 使用 variant 后的 model id。
+- [ ] route.resolve 输出 base provider model id + provider_options。
+- [ ] typed inference 若收到 variant exact model，应能按 metadata 自动 lower；不应要求调用方必须手动补 provider_options。
+- [ ] provider adapter 调用前统一把 AICC variant 还原成 provider base model + provider options。
+- [ ] 用户传入的 provider_options 与 route provider_options 的 merge 规则放在 helper 层，不放在数据面协议里。
+- [ ] usage / trace / audit 使用 AICC exact model 聚合，避免不同 reasoning 档位混在一起。
+- [ ] audit 额外保留 provider actual model 和 provider options，便于复现。
+
+## 5. Logical Model Definition 与 Auto-Mount
+
+### 5.1 当前实现
+
+- 当前 logical mount 主要来自 `ModelMetadata.logical_mounts`。
+- `ModelRegistry::default_items_for_path()` 会把 inventory 中同名 mount 的 exact models 生成默认 items。
+- `default_logical_tree.rs` 提供内置二级目录模板。
+- 尚未有独立 `LogicalModelDefinition`，也没有基于 `min_line` 的 admission check。
+
+### 5.2 目标结构
 
 ```text
 LogicalModelDefinition
@@ -251,87 +289,44 @@ LogicalModelDefinition
   user_visible_tier
 ```
 
-### 5.3 Min Line
+`min_line` 是 hard gate，只决定模型是否能挂载到该逻辑模型名。
 
-每个逻辑模型名下有一组最小需求线，即 `min_line`。
+`disable_line` 是能力禁用约束，影响本次 request lowering 和 trace，不表达 fallback / provider 范围。
 
-示例：
+### 5.3 TODO
 
-```text
-llm.chat:
-  api_type: llm.chat
-  min_capabilities:
-    streaming: true
-  scheduler_profile: balanced
-
-llm.plan:
-  api_type: llm.chat
-  min_capabilities:
-    tool_call: true
-    json_schema: true
-  min_context_tokens: 128000
-  min_quality_score: 0.8
-  scheduler_profile: quality_first
-```
-
-`disable_line` 是 `min_line` 的反向约束，用来表达该逻辑模型名默认不应启用的能力。它不是 route policy；它仍然是能力约束的一部分。没有禁用项时应省略 `disable_line`，不要用显式 `false` 表达。
-
-示例：
-
-```text
-llm.private_chat:
-  api_type: llm.chat
-  min_capabilities:
-    streaming: true
-  disable:
-    web_search: true
-```
-
-TODO:
-
+- [ ] 定义 `LogicalModelDefinition` schema。
 - [ ] 定义 `ModelRequirement` / `min_line` schema。
 - [ ] 定义 `ModelDisable` / `disable_line` schema，字段集合与 `ModelRequirement` 对称。
-- [ ] 明确 min_line 是 hard gate，只决定能不能挂载。
-- [ ] 明确 disable_line 是能力禁用约束，影响 provider request lowering 和候选能力启用状态，但不表达 fallback / provider 范围。
-- [ ] 排序仍由 scheduler profile 处理。
-- [ ] 运行时 route trace 解释“为什么某模型不满足 min_line”。
-- [ ] 运行时 route trace 解释“为什么某能力被 disable_line 禁用”。
-
-## 6. Auto-Mount
-
-### 6.1 概念
-
-逻辑模型名支持“全挂载模式”：系统扫描所有 provider inventory，只要某个物理模型 metadata 满足该逻辑模型名的 `min_line`，就自动挂载进去。
-
-```text
-ModelMetadata.capabilities
-+ LogicalModelDefinition.min_line
-= admission result
-```
-
-### 6.2 Mount Mode
-
-建议支持：
-
-```text
-manual  // 只使用显式配置 items
-auto    // 扫描所有 provider inventory，满足 min_line 即挂载
-hybrid  // auto + manual override
-```
-
-### 6.3 TODO
-
-- [ ] 定义 `mount_mode`。
-- [ ] 实现 admission check：`ModelMetadata` 是否满足 `LogicalModelDefinition.min_line`。
-- [ ] 实现 auto-mount 构造逻辑，把满足条件的 model 生成 logical node items。
+- [ ] 定义 `mount_mode`：
+  - `manual`
+  - `auto`
+  - `hybrid`
+- [ ] 实现 admission check：`ModelMetadata.capabilities` 是否满足 `min_line`。
+- [ ] 实现 auto-mount：扫描 `ProviderInventory.models`，满足 min_line 的模型自动生成 logical items。
 - [ ] manual override 可以覆盖 auto item 的 weight / enabled / blocked。
-- [ ] route trace 记录 item 来源：manual / auto / override。
+- [ ] `default_logical_tree.rs` 从静态 item 模板逐步迁移为 logical definition + scheduler profile。
+- [ ] route trace 记录 item 来源：
+  - builtin definition
+  - driver metadata mount
+  - auto admission
+  - manual override
+  - session overlay
+- [ ] route trace 解释模型不满足 min_line 的原因。
+- [ ] route trace 解释能力被 disable_line 禁用的原因。
 
-## 7. Session Profile Overlay
+## 6. Session Profile Overlay
 
-### 7.1 核心原则
+### 6.1 当前实现
 
-Session 级模型偏好不应绕过逻辑模型名。它应该复用逻辑模型目录树机制，表现为一层 session 视角下的 overlay。
+- `SessionConfigStore` 已支持按 `session_id` 存储 session config。
+- `LogicalNode.items` 可以表达 replace。
+- `LogicalNode.item_overrides` 可以表达 inherit-style patch。
+- `exact_model_weights` 可以表达偏好权重。
+- policy merge / lock 已存在。
+- 当前结构还没有显式 `merge_mode`，也没有 session profile 名称、overlay 来源 trace、disable override。
+
+### 6.2 目标语义
 
 ```text
 Base Logical Tree
@@ -339,205 +334,169 @@ Base Logical Tree
 = Effective Logical Tree
 ```
 
-Agent / tools 仍然只调用逻辑模型名：
+两种核心模式：
 
-```text
-llm.chat
-llm.plan
-llm.code
-```
+- `inherit`：优先某个模型，但保留原候选和 fallback。
+- `replace`：Only 模式，只保留指定模型；不可用时失败。
 
-不同 session profile 下，同一个逻辑模型名看到不同的目录视图。
+### 6.3 TODO
 
-### 7.2 Inherit 模式
-
-继承式 overlay，用于“优先使用某个模型，但保留原候选和 fallback”。
-
-语义：
-
-```text
-Base llm.chat:
-  model A weight=1
-  model B weight=1
-  model C weight=1
-
-Session overlay:
-  llm.chat:
-    merge_mode=inherit
-    model B weight=5
-
-Effective llm.chat:
-  model A weight=1
-  model B weight=5
-  model C weight=1
-```
-
-这相当于 COW，只调整权重，原逻辑目录下的物理模型仍然存在。
-
-### 7.3 Replace 模式
-
-替换式 overlay，用于 Only 模式。
-
-语义：
-
-```text
-Base llm.chat:
-  model A
-  model B
-  model C
-
-Session overlay:
-  llm.chat:
-    merge_mode=replace
-    items:
-      model B
-
-Effective llm.chat:
-  model B
-```
-
-该 session 视角下，目录里只有用户指定的模型。其他候选不存在，因此不可用时直接失败，不进行自动切换。
-
-### 7.4 数据结构草案
-
-```text
-SessionLogicalProfile
-  profile_name
-  overlays:
-    path:
-      merge_mode: inherit | replace
-      items
-      item_overrides
-      disable_override
-      route_policy_override
-      fallback_override
-      scheduler_profile_override
-```
-
-第一版暂不支持从继承视图中删除 inherited item，避免复杂化。Only 需求用 `replace` 表达。
-
-### 7.5 TODO
-
-- [ ] 定义 `SessionLogicalProfile` / `LogicalTreeOverlay` schema。
-- [ ] 定义 overlay merge 规则。
+- [ ] 定义 `SessionLogicalProfile` schema。
+- [ ] 定义 `LogicalTreeOverlay` schema。
+- [ ] 明确 `merge_mode=inherit|replace` 与现有 `item_overrides|items` 的映射关系。
 - [ ] 路由前生成 `EffectiveSessionConfig`。
 - [ ] Router / Scheduler 只看 effective config，不关心 overlay 来源。
 - [ ] Provider adapter 只看最终 exact model，不关心 session profile。
-- [ ] overlay 可以覆盖 `disable_line`，但 route policy 覆盖必须走 `route_policy_override`。
-- [ ] Trace 记录 overlay 来源：
+- [ ] overlay 可以覆盖 `disable_line`。
+- [ ] route policy 覆盖必须走 `route_policy_override`，不能混入 disable。
+- [ ] trace 记录 overlay 来源：
   - `logical_profile_scope=session`
   - `overlay_path`
   - `merge_mode`
   - `selected_from_overlay`
 - [ ] `inherit` 模式下指定模型 quota exhausted 可以 fallback。
 - [ ] `replace` 模式下指定模型 quota exhausted 直接失败。
+- [ ] 第一版可不支持从 inherited view 中删除单个 inherited item；Only 用 `replace`。
 
-## 8. Routing 手工模式与自动模式
+## 7. UI / Agent / Workflow 迁移
 
-### 8.1 用户心智
+### 7.1 当前实现
 
-自动模式：
+- `src/tools/buckyos-agent/lib/aicc.ts` 仍构造旧 `AiMethodRequest`，通过旧 method 调用 AICC。
+- workflow adapter 位于 `src/kernel/workflow/src/adapters/aicc.rs`，需要检查是否仍直接依赖旧 all-in-one 形态。
+- AI Center / control panel 侧有 AICC settings，但 routing UI 尚未围绕新 logical model definition 展示。
 
-- 用户相信 AICC 自动调度。
-- 系统根据任务类型挂到不同逻辑模型名。
-- 逻辑模型名代表 BuckyOS 的 best practice。
+### 7.2 TODO
 
-手工模式：
-
-- 用户理解逻辑模型名。
-- 用户在 Routing 里修改某个逻辑模型名的目录视图。
-- 可以配置 Only 模式，模型不可用时直接失败。
-
-### 8.2 TODO
-
+- [ ] Agent SDK 新增 helper：
+  - `llmChat()`
+  - `textToImage()`
+  - 内部执行 `route.resolve + typed inference`。
+- [ ] CLI tool 新增显式两阶段调试命令：
+  - resolve route
+  - invoke exact model
+  - helper call
+- [ ] workflow adapter 使用 helper 或显式两阶段调用，不直接把逻辑模型名传给数据面。
 - [ ] AI Center Routing UI 围绕逻辑模型名展示，不围绕 provider 参数面板展示。
-- [ ] 每个逻辑模型名展示 min_line、候选池、mount mode、profile、fallback。
-- [ ] 手工指定模型时，配置层使用 logical tree overlay / manual item，而不是直接改请求参数。
+- [ ] 每个逻辑模型名展示：
+  - min_line
+  - disable_line
+  - mount mode
+  - candidate pool
+  - scheduler profile
+  - fallback
+  - active session overlay
+- [ ] 手工指定模型时，配置层使用 logical tree overlay / manual item，不直接改请求参数。
 - [ ] 配置时检测指定模型是否满足该逻辑模型名 min_line。
 - [ ] 不满足时给出明确警告或拒绝。
 
-## 9. Remote Metadata Sync
+## 8. Remote Metadata Sync
 
-### 9.1 目标
+### 8.1 目标
 
-避免为了升级 provider model metadata 频繁发 BuckyOS 版本。远端同步是更新通道，不是运行依赖。
+避免为了更新 provider model metadata 频繁发 BuckyOS 版本。远端同步是更新通道，不是启动依赖。
 
-### 9.2 Per Driver URL
+### 8.2 TODO
 
-建议按 driver 拉取：
-
-```text
-https://meta.buckyos.ai/aicc/model_metadata/v1/openai.json
-https://meta.buckyos.ai/aicc/model_metadata/v1/claude.json
-https://meta.buckyos.ai/aicc/model_metadata/v1/gemini.json
-```
-
-### 9.3 要求
-
-- [ ] 每个 package 带 `schema_version`、`provider_driver`、`revision`、`expires_at`、`signature`。
+- [ ] 定义 per-driver metadata URL：
+  - `https://meta.buckyos.ai/aicc/model_metadata/v1/openai.json`
+  - `https://meta.buckyos.ai/aicc/model_metadata/v1/claude.json`
+  - `https://meta.buckyos.ai/aicc/model_metadata/v1/gemini.json`
+- [ ] 每个 package 带：
+  - `schema_version`
+  - `provider_driver`
+  - `revision`
+  - `expires_at`
+  - `signature`
 - [ ] 拉取结果落本地 cache。
 - [ ] 失败使用上一个 cache 或 builtin。
 - [ ] 支持禁用远端同步。
 - [ ] 支持回滚到指定 revision。
 - [ ] 签名验证失败时拒绝使用。
+- [ ] 远端同步失败不得影响 AICC 启动和已有 provider inventory。
 
-## 10. Trace / Usage / Audit
+## 9. Trace / Usage / Audit
 
-### 10.1 目标
+### 9.1 当前实现
 
-用户和开发者必须能解释“为什么这次用了这个模型”。
+- `RouteTrace` 已记录 request、session、api type、requested model、candidate count、filtered candidates、ranked candidates、fallback chain、selected exact model、scheduler profile、user summary。
+- `route.resolve` 已把 trace 序列化到响应中。
+- task result extra 中已有 route_trace 透出路径。
 
-### 10.2 TODO
+### 9.2 TODO
 
-- [ ] Route trace 记录 requested logical path。
-- [ ] Route trace 记录 effective logical tree 来源：base / auto-mount / manual / session overlay。
+- [ ] Route trace 记录 requested logical path，且区分 legacy all-in-one / route.resolve / helper 来源。
+- [ ] Route trace 记录 effective logical tree 来源：
+  - base
+  - driver metadata
+  - auto-mount
+  - manual
+  - session overlay
 - [ ] Route trace 记录 selected AICC exact model。
 - [ ] Route trace 记录 provider actual model。
-- [ ] Route trace 记录 provider options derived from variant，例如 reasoning effort。
-- [ ] Usage 按 AICC exact model 聚合，避免 reasoning variants 混在一起。
-- [ ] Audit 保留 provider actual model，便于复现和排障。
+- [ ] Route trace 记录 provider options derived from variant。
+- [ ] Route trace 记录 enabled / disabled capabilities。
+- [ ] Route trace 记录 helper options merge 结果。
+- [ ] Usage 按 AICC exact model 聚合。
+- [ ] Audit 保留 provider actual model、provider options、inventory revision、session config revision。
 
-## 11. 实施顺序建议
+## 10. 实施顺序建议
 
-### Phase 1: 文档和 Schema
+### Phase 1: 新 API 边界加固
 
-- [ ] 写 AICC metadata 概念分层文档。
+- [ ] 补协议文档，明确 route control plane / inference data plane / helper 三层。
+- [ ] 补 typed inference exact-only 测试。
+- [ ] `route.resolve` 禁止 exact model 输入。
+- [ ] `RouteResolveResponse` 补 capabilities 字段。
+- [ ] 明确并测试 `fallback_attempts` 语义。
+- [ ] `helper.*` 改为两阶段组合或从 service 核心协议中移出。
+
+### Phase 2: SDK / Workflow 迁移
+
+- [ ] TypeScript Agent SDK 增加新 helper。
+- [ ] buckyos-agent 默认走 helper。
+- [ ] workflow adapter 迁移到 helper 或显式两阶段调用。
+- [ ] CLI 增加 resolve / invoke / helper 调试命令。
+
+### Phase 3: Metadata Resolver
+
 - [ ] 定义 driver metadata schema。
-- [ ] 定义 logical model definition / min_line schema。
-- [ ] 定义 session logical profile / overlay schema。
+- [ ] 新增 metadata resolver。
+- [ ] OpenAI 接入 resolver。
+- [ ] Claude classifier 收编到 resolver。
+- [ ] unknown model conservative fallback。
 
-### Phase 2: 本地 Metadata Resolver
+### Phase 4: Logical Definition + Auto-Mount
 
-- [ ] 新增 metadata resolver 模块。
-- [ ] 接入本地 per-driver metadata 文件。
-- [ ] OpenAI inventory 改为 `/models` + resolver。
-- [ ] Claude classifier 收编为 resolver 规则或 metadata。
-- [ ] unknown model 使用 conservative fallback。
-
-### Phase 3: Logical Model Auto-Mount
-
+- [ ] 定义 logical model schema。
 - [ ] 实现 min_line admission。
-- [ ] 实现 mount_mode: manual / auto / hybrid。
-- [ ] Router 使用 auto-mount 后的 effective logical tree。
-- [ ] Trace 展示 auto-mount 结果和过滤原因。
+- [ ] 实现 mount_mode。
+- [ ] `default_logical_tree` 迁移到 definition。
+- [ ] route trace 展示 admission 和 auto-mount 结果。
 
-### Phase 4: Session Profile Overlay
+### Phase 5: Session Overlay
 
-- [ ] 实现 overlay merge。
+- [ ] 定义显式 overlay schema。
 - [ ] 支持 inherit / replace。
-- [ ] 接入 Agent session route context。
-- [ ] Trace 展示 session overlay 生效情况。
+- [ ] 接入 session profile。
+- [ ] trace 展示 overlay 生效情况。
 
-### Phase 5: Remote Sync
+### Phase 6: Remote Sync
 
-- [ ] 实现 per-driver remote sync。
-- [ ] 本地 cache、签名、revision、回滚。
-- [ ] 加管理开关和诊断日志。
+- [ ] per-driver remote sync。
+- [ ] cache、签名、revision、回滚。
+- [ ] 管理开关和诊断日志。
 
-## 12. 最小验证集
+## 11. 最小验证集
 
+- [ ] `route.resolve(llm.chat)` 能返回 exact model、provider 信息、fallback attempts、route trace。
+- [ ] `route.resolve(exact_model)` 被拒绝。
+- [ ] `chat.completions.create(exact_model)` 能跑通。
+- [ ] `chat.completions.create(logical_model)` 被拒绝。
+- [ ] exact model unavailable 时 typed inference 不 fallback。
+- [ ] helper `llm_chat` 行为等价于 route + typed inference。
 - [ ] OpenAI `/models` 返回 `gpt-5.1`，resolver 展开 base model 和 reasoning variants。
-- [ ] `gpt-5.1:reasoning-high@openai` 路由后，provider request 还原成 `model=gpt-5.1` + `reasoning.effort=high`。
+- [ ] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
 - [ ] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。
 - [ ] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
 - [ ] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。

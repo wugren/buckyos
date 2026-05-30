@@ -456,6 +456,7 @@ fn build_ai_request(schema: &AiccMethodSchema, input: &Value) -> WorkflowResult<
     let extra = input.get("extra").cloned();
 
     let requirements = Requirements {
+        required: Default::default(),
         must_features,
         max_latency_ms,
         max_cost_usd,
@@ -486,6 +487,7 @@ fn build_ai_request(schema: &AiccMethodSchema, input: &Value) -> WorkflowResult<
         capability,
         model: ModelSpec::new(alias, model_hint),
         requirements,
+        disable: Default::default(),
         payload,
         policy,
         idempotency_key,
