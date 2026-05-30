@@ -448,10 +448,19 @@ impl ScheduleTaskMirrorClient {
         }
 
         let root_id = schedule.schedule_id.clone();
+        if let Some(task_id) = self.find_existing_root_task(schedule).await? {
+            self.update_root_task_by_id(task_id, schedule).await?;
+            return Ok(ScheduleTaskMirror {
+                root_task_id: Some(task_id),
+                root_id: Some(root_id),
+            });
+        }
+
+        let task_name = schedule_root_task_name(schedule);
         let task = self
             .client
             .create_task(
-                &format!("workflow/schedule/{}", schedule.name),
+                task_name.as_str(),
                 "workflow/schedule",
                 Some(schedule_task_data(schedule)),
                 self.user_id.as_str(),
@@ -474,6 +483,14 @@ impl ScheduleTaskMirrorClient {
         let Some(task_id) = schedule.task_mirror.root_task_id else {
             return Ok(());
         };
+        self.update_root_task_by_id(task_id, schedule).await
+    }
+
+    async fn update_root_task_by_id(
+        &self,
+        task_id: i64,
+        schedule: &WorkflowSchedule,
+    ) -> Result<(), String> {
         self.client
             .update_task(
                 task_id,
@@ -484,6 +501,30 @@ impl ScheduleTaskMirrorClient {
             )
             .await
             .map_err(|err| err.to_string())
+    }
+
+    async fn find_existing_root_task(
+        &self,
+        schedule: &WorkflowSchedule,
+    ) -> Result<Option<i64>, String> {
+        let tasks = self
+            .client
+            .list_tasks(
+                Some(TaskFilter {
+                    app_id: Some(self.app_id.clone()),
+                    task_type: Some("workflow/schedule".to_string()),
+                    root_id: Some(schedule.schedule_id.clone()),
+                    ..Default::default()
+                }),
+                Some(self.user_id.as_str()),
+                Some(self.app_id.as_str()),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(tasks
+            .into_iter()
+            .find(|task| task.user_id == self.user_id && task.root_id == schedule.schedule_id)
+            .map(|task| task.id))
     }
 
     pub async fn create_fire_subtask(
@@ -602,6 +643,13 @@ fn schedule_root_task_permissions() -> TaskPermissions {
         read: TaskScope::User,
         write: TaskScope::User,
     }
+}
+
+fn schedule_root_task_name(schedule: &WorkflowSchedule) -> String {
+    format!(
+        "workflow/schedule/{} [{}]",
+        schedule.name, schedule.schedule_id
+    )
 }
 
 fn is_create_subtask_permission_error(message: &str) -> bool {
