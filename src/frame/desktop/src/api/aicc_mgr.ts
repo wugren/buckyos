@@ -3,6 +3,7 @@ import { isMockRuntime } from '../runtime'
 import { MockDataStore } from '../app/ai-center/mock/store'
 import type {
   AIStatus,
+  ApiNamespace,
   ApiType,
   LocalModel,
   LogicalNode,
@@ -166,10 +167,27 @@ interface RawUsageBucketedRow {
   aggregate?: RawUsageAggregate
 }
 
+interface RawUsageEvent {
+  event_id?: unknown
+  tenant_id?: unknown
+  caller_app_id?: unknown
+  task_id?: unknown
+  capability?: unknown
+  request_model?: unknown
+  provider_model?: unknown
+  input_tokens?: unknown
+  output_tokens?: unknown
+  total_tokens?: unknown
+  request_units?: unknown
+  finance_snapshot_json?: unknown
+  created_at_ms?: unknown
+}
+
 interface RawUsageQueryResponse {
   total?: RawUsageAggregate
   grouped?: RawUsageGroupedRow[]
   buckets?: RawUsageBucketedRow[]
+  events?: RawUsageEvent[]
 }
 
 interface RawLogicalNode {
@@ -185,7 +203,7 @@ interface RawLogicalNode {
 
 interface AiccDataProvider {
   fetchSnapshot(): Promise<StoreSnapshot>
-  addProvider(draft: WizardDraft): Promise<ProviderView>
+  addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
@@ -241,8 +259,16 @@ export class AICCModelStore implements AICCMgr {
   }
 
   async addProvider(draft: WizardDraft): Promise<ProviderView> {
-    const provider = await this.provider.addProvider(withProviderInstanceName(draft, this.snapshot))
+    const nextDraft = withProviderInstanceName(draft, this.snapshot)
+    await this.provider.addProvider(nextDraft)
     await this.refresh()
+    const providerInstanceName = nextDraft.provider_instance_name
+    const provider = this.snapshot.providers.find((item) =>
+      item.config.provider_instance_name === providerInstanceName,
+    )
+    if (!provider) {
+      throw new Error('aicc.provider_add_not_reflected')
+    }
     return provider
   }
 
@@ -285,8 +311,8 @@ class MockAiccProvider implements AiccDataProvider {
     return this.store.getSnapshot()
   }
 
-  async addProvider(draft: WizardDraft): Promise<ProviderView> {
-    return this.store.addProvider(draft)
+  async addProvider(draft: WizardDraft): Promise<void> {
+    this.store.addProvider(draft)
   }
 
   async deleteProvider(id: string): Promise<void> {
@@ -316,7 +342,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   private usageTrend: UsageTrendPoint[] = []
 
   async fetchSnapshot(): Promise<StoreSnapshot> {
-    const [directory, usageSummary, usageTrend] = await Promise.all([
+    const [directory, usageByModel, usageByCapability, usageByApp, usageTrend, usageEvents, usageLastDay, usageThisMonth] = await Promise.all([
       this.call<RawModelDirectory>('models.list', {}),
       this.queryUsage({
         time_range: { kind: 'last30d' },
@@ -327,32 +353,59 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       this.queryUsage({
         time_range: { kind: 'last30d' },
         filters: {},
+        group_by: ['capability'],
+        output_mode: 'summary',
+      }),
+      this.queryUsage({
+        time_range: { kind: 'last30d' },
+        filters: {},
+        group_by: ['caller_app_id'],
+        output_mode: 'summary',
+      }),
+      this.queryUsage({
+        time_range: { kind: 'last30d' },
+        filters: {},
         time_bucket: 'day',
         output_mode: 'summary',
       }),
+      this.queryUsage({
+        time_range: { kind: 'last30d' },
+        filters: {},
+        output_mode: 'events',
+        limit: 50,
+      }),
+      this.queryUsage({
+        time_range: { kind: 'last1d' },
+        filters: {},
+        output_mode: 'summary',
+      }),
+      this.queryUsage({
+        time_range: currentMonthTimeRange(),
+        filters: {},
+        output_mode: 'summary',
+      }),
     ])
-    this.usageSummary = toUsageSummary(usageSummary)
+    this.usageSummary = toUsageSummary({
+      byModel: usageByModel,
+      byCapability: usageByCapability,
+      byApp: usageByApp,
+      lastDay: usageLastDay,
+      thisMonth: usageThisMonth,
+    })
     this.usageTrend = toUsageTrend(usageTrend)
     const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
-    return toStoreSnapshot(directory, rawProviders)
+    return toStoreSnapshot(directory, rawProviders, toUsageEvents(usageEvents))
   }
 
-  async addProvider(draft: WizardDraft): Promise<ProviderView> {
+  async addProvider(draft: WizardDraft): Promise<void> {
     const validation = await this.validateConnection(draft)
     if (!validation.auth_valid || !validation.endpoint_reachable) {
       throw new Error(validation.errors[0] ?? 'aicc.provider_validation_failed')
     }
-    const result = await this.call<{ ok?: unknown; provider_instance_name?: unknown }>('provider.add', toProviderWritePayload(draft))
+    const result = await this.call<{ ok?: unknown }>('provider.add', toProviderWritePayload(draft))
     if (result.ok !== true) {
       throw new Error('aicc.provider_add_failed')
     }
-    const providerInstanceName = asNonEmptyString(result.provider_instance_name, draft.provider_instance_name ?? '')
-    const snapshot = await this.fetchSnapshot()
-    const provider = snapshot.providers.find((item) => item.config.provider_instance_name === providerInstanceName)
-    if (!provider) {
-      throw new Error('aicc.provider_add_not_reflected')
-    }
-    return provider
   }
 
   async deleteProvider(id: string): Promise<void> {
@@ -449,24 +502,53 @@ function slugify(value: string): string {
   return slug || 'provider'
 }
 
+function defaultProviderEndpoint(providerType: ProviderType | null): string {
+  switch (providerType) {
+    case 'sn_router': return 'https://sn.buckyos.ai/api/v1/ai/'
+    case 'openai': return 'https://api.openai.com/v1'
+    case 'anthropic': return 'https://api.anthropic.com'
+    case 'google': return 'https://generativelanguage.googleapis.com/v1beta'
+    case 'openrouter': return 'https://openrouter.ai/api/v1'
+    default: return ''
+  }
+}
+
 function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
+  const providerType = draft.provider_type ?? 'custom'
+  const endpoint = draft.endpoint.trim() || defaultProviderEndpoint(providerType)
   return {
     provider_instance_name: draft.provider_instance_name,
-    provider_type: draft.provider_type ?? 'custom',
+    provider_type: providerType,
     name: draft.name,
-    endpoint: draft.endpoint,
+    endpoint,
     protocol_type: draft.protocol_type,
     api_key: draft.api_key,
     auto_sync_models: draft.auto_sync_models,
   }
 }
 
-function toUsageSummary(raw: RawUsageQueryResponse): UsageSummary {
-  const total = raw.total ?? {}
-  const grouped = Array.isArray(raw.grouped) ? raw.grouped : []
+function currentMonthTimeRange(): Record<string, unknown> {
+  const start = new Date()
+  start.setDate(1)
+  start.setHours(0, 0, 0, 0)
+  return {
+    kind: 'explicit',
+    start_time_ms: start.getTime(),
+    end_time_ms: Date.now(),
+  }
+}
+
+function toUsageSummary(raw: {
+  byModel: RawUsageQueryResponse
+  byCapability: RawUsageQueryResponse
+  byApp: RawUsageQueryResponse
+  lastDay: RawUsageQueryResponse
+  thisMonth: RawUsageQueryResponse
+}): UsageSummary {
+  const total = raw.byModel.total ?? {}
   const byModel: Record<string, number> = {}
   const byProvider: Record<string, number> = {}
-  for (const row of grouped) {
+  for (const row of groupedRows(raw.byModel)) {
     const model = asNonEmptyString(row.group?.provider_model, '')
     if (!model) continue
     const tokens = aggregateTokens(row.aggregate)
@@ -477,13 +559,59 @@ function toUsageSummary(raw: RawUsageQueryResponse): UsageSummary {
     }
   }
 
+  const byApiNamespace = emptyApiNamespaceUsage()
+  for (const row of groupedRows(raw.byCapability)) {
+    const capability = asNonEmptyString(row.group?.capability, '')
+    const namespace = capabilityToApiNamespace(capability)
+    byApiNamespace[namespace] += aggregateTokens(row.aggregate)
+  }
+
+  const byApp: Record<string, number> = {}
+  for (const row of groupedRows(raw.byApp)) {
+    const app = asNonEmptyString(row.group?.caller_app_id, 'system')
+    byApp[app || 'system'] = aggregateTokens(row.aggregate)
+  }
+
   return {
     ...EMPTY_USAGE_SUMMARY,
+    by_api_namespace: byApiNamespace,
     total_tokens: aggregateTokens(total),
     total_requests: asNumber(total.total_requests, 0),
+    today_tokens: aggregateTokens(raw.lastDay.total),
+    this_month_tokens: aggregateTokens(raw.thisMonth.total),
     by_provider: byProvider,
     by_model: byModel,
+    by_app: byApp,
   }
+}
+
+function groupedRows(raw: RawUsageQueryResponse): RawUsageGroupedRow[] {
+  return Array.isArray(raw.grouped) ? raw.grouped : []
+}
+
+function emptyApiNamespaceUsage(): Record<ApiNamespace, number> {
+  return {
+    llm: 0,
+    embedding: 0,
+    rerank: 0,
+    image: 0,
+    vision: 0,
+    audio: 0,
+    video: 0,
+    agent: 0,
+  }
+}
+
+function capabilityToApiNamespace(value: string): ApiNamespace {
+  const lower = value.toLowerCase()
+  if (lower.startsWith('embedding')) return 'embedding'
+  if (lower.startsWith('rerank')) return 'rerank'
+  if (lower.startsWith('image')) return 'image'
+  if (lower.startsWith('vision')) return 'vision'
+  if (lower.startsWith('audio')) return 'audio'
+  if (lower.startsWith('video')) return 'video'
+  if (lower.startsWith('agent')) return 'agent'
+  return 'llm'
 }
 
 function providerInstanceFromExactModel(model: string): string | undefined {
@@ -501,6 +629,56 @@ function toUsageTrend(raw: RawUsageQueryResponse): UsageTrendPoint[] {
   }))
 }
 
+function toUsageEvents(raw: RawUsageQueryResponse): StoreSnapshot['usageEvents'] {
+  const events = Array.isArray(raw.events) ? raw.events : []
+  return events.map((event) => {
+    const providerModel = asNonEmptyString(event.provider_model, '')
+    const tokensIn = asOptionalNumber(event.input_tokens)
+    const tokensOut = asOptionalNumber(event.output_tokens)
+    const tokenEquivalent = asOptionalNumber(event.total_tokens)
+      ?? asOptionalNumber(event.request_units)
+      ?? ((tokensIn ?? 0) + (tokensOut ?? 0))
+
+    return {
+      id: asNonEmptyString(event.event_id, asNonEmptyString(event.task_id, `usage-${asNumber(event.created_at_ms, 0)}`)),
+      timestamp: new Date(asNumber(event.created_at_ms, 0)).toISOString(),
+      provider_instance_name: providerInstanceFromExactModel(providerModel) ?? 'unknown-provider',
+      exact_model: providerModel || 'unknown-model',
+      requested_model: asNonEmptyString(event.request_model, providerModel || 'unknown-model'),
+      api_type: capabilityToApiType(asNonEmptyString(event.capability, 'llm')),
+      tenant_id: asNonEmptyString(event.tenant_id, 'default'),
+      app_id: asOptionalString(event.caller_app_id),
+      session_id: asOptionalString(event.task_id),
+      tokens_in: tokensIn,
+      tokens_out: tokensOut,
+      token_equivalent: tokenEquivalent,
+      estimated_cost: estimatedCost(event.finance_snapshot_json),
+      status: 'success',
+    }
+  })
+}
+
+function capabilityToApiType(value: string): ApiType {
+  const inferred = inferApiType(value)
+  if (inferred) return inferred
+  switch (capabilityToApiNamespace(value)) {
+    case 'embedding': return 'embedding.text'
+    case 'rerank': return 'rerank'
+    case 'image': return 'image.txt2img'
+    case 'vision': return 'vision.ocr'
+    case 'audio': return 'audio.tts'
+    case 'video': return 'video.txt2video'
+    case 'agent': return 'agent.computer_use'
+    case 'llm':
+    default: return 'llm.chat'
+  }
+}
+
+function estimatedCost(value: unknown): number | undefined {
+  const snapshot = asRecord(value)
+  return asOptionalNumber(snapshot.amount)
+}
+
 function aggregateTokens(raw?: RawUsageAggregate): number {
   if (!raw) return 0
   return asNumber(raw.total_tokens, 0)
@@ -508,7 +686,11 @@ function aggregateTokens(raw?: RawUsageAggregate): number {
     || asNumber(raw.request_units, 0)
 }
 
-function toStoreSnapshot(directory: RawModelDirectory, rawProviders: RawProviderInventory[]): StoreSnapshot {
+function toStoreSnapshot(
+  directory: RawModelDirectory,
+  rawProviders: RawProviderInventory[],
+  usageEvents: StoreSnapshot['usageEvents'] = [],
+): StoreSnapshot {
   const inventories = rawProviders.map(toProviderInventory)
   const cloudProviders = inventories
     .filter((inventory) => inventory.provider_type !== 'local_inference')
@@ -524,7 +706,7 @@ function toStoreSnapshot(directory: RawModelDirectory, rawProviders: RawProvider
 
   return {
     providers: cloudProviders,
-    usageEvents: [],
+    usageEvents,
     sessionConfig,
     routeTraces: [],
     localModels,
