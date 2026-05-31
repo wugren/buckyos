@@ -2,6 +2,27 @@
 
 本文档基于 `notepads/aicc-new-api.md` 的分层设计，并按当前仓库实现修订。目标不是从零设计，而是在已有第一版实现上收敛边界：把“逻辑模型路由”和“物理模型推理”真正拆开，同时继续推进模型 metadata、逻辑模型名、auto-mount 与 session profile overlay。
 
+## 进度复核（2026-05-30，按实际代码核对）
+
+本次复核基于对 `src/frame/aicc/src/*`、`src/kernel/buckyos-api/src/aicc_client.rs`、`src/tools/buckyos-agent/lib/aicc.ts`、`src/kernel/workflow/src/adapters/aicc.rs` 及 `src/frame/aicc/tests/*` 的逐文件核对，不再依赖旧勾选。
+
+**底层（后端）升级状态：Phase 1–5 基本完成，可以进入 PRD/UI 阶段。**
+
+- ✅ **Phase 1 新 API 边界**：`route.resolve` / `chat.completions.create` / `images.generate` / `helper.llm_chat` / `helper.text_to_image` 全部定义、dispatch、有 handler；`route.resolve` 拒绝 exact model 输入，typed inference 强制 `exact_model`；helper 走两阶段（resolve + typed inference），不再转发旧 all-in-one。`RouteResolveResponse` 带 `enabled/disabled_capabilities`。（`aicc_client.rs:17-21,1332-1353`，`aicc.rs:3307-3528,4286-4324`）
+- ✅ **Phase 2 SDK/Workflow 迁移**：Agent SDK 有 `llmChat()/textToImage()`（透明走 helper）；workflow adapter `LLM_CHAT/IMAGE_TXT2IMG` 走 `helper_*`。唯独 **CLI 两阶段调试命令仍缺**。（`aicc.ts:145-149,280-330`，`adapters/aicc.rs:387-392`）
+- ✅ **Phase 3 Metadata Resolver**：`metadata_resolver.rs`（968 行）schema 齐全；match 优先级 exact→pattern→default→conservative 正确；五个 driver（openai/claude/gemini/minimax/fal）全部接入 resolver；unknown model 保守 fallback（有测试 `openai_unknown_fallback_is_conservative`）；metadata 缺失/损坏会 `warn` 后跳过并退回 builtin。**override 链 builtin→remote_cache→local→system_config 已实现，但 signature 校验只占位未验、无远端拉取。**
+- ✅ **Phase 4 Logical Definition + Auto-Mount**：`LogicalModelDefinition`（全字段）、`ModelRequirement/min_line`、`ModelDisable/disable_line`、`MountMode(manual/auto/hybrid)`、admission check、auto-mount、manual override、route trace 来源标注全部落地。（`model_types.rs:405-502,878-912`，`model_registry.rs:264-425`，`default_logical_tree.rs:455-485`）
+- ✅ **Phase 5 Session Overlay**：`SessionLogicalProfile`/`LogicalTreeOverlay`/`OverlayMergeMode(inherit|replace)`、`EffectiveSessionConfig`、overlay 覆盖 disable_line、`route_policy_override` 独立、overlay trace、inherit 可 fallback / replace 失败 均有实现且有测试。（`model_session.rs:93-369`，`model_router.rs:1086-1233`）
+- ❌ **Phase 6 Remote Metadata Sync：未开始**（无 per-driver URL 拉取、无 cache TTL/原子写、无 signature 验证、无 revision 回滚）。这是后端唯一的大块缺口，但属于“更新通道”，不阻塞 PRD/UI。
+
+**进入 PRD/UI 前仍建议收尾的小项（非阻塞）：**
+- `route_trace` 仍是裸 `Value`（`RouteResolveResponse.route_trace: Option<Value>`），未提升为 typed struct（§1.2）。
+- 旧 all-in-one `ai_methods::*` 仍全部 public 且未标记 legacy/deprecated，breaking-change 版本的删除/隐藏策略未定（§1.2）。
+- CLI resolve/invoke/helper 调试命令缺失（§1.2 / §7.2 / Phase 2）。
+- metadata 缺失/损坏/远端不可用下可启动：行为已实现但缺显式测试（§11）。
+
+**下一步（用户思路）：底层已就绪 → 修改 AI Center PRD → 完成 UI（§7 整块，外加 §2.2 末尾文案统一、§9 UI 透出）。**
+
 ## 0. 当前实现基线
 
 ### 0.1 已落地的新 API 雏形
@@ -456,30 +477,30 @@ Base Logical Tree
 - [x] TypeScript Agent SDK 增加新 helper。
 - [x] buckyos-agent 默认走 helper。
 - [x] workflow adapter 迁移到 helper 或显式两阶段调用。
-- [ ] CLI 增加 resolve / invoke / helper 调试命令。
+- [ ] CLI 增加 resolve / invoke / helper 调试命令。（唯一未完成项）
 
-### Phase 3: Metadata Resolver
+### Phase 3: Metadata Resolver（已完成，远端同步除外）
 
-- [ ] 定义 driver metadata schema。
-- [ ] 新增 metadata resolver。
-- [ ] OpenAI 接入 resolver。
-- [ ] Claude classifier 收编到 resolver。
-- [ ] unknown model conservative fallback。
+- [x] 定义 driver metadata schema。
+- [x] 新增 metadata resolver。（`metadata_resolver.rs`）
+- [x] OpenAI 接入 resolver。
+- [x] Claude classifier 收编到 resolver。
+- [x] unknown model conservative fallback。（有测试 `openai_unknown_fallback_is_conservative`）
 
-### Phase 4: Logical Definition + Auto-Mount
+### Phase 4: Logical Definition + Auto-Mount（已完成）
 
-- [ ] 定义 logical model schema。
-- [ ] 实现 min_line admission。
-- [ ] 实现 mount_mode。
-- [ ] `default_logical_tree` 迁移到 definition。
-- [ ] route trace 展示 admission 和 auto-mount 结果。
+- [x] 定义 logical model schema。
+- [x] 实现 min_line admission。
+- [x] 实现 mount_mode。
+- [x] `default_logical_tree` 迁移到 definition。
+- [x] route trace 展示 admission 和 auto-mount 结果。
 
-### Phase 5: Session Overlay
+### Phase 5: Session Overlay（已完成）
 
-- [ ] 定义显式 overlay schema。
-- [ ] 支持 inherit / replace。
-- [ ] 接入 session profile。
-- [ ] trace 展示 overlay 生效情况。
+- [x] 定义显式 overlay schema。
+- [x] 支持 inherit / replace。
+- [x] 接入 session profile。
+- [x] trace 展示 overlay 生效情况。
 
 ### Phase 6: Remote Sync
 
@@ -501,6 +522,6 @@ Base Logical Tree
 - [x] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
 - [x] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。
 - [x] session replace overlay 只保留指定模型，并在 quota exhausted 后失败。
-- [ ] unknown model 不默认声明高风险能力。
-- [ ] metadata 文件缺失、损坏、远端不可用时 AICC 可启动。
-- [ ] route trace 能解释 base tree、auto-mount、session overlay 和 provider lowering。
+- [x] unknown model 不默认声明高风险能力。（`metadata_resolver.rs` conservative fallback + 测试）
+- [~] metadata 文件缺失、损坏、远端不可用时 AICC 可启动。（行为已实现：缺失/损坏 `warn` 跳过退回 builtin；缺显式启动测试）
+- [x] route trace 能解释 base tree、auto-mount、session overlay 和 provider lowering。（`model_router.rs` LogicalItemSourceTrace / LogicalAdmissionTrace / SessionOverlayTrace + variant lowering）

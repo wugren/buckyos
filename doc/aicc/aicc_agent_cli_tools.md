@@ -33,10 +33,12 @@ CLI 只列出最终结果对用户或交付物有直接意义的能力。`embedd
 
 CLI 不重新定义 AI 协议。每个命令只负责：
 
-1. 把命令行参数转换成 `AiMethodRequest.payload.input_json`。
+1. 把命令行参数转换成对应 method 的请求体。
 2. 把本地输入文件转换成 `ResourceRef`。
 3. 调用 `/kapi/aicc` 对应 method。
-4. 把 `AiResponseSummary.artifacts` 或 `extra` 落到本地文件 / stdout。
+4. 把 artifacts / 文本结果落到本地文件 / stdout。
+
+> 调用路径：CLI 默认走 helper 层（如文生图走 `helper.text_to_image`），由 helper 内部 `route.resolve` + typed inference（`images.generate`）完成；传入的是逻辑模型名。需要强制指定精确模型或调试两阶段时，可显式 `route.resolve` 再 `images.generate(exact_model=...)`。CLI 不再直接构造 legacy all-in-one `AiMethodRequest`（该形态仅兼容保留）。
 
 ---
 

@@ -5,7 +5,10 @@ use crate::model_registry::{
 };
 use crate::model_router::{ModelRouter, RouteRequest};
 use crate::model_scheduler::{ModelScheduler, StickyBindingKey, StickyBindingStore};
-use crate::model_session::{merge_session_config, SessionConfig, SessionConfigStore};
+use crate::model_session::{
+    build_effective_session_config, merge_session_config, EffectiveSessionConfig, SessionConfig,
+    SessionConfigStore, SessionLogicalProfile,
+};
 use crate::model_types::{
     ApiType, CostClass, CostEstimateInput, CostEstimateOutput, ExactModelName, HealthStatus,
     LatencyClass, ModelAttributes, ModelCandidate, ModelCapabilities, ModelHealth, ModelMetadata,
@@ -1592,6 +1595,7 @@ fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
         logical_item_sources: Vec::new(),
         logical_admission: Vec::new(),
         disabled_capability_sources: Vec::new(),
+        session_overlays: Vec::new(),
         session_sticky_hit: false,
         scheduler_profile: Default::default(),
         runtime_failover_count: 0,
@@ -2235,6 +2239,56 @@ fn apply_policy_config_to_route_policy(policy: &mut RoutePolicy, config: &Policy
     }
 }
 
+fn apply_logical_node_policy_override(
+    policy: &mut RoutePolicy,
+    session_config: &SessionConfig,
+    model: &str,
+) -> std::result::Result<(), crate::model_types::RouteError> {
+    if crate::model_types::is_exact_model_name(model) {
+        return Ok(());
+    }
+    let Some(node) = session_config.node(model) else {
+        return Ok(());
+    };
+    if let Some(config) = node.policy.as_ref() {
+        apply_policy_config_to_route_policy(policy, config);
+    }
+    if let Some(config) = node.route_policy_override.as_ref() {
+        apply_policy_config_to_route_policy(policy, config);
+    }
+    Ok(())
+}
+
+fn disabled_capabilities_for_logical_path(
+    session_config: &SessionConfig,
+    registry: &ModelRegistry,
+    logical_path: &str,
+) -> Vec<String> {
+    if let Some(disable_line) = session_config
+        .node(logical_path)
+        .and_then(|node| node.disable_line.as_ref())
+    {
+        return disable_line.feature_names();
+    }
+    registry
+        .logical_definition(logical_path)
+        .map(|definition| definition.disable_line.feature_names())
+        .unwrap_or_default()
+}
+
+fn mark_selected_session_overlay(trace: &mut RouteTrace, selected: &ModelCandidate) {
+    if trace.session_overlays.is_empty() {
+        return;
+    }
+    for overlay in trace.session_overlays.iter_mut() {
+        let prefix = format!("{} -> ", overlay.overlay_path);
+        overlay.selected_from_overlay = selected
+            .route_paths
+            .iter()
+            .any(|path| path.starts_with(prefix.as_str()));
+    }
+}
+
 fn required_model_features(requirements: &Requirements) -> RequiredModelFeatures {
     let mut required = RequiredModelFeatures::default();
     required.streaming = requirements.required.streaming;
@@ -2808,7 +2862,13 @@ impl AIComputeCenter {
             .resolve_request_session_config(request, session_id.as_deref())
             .map_err(route_error_to_rpc)?;
         let mut policy = route_policy_from_request(request);
-        apply_policy_config_to_route_policy(&mut policy, &effective_session_config.policy);
+        apply_policy_config_to_route_policy(&mut policy, &effective_session_config.config.policy);
+        apply_logical_node_policy_override(
+            &mut policy,
+            &effective_session_config.config,
+            request.model.alias.as_str(),
+        )
+        .map_err(route_error_to_rpc)?;
         if route_cfg.fallback_limit == 0 {
             policy.runtime_failover = false;
         }
@@ -2817,7 +2877,7 @@ impl AIComputeCenter {
             .model_registry
             .read()
             .map_err(|_| reason_error("internal_error", "model registry lock poisoned"))?;
-        let router = ModelRouter::new(&registry, &effective_session_config);
+        let router = ModelRouter::new(&registry, &effective_session_config.config);
         let resolution = router.resolve(RouteRequest {
             request_id: request_id.to_string(),
             session_id: session_id.clone(),
@@ -2826,6 +2886,7 @@ impl AIComputeCenter {
             policy: policy.clone(),
             session_config_revision,
             session_config_updated,
+            session_overlay_trace: effective_session_config.overlay_trace.clone(),
         });
 
         let mut resolution = resolution.map_err(route_error_to_rpc)?;
@@ -2833,8 +2894,13 @@ impl AIComputeCenter {
             .trace
             .resolved_logical_path
             .as_deref()
-            .and_then(|path| registry.logical_definition(path))
-            .map(|definition| definition.disable_line.feature_names())
+            .map(|path| {
+                disabled_capabilities_for_logical_path(
+                    &effective_session_config.config,
+                    &registry,
+                    path,
+                )
+            })
             .unwrap_or_default();
         drop(registry);
         self.apply_dynamic_cost_estimates(tenant_id, request, &mut resolution.candidates);
@@ -2870,6 +2936,7 @@ impl AIComputeCenter {
         resolution.trace.provider_options = selected_provider_options.clone();
         resolution.trace.session_sticky_hit = scheduled.sticky_hit;
         resolution.trace.ranked_candidates = scheduled.ranked_candidates;
+        mark_selected_session_overlay(&mut resolution.trace, &scheduled.selected);
         resolution.trace.user_summary = Some(user_summary_for_route(
             &resolution.trace,
             &scheduled.selected,
@@ -3011,10 +3078,13 @@ impl AIComputeCenter {
         &self,
         request: &AiMethodRequest,
         session_id: Option<&str>,
-    ) -> std::result::Result<(SessionConfig, bool, Option<String>), crate::model_types::RouteError>
-    {
+    ) -> std::result::Result<
+        (EffectiveSessionConfig, bool, Option<String>),
+        crate::model_types::RouteError,
+    > {
         let request_config = extract_session_config(request, "session_config")?;
         let request_patch = extract_session_config(request, "session_config_patch")?;
+        let request_profile = extract_session_profile(request)?;
         let expected_revision = extract_expected_session_config_revision(request);
 
         if let Some(session_id) = session_id {
@@ -3031,9 +3101,14 @@ impl AIComputeCenter {
             } else {
                 store.get_or_create(session_id)?
             };
+            let mut config = stored.config;
+            apply_request_session_profile(&mut config, request_profile)?;
+            let effective = build_effective_session_config(&config)?;
             return Ok((
-                stored.config,
-                expected_revision.is_some() || extract_has_session_config_update(request),
+                effective,
+                expected_revision.is_some()
+                    || extract_has_session_config_update(request)
+                    || request_control_value(request, "session_profile").is_some(),
                 Some(stored.revision),
             ));
         }
@@ -3055,8 +3130,13 @@ impl AIComputeCenter {
             config = merge_session_config(&config, &patch)?;
             updated = true;
         }
+        if request_profile.is_some() {
+            apply_request_session_profile(&mut config, request_profile)?;
+            updated = true;
+        }
         config.validate()?;
-        Ok((config.clone(), updated, config.revision.clone()))
+        let revision = config.revision.clone();
+        Ok((build_effective_session_config(&config)?, updated, revision))
     }
 
     fn legacy_catalog_provider_model(
@@ -3258,9 +3338,6 @@ impl AIComputeCenter {
                 if let Some(output_tokens) = request.estimated_output_tokens {
                     object.insert("estimated_output_tokens".to_string(), json!(output_tokens));
                 }
-                if let Some(session_profile) = request.session_profile.clone() {
-                    object.insert("session_profile".to_string(), session_profile);
-                }
             }
             requirements.extra = Some(extra);
         }
@@ -3274,7 +3351,7 @@ impl AIComputeCenter {
         )
         .with_policy(request.policy.clone());
         method_request.disable = request.disable.clone();
-        if let Some(session_id) = request.session_id.as_ref() {
+        if request.session_id.is_some() || request.session_profile.is_some() {
             let mut options = method_request
                 .payload
                 .options
@@ -3284,7 +3361,12 @@ impl AIComputeCenter {
                 options = json!({});
             }
             if let Some(object) = options.as_object_mut() {
-                object.insert("session_id".to_string(), json!(session_id));
+                if let Some(session_id) = request.session_id.as_ref() {
+                    object.insert("session_id".to_string(), json!(session_id));
+                }
+                if let Some(session_profile) = request.session_profile.clone() {
+                    object.insert("session_profile".to_string(), session_profile);
+                }
             }
             method_request.payload.options = Some(options);
         }
@@ -4287,6 +4369,37 @@ fn extract_session_config(
     })?;
     config.validate()?;
     Ok(Some(config))
+}
+
+fn extract_session_profile(
+    request: &AiMethodRequest,
+) -> std::result::Result<Option<Value>, crate::model_types::RouteError> {
+    Ok(request_control_value(request, "session_profile").cloned())
+}
+
+fn apply_request_session_profile(
+    config: &mut SessionConfig,
+    profile: Option<Value>,
+) -> std::result::Result<(), crate::model_types::RouteError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if let Some(name) = profile
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        config.active_logical_profile = Some(name.to_string());
+        return Ok(());
+    }
+    let profile = serde_json::from_value::<SessionLogicalProfile>(profile).map_err(|err| {
+        crate::model_types::RouteError::new(
+            crate::model_types::RouteErrorCode::SessionConfigInvalid,
+            format!("session_profile is invalid: {}", err),
+        )
+    })?;
+    config.logical_profile = Some(profile);
+    Ok(())
 }
 
 fn extract_expected_session_config_revision(request: &AiMethodRequest) -> Option<String> {

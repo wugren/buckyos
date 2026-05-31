@@ -1,9 +1,11 @@
 # BuckyOS AICC 模型路由技术需求文档
 
-版本：v0.2 Draft
-状态：Review 收敛稿
+版本：v0.3 Draft
+状态：Review 收敛稿（对齐 2026-05-30 落地实现）
 依据：语音记录整理与补全
 适用范围：BuckyOS AICC 新版本模型路由、模型降级、Provider 注册与调度策略
+
+> 已落地：控制面 / 数据面 API 拆分（`route.resolve` + typed inference，见 §4.2）、精确模型 variant 后缀（§5.1.1）、逻辑模型定义 `min_line` / `disable_line` / `mount_mode` / auto-mount（§6.7）、driver metadata resolver（§7.2）、session 逻辑树 overlay `inherit|replace`（§12.4）、扩展 route trace 来源字段（§13.2）。
 
 ---
 
@@ -107,6 +109,18 @@ flowchart LR
 | Provider Executor | 执行实际 Provider 调用，处理重试、运行时 failover 和错误归一化。 |
 | Route Trace / Metrics | 记录路由原因、候选数量、fallback 原因、最终 Provider、成本估算、执行状态等。 |
 
+### 4.2 控制面 / 数据面 API 边界
+
+模型路由对外暴露为独立的控制面接口，与真实推理的数据面接口拆开（详见 `doc/aicc/aicc_api设计.md`）：
+
+| 层 | kRPC method | 职责 |
+|---|---|---|
+| 控制面 | `route.resolve` | 输入逻辑模型名 + routing constraints，输出确定的精确模型、`provider_options`、`fallback_attempts`、`enabled/disabled_capabilities`、`route_trace`。拒绝 exact model 输入。 |
+| 数据面 | `chat.completions.create` / `images.generate` | 只接受 `exact_model`，不做逻辑路由、不隐式 fallback；本节描述的目录展开 / 调度 / session 粘性都属于控制面。 |
+| Helper | `helper.llm_chat` / `helper.text_to_image` | 客户端组合层，先 `route.resolve` 再调数据面，不拥有独立路由逻辑。 |
+
+本文（路由体系）描述的展开、过滤、调度、fallback、session overlay 均发生在 `route.resolve` 控制面；数据面只消费控制面给出的精确模型。
+
 ---
 
 ## 5. 模型名体系
@@ -143,6 +157,22 @@ qwen3@local
 - 默认不做逻辑 fallback；
 - 当 Provider 不可用时，是否允许运行时 fallback 由 request policy 明确控制；
 - 对调试、测试、Provider 对比、强制指定供应商场景非常重要。
+
+#### 5.1.1 Variant 后缀（reasoning effort 等）
+
+`provider_model_id` 可携带 `:variant` 后缀，用于把“同一 base model + 不同档位”表达成不同的 AICC 精确模型名，而不是普通请求参数：
+
+```text
+<base_provider_model_id>:<variant>@<provider_instance_name>
+```
+
+例如 `gpt-5.1:reasoning-high@openai_primary`。
+
+- variant 字典由 driver metadata 的 `variants` 定义（见 `doc/aicc/driver_metadata_schema.md`），不同 driver 可有不同 variant。
+- metadata resolver 把带 variant 的模型展开成独立 `ModelMetadata`，记录 `provider_actual_model_id`（指回 base model）并预置 `provider_options`。
+- `route.resolve` 输出 `selected_exact_model`（含 variant）、base `provider_model_id` 还原值，以及 lowering 后的 `provider_options`，例如 `{ "reasoning": { "effort": "high" } }`。
+- 数据面收到带 variant 的 `exact_model` 时按 metadata 自动 lower 成 provider base model + provider options，不要求调用方手动补 `provider_options`。
+- usage / trace / audit 以含 variant 的 AICC 精确模型聚合，避免不同 reasoning 档位混在一起。
 
 ### 5.2 逻辑模型名
 
@@ -322,6 +352,39 @@ Provider inventory 中的 `logical_mounts` 是 Provider 对“自己的真实模
 1. 调整家族目录内部的物理模型优先级，例如在 `llm.gpt5` 下调整不同 Provider 的 GPT 模型权重；
 2. 调整角色目录对家族目录的优先级，例如在 `llm.plan` 下给 `llm.gpt5` 和 `llm.claude` 设置不同权重。
 
+### 6.7 逻辑模型定义与自动挂载（LogicalModelDefinition）
+
+除了 item 软链接，逻辑模型名本身可以有一个 `LogicalModelDefinition`，声明挂载到该逻辑模型名的模型必须满足的能力门限、本次禁用能力、挂载模式等。结构：
+
+```text
+LogicalModelDefinition
+  path                 # 逻辑模型路径，如 llm.plan
+  api_type             # 绑定的 API 形态，如 llm.chat
+  min_line             # ModelRequirement：硬能力门限（admission gate）
+  disable_line         # ModelDisable：本次路由禁用的能力
+  default_options      # 默认 provider 调用参数
+  mount_mode           # manual | auto | hybrid（默认 hybrid）
+  scheduler_profile    # 调度策略
+  fallback             # fallback 规则
+  route_policy         # 路由策略约束
+  user_visible_tier    # 用户可见分层
+```
+
+`min_line` / `disable_line` 字段集合对称，都是结构化能力位：`streaming` / `tool_call` / `json_schema` / `web_search` / `vision` / `min_context_tokens`。
+
+语义：
+
+1. **`min_line` 是硬 gate**，只决定模型能否挂到该逻辑模型名。`ModelMetadata.capabilities` 不满足 `min_line` 的模型被过滤，不可被权重或调度分数翻盘。
+2. **`disable_line` 是能力禁用约束**，影响本次 request lowering 和 trace，不表达 fallback / provider 范围。
+3. **`mount_mode`**：
+   - `manual`：只用显式配置的 item；
+   - `auto`：扫描 `ProviderInventory.models`，把满足 `min_line` 的模型自动生成 logical item（auto-mount）；
+   - `hybrid`：auto-mount + 允许 manual override 覆盖 auto item 的 weight / enabled / blocked。
+4. admission check 与 auto-mount 都在 Registry 层完成，Router 只看最终候选。
+5. route trace 会记录每个候选 item 的来源（builtin definition / driver metadata mount / auto admission / manual override / session overlay），并解释模型为何不满足 `min_line`、哪些能力被 `disable_line` 禁用。
+
+> 能力判断的真相源是 `ProviderInventory.models[].capabilities`（由 driver metadata resolver 产出），不再依赖 legacy `ProviderInstance.features`；`must_features` / `Feature` 只是旧请求的兼容表达。
+
 ---
 
 ## 7. Provider 注册需求
@@ -340,6 +403,8 @@ Provider inventory 中的 `logical_mounts` 是 Provider 对“自己的真实模
 Provider 需要通过声明式接口返回自身当前可提供的模型及其元数据。本文中的 Provider 指 Provider instance；同一厂商、同一实现类型可以创建多个 instance，例如两个 OpenAI API token 可以分别注册为 `openai_primary` 和 `openai_backup`。每个 instance 的 `provider_instance_name` 必须唯一，且不允许包含 `@`。
 
 这份模型列表是 Provider 的运行时能力声明，不是 AICC 的静态配置。AICC Registry 应周期性或按需调用 Provider 的 inventory/metadata 接口刷新能力清单，避免出现“厂商新增或下线模型后必须修改 AICC 配置才能生效”的情况。Provider 可以自行决定自己的能力清单何时更新，例如启动时加载、本地模型安装完成后更新、云端 inventory 变化后更新，或凭据/套餐变化后更新。
+
+> **Provider 自发现只负责发现 provider model id；能力 metadata 由 driver metadata resolver 产出。** Provider（如 OpenAI）可以只通过 `/models` 报告模型 id，AICC 的 metadata resolver 再按 driver metadata（builtin → remote cache → local override → system-config override；匹配优先级 exact → pattern → default → conservative fallback）把它转成最终 `ModelMetadata.capabilities` / `logical_mounts` / `variants`。unknown model 走保守 fallback，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 与 driver 文件（`openai.json` / `claude.json` / `gemini.json` / `fal.json` / `minimax.json`）见 `doc/aicc/driver_metadata_schema.md`。远端同步（per-driver URL 拉取、cache TTL、签名验证、revision 回滚）是后续“更新通道”，尚未实现，不影响启动；metadata 文件缺失 / 损坏时退回 builtin 保守 fallback 仍可启动。
 
 建议接口返回 schema：
 
@@ -1101,6 +1166,45 @@ policy:
 
 合并后传给调度器的有效 policy 可以展开成普通值，但配置合并阶段必须保留 lock 元数据。下级 patch 如果尝试修改 `locked: true` 的字段，应拒绝整个 patch 并返回 `AICC_ROUTE_POLICY_LOCKED`，不能静默忽略。
 
+### 12.4 Session 逻辑树 Overlay（SessionLogicalProfile）
+
+除了直接 patch `logical_tree`，session 还可以用显式的 `SessionLogicalProfile` 对逻辑树打 overlay。语义模型是：
+
+```text
+Base Logical Tree + Session Profile Layer = Effective Logical Tree
+```
+
+结构：
+
+```text
+SessionLogicalProfile
+  name                       # profile 名
+  overlays: [LogicalTreeOverlay]
+  route_policy_override      # 独立的 policy 覆盖通道（不混入 disable）
+
+LogicalTreeOverlay
+  path                       # 目标逻辑路径，如 llm.plan
+  merge_mode                 # inherit | replace（默认 inherit）
+  items / item_overrides / exact_model_weights
+  disable_line               # 本 overlay 禁用的能力
+  fallback
+  route_policy_override
+  source                     # overlay 来源标注
+```
+
+两种核心模式：
+
+1. **`inherit`**：优先指定模型，但保留原候选和 fallback；指定模型 quota exhausted 后可 fallback。
+2. **`replace`**：Only 模式，只保留指定模型；不可用 / quota exhausted 时直接失败，不 fallback。
+
+落地规则：
+
+1. 路由前先把 `SessionLogicalProfile` 应用到 base config，生成 `EffectiveSessionConfig`；Router / Scheduler 只看 effective config，不关心 overlay 来源；Provider adapter 只看最终精确模型。
+2. `merge_mode=inherit` 映射到 `item_overrides`-style patch，`merge_mode=replace` 映射到 `items` 完整覆盖。
+3. overlay 可覆盖 `disable_line`；路由策略覆盖必须走 `route_policy_override`，不能混入 disable。
+4. trace 记录 overlay 来源：`logical_profile_scope=session`、`overlay_path`、`merge_mode`、`selected_from_overlay`。
+5. 第一版不支持从 inherited view 中删除单个 inherited item；要做 Only 用 `replace`。
+
 ---
 
 ## 13. 可解释性与 Trace
@@ -1168,6 +1272,33 @@ interface RouteTrace {
   };
   estimated_cost_usd?: number;
   runtime_failover_count: number;
+  // 逻辑模型定义 / auto-mount / overlay 来源解释（见 §6.7、§12.4）
+  logical_item_sources?: Array<{
+    exact_model: string;
+    source: "builtin_definition" | "driver_metadata_mount" | "auto_admission" | "manual_override" | "session_overlay";
+  }>;
+  logical_admission?: Array<{
+    provider_model_id: string;
+    admitted: boolean;
+    missing_requirements?: string[];   // 不满足 min_line 的能力项
+  }>;
+  disabled_capability_sources?: Array<{
+    capability: string;
+    source: "disable_line" | "request_disable" | "session_overlay";
+  }>;
+  session_overlays?: Array<{
+    logical_profile_scope: "session";
+    overlay_path: string;
+    merge_mode: "inherit" | "replace";
+    selected_from_overlay: boolean;
+  }>;
+  // variant lowering：含 variant 的精确模型还原成 base + provider_options（见 §5.1.1）
+  provider_options_lowering?: {
+    provider_actual_model_id?: string;
+    provider_options?: Record<string, unknown>;
+  };
+  enabled_capabilities?: string[];
+  disabled_capabilities?: string[];
   user_summary?: UserFacingRouteSummary;
   warnings?: string[];
 }
@@ -1181,6 +1312,8 @@ interface UserFacingRouteSummary {
   was_failover: boolean;
 }
 ```
+
+> 协议层 `RouteResolveResponse.route_trace` 当前序列化为 JSON `Value` 承载上述字段，尚未提升为对外 typed struct；Rust 内部以结构化 trace 填充。
 
 `ranked_candidates` 只在 `policy.explain = true` 或开发模式返回，用于解释“为什么没选另一个候选”。生产默认 trace 可以省略该字段。`user_summary` 由后端根据 RouteTrace 和固定模板派生，UI 不应自行解析 `score_breakdown` 来生成用户可见文案。`reason_short` 必须来自预设模板，例如“按最高质量策略选择”“同优先级内成本最低”“命中 session 绑定”“高隐私策略只允许本地 Provider”。
 

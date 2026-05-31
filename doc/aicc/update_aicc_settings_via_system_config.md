@@ -42,8 +42,9 @@ AICC 启动和 `reload_settings` / `service.reload_settings` 时会读取该 key
 - `provider_instance_name` 是 Provider instance 的唯一名。旧字段 `instance_id` 可能仍被部分 Provider 兼容，但新配置统一使用 `provider_instance_name`。
 - `provider_type` 是可信部署类型，不是厂商名。常用值：`cloud_api`、`local_inference`、`proxy_unknown`。
 - `provider_driver` 是厂商或适配器名，例如 `openai`、`claude`、`google-gemini`、`minimax`。
-- 精确模型名由 AICC/Provider inventory 形成，格式是 `<provider_model_id>@<provider_instance_name>`，例如 `gpt-5.2@openai-primary`。
+- 精确模型名由 AICC/Provider inventory 形成，格式是 `<provider_model_id>[:variant]@<provider_instance_name>`，例如 `gpt-5.2@openai-primary`、`gpt-5.1:reasoning-high@openai-primary`（variant 由 driver metadata 展开，见 `doc/aicc/driver_metadata_schema.md`）。
 - 新版路由不要求在 settings 里维护静态 alias；Provider 通过 inventory 的 `logical_mounts` 挂到 `llm.chat`、`llm.plan`、`llm.gpt5` 等逻辑目录。
+- 模型能力（capabilities）由 driver metadata resolver 产出，不再以 settings 里的 `features` 为路由真相源；`features` 仅作旧调用兼容字段保留。`provider_type` 还参与 `local_only` / `strict_local` 策略过滤，必须如实填写部署类型。
 
 ## 3. 更新方式
 

@@ -115,14 +115,19 @@ provider_model_metadata(
 
 AICC 会把多个 Provider 的 inventory 汇入 `ModelRegistry`，同一个逻辑模型名可以产生多个候选。
 
+> **能力 metadata 优先走 driver metadata resolver，而不是 Provider 自声明。** Provider 自发现只需负责发现 `provider_model_id`（例如 OpenAI 通过 `/models` 报告模型列表）；`metadata_resolver.rs` 再按 driver metadata（`openai.json` / `claude.json` / `gimini.json` 对应的 gemini / `fal.json` / `minimax.json`）把 model id 转成最终 `ModelMetadata` 的 `capabilities` / `logical_mounts` / `variants`。匹配优先级：exact `models` → `patterns` → `defaults` → conservative fallback；override 链：builtin → remote cache → local override → system-config override。unknown model 保守对待，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 见 `doc/aicc/driver_metadata_schema.md`。新接入 Provider 应把按模型名细分能力的规则收编到 driver metadata（参考 `claude.rs` 的 classifier 收编路径），而不是写死在 adapter 里，也不再依赖 legacy `ProviderInstance.features`。
+>
+> reasoning effort 等档位用 driver metadata 的 `variants` 表达（展开成 `gpt-5.1:reasoning-high@instance` 这类带 variant 的精确模型 + 预置 `provider_options`），不要做成普通请求参数。
+
 ### 步骤 3：实现协议转换层
 
-如果上游 API 与 AICC `AiMethodRequest` 差异较大，建议拆出 `<provider>_protocol.rs`：
+如果上游 API 与 AICC 请求差异较大，建议拆出 `<provider>_protocol.rs`：
 
-- 把 `payload.messages` / `payload.text` / `payload.input_json` 转成上游请求
+- 把 content-block 形态的 `messages`（`AiMessage { role: AiRole, content: Vec<AiContent> }`，见 `aicc_api设计.md` §3.2）转成上游请求；`tool`/`developer` 等 IR role、`tool_use`/`tool_result`/`thinking`/`provider_state` 等 block 在 lowering 时改写为各 provider 原生形态
 - 处理 `tools`、`tool_choice`、`response_format`、`max_tokens` 等参数白名单
+- 把带 variant 的精确模型还原成 provider base model + provider options（如 `reasoning.effort`）后再发请求
 - 对不合法请求返回 fatal 类错误
-- 将上游响应转成 `AiResponseSummary`
+- 将上游响应转回 content-block `AiMessage`（typed inference 路径）或 `AiResponseSummary`（legacy 路径）
 
 协议层只做结构转换，不做路由决策。
 

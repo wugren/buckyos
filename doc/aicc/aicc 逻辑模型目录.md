@@ -174,6 +174,8 @@ agent_runtime
 - **物理型号**是带版本号的具体快照,如 `claude-opus-4.7@anthropic`、`gpt-5.5@openai`,只用于复现、锁定、审计和 Provider 侧实际路由。
 - **任务抽象目录**默认通过内置树链接到 Provider 逻辑挂点,也允许 Provider inventory 直接挂载精确模型。OpenAI 当前按角色直接挂载:GPT nano -> `llm.swift`;GPT mini -> `llm.gpt-mini` + `llm.summarize`;GPT 标准非 pro -> `llm.chat` + `llm.code` + `llm.gpt-standard`;GPT pro -> `llm.plan` + `llm.reason`;其它 OpenAI LLM -> `llm.gpt`。
 - **家族目录**保留为 UI 展示、用户偏好和物理型号索引用途。物理型号可以同时归入家族目录,但不作为任务抽象目录的直接 target。
+- **挂载受 `min_line` admission 约束**:逻辑模型名可带 `LogicalModelDefinition`(`min_line` / `disable_line` / `mount_mode`,见 `doc/aicc/aicc_router.md` §6.7)。无论是 Provider inventory 的 `logical_mounts` 还是 auto-mount,候选模型都必须满足该逻辑模型名的 `min_line`(如 `tool_call` / `json_schema` / `min_context_tokens`)才能挂入;不满足的模型被过滤,原因写入 route trace。`mount_mode=auto/hybrid` 时,满足 `min_line` 的 inventory 模型会被自动挂载,无需逐个手配 item。
+- **reasoning 档位是精确模型 variant**:同一 base model 的不同 reasoning effort 表现为不同精确模型(如 `gpt-5.1:reasoning-high@openai`),由 driver metadata 的 `variants` 展开,而不是普通请求参数。
 
 ### 3.1 `llm` Provider 逻辑挂点目录
 

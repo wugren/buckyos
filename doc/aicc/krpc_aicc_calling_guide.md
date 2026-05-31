@@ -26,9 +26,21 @@ AICC 使用 kRPC 协议，请求体不是 JSON-RPC。基本结构为：
 
 ## 2. Method
 
-AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC method。
+AICC 对外接口分成控制面 / 数据面 / Helper 三层（见 `doc/aicc/aicc_api设计.md`），有三种调用方式：
 
-常用 method：
+| 调用方式 | method | 何时用 |
+|---|---|---|
+| 两阶段（推荐用于需要解释 / 缓存路由结果时） | `route.resolve` → `chat.completions.create` / `images.generate` | 先解析逻辑模型名得到确定精确模型，再用精确模型推理 |
+| Helper（推荐用于普通调用） | `helper.llm_chat` / `helper.text_to_image` | 传逻辑模型名，内部自动 route + 推理 |
+| Legacy all-in-one（兼容保留） | `llm.chat` / `image.txt2img` / ... | 旧 SDK、兼容调用；不再是核心语义 |
+
+核心 / 数据面 method：
+
+- `route.resolve`（控制面，只接受逻辑模型名）
+- `chat.completions.create` / `images.generate`（数据面，只接受 `exact_model`）
+- `helper.llm_chat` / `helper.text_to_image`（组合层）
+
+legacy all-in-one method（兼容保留，不再使用 `complete`）：
 
 - `llm.chat`
 - `llm.completion`
@@ -51,7 +63,61 @@ AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC
 - `reload_settings` / `service.reload_settings`
 - `models.list` / `service.models.list`
 
-## 3. 最小 LLM 请求
+## 2.1 推荐调用：两阶段与 Helper
+
+**两阶段**——先 `route.resolve` 解析逻辑模型名，再用返回的 `selected_exact_model` 调数据面：
+
+```json
+{
+  "method": "route.resolve",
+  "params": {
+    "api_type": "llm.chat",
+    "logical_model": "llm.plan",
+    "requirements": { "tool_call": true, "json_schema": true },
+    "policy": { "profile": "quality_first" },
+    "session_id": "s-001"
+  },
+  "sys": [1001, "<session_token>", "trace-aicc-route"]
+}
+```
+
+返回 `selected_exact_model`（如 `gpt-5.1:reasoning-high@openai_primary`）、`provider_options`、`fallback_attempts`、`enabled/disabled_capabilities`、`route_trace`。随后：
+
+```json
+{
+  "method": "chat.completions.create",
+  "params": {
+    "exact_model": "gpt-5.1:reasoning-high@openai_primary",
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "请给我写一段发布说明" }] }
+    ],
+    "provider_options": { "reasoning": { "effort": "high" } }
+  },
+  "sys": [1001, "<session_token>", "trace-aicc-chat"]
+}
+```
+
+数据面只接受 `exact_model`，传逻辑模型名会被拒绝；primary 模型 quota exhausted / unavailable 时不 fallback，需要换模型时由调用方重新 `route.resolve` 或自取 `fallback_attempts` 候选。注意 `messages[].content` 是 content-block 数组（`AiMessage`，见 `aicc_api设计.md` §3.2），不再是纯字符串。
+
+**Helper**——一次调用，内部自动展开为 route + 推理：
+
+```json
+{
+  "method": "helper.llm_chat",
+  "params": {
+    "model": "llm.plan",
+    "requirements": { "tool_call": true },
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "请给我写一段发布说明" }] }
+    ]
+  },
+  "sys": [1001, "<session_token>", "trace-aicc-helper"]
+}
+```
+
+## 3. 最小 LLM 请求（legacy all-in-one）
+
+> 下面是 legacy `llm.chat` all-in-one 形态，保留给兼容调用；新调用请用 §2.1 的两阶段或 helper。`messages[].content` 已是 content-block 数组形态。
 
 ```json
 {
@@ -74,7 +140,7 @@ AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC
       "messages": [
         {
           "role": "user",
-          "content": "请给我写一段发布说明"
+          "content": [{ "type": "text", "text": "请给我写一段发布说明" }]
         }
       ],
       "options": {
@@ -122,7 +188,7 @@ AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC
       "messages": [
         {
           "role": "user",
-          "content": "用一句话解释 AICC 路由"
+          "content": [{ "type": "text", "text": "用一句话解释 AICC 路由" }]
         }
       ]
     }
@@ -179,7 +245,7 @@ AI 调用 method 直接使用能力方法名，不再使用旧的 `complete` RPC
       "messages": [
         {
           "role": "user",
-          "content": "总结这段本地资料"
+          "content": [{ "type": "text", "text": "总结这段本地资料" }]
         }
       ],
       "options": {

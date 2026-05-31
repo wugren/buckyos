@@ -73,6 +73,10 @@
 
 | 功能域 | 必测点 | 主要层级 |
 |---|---|---|
+| API 分层 | `route.resolve`（拒绝 exact model、返回 selected_exact_model/provider_options/fallback_attempts/enabled+disabled_capabilities/trace）、typed inference（`chat.completions.create`/`images.generate` 只接受 exact model、拒绝逻辑模型、不 fallback）、`helper.llm_chat`/`helper.text_to_image` 等价于 route+typed inference、legacy all-in-one 兼容 | L1/L2/L3 |
+| 逻辑模型定义 | `min_line` admission 过滤、`disable_line` 禁用能力、`mount_mode` auto-mount、manual override | L1/L3 |
+| Metadata resolver | exact→pattern→default→conservative 匹配优先级、unknown model 不默认高风险能力、metadata 缺失/损坏退回 builtin 可启动、variant 展开 + provider_options lowering | L1/L3 |
+| Session overlay | `SessionLogicalProfile` inherit（可 fallback）/ replace（quota exhausted 失败）、overlay trace | L1/L3 |
 | Method schema | `llm.chat`、`llm.completion`、`embedding.text`、`embedding.multimodal`、`rerank`、`image.*`、`vision.*`、`audio.*`、`video.*`、`agent.computer_use` 占位语义 | L1/L3/L4 |
 | Provider inventory | `provider_instance_name`、`provider_type`、`provider_driver`、`exact_model`、`api_types`、`logical_mounts`、capabilities、pricing、health | L1/L3 |
 | 路由解析 | 逻辑模型、精确模型、旧 alias 兼容、非法模型名、目录不存在 | L1/L2/L3 |
@@ -122,8 +126,11 @@
 
 | Method | 必测输入 | 必测输出 | 异常 |
 |---|---|---|---|
-| `llm.chat` | 纯文本 messages、content part、image/audio resource、tools、response_format JSON schema、generation params | `text`、`tool_calls`、`finish_reason`、usage、route trace | tool schema 非法、JSON schema 不满足、context too long、feature unsupported |
-| `llm.completion` | `prompt`、`suffix` | `text`、`finish_reason` | legacy wrapper 到 chat 失败、空 prompt |
+| `route.resolve` | `api_type`、逻辑模型名 `logical_model`、requirements、disable、policy | `selected_exact_model`、provider 信息、`provider_options`、`fallback_attempts`、`enabled/disabled_capabilities`、`route_trace` | 传入 exact model 被拒（错误码明确）、无候选 |
+| `chat.completions.create` | `exact_model`、content-block `messages`、tools、response_format、provider_options | `message: AiMessage`、`tool_calls`、`finish_reason`、usage、route trace | 传入逻辑模型名被拒、primary quota exhausted 不 fallback |
+| `helper.llm_chat` | 逻辑模型名 + messages | 等价于 `route.resolve` + `chat.completions.create` | 与两阶段行为一致性 |
+| `llm.chat`（legacy） | content-block messages、image/document/tool_use block、tools、response_format JSON schema、generation params | `text`/`message`、`tool_calls`、`finish_reason`、usage、route trace | tool schema 非法、JSON schema 不满足、context too long、feature unsupported |
+| `llm.completion`（legacy） | `prompt`、`suffix` | `text`、`finish_reason` | legacy wrapper 到 chat 失败、空 prompt |
 
 ### 7.2 Embedding / Rerank
 
@@ -137,7 +144,9 @@
 
 | Method | 必测输入 | 必测输出 | 异常 |
 |---|---|---|---|
-| `image.txt2img` | prompt、negative_prompt、n、aspect_ratio、quality、seed、output | image artifacts，FileObject meta 写 media type / size | output media type 不支持、预算超限 |
+| `images.generate`（typed inference） | `exact_model`、prompt、negative_prompt、size、quality、seed、output | image artifacts，FileObject meta 写 media type / size | 传入逻辑模型名被拒、primary 不 fallback |
+| `helper.text_to_image` | 逻辑模型名 + prompt | 等价于 `route.resolve` + `images.generate` | 与两阶段行为一致性 |
+| `image.txt2img`（legacy） | prompt、negative_prompt、n、aspect_ratio、quality、seed、output | image artifacts，FileObject meta 写 media type / size | output media type 不支持、预算超限 |
 | `image.img2img` | source image、prompt、strength、output | image artifacts | source image invalid、strength 越界 |
 | `image.inpaint` | image、mask、prompt、mask_semantics | image artifacts | mask 缺失、mask semantics 不兼容 |
 | `image.upscale` | image、scale、target size、preserve_faces | image artifact | 目标分辨率不满足、fallback 不能满足硬约束 |
@@ -593,6 +602,10 @@ test/aicc_test/reports/acceptance/<run_id>/
 | fixture 目录 | `test/aicc_test/fixtures`，必要时 Rust tests 内也保留最小 fixture | 固定图片、音频、视频、文档、mask、embedding 大批量输入 |
 | 报告 schema 固化 | `test/aicc_test/reports/acceptance` | 输出 `summary.json` 和 `summary.md`，方便 CI / 发布验收读取 |
 | 脱敏扫描 | runner 或独立检查脚本 | 扫描报告、trace、task data、日志摘要 |
+| 新 API 分层黑盒覆盖 | `src/frame/aicc/tests`、L2/L3 | `route.resolve`（拒绝 exact）、typed inference exact-only/no-fallback、`helper.*` 等价性、min_line admission、metadata resolver conservative fallback / variant lowering、session overlay inherit/replace 的黑盒用例（Phase 1–5 已落地，部分用例已在 Rust tests，需补 L2/L3 与 metadata 缺失启动用例） |
+| CLI 两阶段调试命令 | Agent CLI | `route.resolve` / `invoke exact_model` / `helper call` 调试命令尚未实现，是已知唯一未完成迁移项 |
+
+> 后端 Phase 1–5（新 API 边界、SDK/workflow 迁移、metadata resolver、逻辑模型定义+auto-mount、session overlay）已落地；Phase 6 远端 metadata 同步未开始（仅“更新通道”，不阻塞验收）。
 
 ## 23. 用例命名规范
 
@@ -607,8 +620,8 @@ test/aicc_test/reports/acceptance/<run_id>/
 | 字段 | 示例 |
 |---|---|
 | `layer` | `l1`、`l2`、`l3`、`l4` |
-| `domain` | `routing`、`scheduler`、`provider`、`protocol`、`resource`、`task`、`usage`、`security`、`settings`、`gateway` |
-| `feature` | `exact_model`、`fallback`、`stream_merge`、`reload_settings`、`named_object` |
+| `domain` | `routing`、`route_resolve`、`typed_inference`、`helper`、`metadata`、`overlay`、`scheduler`、`provider`、`protocol`、`resource`、`task`、`usage`、`security`、`settings`、`gateway` |
+| `feature` | `exact_model`、`fallback`、`min_line`、`auto_mount`、`variant_lowering`、`inherit`、`replace`、`stream_merge`、`reload_settings`、`named_object` |
 | `scenario` | `success`、`no_fallback`、`rate_limit`、`policy_rejected`、`conflict` |
 
 示例：
