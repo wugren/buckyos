@@ -91,6 +91,7 @@ const OPENAI_IMAGE_EDIT_OPTION_ALLOWLIST: &[&str] = &[
 pub struct OpenAIInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
+    pub api_token: String,
     pub base_url: String,
     pub auth_mode: String,
     pub timeout_ms: u64,
@@ -3124,6 +3125,12 @@ impl Provider for OpenAIProvider {
         }
     }
 
+    async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
+        self.refresh_inventory_once()
+            .await
+            .map_err(|err| ProviderError::retryable(err.to_string()))
+    }
+
     async fn start(
         &self,
         ctx: crate::aicc::InvokeCtx,
@@ -3581,6 +3588,8 @@ struct SettingsOpenAIInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_auth_mode")]
@@ -3758,6 +3767,7 @@ fn build_openai_instances(settings: &OpenAISettings) -> Result<Vec<OpenAIInstanc
         vec![SettingsOpenAIInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             auth_mode: default_auth_mode(),
             timeout_ms: default_timeout_ms(),
@@ -3771,6 +3781,11 @@ fn build_openai_instances(settings: &OpenAISettings) -> Result<Vec<OpenAIInstanc
         instances.push(OpenAIInstanceConfig {
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             auth_mode: raw_instance.auth_mode,
             timeout_ms: raw_instance.timeout_ms,
@@ -3895,10 +3910,12 @@ pub fn register_openai_llm_providers(center: &AIComputeCenter, settings: &Value)
         return Ok(0);
     };
     let instances = build_openai_instances(&openai_settings)?;
-    let api_token = openai_settings.api_token.trim().to_string();
     let mut prepared = Vec::<(OpenAIInstanceConfig, Arc<dyn Provider>)>::new();
     for config in instances.iter() {
-        let provider = Arc::new(OpenAIProvider::new(config.clone(), api_token.as_str())?);
+        let provider = Arc::new(OpenAIProvider::new(
+            config.clone(),
+            config.api_token.as_str(),
+        )?);
         provider.clone().start_inventory_refresh();
         prepared.push((config.clone(), provider));
     }
@@ -4438,6 +4455,7 @@ data: [DONE]
             instances: vec![SettingsOpenAIInstanceConfig {
                 provider_instance_name: "openai-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: String::new(),
                 base_url: default_base_url(),
                 auth_mode: default_auth_mode(),
                 timeout_ms: default_timeout_ms(),
@@ -4458,6 +4476,7 @@ data: [DONE]
             instances: vec![SettingsOpenAIInstanceConfig {
                 provider_instance_name: "sn-ai-provider-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: String::new(),
                 base_url: "https://sn.buckyos.ai/v1".to_string(),
                 auth_mode: DEVICE_JWT_AUTH_MODE.to_string(),
                 timeout_ms: default_timeout_ms(),
@@ -4475,6 +4494,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "sn-ai-provider-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: "token".to_string(),
                 base_url: "https://sn.buckyos.ai/api/v1/ai/chat/completions".to_string(),
                 auth_mode: "bearer".to_string(),
                 timeout_ms: default_timeout_ms(),
@@ -4491,6 +4511,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
                 timeout_ms: default_timeout_ms(),
@@ -4604,6 +4625,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
                 timeout_ms: default_timeout_ms(),
@@ -4805,6 +4827,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
                 timeout_ms: default_timeout_ms(),

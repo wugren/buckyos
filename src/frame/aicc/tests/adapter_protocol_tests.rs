@@ -14,6 +14,7 @@ fn openai_provider(base_url: String, timeout_ms: u64) -> OpenAIProvider {
         OpenAIInstanceConfig {
             provider_instance_name: "openai-test".to_string(),
             provider_type: "cloud_api".to_string(),
+            api_token: "token".to_string(),
             base_url,
             auth_mode: "bearer".to_string(),
             timeout_ms,
@@ -29,6 +30,7 @@ fn gimini_provider(base_url: String, timeout_ms: u64) -> GoogleGiminiProvider {
             provider_instance_name: "gimini-test".to_string(),
             provider_type: "cloud_api".to_string(),
             provider_driver: "google-gemini".to_string(),
+            api_token: "token".to_string(),
             base_url,
             timeout_ms,
             models: vec!["gemini-2.5-flash".to_string()],
@@ -49,6 +51,7 @@ fn claude_provider(base_url: String, timeout_ms: u64) -> ClaudeProvider {
             provider_instance_name: "claude-test".to_string(),
             provider_type: "cloud_api".to_string(),
             provider_driver: "claude".to_string(),
+            api_token: "token".to_string(),
             base_url,
             timeout_ms,
             models: vec!["claude-3-7-sonnet-20250219".to_string()],

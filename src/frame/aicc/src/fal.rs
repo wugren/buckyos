@@ -36,6 +36,7 @@ const DEFAULT_VIDEO_UPSCALE_MODEL: &str = "fal-ai/video-upscaler";
 pub struct FalInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub image_upscale_models: Vec<String>,
@@ -615,6 +616,8 @@ struct SettingsFalInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -685,6 +688,7 @@ fn build_fal_instances(settings: &FalSettings) -> Result<Vec<FalInstanceConfig>>
         vec![SettingsFalInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             image_upscale_models: vec![],
@@ -718,6 +722,11 @@ fn build_fal_instances(settings: &FalSettings) -> Result<Vec<FalInstanceConfig>>
         instances.push(FalInstanceConfig {
             provider_instance_name: raw.provider_instance_name,
             provider_type: raw.provider_type,
+            api_token: if raw.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw.api_token
+            },
             base_url: raw.base_url,
             timeout_ms: raw.timeout_ms,
             image_upscale_models,
@@ -734,18 +743,18 @@ pub fn register_fal_providers(center: &AIComputeCenter, settings: &Value) -> Res
         info!("aicc fal provider is disabled (settings.fal missing or disabled)");
         return Ok(0);
     };
-    if fal_settings.api_token.trim().is_empty() {
-        return Err(anyhow!(
-            "settings.fal.api_token (or api_key) is required when fal provider is enabled"
-        ));
-    }
-
     let instances = build_fal_instances(&fal_settings)?;
     info!("aicc fal registering instances={}", instances.len());
 
     let mut prepared = Vec::<(FalInstanceConfig, Arc<dyn Provider>)>::new();
     for config in instances.iter() {
-        let provider = FalProvider::new(config.clone(), fal_settings.api_token.clone())?;
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "fal instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
+        let provider = FalProvider::new(config.clone(), config.api_token.clone())?;
         prepared.push((config.clone(), Arc::new(provider)));
     }
 

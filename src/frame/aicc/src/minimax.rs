@@ -32,6 +32,7 @@ pub struct MiniMaxInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
     pub provider_driver: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
@@ -404,6 +405,8 @@ struct SettingsMiniMaxInstanceConfig {
     provider_type: String,
     #[serde(default = "default_provider_driver")]
     provider_driver: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -508,6 +511,7 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
             provider_driver: default_provider_driver(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             models: vec![],
@@ -545,6 +549,11 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
             provider_driver: raw_instance.provider_driver,
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             timeout_ms: raw_instance.timeout_ms,
             models,
@@ -620,13 +629,6 @@ pub fn register_minimax_providers(center: &AIComputeCenter, settings: &Value) ->
         info!("aicc minimax provider is disabled (settings.minimax missing or disabled)");
         return Ok(0);
     };
-    if minimax_settings.api_token.trim().is_empty() {
-        warn!("aicc minimax provider enabled but api_token is empty");
-        return Err(anyhow!(
-            "settings.minimax.api_token (or api_key) is required when minimax provider is enabled"
-        ));
-    }
-
     let instances = build_minimax_instances(&minimax_settings)?;
     info!(
         "aicc minimax registering instances={} default_models={:?}",
@@ -638,7 +640,13 @@ pub fn register_minimax_providers(center: &AIComputeCenter, settings: &Value) ->
     );
     let mut prepared = Vec::<(MiniMaxInstanceConfig, Arc<dyn Provider>)>::new();
     for config in instances.iter() {
-        let provider = MiniMaxProvider::new(config.clone(), minimax_settings.api_token.clone())?;
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "minimax instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
+        let provider = MiniMaxProvider::new(config.clone(), config.api_token.clone())?;
         prepared.push((config.clone(), Arc::new(provider)));
     }
 

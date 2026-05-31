@@ -37,6 +37,7 @@ pub struct ClaudeInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
     pub provider_driver: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
@@ -829,6 +830,12 @@ impl Provider for ClaudeProvider {
         }
     }
 
+    async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
+        self.refresh_inventory_once()
+            .await
+            .map_err(|err| ProviderError::retryable(err.to_string()))
+    }
+
     async fn start(
         &self,
         ctx: crate::aicc::InvokeCtx,
@@ -927,6 +934,8 @@ struct SettingsClaudeInstanceConfig {
     provider_type: String,
     #[serde(default = "default_provider_driver")]
     provider_driver: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -1116,6 +1125,7 @@ fn build_claude_instances(settings: &ClaudeSettings) -> Result<Vec<ClaudeInstanc
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
             provider_driver: default_provider_driver(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             models: vec![],
@@ -1153,6 +1163,11 @@ fn build_claude_instances(settings: &ClaudeSettings) -> Result<Vec<ClaudeInstanc
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
             provider_driver: raw_instance.provider_driver,
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             timeout_ms: raw_instance.timeout_ms,
             models,
@@ -1228,13 +1243,6 @@ pub fn register_claude_providers(center: &AIComputeCenter, settings: &Value) -> 
         info!("aicc claude provider is disabled (settings.claude missing or disabled)");
         return Ok(0);
     };
-    if claude_settings.api_token.trim().is_empty() {
-        warn!("aicc claude provider enabled but api_token is empty");
-        return Err(anyhow!(
-            "settings.claude.api_token (or api_key) is required when claude provider is enabled"
-        ));
-    }
-
     let instances = build_claude_instances(&claude_settings)?;
     info!(
         "aicc claude registering instances={} default_models={:?}",
@@ -1246,9 +1254,15 @@ pub fn register_claude_providers(center: &AIComputeCenter, settings: &Value) -> 
     );
     let mut prepared = Vec::<(ClaudeInstanceConfig, Arc<ClaudeProvider>)>::new();
     for config in instances.iter() {
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "claude instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
         let provider = Arc::new(ClaudeProvider::new(
             config.clone(),
-            claude_settings.api_token.clone(),
+            config.api_token.clone(),
         )?);
         provider.clone().start_inventory_refresh();
         prepared.push((config.clone(), provider));

@@ -81,6 +81,7 @@ pub struct GoogleGiminiInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
     pub provider_driver: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
@@ -2351,6 +2352,12 @@ impl Provider for GoogleGiminiProvider {
         }
     }
 
+    async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
+        self.refresh_inventory_once()
+            .await
+            .map_err(|err| ProviderError::retryable(err.to_string()))
+    }
+
     async fn start(
         &self,
         ctx: crate::aicc::InvokeCtx,
@@ -2467,6 +2474,8 @@ struct SettingsGoogleGiminiInstanceConfig {
     provider_type: String,
     #[serde(default = "default_provider_driver")]
     provider_driver: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -2778,6 +2787,7 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
             provider_driver: default_provider_driver(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             models: vec![],
@@ -2839,6 +2849,11 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
             ),
             provider_type: raw_instance.provider_type,
             provider_driver: normalize_legacy_gemini_driver(raw_instance.provider_driver),
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             timeout_ms: raw_instance.timeout_ms,
             models,
@@ -2971,18 +2986,18 @@ pub fn register_google_gimini_providers(
         info!("aicc google gimini provider is disabled (gimini settings missing or disabled)");
         return Ok(0);
     };
-    if gimini_settings.api_token.trim().is_empty() {
-        return Err(anyhow!(
-            "gimini.api_token (or api_key) is required when gimini provider is enabled"
-        ));
-    }
-
     let instances = build_gimini_instances(&gimini_settings)?;
     let mut prepared = Vec::<(GoogleGiminiInstanceConfig, Arc<GoogleGiminiProvider>)>::new();
     for config in instances.iter() {
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "gimini instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
         let provider = Arc::new(GoogleGiminiProvider::new(
             config.clone(),
-            gimini_settings.api_token.clone(),
+            config.api_token.clone(),
         )?);
         provider.clone().start_inventory_refresh();
         prepared.push((config.clone(), provider));
@@ -3243,6 +3258,7 @@ mod tests {
                 provider_instance_name: "gimini-1".to_string(),
                 provider_type: "cloud_api".to_string(),
                 provider_driver: "google-gimini".to_string(),
+                api_token: String::new(),
                 base_url: default_base_url(),
                 timeout_ms: default_timeout_ms(),
                 models: vec![

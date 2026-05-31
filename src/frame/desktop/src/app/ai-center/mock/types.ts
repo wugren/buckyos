@@ -260,6 +260,7 @@ export interface AIStatus {
 // ========== Wizard ==========
 
 export interface WizardDraft {
+  provider_instance_name?: string
   provider_type: ProviderType | null
   name: string
   endpoint: string

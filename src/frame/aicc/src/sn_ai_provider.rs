@@ -27,6 +27,8 @@ struct SettingsSnAIProviderInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_auth_mode")]
@@ -83,6 +85,7 @@ fn build_sn_ai_provider_instances(
         vec![SettingsSnAIProviderInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             auth_mode: default_auth_mode(),
             timeout_ms: default_timeout_ms(),
@@ -96,6 +99,11 @@ fn build_sn_ai_provider_instances(
         instances.push(OpenAIInstanceConfig {
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             auth_mode: raw_instance.auth_mode,
             timeout_ms: raw_instance.timeout_ms,
@@ -111,10 +119,12 @@ pub fn register_sn_ai_provider(center: &AIComputeCenter, settings: &Value) -> Re
         return Ok(0);
     };
     let instances = build_sn_ai_provider_instances(&sn_settings)?;
-    let api_token = sn_settings.api_token.trim().to_string();
     let mut prepared = Vec::<(OpenAIInstanceConfig, Arc<dyn Provider>)>::new();
     for config in instances.iter() {
-        let provider = Arc::new(OpenAIProvider::new(config.clone(), api_token.as_str())?);
+        let provider = Arc::new(OpenAIProvider::new(
+            config.clone(),
+            config.api_token.as_str(),
+        )?);
         provider.clone().start_inventory_refresh();
         prepared.push((config.clone(), provider));
     }
@@ -149,6 +159,7 @@ mod tests {
             instances: vec![SettingsSnAIProviderInstanceConfig {
                 provider_instance_name: "sn-ai-provider-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                api_token: String::new(),
                 base_url: "https://sn.buckyos.ai/api/v1/ai/".to_string(),
                 auth_mode: "device_jwt".to_string(),
                 timeout_ms: default_timeout_ms(),

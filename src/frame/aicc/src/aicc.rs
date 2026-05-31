@@ -1238,6 +1238,9 @@ pub trait Provider: Send + Sync {
         None
     }
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput;
+    async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
+        Ok(self.inventory())
+    }
     async fn start(
         &self,
         ctx: InvokeCtx,
@@ -2976,6 +2979,8 @@ impl AIComputeCenter {
                             "api_types": model.api_types,
                             "logical_mounts": model.logical_mounts,
                             "capabilities": model.capabilities,
+                            "attributes": model.attributes,
+                            "pricing": model.pricing,
                             "health": model.health.status,
                             "quota": model.health.quota_state,
                         })
@@ -2985,6 +2990,8 @@ impl AIComputeCenter {
                     "provider_instance_name": inventory.provider_instance_name,
                     "provider_driver": inventory.provider_driver,
                     "provider_type": inventory.provider_type,
+                    "provider_origin": inventory.provider_origin,
+                    "provider_type_revision": inventory.provider_type_revision,
                     "version": inventory.version,
                     "inventory_revision": inventory.inventory_revision,
                     "models": models_json,
@@ -3044,6 +3051,28 @@ impl AIComputeCenter {
                 err
             );
         }
+    }
+
+    pub async fn refresh_provider_inventory(
+        &self,
+        provider_instance_name: &str,
+    ) -> std::result::Result<ProviderInventory, RPCErrors> {
+        let provider = self
+            .registry
+            .get_provider(provider_instance_name)
+            .ok_or_else(|| reason_error("provider_not_found", "provider not found"))?;
+        let inventory = provider.refresh_inventory().await.map_err(|err| {
+            reason_error(
+                "provider_refresh_failed",
+                format!("refresh provider inventory failed: {}", err),
+            )
+        })?;
+        self.model_registry
+            .write()
+            .map_err(|_| reason_error("internal_error", "model registry lock poisoned"))?
+            .apply_inventory(inventory.clone())
+            .map_err(route_error_to_rpc)?;
+        Ok(inventory)
     }
 
     pub fn update_route_config(&self, new_cfg: RouteConfig) {
