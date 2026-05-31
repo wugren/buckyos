@@ -30,11 +30,15 @@ use buckyos_api::{
     TypedTaskData, AICC_SERVICE_SERVICE_NAME,
 };
 use log::{debug, error, info, warn};
-use ndn_lib::{ChunkHasher, FileObject, NamedObject, ObjId};
+use ndn_lib::{
+    load_named_object_from_obj_str, ChunkHasher, ChunkId, FileObject, NamedObject, ObjId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -980,6 +984,251 @@ impl ResourceResolver for PassthroughResourceResolver {
     ) -> std::result::Result<ResolvedRequest, RPCErrors> {
         Ok(ResolvedRequest::new(req.clone()))
     }
+}
+
+#[derive(Default)]
+pub struct NamedStoreResourceResolver;
+
+#[async_trait]
+impl ResourceResolver for NamedStoreResourceResolver {
+    async fn resolve(
+        &self,
+        _ctx: &InvokeCtx,
+        req: &AiMethodRequest,
+    ) -> std::result::Result<ResolvedRequest, RPCErrors> {
+        let mut resolved = req.clone();
+        for resource in resolved.payload.resources.iter_mut() {
+            self.resolve_resource_ref(resource).await?;
+        }
+        for message in resolved.payload.messages.iter_mut() {
+            for content in message.content.iter_mut() {
+                match content {
+                    AiContent::Image { source } | AiContent::Document { source, .. } => {
+                        self.resolve_resource_ref(source).await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(input_json) = resolved.payload.input_json.as_mut() {
+            self.resolve_resource_refs_in_value(input_json).await?;
+        }
+        Ok(ResolvedRequest::new(resolved))
+    }
+}
+
+impl NamedStoreResourceResolver {
+    async fn resolve_resource_ref(
+        &self,
+        resource: &mut ResourceRef,
+    ) -> std::result::Result<(), RPCErrors> {
+        let ResourceRef::NamedObject { obj_id } = resource else {
+            return Ok(());
+        };
+        let (mime, bytes) = load_named_object_resource(obj_id).await?;
+        *resource = ResourceRef::Base64 {
+            mime,
+            data_base64: general_purpose::STANDARD.encode(bytes),
+        };
+        Ok(())
+    }
+
+    fn resolve_resource_refs_in_value<'a>(
+        &'a self,
+        value: &'a mut Value,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), RPCErrors>> + Send + 'a>> {
+        Box::pin(async move {
+            match value {
+                Value::Object(object) => {
+                    if object
+                        .get("kind")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|kind| kind == "named_object")
+                    {
+                        let obj_id = object
+                            .get("obj_id")
+                            .and_then(|value| value.as_str())
+                            .ok_or_else(|| {
+                                reason_error("resource_invalid", "named_object obj_id is missing")
+                            })?;
+                        let obj_id = ObjId::new(obj_id).map_err(|error| {
+                            reason_error(
+                                "resource_invalid",
+                                format!("named_object obj_id is invalid: {}", error),
+                            )
+                        })?;
+                        let mut resource = ResourceRef::NamedObject { obj_id };
+                        self.resolve_resource_ref(&mut resource).await?;
+                        *value = serde_json::to_value(resource).map_err(|error| {
+                            reason_error(
+                                "resource_invalid",
+                                format!("serialize resolved resource failed: {}", error),
+                            )
+                        })?;
+                        return Ok(());
+                    }
+                    for child in object.values_mut() {
+                        self.resolve_resource_refs_in_value(child).await?;
+                    }
+                }
+                Value::Array(items) => {
+                    for child in items {
+                        self.resolve_resource_refs_in_value(child).await?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn load_named_object_resource(
+    obj_id: &ObjId,
+) -> std::result::Result<(String, Vec<u8>), RPCErrors> {
+    let runtime = get_buckyos_api_runtime().map_err(|error| {
+        reason_error(
+            "resource_invalid",
+            format!("get buckyos runtime failed: {}", error),
+        )
+    })?;
+    let named_store = runtime.get_named_store().await.map_err(|error| {
+        reason_error(
+            "resource_invalid",
+            format!("get named_store failed: {}", error),
+        )
+    })?;
+
+    if obj_id.is_chunk() {
+        let chunk_id = ChunkId::from_obj_id(obj_id);
+        let bytes = named_store
+            .get_chunk_data(&chunk_id)
+            .await
+            .map_err(|error| {
+                reason_error(
+                    "resource_invalid",
+                    format!("read named_object chunk {} failed: {}", obj_id, error),
+                )
+            })?;
+        return Ok((infer_mime_from_bytes(&bytes), bytes));
+    }
+
+    let object_str = named_store.get_object(obj_id).await.map_err(|error| {
+        reason_error(
+            "resource_invalid",
+            format!("read named_object {} failed: {}", obj_id, error),
+        )
+    })?;
+    let object_json = serde_json::from_str::<Value>(object_str.as_str())
+        .or_else(|_| load_named_object_from_obj_str(object_str.as_str()))
+        .map_err(|error| {
+            reason_error(
+                "resource_invalid",
+                format!("parse named_object {} failed: {}", obj_id, error),
+            )
+        })?;
+    let file_object = serde_json::from_value::<FileObject>(object_json.clone()).ok();
+    let chunk_ids = runtime
+        .get_chunklist_from_known_named_object(obj_id, &object_json)
+        .await
+        .or_else(|_| {
+            file_object
+                .as_ref()
+                .and_then(|file| ObjId::new(file.content.as_str()).ok())
+                .filter(|content_id| content_id.is_chunk())
+                .map(|content_id| vec![ChunkId::from_obj_id(&content_id)])
+                .ok_or_else(|| {
+                    reason_error(
+                        "resource_invalid",
+                        format!(
+                            "named_object {} does not point to readable chunk data",
+                            obj_id
+                        ),
+                    )
+                })
+        })?;
+
+    let mut bytes = Vec::new();
+    for chunk_id in chunk_ids {
+        let mut chunk_bytes = named_store
+            .get_chunk_data(&chunk_id)
+            .await
+            .map_err(|error| {
+                reason_error(
+                    "resource_invalid",
+                    format!(
+                        "read named_object {} chunk {} failed: {}",
+                        obj_id,
+                        chunk_id.to_string(),
+                        error
+                    ),
+                )
+            })?;
+        bytes.append(&mut chunk_bytes);
+    }
+
+    let mime = file_object
+        .as_ref()
+        .and_then(|file| file_object_mime(file))
+        .unwrap_or_else(|| infer_mime_from_bytes(&bytes));
+    Ok((mime, bytes))
+}
+
+fn file_object_mime(file: &FileObject) -> Option<String> {
+    for key in ["mime_type", "media_type", "content_type"] {
+        if let Some(mime) = file
+            .meta
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(mime.to_string());
+        }
+    }
+    infer_mime_from_name(file.name.as_str())
+}
+
+fn infer_mime_from_name(name: &str) -> Option<String> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png".to_string()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "mp3" => Some("audio/mpeg".to_string()),
+        "wav" => Some("audio/wav".to_string()),
+        "ogg" => Some("audio/ogg".to_string()),
+        "mp4" => Some("video/mp4".to_string()),
+        "json" => Some("application/json".to_string()),
+        "txt" => Some("text/plain".to_string()),
+        _ => None,
+    }
+}
+
+fn infer_mime_from_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".to_string();
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return "image/jpeg".to_string();
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp".to_string();
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif".to_string();
+    }
+    if bytes.starts_with(b"ID3") || bytes.starts_with(b"\xff\xfb") {
+        return "audio/mpeg".to_string();
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return "audio/wav".to_string();
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return "video/mp4".to_string();
+    }
+    "application/octet-stream".to_string()
 }
 
 #[async_trait]

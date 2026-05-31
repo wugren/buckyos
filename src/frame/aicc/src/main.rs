@@ -36,7 +36,7 @@ use log::{error, info, warn};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::aicc::AIComputeCenter;
+use crate::aicc::{AIComputeCenter, NamedStoreResourceResolver};
 use crate::aicc_usage_log_db::AiccUsageLogDb;
 use crate::claude::register_claude_providers;
 use crate::fal::register_fal_providers;
@@ -304,6 +304,7 @@ pub async fn start_aicc_service(mut center: AIComputeCenter) -> Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("init task-manager client for aicc failed: {}", err))?;
     center.set_task_manager_client(Arc::new(taskmgr));
+    center.set_resource_resolver(Arc::new(NamedStoreResourceResolver));
 
     let settings = match runtime.get_my_settings().await {
         Ok(settings) => settings,
