@@ -29,7 +29,9 @@ use http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use http::{Method, StatusCode, Version};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use log::info;
-use named_store::{NamedDataMgrZoneGateway, NdmZoneGatewayConfig};
+use named_store::{
+    NamedDataMgrNodeGateway, NamedDataMgrZoneGateway, NdmNodeGatewayConfig, NdmZoneGatewayConfig,
+};
 use serde_json::*;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -216,6 +218,7 @@ struct ControlPanelServer {
     file_manager: Arc<file_manager::BuckyFileServer>,
     app_installer: app_installer::AppInstaller,
     ndm_gateway: Option<Arc<NamedDataMgrZoneGateway>>,
+    ndm_read_gateway: Option<Arc<NamedDataMgrNodeGateway>>,
 }
 
 impl ControlPanelServer {
@@ -246,6 +249,7 @@ impl ControlPanelServer {
             file_manager,
             app_installer: app_installer::AppInstaller::new(),
             ndm_gateway: None,
+            ndm_read_gateway: None,
         }
     }
 
@@ -1190,15 +1194,18 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
                 .get_cache_folder()
                 .unwrap_or_else(|_| get_buckyos_root_dir().join("cache").join("control-panel"))
                 .join("ndm_upload_cache");
+            let store_mgr = Arc::new(store_mgr);
             let ndm_config = NdmZoneGatewayConfig {
                 cache_dir: ndm_cache_dir,
                 ..Default::default()
             };
-            let ndm_gw = Arc::new(NamedDataMgrZoneGateway::new(
-                Arc::new(store_mgr),
-                ndm_config,
+            let ndm_gw = Arc::new(NamedDataMgrZoneGateway::new(store_mgr.clone(), ndm_config));
+            let ndm_read_gw = Arc::new(NamedDataMgrNodeGateway::new(
+                store_mgr,
+                NdmNodeGatewayConfig::default(),
             ));
             control_panel_server.ndm_gateway = Some(ndm_gw);
+            control_panel_server.ndm_read_gateway = Some(ndm_read_gw);
             info!("NDM zone gateway initialized");
         }
         Err(e) => {
@@ -1228,6 +1235,10 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
     if let Some(ref ndm_gw) = control_panel_server.ndm_gateway {
         let _ = runner.add_http_server("/ndm".to_string(), ndm_gw.clone());
         info!("NDM zone gateway registered at /ndm");
+    }
+    if let Some(ref ndm_read_gw) = control_panel_server.ndm_read_gateway {
+        let _ = runner.add_http_server("/ndm/proxy/v1/read".to_string(), ndm_read_gw.clone());
+        info!("NDM read proxy gateway registered at /ndm/proxy/v1/read");
     }
 
     // 添加 web (best-effort, skip if path cannot be resolved)

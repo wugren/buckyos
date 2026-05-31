@@ -30,6 +30,7 @@ interface ProviderCardProps {
 export function ProviderCard({ provider, selected, onClick }: ProviderCardProps) {
   const Icon = providerIcons[provider.config.provider_type] ?? Server
   const modelCount = provider.status.discovered_models.length
+  const degradedCount = provider.status.discovered_models.filter((m) => m.health.status !== 'available').length
 
   return (
     <button
@@ -45,10 +46,13 @@ export function ProviderCard({ provider, selected, onClick }: ProviderCardProps)
         <div className="text-sm font-medium truncate" style={{ color: 'var(--cp-text)' }}>
           {provider.config.name}
         </div>
+        <div className="text-[11px] truncate" style={{ color: 'var(--cp-muted)' }}>
+          {provider.config.provider_instance_name} · {provider.config.provider_driver}
+        </div>
       </div>
       <StatusBadge status={authStatusToVariant(provider.status.auth_status)} />
       <span className="text-xs" style={{ color: 'var(--cp-muted)' }}>
-        {modelCount}
+        {modelCount}{degradedCount > 0 ? `/${degradedCount}` : ''}
       </span>
     </button>
   )

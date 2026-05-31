@@ -1,8 +1,11 @@
 import type {
   AIStatus,
-  LogicalModelConfig,
+  ApiNamespace,
   LocalModel,
+  ModelMetadata,
   ProviderView,
+  RouteTrace,
+  SessionConfig,
   StoreSnapshot,
   UsageEvent,
   UsageSummary,
@@ -10,30 +13,58 @@ import type {
   ValidationResult,
   WizardDraft,
 } from './types'
-import { getEmptySeed, getPopulatedSeed } from './seed'
+import { getEmptySeed, getPopulatedSeed, model } from './seed'
 
 function getScenarioFromURL(): 'empty' | 'populated' {
   const params = new URLSearchParams(window.location.search)
   return params.get('scenario') === 'populated' ? 'populated' : 'empty'
 }
 
-// Model lists returned by validateConnection per provider type
+function namespaceFromApiType(apiType: string): ApiNamespace {
+  if (apiType === 'rerank') return 'rerank'
+  const namespace = apiType.split('.')[0]
+  if (
+    namespace === 'llm' ||
+    namespace === 'embedding' ||
+    namespace === 'image' ||
+    namespace === 'vision' ||
+    namespace === 'audio' ||
+    namespace === 'video' ||
+    namespace === 'agent'
+  ) {
+    return namespace
+  }
+  return 'llm'
+}
+
 const discoveredModelsByType: Record<string, string[]> = {
-  sn_router: ['llm-chat-standard', 'llm-chat-advanced', 'llm-code', 'txt2img-standard'],
-  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'dall-e-3', 'dall-e-2', 'whisper-1', 'tts-1', 'tts-1-hd', 'text-embedding-3-large', 'text-embedding-3-small', 'text-embedding-ada-002'],
-  anthropic: ['claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku'],
-  google: ['gemini-pro', 'gemini-pro-vision', 'gemini-ultra'],
-  openrouter: ['openrouter/auto', 'openrouter/gpt-4o', 'openrouter/claude-3-sonnet'],
-  custom: ['model-a', 'model-b'],
+  sn_router: ['sn-router-balanced@sn-router', 'sn-router-image@sn-router'],
+  openai: ['gpt-5.1@openai-main', 'gpt-5.1-mini@openai-main', 'text-embedding-3-large@openai-main'],
+  anthropic: ['claude-opus-4.7@anthropic-work', 'claude-sonnet-4.5@anthropic-work'],
+  google: ['gemini-2.5-pro@google-main', 'gemini-2.5-flash@google-main'],
+  openrouter: ['openrouter-auto@openrouter-main', 'deepseek-r1@openrouter-main'],
+  custom: ['custom-chat-model@custom-provider', 'custom-embedding@custom-provider'],
+}
+
+function modelsForDraft(draft: WizardDraft, instanceName: string): ModelMetadata[] {
+  const names = discoveredModelsByType[draft.provider_type ?? 'custom'] ?? []
+  return names.map((exactName) => {
+    const providerModelId = exactName.split('@')[0] ?? exactName
+    const apiTypes = providerModelId.includes('embedding') ? ['embedding.text' as const] : ['llm.chat' as const]
+    const mount = providerModelId.includes('embedding') ? 'embedding.large' : `llm.${draft.provider_type ?? 'custom'}`
+    return model(providerModelId, instanceName, [mount], apiTypes)
+  })
 }
 
 export class MockDataStore {
   private providers: Map<string, ProviderView>
   private usageEvents: UsageEvent[]
-  private logicalModels: LogicalModelConfig[]
+  private sessionConfig: SessionConfig
+  private routeTraces: RouteTrace[]
   private localModels: LocalModel[]
   private snapshot: StoreSnapshot
   private usageSummary: UsageSummary
+  private usageTrend: UsageTrendPoint[]
   private listeners: Set<() => void> = new Set()
   private snapshotVersion = 0
 
@@ -43,13 +74,13 @@ export class MockDataStore {
 
     this.providers = new Map(seed.providers.map((p) => [p.config.id, p]))
     this.usageEvents = seed.usageEvents
-    this.logicalModels = seed.logicalModels
+    this.sessionConfig = seed.sessionConfig
+    this.routeTraces = seed.routeTraces
     this.localModels = seed.localModels
     this.snapshot = this.buildSnapshot()
     this.usageSummary = this.computeUsageSummary()
+    this.usageTrend = this.computeUsageTrend()
   }
-
-  // ---- Subscription (useSyncExternalStore compatible) ----
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -65,6 +96,7 @@ export class MockDataStore {
   private notify() {
     this.snapshot = this.buildSnapshot()
     this.usageSummary = this.computeUsageSummary()
+    this.usageTrend = this.computeUsageTrend()
     this.snapshotVersion++
     this.listeners.forEach((fn) => fn())
   }
@@ -73,34 +105,44 @@ export class MockDataStore {
     return {
       providers: Array.from(this.providers.values()),
       usageEvents: this.usageEvents,
-      logicalModels: this.logicalModels,
+      sessionConfig: this.sessionConfig,
+      routeTraces: this.routeTraces,
       localModels: this.localModels,
       aiStatus: this.computeAIStatus(),
     }
   }
 
-  // ---- Provider Operations ----
+  private allModels(): ModelMetadata[] {
+    return [
+      ...Array.from(this.providers.values()).flatMap((p) => p.status.discovered_models),
+      ...this.localModels,
+    ]
+  }
 
   private computeAIStatus(): AIStatus {
     const providers = Array.from(this.providers.values())
-    const count = providers.length
-    const modelCount = providers.reduce(
-      (sum, p) => sum + p.status.discovered_models.length,
-      0,
-    )
-    const hasRouting = this.logicalModels.some(
-      (lm) => lm.resolved_model !== undefined,
-    )
+    const cloudProviderCount = providers.filter((p) => p.config.provider_runtime_type === 'cloud_api' || p.config.provider_runtime_type === 'proxy_unknown').length
+    const models = this.allModels()
+    const hasProviderOrModel = cloudProviderCount > 0 || models.length > 0
+    const healthCounts = {
+      available: models.filter((m) => m.health.status === 'available').length,
+      degraded: models.filter((m) => m.health.status === 'degraded').length,
+      unavailable: models.filter((m) => m.health.status === 'unavailable').length,
+    }
+    const quotaWarnings = models.filter((m) => m.health.quota_state === 'near_limit' || m.health.quota_state === 'exhausted').length
 
     let state: AIStatus['state'] = 'disabled'
-    if (count === 1) state = 'single_provider'
-    else if (count > 1) state = 'multi_provider'
+    if (cloudProviderCount === 1) state = 'single_provider'
+    else if (cloudProviderCount > 1 || (hasProviderOrModel && models.length > 1)) state = 'multi_provider'
 
     return {
       state,
-      provider_count: count,
-      model_count: modelCount,
-      default_routing_ok: hasRouting,
+      provider_count: cloudProviderCount,
+      model_count: models.length,
+      default_routing_ok: this.sessionConfig.logical_tree.length > 0,
+      health_counts: healthCounts,
+      quota_warnings: quotaWarnings,
+      inventory_ok: providers.every((p) => p.status.model_sync_status === 'ok'),
     }
   }
 
@@ -118,37 +160,54 @@ export class MockDataStore {
 
   addProvider(draft: WizardDraft): ProviderView {
     const id = `provider-${Date.now()}`
-    const models = discoveredModelsByType[draft.provider_type ?? 'custom'] ?? []
+    const providerType = draft.provider_type ?? 'custom'
+    const instanceName = `${providerType}-${Date.now().toString(36)}`
+    const models = modelsForDraft(draft, instanceName)
+    const isSnRouter = providerType === 'sn_router'
 
     const view: ProviderView = {
       config: {
         id,
-        name: draft.name || (draft.provider_type ?? 'Custom'),
-        provider_type: draft.provider_type ?? 'custom',
-        auth_mode: draft.api_key ? 'api_key' : undefined,
+        name: draft.name || providerType,
+        provider_type: providerType,
+        provider_instance_name: instanceName,
+        provider_runtime_type: isSnRouter ? 'proxy_unknown' : 'cloud_api',
+        provider_driver: isSnRouter ? 'sn' : providerType,
+        provider_origin: isSnRouter ? 'builtin' : 'user_config',
+        auth_mode: draft.api_key ? 'api_key' : 'oauth',
         endpoint: draft.endpoint || undefined,
         protocol_type: draft.protocol_type ?? undefined,
         auto_sync_models: draft.auto_sync_models,
         created_at: new Date().toISOString(),
+      },
+      inventory: {
+        provider_instance_name: instanceName,
+        provider_type: isSnRouter ? 'proxy_unknown' : 'cloud_api',
+        provider_driver: isSnRouter ? 'sn' : providerType,
+        provider_origin: isSnRouter ? 'builtin' : 'user_config',
+        inventory_revision: `${instanceName}-rev-now`,
+        version: 'mock',
+        models,
       },
       status: {
         provider_id: id,
         is_connected: true,
         auth_status: 'ok',
         usage_supported: true,
-        balance_supported: draft.provider_type !== 'custom',
+        balance_supported: providerType !== 'custom',
         discovered_models: models,
         model_sync_status: 'ok',
         last_verified_at: new Date().toISOString(),
         last_model_sync_at: new Date().toISOString(),
       },
       account: {
-        provider_id: id,
+        provider_instance_name: instanceName,
         usage_supported: true,
-        cost_supported: draft.provider_type !== 'sn_router',
-        balance_supported: draft.provider_type !== 'custom',
-        balance_unit: draft.provider_type === 'sn_router' ? 'credit' : 'usd',
-        balance_value: draft.provider_type === 'sn_router' ? 500 : undefined,
+        cost_supported: !isSnRouter,
+        balance_supported: providerType !== 'custom',
+        pricing_mode: isSnRouter ? 'free_quota' : 'per_token',
+        balance_unit: isSnRouter ? 'credit' : 'usd',
+        balance_value: isSnRouter ? 500 : undefined,
       },
     }
 
@@ -163,11 +222,8 @@ export class MockDataStore {
   }
 
   refreshProviderModels(_id: string): void {
-    // noop in mock
     this.notify()
   }
-
-  // ---- Wizard Simulation ----
 
   validateConnection(draft: WizardDraft): ValidationResult {
     const errors: string[] = []
@@ -198,8 +254,6 @@ export class MockDataStore {
     }
   }
 
-  // ---- Usage ----
-
   getUsageSummary(): UsageSummary {
     return this.usageSummary
   }
@@ -209,9 +263,19 @@ export class MockDataStore {
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
 
-    const byCategory: Record<string, number> = { text: 0, image: 0, audio: 0, video: 0 }
+    const byApiNamespace: Record<ApiNamespace, number> = {
+      llm: 0,
+      embedding: 0,
+      rerank: 0,
+      image: 0,
+      vision: 0,
+      audio: 0,
+      video: 0,
+      agent: 0,
+    }
     const byProvider: Record<string, number> = {}
     const byModel: Record<string, number> = {}
+    const byApp: Record<string, number> = {}
 
     let totalTokens = 0
     let totalRequests = 0
@@ -220,8 +284,9 @@ export class MockDataStore {
     let monthTokens = 0
 
     for (const evt of this.usageEvents) {
-      const tokens = evt.tokens_in + evt.tokens_out
+      const tokens = evt.token_equivalent ?? (evt.tokens_in ?? 0) + (evt.tokens_out ?? 0)
       const ts = new Date(evt.timestamp).getTime()
+      const namespace = namespaceFromApiType(evt.api_type)
 
       totalTokens += tokens
       totalRequests++
@@ -230,9 +295,10 @@ export class MockDataStore {
       if (ts >= todayStart) todayTokens += tokens
       if (ts >= monthStart) monthTokens += tokens
 
-      byCategory[evt.category] = (byCategory[evt.category] ?? 0) + tokens
-      byProvider[evt.provider_id] = (byProvider[evt.provider_id] ?? 0) + tokens
-      byModel[evt.model_name] = (byModel[evt.model_name] ?? 0) + tokens
+      byApiNamespace[namespace] = (byApiNamespace[namespace] ?? 0) + tokens
+      byProvider[evt.provider_instance_name] = (byProvider[evt.provider_instance_name] ?? 0) + tokens
+      byModel[evt.exact_model] = (byModel[evt.exact_model] ?? 0) + tokens
+      byApp[evt.app_id ?? 'system'] = (byApp[evt.app_id ?? 'system'] ?? 0) + tokens
     }
 
     return {
@@ -241,14 +307,18 @@ export class MockDataStore {
       total_estimated_cost: Number(totalCost.toFixed(2)),
       today_tokens: todayTokens,
       this_month_tokens: monthTokens,
-      by_category: byCategory as UsageSummary['by_category'],
+      by_api_namespace: byApiNamespace,
       by_provider: byProvider,
       by_model: byModel,
+      by_app: byApp,
     }
   }
 
   getUsageTrend(_granularity: string): UsageTrendPoint[] {
-    // Simplified: group by day over past 30 days
+    return this.usageTrend
+  }
+
+  private computeUsageTrend(): UsageTrendPoint[] {
     const now = Date.now()
     const day = 24 * 60 * 60 * 1000
     const points: UsageTrendPoint[] = []
@@ -262,51 +332,40 @@ export class MockDataStore {
       for (const evt of this.usageEvents) {
         const ts = new Date(evt.timestamp).getTime()
         if (ts >= dayStart && ts < dayEnd) {
-          tokens += evt.tokens_in + evt.tokens_out
+          tokens += evt.token_equivalent ?? (evt.tokens_in ?? 0) + (evt.tokens_out ?? 0)
           cost += evt.estimated_cost ?? 0
         }
       }
 
       points.push({
-        timestamp: new Date(dayEnd).toISOString().slice(0, 10),
+        timestamp: new Date(dayEnd).toISOString().slice(5, 10),
         tokens,
         estimated_cost: Number(cost.toFixed(4)),
       })
     }
-
     return points
   }
 
-  getUsageEvents(filters?: { provider_id?: string; model?: string }): UsageEvent[] {
+  getUsageEvents(filters?: { provider_instance_name?: string; model?: string }): UsageEvent[] {
     let events = this.usageEvents
-    if (filters?.provider_id) {
-      events = events.filter((e) => e.provider_id === filters.provider_id)
+    if (filters?.provider_instance_name) {
+      events = events.filter((e) => e.provider_instance_name === filters.provider_instance_name)
     }
     if (filters?.model) {
-      events = events.filter((e) => e.model_name === filters.model)
+      events = events.filter((e) => e.exact_model === filters.model)
     }
     return events
   }
-
-  // ---- Models ----
 
   getLocalModels(): LocalModel[] {
     return this.localModels
   }
 
-  // ---- Routing ----
-
-  getLogicalModels(): LogicalModelConfig[] {
-    return this.logicalModels
+  getSessionConfig(): SessionConfig {
+    return this.sessionConfig
   }
 
-  updateLogicalModel(name: string, config: LogicalModelConfig): void {
-    const idx = this.logicalModels.findIndex((m) => m.name === name)
-    if (idx >= 0) {
-      this.logicalModels[idx] = config
-    } else {
-      this.logicalModels.push(config)
-    }
-    this.notify()
+  getRouteTraces(): RouteTrace[] {
+    return this.routeTraces
   }
 }

@@ -1,216 +1,726 @@
 import type {
-  ProviderView,
-  UsageEvent,
-  LogicalModelConfig,
+  ApiType,
   LocalModel,
-  UsageCategory,
+  LogicalNode,
+  ModelMetadata,
+  ProviderType,
+  ProviderView,
+  RouteTrace,
+  SchedulerProfile,
+  SessionConfig,
+  UsageEvent,
 } from './types'
 
-// ========== Provider Seeds ==========
+function model(
+  providerModelId: string,
+  providerInstanceName: string,
+  mounts: string[],
+  apiTypes: ApiType[],
+  overrides: Partial<ModelMetadata> = {},
+): ModelMetadata {
+  const exactModel = `${providerModelId}@${providerInstanceName}`
 
-const snRouterProvider: ProviderView = {
-  config: {
-    id: 'sn-router-1',
-    name: 'SN Router',
-    provider_type: 'sn_router',
-    auto_sync_models: true,
-    created_at: '2025-11-01T08:00:00Z',
-  },
-  status: {
-    provider_id: 'sn-router-1',
-    is_connected: true,
-    auth_status: 'ok',
-    usage_supported: true,
-    balance_supported: true,
-    discovered_models: [
-      'llm-chat-standard',
-      'llm-chat-advanced',
-      'llm-code',
-      'txt2img-standard',
-    ],
-    model_sync_status: 'ok',
-    last_verified_at: '2025-12-15T10:30:00Z',
-    last_model_sync_at: '2025-12-15T10:30:00Z',
-  },
-  account: {
-    provider_id: 'sn-router-1',
-    usage_supported: true,
-    cost_supported: false,
-    balance_supported: true,
-    balance_unit: 'credit',
-    balance_value: 500,
-    usage_value: 234567,
-  },
+  return {
+    provider_model_id: providerModelId,
+    exact_model: exactModel,
+    logical_mounts: mounts,
+    api_types: apiTypes,
+    capabilities: {
+      streaming: apiTypes.some((t) => t.startsWith('llm.')),
+      tool_call: apiTypes.some((t) => t.startsWith('llm.')),
+      json_schema: apiTypes.some((t) => t.startsWith('llm.')),
+      web_search: false,
+      vision: apiTypes.some((t) => t.startsWith('vision.') || t === 'llm.chat'),
+      max_context_tokens: 128000,
+      max_output_tokens: 8192,
+    },
+    attributes: {
+      local: providerInstanceName === 'local',
+      privacy: providerInstanceName === 'local' ? 'local' : 'public_cloud',
+      quality_score: 82,
+      latency_class: 'normal',
+      cost_class: 'medium',
+      tier: 'mid',
+    },
+    pricing: {
+      input_token_usd: 0.000003,
+      output_token_usd: 0.000012,
+    },
+    health: {
+      status: 'available',
+      p50_latency_ms: 760,
+      p95_latency_ms: 2100,
+      error_rate_5m: 0.006,
+      quota_state: 'normal',
+    },
+    ...overrides,
+  }
 }
 
-const openaiProvider: ProviderView = {
-  config: {
-    id: 'openai-1',
-    name: 'OpenAI',
-    provider_type: 'openai',
-    auth_mode: 'api_key',
+const snModels = [
+  model('sn-router-balanced', 'sn-router', ['llm.chat', 'llm.fallback'], ['llm.chat'], {
+    attributes: {
+      local: false,
+      privacy: 'private_safe',
+      quality_score: 78,
+      latency_class: 'fast',
+      cost_class: 'low',
+      tier: 'mid',
+    },
+    health: {
+      status: 'available',
+      p50_latency_ms: 420,
+      p95_latency_ms: 980,
+      error_rate_5m: 0.004,
+      quota_state: 'normal',
+    },
+  }),
+  model('sn-router-image', 'sn-router', ['image.txt2img'], ['image.txt2img'], {
+    attributes: {
+      local: false,
+      privacy: 'private_safe',
+      quality_score: 74,
+      latency_class: 'normal',
+      cost_class: 'low',
+      tier: 'mid',
+    },
+  }),
+]
+
+const openaiModels = [
+  model('gpt-5.1', 'openai-main', ['llm.gpt-frontier', 'llm.code'], ['llm.chat'], {
+    parameter_scale: 'frontier',
+    capabilities: {
+      streaming: true,
+      tool_call: true,
+      json_schema: true,
+      web_search: true,
+      vision: true,
+      max_context_tokens: 256000,
+      max_output_tokens: 32768,
+    },
+    attributes: {
+      local: false,
+      privacy: 'public_cloud',
+      quality_score: 93,
+      latency_class: 'normal',
+      cost_class: 'high',
+      tier: 'flagship',
+    },
+    pricing: {
+      input_token_usd: 0.00001,
+      output_token_usd: 0.00004,
+      cache_input_token_usd: 0.0000025,
+    },
+  }),
+  model('gpt-5.1-mini', 'openai-main', ['llm.swift', 'llm.fallback'], ['llm.chat'], {
+    attributes: {
+      local: false,
+      privacy: 'public_cloud',
+      quality_score: 82,
+      latency_class: 'fast',
+      cost_class: 'low',
+      tier: 'nano',
+    },
+    pricing: {
+      input_token_usd: 0.0000015,
+      output_token_usd: 0.000006,
+      cache_input_token_usd: 0.0000004,
+    },
+  }),
+  model('text-embedding-3-large', 'openai-main', ['embedding.large'], ['embedding.text'], {
+    capabilities: {
+      streaming: false,
+      tool_call: false,
+      json_schema: false,
+      web_search: false,
+      vision: false,
+      max_context_tokens: 8192,
+    },
+    attributes: {
+      local: false,
+      privacy: 'public_cloud',
+      quality_score: 88,
+      latency_class: 'fast',
+      cost_class: 'low',
+      tier: 'mid',
+    },
+  }),
+]
+
+const anthropicModels = [
+  model('claude-opus-4.7', 'anthropic-work', ['llm.opus'], ['llm.chat'], {
+    parameter_scale: 'frontier',
+    attributes: {
+      local: false,
+      privacy: 'public_cloud',
+      quality_score: 95,
+      latency_class: 'slow',
+      cost_class: 'high',
+      tier: 'flagship',
+    },
+    health: {
+      status: 'degraded',
+      p50_latency_ms: 1340,
+      p95_latency_ms: 4800,
+      error_rate_5m: 0.036,
+      quota_state: 'near_limit',
+    },
+  }),
+  model('claude-sonnet-4.5', 'anthropic-work', ['llm.sonnet', 'llm.code'], ['llm.chat'], {
+    attributes: {
+      local: false,
+      privacy: 'public_cloud',
+      quality_score: 90,
+      latency_class: 'normal',
+      cost_class: 'medium',
+      tier: 'mid',
+    },
+    health: {
+      status: 'available',
+      p50_latency_ms: 920,
+      p95_latency_ms: 2400,
+      error_rate_5m: 0.01,
+      quota_state: 'normal',
+    },
+  }),
+]
+
+const localModels: LocalModel[] = [
+  {
+    id: 'local-qwen-coder',
+    name: 'Qwen Coder 32B',
+    size_bytes: 21.6 * 1024 * 1024 * 1024,
+    status: 'ready',
+    last_used_at: '2026-05-29T18:20:00Z',
+    ...model('qwen2.5-coder-32b', 'local', ['llm.local-code', 'llm.code'], ['llm.chat'], {
+      parameter_scale: '32B',
+      attributes: {
+        local: true,
+        privacy: 'local',
+        quality_score: 78,
+        latency_class: 'fast',
+        cost_class: 'low',
+        tier: 'mid',
+      },
+      pricing: {},
+      health: {
+        status: 'available',
+        p50_latency_ms: 180,
+        p95_latency_ms: 520,
+        error_rate_5m: 0.002,
+        quota_state: 'normal',
+      },
+    }),
+  },
+  {
+    id: 'local-embed',
+    name: 'BGE M3 Embedding',
+    size_bytes: 2.2 * 1024 * 1024 * 1024,
+    status: 'loading',
+    ...model('bge-m3', 'local', ['embedding.local'], ['embedding.text'], {
+      parameter_scale: '567M',
+      capabilities: {
+        streaming: false,
+        tool_call: false,
+        json_schema: false,
+        web_search: false,
+        vision: false,
+        max_context_tokens: 8192,
+      },
+      attributes: {
+        local: true,
+        privacy: 'local',
+        quality_score: 76,
+        latency_class: 'fast',
+        cost_class: 'low',
+        tier: 'nano',
+      },
+      pricing: {},
+      health: {
+        status: 'degraded',
+        p50_latency_ms: 210,
+        p95_latency_ms: 900,
+        error_rate_5m: 0.018,
+        quota_state: 'unknown',
+      },
+    }),
+  },
+]
+
+function provider(
+  id: string,
+  name: string,
+  providerType: ProviderType,
+  instanceName: string,
+  driver: string,
+  models: ModelMetadata[],
+  options: {
+    connected?: boolean
+    authStatus?: 'ok' | 'expired' | 'invalid' | 'unknown'
+    balanceUnit?: 'usd' | 'credit'
+    balanceValue?: number
+    estimatedCost?: number
+    pricingMode?: 'per_token' | 'subscription' | 'free_quota' | 'unknown'
+    endpoint?: string
+    syncStatus?: 'ok' | 'syncing' | 'failed'
+  } = {},
+): ProviderView {
+  return {
+    config: {
+      id,
+      name,
+      provider_type: providerType,
+      provider_instance_name: instanceName,
+      provider_runtime_type: providerType === 'sn_router' ? 'proxy_unknown' : 'cloud_api',
+      provider_driver: driver,
+      provider_origin: providerType === 'sn_router' ? 'builtin' : 'user_config',
+      auth_mode: providerType === 'sn_router' ? 'oauth' : 'api_key',
+      endpoint: options.endpoint,
+      auto_sync_models: true,
+      created_at: '2026-05-20T08:00:00Z',
+    },
+    inventory: {
+      provider_instance_name: instanceName,
+      provider_type: providerType === 'sn_router' ? 'proxy_unknown' : 'cloud_api',
+      provider_driver: driver,
+      provider_origin: providerType === 'sn_router' ? 'builtin' : 'user_config',
+      inventory_revision: `${instanceName}-rev-20260529`,
+      version: '2026.05',
+      models,
+    },
+    status: {
+      provider_id: id,
+      is_connected: options.connected ?? true,
+      auth_status: options.authStatus ?? 'ok',
+      usage_supported: true,
+      balance_supported: options.balanceValue !== undefined,
+      discovered_models: models,
+      model_sync_status: options.syncStatus ?? 'ok',
+      last_verified_at: '2026-05-30T09:16:00Z',
+      last_model_sync_at: '2026-05-30T09:12:00Z',
+    },
+    account: {
+      provider_instance_name: instanceName,
+      usage_supported: true,
+      cost_supported: options.estimatedCost !== undefined,
+      balance_supported: options.balanceValue !== undefined,
+      pricing_mode: options.pricingMode ?? 'per_token',
+      balance_unit: options.balanceUnit,
+      balance_value: options.balanceValue,
+      estimated_cost: options.estimatedCost,
+      usage_value: 448920,
+    },
+  }
+}
+
+const providers = [
+  provider('sn-router-1', 'SN Router', 'sn_router', 'sn-router', 'sn', snModels, {
+    balanceUnit: 'credit',
+    balanceValue: 860,
+    pricingMode: 'free_quota',
+  }),
+  provider('openai-1', 'OpenAI Main Key', 'openai', 'openai-main', 'openai', openaiModels, {
+    balanceUnit: 'usd',
+    balanceValue: 38.25,
+    estimatedCost: 12.84,
     endpoint: 'https://api.openai.com',
-    auto_sync_models: true,
-    created_at: '2025-11-05T14:00:00Z',
-  },
-  status: {
-    provider_id: 'openai-1',
-    is_connected: true,
-    auth_status: 'ok',
-    usage_supported: true,
-    balance_supported: true,
-    discovered_models: [
-      'gpt-4o',
-      'gpt-4o-mini',
-      'gpt-4-turbo',
-      'gpt-3.5-turbo',
-      'dall-e-3',
-      'dall-e-2',
-      'whisper-1',
-      'tts-1',
-      'tts-1-hd',
-      'text-embedding-3-large',
-      'text-embedding-3-small',
-      'text-embedding-ada-002',
-    ],
-    model_sync_status: 'ok',
-    last_verified_at: '2025-12-15T09:00:00Z',
-    last_model_sync_at: '2025-12-15T09:00:00Z',
-  },
-  account: {
-    provider_id: 'openai-1',
-    usage_supported: true,
-    cost_supported: true,
-    balance_supported: true,
-    balance_unit: 'usd',
-    balance_value: 23.5,
-    estimated_cost: 8.72,
-    usage_value: 456789,
-  },
-}
-
-const anthropicProvider: ProviderView = {
-  config: {
-    id: 'anthropic-1',
-    name: 'Anthropic',
-    provider_type: 'anthropic',
-    auth_mode: 'api_key',
+  }),
+  provider('anthropic-1', 'Anthropic Work', 'anthropic', 'anthropic-work', 'anthropic', anthropicModels, {
+    connected: true,
+    authStatus: 'ok',
+    estimatedCost: 18.4,
     endpoint: 'https://api.anthropic.com',
-    auto_sync_models: true,
-    created_at: '2025-11-10T09:00:00Z',
-  },
-  status: {
-    provider_id: 'anthropic-1',
-    is_connected: false,
-    auth_status: 'expired',
-    usage_supported: true,
-    balance_supported: false,
-    discovered_models: [
-      'claude-3-opus',
-      'claude-3-sonnet',
-      'claude-3-haiku',
-    ],
-    model_sync_status: 'failed',
-    last_verified_at: '2025-12-10T08:00:00Z',
-    last_model_sync_at: '2025-12-10T08:00:00Z',
-  },
-  account: {
-    provider_id: 'anthropic-1',
-    usage_supported: true,
-    cost_supported: true,
-    balance_supported: false,
-    estimated_cost: 3.21,
-    usage_value: 123456,
-  },
+    syncStatus: 'failed',
+  }),
+]
+
+function exactNode(path: string, label: string, apiType: ApiType, resolved: boolean): LogicalNode {
+  return {
+    path,
+    label,
+    level: 'L1',
+    api_type: apiType,
+    exact_model_weights: {},
+    policy: { profile: 'balanced' },
+    resolved_exact_model: resolved ? path : undefined,
+  }
 }
 
-// ========== Usage Event Seeds ==========
+function mountNode(
+  path: string,
+  label: string,
+  apiType: ApiType,
+  resolvedExactModel: string | undefined,
+  children: LogicalNode[] = [],
+): LogicalNode {
+  return {
+    path,
+    label,
+    level: 'L2',
+    api_type: apiType,
+    exact_model_weights: {},
+    fallback: { mode: 'strict' },
+    policy: { profile: 'balanced', allow_fallback: false },
+    resolved_exact_model: resolvedExactModel,
+    children,
+  }
+}
+
+function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
+  const opusExact = 'claude-opus-4.7@anthropic-work'
+  const sonnetExact = 'claude-sonnet-4.5@anthropic-work'
+  const gptExact = 'gpt-5.1@openai-main'
+  const miniExact = 'gpt-5.1-mini@openai-main'
+  const localCodeExact = 'qwen2.5-coder-32b@local'
+  const embeddingExact = 'text-embedding-3-large@openai-main'
+  const localEmbeddingExact = 'bge-m3@local'
+  const imageExact = 'sn-router-image@sn-router'
+
+  return [
+    {
+      path: 'llm',
+      label: 'LLM namespace',
+      level: 'L3',
+      api_type: 'llm.chat',
+      exact_model_weights: {},
+      fallback: { mode: 'strict' },
+      policy: { profile: 'balanced', allow_fallback: true, runtime_failover: true },
+      resolved_exact_model: withPhysicalModels ? 'sn-router-balanced@sn-router' : undefined,
+      children: [
+        {
+          path: 'llm.plan',
+          label: 'Planning',
+          level: 'L3',
+          api_type: 'llm.chat',
+          items: {
+            opus: { target: 'llm.opus', weight: 2.5 },
+            gemini: { target: 'llm.gemini-pro', weight: 2.4 },
+            gpt: { target: 'llm.gpt-frontier', weight: 2.2 },
+            local_code: { target: 'llm.local-code', weight: 1.1 },
+          },
+          exact_model_weights: {},
+          fallback: { mode: 'parent' },
+          policy: { profile: 'quality_first', allow_fallback: true, runtime_failover: true },
+          resolved_exact_model: withPhysicalModels ? opusExact : undefined,
+          children: [
+            mountNode('llm.opus', 'Provider flagship planning mount', 'llm.chat', withPhysicalModels ? opusExact : undefined, withPhysicalModels ? [
+              exactNode(opusExact, 'Anthropic Opus exact model', 'llm.chat', true),
+            ] : []),
+            mountNode('llm.gemini-pro', 'Gemini planning mount', 'llm.chat', undefined),
+            mountNode('llm.gpt-frontier', 'OpenAI frontier mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+              exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
+            ] : []),
+            mountNode('llm.local-code', 'Local code-capable mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
+            ] : []),
+          ],
+        },
+        {
+          path: 'llm.code',
+          label: 'Code generation',
+          level: 'L3',
+          api_type: 'llm.chat',
+          items: {
+            sonnet: { target: 'llm.sonnet', weight: 2.4 },
+            gpt: { target: 'llm.gpt-frontier', weight: 2.1 },
+            local: { target: 'llm.local-code', weight: 1.8 },
+          },
+          exact_model_weights: withPhysicalModels ? { [localCodeExact]: 1.2 } : {},
+          fallback: { mode: 'target_logical', target: 'llm.fallback' },
+          policy: { profile: 'local_first', allow_fallback: true, required_features: ['tool_call'] },
+          resolved_exact_model: withPhysicalModels ? sonnetExact : undefined,
+          children: [
+            mountNode('llm.sonnet', 'Balanced coding mount', 'llm.chat', withPhysicalModels ? sonnetExact : undefined, withPhysicalModels ? [
+              exactNode(sonnetExact, 'Anthropic Sonnet exact model', 'llm.chat', true),
+            ] : []),
+            mountNode('llm.gpt-frontier', 'OpenAI frontier mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+              exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
+            ] : []),
+            mountNode('llm.local-code', 'Local coding mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
+            ] : []),
+          ],
+        },
+        {
+          path: 'llm.swift',
+          label: 'Fast responses',
+          level: 'L3',
+          api_type: 'llm.chat',
+          items: {
+            mini: { target: 'llm.nano', weight: 2 },
+            sn: { target: 'llm.sn-balanced', weight: 1.7 },
+          },
+          exact_model_weights: {},
+          fallback: { mode: 'parent' },
+          policy: { profile: 'latency_first', allow_fallback: true },
+          resolved_exact_model: withPhysicalModels ? miniExact : undefined,
+          children: [
+            mountNode('llm.nano', 'Low-cost fast mount', 'llm.chat', withPhysicalModels ? miniExact : undefined, withPhysicalModels ? [
+              exactNode(miniExact, 'OpenAI mini exact model', 'llm.chat', true),
+            ] : []),
+            mountNode('llm.sn-balanced', 'SN balanced mount', 'llm.chat', withPhysicalModels ? 'sn-router-balanced@sn-router' : undefined, withPhysicalModels ? [
+              exactNode('sn-router-balanced@sn-router', 'SN balanced exact model', 'llm.chat', true),
+            ] : []),
+          ],
+        },
+        {
+          path: 'llm.reason',
+          label: 'Deep reasoning',
+          level: 'L3',
+          api_type: 'llm.chat',
+          items: {
+            reasoner: { target: 'llm.reasoner', weight: 2.8 },
+          },
+          exact_model_weights: {},
+          fallback: { mode: 'disabled' },
+          policy: { profile: 'quality_first', allow_fallback: false },
+          resolved_exact_model: undefined,
+          children: [
+            mountNode('llm.reasoner', 'Reasoning mount without inventory match', 'llm.chat', undefined),
+          ],
+        },
+      ],
+    },
+    {
+      path: 'embedding',
+      label: 'Embedding namespace',
+      level: 'L3',
+      api_type: 'embedding.text',
+      items: {
+        cloud: { target: 'embedding.large', weight: 1.8 },
+        local: { target: 'embedding.local', weight: 1.4 },
+      },
+      exact_model_weights: {},
+      fallback: { mode: 'parent' },
+      policy: { profile: 'cost_first', allow_fallback: true },
+      resolved_exact_model: withPhysicalModels ? embeddingExact : undefined,
+      children: [
+        mountNode('embedding.large', 'Cloud embedding mount', 'embedding.text', withPhysicalModels ? embeddingExact : undefined, withPhysicalModels ? [
+          exactNode(embeddingExact, 'OpenAI embedding exact model', 'embedding.text', true),
+        ] : []),
+        mountNode('embedding.local', 'Local embedding mount', 'embedding.text', withPhysicalModels ? localEmbeddingExact : undefined, withPhysicalModels ? [
+          exactNode(localEmbeddingExact, 'Local embedding exact model', 'embedding.text', true),
+        ] : []),
+      ],
+    },
+    {
+      path: 'image.txt2img',
+      label: 'Text to image',
+      level: 'L3',
+      api_type: 'image.txt2img',
+      items: {
+        sn: { target: 'image.sn-txt2img', weight: 1 },
+        local: { target: 'image.local-txt2img', weight: 0.8 },
+      },
+      exact_model_weights: {},
+      fallback: { mode: 'disabled' },
+      policy: { profile: 'balanced', allow_fallback: false },
+      resolved_exact_model: withPhysicalModels ? imageExact : undefined,
+      locked: true,
+      children: [
+        mountNode('image.sn-txt2img', 'SN image mount', 'image.txt2img', withPhysicalModels ? imageExact : undefined, withPhysicalModels ? [
+          exactNode(imageExact, 'SN text-to-image exact model', 'image.txt2img', true),
+        ] : []),
+        mountNode('image.local-txt2img', 'Local image mount without installed model', 'image.txt2img', undefined),
+      ],
+    },
+    {
+      path: 'vision.ocr',
+      label: 'OCR',
+      level: 'L3',
+      api_type: 'vision.ocr',
+      items: {
+        cloud: { target: 'vision.ocr-cloud', weight: 1 },
+      },
+      exact_model_weights: {},
+      fallback: { mode: 'strict' },
+      policy: { profile: 'balanced', allow_fallback: false, required_features: ['vision'] },
+      resolved_exact_model: undefined,
+      children: [
+        mountNode('vision.ocr-cloud', 'OCR mount without discovered provider model', 'vision.ocr', undefined),
+      ],
+    },
+    {
+      path: 'audio.tts',
+      label: 'Text to speech',
+      level: 'L3',
+      api_type: 'audio.tts',
+      items: {
+        voice: { target: 'audio.voice', weight: 1 },
+      },
+      exact_model_weights: {},
+      fallback: { mode: 'strict' },
+      policy: { profile: 'latency_first', allow_fallback: false },
+      resolved_exact_model: undefined,
+      children: [
+        mountNode('audio.voice', 'TTS mount without discovered provider model', 'audio.tts', undefined),
+      ],
+    },
+  ]
+}
+
+function buildSessionConfig(withPhysicalModels: boolean): SessionConfig {
+  return {
+    inherit: 'builtin-aicc-router-v2',
+    revision: withPhysicalModels ? 'mock-aicc-router-v2-with-inventory' : 'mock-aicc-router-v2-directory-only',
+    ttl_seconds: 3600,
+    global_exact_model_weights: withPhysicalModels
+      ? {
+          'qwen2.5-coder-32b@local': 1.2,
+        }
+      : {},
+    policy: {
+      profile: 'balanced',
+      allow_fallback: true,
+      runtime_failover: true,
+    },
+    logical_tree: buildLogicalTree(withPhysicalModels),
+  }
+}
 
 function generateUsageEvents(): UsageEvent[] {
   const events: UsageEvent[] = []
   const now = Date.now()
   const day = 24 * 60 * 60 * 1000
+  const rows = [
+    { provider: 'openai-main', exact: 'gpt-5.1@openai-main', requested: 'llm.code', api: 'llm.chat' as ApiType, cost: 0.000028 },
+    { provider: 'anthropic-work', exact: 'claude-opus-4.7@anthropic-work', requested: 'llm.plan', api: 'llm.chat' as ApiType, cost: 0.000042 },
+    { provider: 'openai-main', exact: 'text-embedding-3-large@openai-main', requested: 'embedding', api: 'embedding.text' as ApiType, cost: 0.000001 },
+    { provider: 'sn-router', exact: 'sn-router-image@sn-router', requested: 'image.txt2img', api: 'image.txt2img' as ApiType, cost: 0.00005 },
+    { provider: 'local', exact: 'qwen2.5-coder-32b@local', requested: 'llm.code', api: 'llm.chat' as ApiType, cost: 0 },
+  ]
+  const apps = ['studio', 'codeassistant', 'messagehub', 'jarvis']
+  const agents = ['agent-coder', 'agent-planner', 'agent-analyst', 'jarvis-default']
 
-  const providers = ['sn-router-1', 'openai-1', 'anthropic-1']
-  const models: Record<string, string[]> = {
-    'sn-router-1': ['llm-chat-standard', 'llm-chat-advanced'],
-    'openai-1': ['gpt-4o', 'gpt-4o-mini', 'dall-e-3'],
-    'anthropic-1': ['claude-3-sonnet', 'claude-3-haiku'],
-  }
-  const categories: UsageCategory[] = ['text', 'text', 'text', 'image']
-  const apps = ['studio', 'codeassistant', 'messagehub', undefined]
-  const agents = ['agent-coder', 'agent-writer', 'agent-analyst', undefined]
-
-  for (let i = 0; i < 150; i++) {
-    const daysAgo = Math.floor(Math.random() * 30)
-    const providerId = providers[i % 3]
-    const providerModels = models[providerId]
-    const modelName = providerModels[i % providerModels.length]
-    const category = categories[i % 4]
-    const tokensIn = Math.floor(Math.random() * 2000) + 100
-    const tokensOut = Math.floor(Math.random() * 3000) + 50
-    const costPerToken = category === 'image' ? 0.00004 : 0.000003
+  for (let i = 0; i < 140; i++) {
+    const daysAgo = Math.floor((i * 7) % 30)
+    const row = rows[i % rows.length]
+    const tokensIn = row.api === 'image.txt2img' ? undefined : 220 + ((i * 131) % 3100)
+    const tokensOut = row.api === 'image.txt2img' ? undefined : 120 + ((i * 97) % 2400)
+    const tokenEquivalent = row.api === 'image.txt2img' ? 1600 + ((i * 71) % 1200) : undefined
+    const billableTokens = tokenEquivalent ?? (tokensIn ?? 0) + (tokensOut ?? 0)
 
     events.push({
       id: `evt-${i.toString().padStart(3, '0')}`,
-      timestamp: new Date(now - daysAgo * day - Math.random() * day).toISOString(),
-      provider_id: providerId,
-      model_name: modelName,
-      category,
-      app_id: apps[i % 4],
-      agent_id: agents[i % 4],
-      session_id: `session-${Math.floor(i / 5)}`,
+      timestamp: new Date(now - daysAgo * day - ((i * 37) % 24) * 60 * 60 * 1000).toISOString(),
+      provider_instance_name: row.provider,
+      exact_model: row.exact,
+      requested_model: row.requested,
+      api_type: row.api,
+      tenant_id: 'devtest',
+      app_id: apps[i % apps.length],
+      agent_id: agents[i % agents.length],
+      session_id: `session-${Math.floor(i / 4).toString().padStart(2, '0')}`,
       tokens_in: tokensIn,
       tokens_out: tokensOut,
-      estimated_cost: Number(((tokensIn + tokensOut) * costPerToken).toFixed(4)),
-      status: i % 20 === 0 ? 'failed' : 'success',
+      token_equivalent: tokenEquivalent,
+      estimated_cost: Number((billableTokens * row.cost).toFixed(4)),
+      status: i % 23 === 0 ? 'failed' : 'success',
     })
   }
 
   return events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
 }
 
-// ========== Logical Model Seeds ==========
-
-const populatedLogicalModels: LogicalModelConfig[] = [
+const routeTraces: RouteTrace[] = [
   {
-    name: 'llm.chat',
-    candidates: [
-      { provider_id: 'openai-1', model_name: 'gpt-4o', priority: 1, enabled: true },
-      { provider_id: 'anthropic-1', model_name: 'claude-3-sonnet', priority: 2, enabled: true },
-      { provider_id: 'sn-router-1', model_name: 'llm-chat-standard', priority: 3, enabled: true },
+    request_id: 'trace-llm-plan-001',
+    session_id: 'session-04',
+    api_type: 'llm.chat',
+    requested_model: 'llm.plan',
+    requested_model_type: 'logical',
+    resolved_logical_path: 'llm.plan',
+    selected_exact_model: 'claude-opus-4.7@anthropic-work',
+    selected_provider_instance_name: 'anthropic-work',
+    ranked_candidates: [
+      { exact_model: 'claude-opus-4.7@anthropic-work', final_score: 0.94, selected: true },
+      { exact_model: 'gpt-5.1@openai-main', final_score: 0.9, selected: false },
+      { exact_model: 'qwen2.5-coder-32b@local', final_score: 0.62, selected: false },
     ],
-    resolved_model: 'OpenAI / gpt-4o',
+    filtered_candidates: [
+      { exact_model: 'sn-router-balanced@sn-router', reason: 'quality score below llm.plan policy threshold' },
+    ],
+    fallback_applied: false,
+    fallback_chain: [],
+    session_sticky_hit: false,
+    scheduler_profile: 'quality_first' satisfies SchedulerProfile,
+    runtime_failover_count: 0,
+    user_summary: {
+      display_name: 'Planning request',
+      model_family: 'Claude Opus',
+      provider_origin: 'cloud',
+      reason_short: 'Selected the high-quality planning role target with no fallback.',
+      was_fallback: false,
+      was_failover: false,
+    },
+    warnings: ['Anthropic quota is near limit.'],
   },
   {
-    name: 'llm.plan',
-    candidates: [
-      { provider_id: 'openai-1', model_name: 'gpt-4o', priority: 1, enabled: true },
-      { provider_id: 'sn-router-1', model_name: 'llm-chat-advanced', priority: 2, enabled: true },
+    request_id: 'trace-llm-code-018',
+    session_id: 'session-18',
+    api_type: 'llm.chat',
+    requested_model: 'llm.code',
+    requested_model_type: 'logical',
+    resolved_logical_path: 'llm.code',
+    selected_exact_model: 'qwen2.5-coder-32b@local',
+    selected_provider_instance_name: 'local',
+    ranked_candidates: [
+      { exact_model: 'qwen2.5-coder-32b@local', final_score: 0.88, selected: true },
+      { exact_model: 'claude-sonnet-4.5@anthropic-work', final_score: 0.86, selected: false },
+      { exact_model: 'gpt-5.1@openai-main', final_score: 0.81, selected: false },
     ],
-    resolved_model: 'OpenAI / gpt-4o',
-  },
-  {
-    name: 'llm.code',
-    candidates: [
-      { provider_id: 'openai-1', model_name: 'gpt-4o', priority: 1, enabled: true },
-      { provider_id: 'sn-router-1', model_name: 'llm-code', priority: 2, enabled: true },
-    ],
-    resolved_model: 'OpenAI / gpt-4o',
-  },
-  {
-    name: 'txt2img',
-    candidates: [],
-    resolved_model: undefined,
+    filtered_candidates: [],
+    fallback_applied: false,
+    fallback_chain: [],
+    session_sticky_hit: true,
+    scheduler_profile: 'local_first' satisfies SchedulerProfile,
+    runtime_failover_count: 0,
+    user_summary: {
+      display_name: 'Code generation',
+      model_family: 'Qwen Coder',
+      provider_origin: 'local',
+      reason_short: 'Local-first policy chose the local coder model for privacy and latency.',
+      was_fallback: false,
+      was_failover: false,
+    },
+    warnings: [],
   },
 ]
 
-// ========== Scenario Exports ==========
+const directoryOnlyRouteTraces: RouteTrace[] = [
+  {
+    request_id: 'trace-directory-only-llm-reason',
+    api_type: 'llm.chat',
+    requested_model: 'llm.reason',
+    requested_model_type: 'logical',
+    resolved_logical_path: 'llm.reason',
+    ranked_candidates: [],
+    filtered_candidates: [
+      { exact_model: 'llm.reasoner', reason: 'logical mount exists, but no provider inventory supplies an exact model' },
+    ],
+    fallback_applied: false,
+    fallback_chain: [],
+    session_sticky_hit: false,
+    scheduler_profile: 'quality_first' satisfies SchedulerProfile,
+    runtime_failover_count: 0,
+    user_summary: {
+      display_name: 'Reasoning request',
+      model_family: 'Unresolved logical mount',
+      provider_origin: 'proxy_unknown',
+      reason_short: 'The logical role exists in the directory, but no physical model is currently mounted under llm.reasoner.',
+      was_fallback: false,
+      was_failover: false,
+    },
+    warnings: ['AICC_ROUTE_NO_CANDIDATE'],
+  },
+]
 
 export interface SeedData {
   providers: ProviderView[]
   usageEvents: UsageEvent[]
-  logicalModels: LogicalModelConfig[]
+  sessionConfig: SessionConfig
+  routeTraces: RouteTrace[]
   localModels: LocalModel[]
 }
 
@@ -218,16 +728,20 @@ export function getEmptySeed(): SeedData {
   return {
     providers: [],
     usageEvents: [],
-    logicalModels: [],
+    sessionConfig: buildSessionConfig(false),
+    routeTraces: directoryOnlyRouteTraces,
     localModels: [],
   }
 }
 
 export function getPopulatedSeed(): SeedData {
   return {
-    providers: [snRouterProvider, openaiProvider, anthropicProvider],
+    providers,
     usageEvents: generateUsageEvents(),
-    logicalModels: populatedLogicalModels,
-    localModels: [],
+    sessionConfig: buildSessionConfig(true),
+    routeTraces,
+    localModels,
   }
 }
+
+export { model }
