@@ -677,6 +677,19 @@ impl ModelItemPatch {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OverlayMergeMode {
+    Inherit,
+    Replace,
+}
+
+impl Default for OverlayMergeMode {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FallbackMode {
     Strict,
     Parent,
@@ -1103,6 +1116,15 @@ pub struct DisabledCapabilityTrace {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionOverlayTrace {
+    pub logical_profile_scope: String,
+    pub overlay_path: String,
+    pub merge_mode: OverlayMergeMode,
+    #[serde(default)]
+    pub selected_from_overlay: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteTrace {
     pub request_id: String,
     #[serde(default)]
@@ -1142,6 +1164,8 @@ pub struct RouteTrace {
     pub logical_admission: Vec<LogicalAdmissionTrace>,
     #[serde(default)]
     pub disabled_capability_sources: Vec<DisabledCapabilityTrace>,
+    #[serde(default)]
+    pub session_overlays: Vec<SessionOverlayTrace>,
     #[serde(default)]
     pub session_sticky_hit: bool,
     pub scheduler_profile: SchedulerProfile,

@@ -29,7 +29,7 @@ use llm_context::{
     interrupt::LLMContextInterruptHandle,
     observation::Observation,
     outcome::{ContextOutput, LLMContextOutcome, ResumeFill},
-    request::{ContextOwnerRef, LLMContextRequest},
+    request::{ContextOwnerRef, LLMContextRequest, ModelPolicy},
     state::{LLMContextSnapshot, LLMContextState},
     step_record::XmlStepRenderer,
     StepRenderer,
@@ -59,9 +59,10 @@ use crate::session_event_pump::SessionEventPump;
 pub use crate::session_model::{
     BackgroundHint, BgEventSnapshot, EventRef, EventSubscription, EventSubscriptionMode,
     ImprovementBudget, ImprovementBudgetUnit, ImprovementTask, ImprovementTaskStatus,
-    InternalContinuation, InterruptMode, PendingInput, PendingTaskCall, ProcessFrame,
-    ReportDeliveryState, SessionInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
-    TimerEventKind,
+    InternalContinuation, InterruptMode, LogicalTreeOverlay, OverlayMergeMode, PendingInput,
+    PendingTaskCall, ProcessFrame, ReportDeliveryState, SessionInput, SessionKind,
+    SessionLogicalProfile, SessionMeta, SessionModelDisable, SessionModelItem,
+    SessionModelItemPatch, SessionStatus, SessionSummary, TimerEventKind,
 };
 use crate::task_dispatch::TaskDispatch;
 use crate::worksession_tools::render_workspace_inventory;
@@ -3636,14 +3637,26 @@ impl AgentSession {
     /// policy for a resumed snapshot. The message stream is inherited
     /// strictly from the snapshot: `on_init` / system prompt rendering only
     /// happens when a session context is created fresh.
-    fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> RequestOverrides {
+    async fn model_policy_for_behavior(&self, behavior: &BehaviorCfg) -> ModelPolicy {
+        let session_profile = {
+            let meta = self.meta.lock().await;
+            meta.session_profile.clone()
+        };
+        model_policy_with_session_profile(
+            behavior.to_model_policy(),
+            self.session_id.as_str(),
+            session_profile.as_ref(),
+        )
+    }
+
+    async fn current_behavior_overrides(&self, behavior: &BehaviorCfg) -> RequestOverrides {
         RequestOverrides {
             system_messages: None,
             user_messages: None,
             tool_policy: Some(behavior.to_tool_policy()),
             objective: Some(behavior.meta.objective.clone()),
             behavior_name: Some(behavior.meta.name.clone()),
-            model_policy: Some(behavior.to_model_policy()),
+            model_policy: Some(self.model_policy_for_behavior(behavior).await),
             budget: Some(behavior.to_budget_spec()),
             human_policy: Some(behavior.to_human_policy()),
             error_policy: Some(behavior.to_error_policy()),
@@ -3726,7 +3739,7 @@ impl AgentSession {
                 // system prompt rendering belongs to fresh context creation.
                 let snapshot = apply_overrides_to_snapshot(
                     snapshot,
-                    self.current_behavior_overrides(behavior),
+                    self.current_behavior_overrides(behavior).await,
                 );
 
                 if turn_message.is_some() || !history_inputs.is_empty() {
@@ -3795,7 +3808,7 @@ impl AgentSession {
             objective: behavior.meta.objective.clone(),
             behavior_name: behavior.meta.name.clone(),
             input,
-            model_policy: behavior.to_model_policy(),
+            model_policy: self.model_policy_for_behavior(behavior).await,
             tool_policy: behavior.to_tool_policy(),
             output: behavior.to_output_spec(),
             budget: behavior.to_budget_spec(),
@@ -3905,7 +3918,7 @@ impl AgentSession {
             objective: cfg.meta.objective.clone(),
             behavior_name: cfg.meta.name.clone(),
             input: self.render_system_messages(cfg).await?,
-            model_policy: cfg.to_model_policy(),
+            model_policy: self.model_policy_for_behavior(cfg).await,
             tool_policy: cfg.to_tool_policy(),
             output: cfg.to_output_spec(),
             budget: cfg.to_budget_spec(),
@@ -5238,7 +5251,7 @@ impl AgentSession {
             tool_policy: Some(new_cfg.to_tool_policy()),
             objective: Some(new_cfg.meta.objective.clone()),
             behavior_name: Some(new_cfg.meta.name.clone()),
-            model_policy: Some(new_cfg.to_model_policy()),
+            model_policy: Some(self.model_policy_for_behavior(new_cfg).await),
             budget: Some(new_cfg.to_budget_spec()),
             human_policy: Some(new_cfg.to_human_policy()),
             error_policy: Some(new_cfg.to_error_policy()),
@@ -7022,6 +7035,34 @@ fn idle_worker_retire_ms(kind: SessionKind) -> u64 {
     } else {
         DEFAULT_IDLE_WORKER_RETIRE_MS
     }
+}
+
+pub(crate) fn model_policy_with_session_profile(
+    mut policy: ModelPolicy,
+    session_id: &str,
+    session_profile: Option<&SessionLogicalProfile>,
+) -> ModelPolicy {
+    let mut options = match policy.provider_options.take() {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("provider_options".to_string(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    options.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    if let Some(profile) = session_profile {
+        options.insert(
+            "session_profile".to_string(),
+            serde_json::to_value(profile).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    policy.provider_options = Some(serde_json::Value::Object(options));
+    policy
 }
 
 impl AgentSession {

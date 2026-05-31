@@ -341,22 +341,22 @@ Base Logical Tree
 
 ### 6.3 TODO
 
-- [ ] 定义 `SessionLogicalProfile` schema。
-- [ ] 定义 `LogicalTreeOverlay` schema。
-- [ ] 明确 `merge_mode=inherit|replace` 与现有 `item_overrides|items` 的映射关系。
-- [ ] 路由前生成 `EffectiveSessionConfig`。
-- [ ] Router / Scheduler 只看 effective config，不关心 overlay 来源。
-- [ ] Provider adapter 只看最终 exact model，不关心 session profile。
-- [ ] overlay 可以覆盖 `disable_line`。
-- [ ] route policy 覆盖必须走 `route_policy_override`，不能混入 disable。
-- [ ] trace 记录 overlay 来源：
+- [x] 定义 `SessionLogicalProfile` schema。
+- [x] 定义 `LogicalTreeOverlay` schema。
+- [x] 明确 `merge_mode=inherit|replace` 与现有 `item_overrides|items` 的映射关系。
+- [x] 路由前生成 `EffectiveSessionConfig`。
+- [x] Router / Scheduler 只看 effective config，不关心 overlay 来源。
+- [x] Provider adapter 只看最终 exact model，不关心 session profile。
+- [x] overlay 可以覆盖 `disable_line`。
+- [x] route policy 覆盖必须走 `route_policy_override`，不能混入 disable。
+- [x] trace 记录 overlay 来源：
   - `logical_profile_scope=session`
   - `overlay_path`
   - `merge_mode`
   - `selected_from_overlay`
-- [ ] `inherit` 模式下指定模型 quota exhausted 可以 fallback。
-- [ ] `replace` 模式下指定模型 quota exhausted 直接失败。
-- [ ] 第一版可不支持从 inherited view 中删除单个 inherited item；Only 用 `replace`。
+- [x] `inherit` 模式下指定模型 quota exhausted 可以 fallback。
+- [x] `replace` 模式下指定模型 quota exhausted 直接失败。
+- [x] 第一版可不支持从 inherited view 中删除单个 inherited item；Only 用 `replace`。
 
 ## 7. UI / Agent / Workflow 迁移
 
@@ -499,8 +499,8 @@ Base Logical Tree
 - [x] `gpt-5.1:reasoning-high@openai` 推理前还原成 `model=gpt-5.1` + `reasoning.effort=high`。
 - [x] `llm.plan` 的 min_line 能过滤掉不满足 tool_call / json_schema / min_context 的模型。
 - [x] auto-mount 能把满足 `llm.chat` min_line 的多个 provider 模型挂入候选池。
-- [ ] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。
-- [ ] session replace overlay 只保留指定模型，并在 quota exhausted 后失败。
+- [x] session inherit overlay 能提高指定模型权重，并在 quota exhausted 后 fallback。
+- [x] session replace overlay 只保留指定模型，并在 quota exhausted 后失败。
 - [ ] unknown model 不默认声明高风险能力。
 - [ ] metadata 文件缺失、损坏、远端不可用时 AICC 可启动。
 - [ ] route trace 能解释 base tree、auto-mount、session overlay 和 provider lowering。

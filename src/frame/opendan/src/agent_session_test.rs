@@ -1429,6 +1429,7 @@ fn session_meta_round_trips_pending_inputs() {
         last_report_delivery: None,
         internal_continuation: None,
         task_binding: None,
+        session_profile: None,
         self_check_seen_item_update_secs: 0,
         self_check_last_round_at_ms: 0,
         self_check_idle_heartbeats: 0,
@@ -1481,6 +1482,50 @@ fn session_meta_round_trips_pending_inputs() {
     assert_eq!(restored.process_stack[0].entry, "ui_default");
     assert_eq!(restored.process_stack[0].current, "ui_default");
     assert!(!restored.process_stack[0].fork);
+}
+
+#[test]
+fn model_policy_carries_session_profile_to_aicc_options() {
+    let profile = SessionLogicalProfile {
+        name: Some("prefer-local".to_string()),
+        overlays: vec![LogicalTreeOverlay {
+            path: "llm.chat".to_string(),
+            merge_mode: OverlayMergeMode::Inherit,
+            items: [(
+                "local".to_string(),
+                SessionModelItem::new("qwen3@local", 10.0),
+            )]
+            .into_iter()
+            .collect(),
+            item_overrides: Default::default(),
+            exact_model_weights: Default::default(),
+            disable_line: None,
+            fallback: None,
+            route_policy_override: None,
+            source: None,
+        }],
+        route_policy_override: None,
+    };
+    let policy = model_policy_with_session_profile(
+        ModelPolicy {
+            preferred: "llm.chat".to_string(),
+            provider_options: Some(serde_json::json!({
+                "temperature": 0.2
+            })),
+            ..Default::default()
+        },
+        "ui-123",
+        Some(&profile),
+    );
+    let options = policy.provider_options.unwrap();
+
+    assert_eq!(options["session_id"], "ui-123");
+    assert_eq!(options["temperature"], 0.2);
+    assert_eq!(options["session_profile"]["name"], "prefer-local");
+    assert_eq!(
+        options["session_profile"]["overlays"][0]["items"]["local"]["target"],
+        "qwen3@local"
+    );
 }
 
 #[test]

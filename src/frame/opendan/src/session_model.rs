@@ -202,6 +202,8 @@ pub struct SessionMeta {
     pub internal_continuation: Option<InternalContinuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<AgentTaskBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_profile: Option<SessionLogicalProfile>,
     /// Self-Check wakeup-gating state (see doc/opendan/Self-Check Behavior.md
     /// §8.3). `seen_item_update_secs` is the max notebook-item `updated_at`
     /// (unix secs) we have already acted on — a newer value means the Notebook
@@ -252,6 +254,7 @@ impl SessionMeta {
             last_report_delivery: None,
             internal_continuation: None,
             task_binding: None,
+            session_profile: None,
             self_check_seen_item_update_secs: 0,
             self_check_last_round_at_ms: 0,
             self_check_idle_heartbeats: 0,
@@ -338,6 +341,94 @@ pub struct ImprovementTask {
 pub enum ImprovementTaskStatus {
     Pending,
     Dispatched,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionLogicalProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<LogicalTreeOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy_override: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogicalTreeOverlay {
+    pub path: String,
+    #[serde(default)]
+    pub merge_mode: OverlayMergeMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub items: BTreeMap<String, SessionModelItem>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_overrides: BTreeMap<String, SessionModelItemPatch>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exact_model_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_line: Option<SessionModelDisable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy_override: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayMergeMode {
+    Inherit,
+    Replace,
+}
+
+impl Default for OverlayMergeMode {
+    fn default() -> Self {
+        OverlayMergeMode::Inherit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionModelItem {
+    pub target: String,
+    #[serde(default = "default_model_item_weight")]
+    pub weight: f64,
+}
+
+impl SessionModelItem {
+    pub fn new(target: impl Into<String>, weight: f64) -> Self {
+        Self {
+            target: target.into(),
+            weight,
+        }
+    }
+}
+
+fn default_model_item_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionModelItemPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionModelDisable {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json_schema: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +646,49 @@ mod tests {
             serde_json::to_string(&SessionKind::SelfCheck).unwrap(),
             "\"self_check\""
         );
+    }
+
+    #[test]
+    fn session_profile_round_trips_aicc_overlay_shape() {
+        let profile = SessionLogicalProfile {
+            name: Some("only-local".to_string()),
+            overlays: vec![LogicalTreeOverlay {
+                path: "llm.chat".to_string(),
+                merge_mode: OverlayMergeMode::Replace,
+                items: [(
+                    "local".to_string(),
+                    SessionModelItem::new("qwen3@local", 1.0),
+                )]
+                .into_iter()
+                .collect(),
+                item_overrides: BTreeMap::new(),
+                exact_model_weights: BTreeMap::new(),
+                disable_line: Some(SessionModelDisable {
+                    web_search: true,
+                    ..Default::default()
+                }),
+                fallback: None,
+                route_policy_override: Some(json!({
+                    "allow_fallback": {
+                        "value": false,
+                        "locked": false
+                    }
+                })),
+                source: None,
+            }],
+            route_policy_override: None,
+        };
+        let value = serde_json::to_value(&profile).unwrap();
+
+        assert_eq!(value["overlays"][0]["merge_mode"], "replace");
+        assert_eq!(
+            value["overlays"][0]["items"]["local"]["target"],
+            "qwen3@local"
+        );
+        assert_eq!(value["overlays"][0]["disable_line"]["web_search"], true);
+
+        let restored: SessionLogicalProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, profile);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::model_types::{
     ApiType, DisabledCapabilityTrace, ExactModelName, FallbackMode, FallbackRule,
     FallbackTraceItem, FilteredCandidateTrace, HealthStatus, LogicalItemSourceTrace,
     ModelCandidate, ProviderType, RequestedModelType, RouteError, RouteErrorCode, RoutePolicy,
-    RouteTrace,
+    RouteTrace, SessionOverlayTrace,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
@@ -20,6 +20,7 @@ pub struct RouteRequest {
     pub policy: RoutePolicy,
     pub session_config_revision: Option<String>,
     pub session_config_updated: bool,
+    pub session_overlay_trace: Vec<SessionOverlayTrace>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ impl<'a> ModelRouter<'a> {
             logical_item_sources: Vec::new(),
             logical_admission: Vec::new(),
             disabled_capability_sources: Vec::new(),
+            session_overlays: request.session_overlay_trace.clone(),
             session_sticky_hit: false,
             scheduler_profile: request.policy.profile.clone(),
             runtime_failover_count: 0,
@@ -465,14 +467,23 @@ impl<'a> ModelRouter<'a> {
     }
 
     fn trace_disable_line(&self, logical_path: &str, trace: &mut RouteTrace) {
-        let Some(definition) = self.registry.logical_definition(logical_path) else {
-            return;
+        let (disable_line, source) = if let Some(node_disable) = self
+            .session_config
+            .node(logical_path)
+            .and_then(|node| node.disable_line.as_ref())
+        {
+            (node_disable, "session_overlay")
+        } else {
+            let Some(definition) = self.registry.logical_definition(logical_path) else {
+                return;
+            };
+            (&definition.disable_line, "builtin_definition")
         };
-        for capability in definition.disable_line.feature_names() {
+        for capability in disable_line.feature_names() {
             let exists = trace.disabled_capability_sources.iter().any(|item| {
                 item.logical_path == logical_path
                     && item.capability == capability
-                    && item.source == "builtin_definition"
+                    && item.source == source
             });
             if exists {
                 continue;
@@ -482,7 +493,7 @@ impl<'a> ModelRouter<'a> {
                 .push(DisabledCapabilityTrace {
                     logical_path: logical_path.to_string(),
                     capability,
-                    source: "builtin_definition".to_string(),
+                    source: source.to_string(),
                     reason: "disable_line".to_string(),
                 });
         }
@@ -595,11 +606,14 @@ fn compare_f64_vec(a: &[f64], b: &[f64]) -> Ordering {
 mod tests {
     use super::*;
     use crate::model_registry::ModelRegistry;
-    use crate::model_session::{LogicalNode, SessionConfig};
+    use crate::model_session::{
+        build_effective_session_config, LogicalNode, LogicalTreeOverlay, SessionConfig,
+        SessionLogicalProfile,
+    };
     use crate::model_types::{
         CostClass, FallbackRule, LogicalModelDefinition, ModelAttributes, ModelCapabilities,
         ModelDisable, ModelHealth, ModelItem, ModelMetadata, ModelPricing, ModelRequirement,
-        MountMode, ProviderInventory, QuotaState, RoutePolicy,
+        MountMode, OverlayMergeMode, ProviderInventory, QuotaState, RoutePolicy,
     };
 
     fn metadata(
@@ -762,6 +776,7 @@ mod tests {
             policy,
             session_config_revision: Some("rev-1".to_string()),
             session_config_updated: false,
+            session_overlay_trace: Vec::new(),
         }
     }
 
@@ -1065,5 +1080,155 @@ mod tests {
             .any(|item| item.logical_path == "llm.gpt5"
                 && item.capability == "web_search"
                 && item.reason == "disable_line"));
+    }
+
+    #[test]
+    fn inherit_overlay_preserves_fallback_candidates_when_preferred_quota_exhausted() {
+        let mut registry = ModelRegistry::new();
+        let mut primary = metadata(
+            "openai_primary",
+            "gpt-5.2",
+            "llm.chat",
+            ProviderType::CloudApi,
+        );
+        primary.health.quota_state = QuotaState::Exhausted;
+        let backup = metadata(
+            "anthropic",
+            "claude-sonnet",
+            "llm.chat",
+            ProviderType::CloudApi,
+        );
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "openai_primary".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "openai".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![primary],
+            })
+            .unwrap();
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "anthropic".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "claude".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![backup],
+            })
+            .unwrap();
+        let config = SessionConfig {
+            logical_profile: Some(SessionLogicalProfile {
+                name: Some("prefer-primary".to_string()),
+                overlays: vec![LogicalTreeOverlay {
+                    path: "llm.chat".to_string(),
+                    merge_mode: OverlayMergeMode::Inherit,
+                    items: [(
+                        "preferred".to_string(),
+                        ModelItem::new("gpt-5.2@openai_primary", 10.0),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                }],
+                route_policy_override: None,
+            }),
+            ..Default::default()
+        };
+        let effective = build_effective_session_config(&config).unwrap();
+        let router = ModelRouter::new(&registry, &effective.config);
+
+        let resolved = router
+            .resolve(RouteRequest {
+                session_overlay_trace: effective.overlay_trace,
+                ..request("llm.chat", RoutePolicy::default())
+            })
+            .unwrap();
+
+        assert_eq!(resolved.candidates.len(), 1);
+        assert_eq!(
+            resolved.candidates[0].exact_model,
+            "claude-sonnet@anthropic"
+        );
+    }
+
+    #[test]
+    fn replace_overlay_does_not_fallback_when_only_model_quota_exhausted() {
+        let mut registry = ModelRegistry::new();
+        let mut primary = metadata(
+            "openai_primary",
+            "gpt-5.2",
+            "llm.chat",
+            ProviderType::CloudApi,
+        );
+        primary.health.quota_state = QuotaState::Exhausted;
+        let backup = metadata(
+            "anthropic",
+            "claude-sonnet",
+            "llm.chat",
+            ProviderType::CloudApi,
+        );
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "openai_primary".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "openai".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![primary],
+            })
+            .unwrap();
+        registry
+            .apply_inventory(ProviderInventory {
+                provider_instance_name: "anthropic".to_string(),
+                provider_type: ProviderType::CloudApi,
+                provider_driver: "claude".to_string(),
+                provider_origin: Default::default(),
+                provider_type_trusted_source: Default::default(),
+                provider_type_revision: None,
+                version: None,
+                inventory_revision: Some("r1".to_string()),
+                models: vec![backup],
+            })
+            .unwrap();
+        let config = SessionConfig {
+            logical_profile: Some(SessionLogicalProfile {
+                name: Some("only-primary".to_string()),
+                overlays: vec![LogicalTreeOverlay {
+                    path: "llm.chat".to_string(),
+                    merge_mode: OverlayMergeMode::Replace,
+                    items: [(
+                        "only".to_string(),
+                        ModelItem::new("gpt-5.2@openai_primary", 1.0),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                }],
+                route_policy_override: None,
+            }),
+            ..Default::default()
+        };
+        let effective = build_effective_session_config(&config).unwrap();
+        let router = ModelRouter::new(&registry, &effective.config);
+
+        let err = router
+            .resolve(RouteRequest {
+                session_overlay_trace: effective.overlay_trace,
+                ..request("llm.chat", RoutePolicy::default())
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code, RouteErrorCode::NoCandidate);
     }
 }
