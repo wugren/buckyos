@@ -1,6 +1,6 @@
 import { Check } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import type { ValidationResult, WizardDraft } from '../../../mock/types'
+import type { ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
 
 interface StepReviewProps {
   draft: WizardDraft

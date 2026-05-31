@@ -1,9 +1,9 @@
 import { Cpu, Download, Pause, Play, Store, Trash2 } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
-import { useLocalModels } from './hooks/use-mock-store'
+import { useLocalModels } from './hooks/use-aicc-store'
 import { EmptyState } from './components/shared/EmptyState'
 import { StatusBadge } from './components/shared/StatusBadge'
-import type { LocalModel } from './mock/types'
+import type { LocalModel } from '../../api/aicc_mgr'
 
 function formatSize(bytes?: number): string {
   if (!bytes) return '—'

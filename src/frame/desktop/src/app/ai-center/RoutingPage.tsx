@@ -17,9 +17,9 @@ import {
   useProviders,
   useRouteTraces,
   useSessionConfig,
-} from './hooks/use-mock-store'
+} from './hooks/use-aicc-store'
 import { StatusBadge } from './components/shared/StatusBadge'
-import type { LogicalNode, ModelMetadata, RouteTrace } from './mock/types'
+import type { LogicalNode, ModelMetadata, RouteTrace } from '../../api/aicc_mgr'
 
 type DirectoryEntry = {
   node: LogicalNode

@@ -1,4 +1,4 @@
-import { useAIStatus } from './hooks/use-mock-store'
+import { useAIStatus } from './hooks/use-aicc-store'
 import { EnableAIGuide } from './components/home/EnableAIGuide'
 import { UsageDashboard } from './components/home/UsageDashboard'
 import type { AICenterPage } from './components/layout/Sidebar'

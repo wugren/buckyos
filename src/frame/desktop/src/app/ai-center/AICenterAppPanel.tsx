@@ -1,7 +1,6 @@
-import { useState } from 'react'
-import type { AppContentLoaderProps } from '../types'
-import { MockStoreContext } from './hooks/use-mock-store'
-import { MockDataStore } from './mock/store'
+import { useEffect, useState } from 'react'
+import { AICCStoreContext } from './hooks/use-aicc-store'
+import { createAICCMgr } from '../../api/aicc_mgr'
 import { AICenterShell } from './components/layout/AICenterShell'
 import type { AICenterPage } from './components/layout/Sidebar'
 import { HomePage } from './HomePage'
@@ -27,14 +26,18 @@ function PageRouter({ page, navigate }: { page: AICenterPage; navigate: (p: AICe
   }
 }
 
-export function AICenterAppPanel(_props: AppContentLoaderProps) {
-  const [store] = useState(() => new MockDataStore())
+export function AICenterAppPanel() {
+  const [store] = useState(() => createAICCMgr())
+
+  useEffect(() => {
+    void store.refresh()
+  }, [store])
 
   return (
-    <MockStoreContext.Provider value={store}>
+    <AICCStoreContext.Provider value={store}>
       <AICenterShell>
         {(page, navigate) => <PageRouter page={page} navigate={navigate} />}
       </AICenterShell>
-    </MockStoreContext.Provider>
+    </AICCStoreContext.Provider>
   )
 }

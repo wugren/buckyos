@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Check, X, AlertTriangle, Loader2 } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import { useMockStore } from '../../../hooks/use-mock-store'
-import type { ValidationResult, WizardDraft } from '../../../mock/types'
+import { useAICCStore } from '../../../hooks/use-aicc-store'
+import type { ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
 
 interface StepValidationProps {
   draft: WizardDraft
@@ -18,7 +18,7 @@ type CheckItem = {
 
 export function StepValidation({ draft, onResult }: StepValidationProps) {
   const { t } = useI18n()
-  const store = useMockStore()
+  const store = useAICCStore()
   const [checks, setChecks] = useState<CheckItem[]>([
     { key: 'endpoint', label: t('aiCenter.wizard.checkEndpoint', 'Checking endpoint connectivity...'), status: 'pending' },
     { key: 'auth', label: t('aiCenter.wizard.checkAuth', 'Verifying authentication...'), status: 'pending' },
@@ -28,73 +28,87 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
   const [models, setModels] = useState<string[]>([])
 
   useEffect(() => {
-    const result = store.validateConnection(draft)
     let cancelled = false
+    const timers: number[] = []
 
-    const steps = [
-      {
-        key: 'endpoint',
-        delay: 400,
-        update: (): CheckItem => ({
+    void store.validateConnection(draft).then((result) => {
+      if (cancelled) return
+      const steps = [
+        {
           key: 'endpoint',
-          label: result.endpoint_reachable
-            ? t('aiCenter.wizard.endpointOk', 'Endpoint reachable')
-            : t('aiCenter.wizard.endpointFail', 'Endpoint not reachable'),
-          status: result.endpoint_reachable ? 'ok' as const : 'error' as const,
-        }),
-      },
-      {
-        key: 'auth',
-        delay: 800,
-        update: (): CheckItem => ({
+          delay: 400,
+          update: (): CheckItem => ({
+            key: 'endpoint',
+            label: result.endpoint_reachable
+              ? t('aiCenter.wizard.endpointOk', 'Endpoint reachable')
+              : t('aiCenter.wizard.endpointFail', 'Endpoint not reachable'),
+            status: result.endpoint_reachable ? 'ok' as const : 'error' as const,
+          }),
+        },
+        {
           key: 'auth',
-          label: result.auth_valid
-            ? t('aiCenter.wizard.authOk', 'Authentication valid')
-            : t('aiCenter.wizard.authFail', 'Authentication failed'),
-          status: result.auth_valid ? 'ok' as const : 'error' as const,
-        }),
-      },
-      {
-        key: 'models',
-        delay: 1200,
-        update: (): CheckItem => ({
+          delay: 800,
+          update: (): CheckItem => ({
+            key: 'auth',
+            label: result.auth_valid
+              ? t('aiCenter.wizard.authOk', 'Authentication valid')
+              : t('aiCenter.wizard.authFail', 'Authentication failed'),
+            status: result.auth_valid ? 'ok' as const : 'error' as const,
+          }),
+        },
+        {
           key: 'models',
-          label: t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
-          status: result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
-        }),
-      },
-      {
-        key: 'balance',
-        delay: 1500,
-        update: (): CheckItem => ({
+          delay: 1200,
+          update: (): CheckItem => ({
+            key: 'models',
+            label: t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
+            status: result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
+          }),
+        },
+        {
           key: 'balance',
-          label: result.balance_available
-            ? t('aiCenter.wizard.balanceOk', 'Balance query available')
-            : t('aiCenter.wizard.balanceUnavailable', 'Balance query not available'),
-          status: result.balance_available ? 'ok' as const : 'warning' as const,
-        }),
-      },
-    ]
+          delay: 1500,
+          update: (): CheckItem => ({
+            key: 'balance',
+            label: result.balance_available
+              ? t('aiCenter.wizard.balanceOk', 'Balance query available')
+              : t('aiCenter.wizard.balanceUnavailable', 'Balance query not available'),
+            status: result.balance_available ? 'ok' as const : 'warning' as const,
+          }),
+        },
+      ]
 
-    steps.forEach((step, i) => {
-      setTimeout(() => {
-        if (cancelled) return
-        setChecks((prev) => {
-          const next = [...prev]
-          next[i] = step.update()
-          // Mark next item as checking
-          if (i + 1 < next.length && next[i + 1].status === 'pending') {
-            next[i + 1] = { ...next[i + 1], status: 'checking' }
+      steps.forEach((step, i) => {
+        const timer = window.setTimeout(() => {
+          if (cancelled) return
+          setChecks((prev) => {
+            const next = [...prev]
+            next[i] = step.update()
+            if (i + 1 < next.length && next[i + 1].status === 'pending') {
+              next[i + 1] = { ...next[i + 1], status: 'checking' }
+            }
+            return next
+          })
+          if (step.key === 'models') {
+            setModels(result.models_discovered)
           }
-          return next
-        })
-        if (step.key === 'models') {
-          setModels(result.models_discovered)
-        }
-        if (i === steps.length - 1) {
-          onResult(result)
-        }
-      }, step.delay)
+          if (i === steps.length - 1) {
+            onResult(result)
+          }
+        }, step.delay)
+        timers.push(timer)
+      })
+    }).catch((error) => {
+      if (cancelled) return
+      const result: ValidationResult = {
+        endpoint_reachable: false,
+        auth_valid: false,
+        models_discovered: [],
+        balance_available: false,
+        errors: [error instanceof Error ? error.message : 'Validation failed'],
+      }
+      setChecks((prev) => prev.map((item) => ({ ...item, status: 'error' as const })))
+      onResult(result)
     })
 
     // Start first item as checking
@@ -104,7 +118,10 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
       return next
     })
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      timers.forEach((timer) => window.clearTimeout(timer))
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

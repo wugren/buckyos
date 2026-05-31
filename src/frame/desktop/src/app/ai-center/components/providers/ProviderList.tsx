@@ -1,7 +1,7 @@
 import { Plus } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { ProviderCard } from './ProviderCard'
-import type { ProviderView } from '../../mock/types'
+import type { ProviderView } from '../../../../api/aicc_mgr'
 
 interface ProviderListProps {
   providers: ProviderView[]

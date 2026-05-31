@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMediaQuery } from '@mui/material'
 import { useI18n } from '../../i18n/provider'
-import { useProviders } from './hooks/use-mock-store'
+import { useProviders } from './hooks/use-aicc-store'
 import { ProviderList } from './components/providers/ProviderList'
 import { ProviderDetailPanel } from './components/providers/ProviderDetailPanel'
 import { EmptyState } from './components/shared/EmptyState'

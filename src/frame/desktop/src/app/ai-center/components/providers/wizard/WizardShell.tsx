@@ -1,13 +1,14 @@
 import { useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import { useMockStore } from '../../../hooks/use-mock-store'
-import type { ProviderType, ValidationResult, WizardDraft } from '../../../mock/types'
+import { useAICCStore } from '../../../hooks/use-aicc-store'
+import type { ProviderType, ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
 import { Stepper } from '../../shared/Stepper'
 import { StepChooseType } from './StepChooseType'
-import { StepConnection, isConnectionValid } from './StepConnection'
+import { StepConnection } from './StepConnection'
 import { StepValidation } from './StepValidation'
 import { StepReview } from './StepReview'
+import { isConnectionValid } from './connectionValidation'
 
 const INITIAL_DRAFT: WizardDraft = {
   provider_type: null,
@@ -25,7 +26,7 @@ interface WizardShellProps {
 
 export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const { t } = useI18n()
-  const store = useMockStore()
+  const store = useAICCStore()
 
   const [step, setStep] = useState(0)
   const [draft, setDraft] = useState<WizardDraft>(INITIAL_DRAFT)
@@ -58,9 +59,15 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const handleNext = async () => {
     if (step === 3) {
       setCreating(true)
-      await new Promise((r) => setTimeout(r, 300))
-      store.addProvider(draft)
-      onCreated()
+      try {
+        await new Promise((r) => setTimeout(r, 300))
+        await store.addProvider(draft)
+        onCreated()
+      } catch (error) {
+        console.error('aicc.addProvider failed', error)
+      } finally {
+        setCreating(false)
+      }
       return
     }
     if (step === 1) {

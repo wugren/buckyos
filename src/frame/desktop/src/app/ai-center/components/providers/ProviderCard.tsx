@@ -1,7 +1,7 @@
 import { Network, Zap, Cpu, Globe, Cloud, Server } from 'lucide-react'
 import { StatusBadge } from '../shared/StatusBadge'
-import type { ProviderView } from '../../mock/types'
-import type { AuthStatus } from '../../mock/types'
+import type { ProviderView } from '../../../../api/aicc_mgr'
+import type { AuthStatus } from '../../../../api/aicc_mgr'
 
 const providerIcons: Record<string, typeof Network> = {
   sn_router: Network,

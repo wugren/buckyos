@@ -1,6 +1,6 @@
 import { Activity, CreditCard, DollarSign, Route, Wallet } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
-import { useAIStatus, useProviders, useRouteTraces, useUsageEvents, useUsageSummary, useUsageTrend } from '../../hooks/use-mock-store'
+import { useAIStatus, useProviders, useRouteTraces, useUsageEvents, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
 import { SummaryCard } from '../shared/SummaryCard'
 
 function formatTokens(n: number): string {

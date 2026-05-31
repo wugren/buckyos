@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import type { ProtocolType, WizardDraft } from '../../../mock/types'
+import type { ProtocolType, WizardDraft } from '../../../../../api/aicc_mgr'
 
 interface StepConnectionProps {
   draft: WizardDraft
@@ -156,15 +156,4 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
       )}
     </div>
   )
-}
-
-export function isConnectionValid(draft: WizardDraft): boolean {
-  if (!draft.provider_type) return false
-  if (draft.provider_type === 'sn_router') return true
-  if (!draft.api_key.trim()) return false
-  if (draft.provider_type === 'custom') {
-    if (!draft.endpoint.trim()) return false
-    if (!draft.protocol_type) return false
-  }
-  return true
 }

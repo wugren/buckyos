@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
-import { useMockStore } from '../../hooks/use-mock-store'
+import { useAICCStore } from '../../hooks/use-aicc-store'
 import { StatusBadge } from '../shared/StatusBadge'
 import { ConfirmDialog } from '../shared/ConfirmDialog'
-import type { AuthStatus, ModelMetadata, ProviderView } from '../../mock/types'
+import type { AuthStatus, ModelMetadata, ProviderView } from '../../../../api/aicc_mgr'
 
 function authStatusLabel(s: AuthStatus, t: (k: string, f: string) => string): string {
   switch (s) {
@@ -37,7 +37,7 @@ interface ProviderDetailPanelProps {
 
 export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanelProps) {
   const { t } = useI18n()
-  const store = useMockStore()
+  const store = useAICCStore()
   const [showModels, setShowModels] = useState(true)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
@@ -47,8 +47,9 @@ export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanel
   const quotaWarningCount = models.filter((m) => m.health.quota_state === 'near_limit' || m.health.quota_state === 'exhausted').length
 
   const handleDelete = () => {
-    store.deleteProvider(config.id)
-    onDeleted()
+    void store.deleteProvider(config.id)
+      .then(onDeleted)
+      .catch((error) => console.error('aicc.deleteProvider failed', error))
   }
 
   const balanceDisplay = account.balance_supported && account.balance_value != null
@@ -137,7 +138,10 @@ export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanel
         <ActionButton
           icon={<RefreshCw size={14} />}
           label={t('aiCenter.providers.refreshModels', 'Refresh Models')}
-          onClick={() => store.refreshProviderModels(config.id)}
+          onClick={() => {
+            void store.refreshProviderModels(config.id)
+              .catch((error) => console.error('aicc.refreshProviderModels failed', error))
+          }}
         />
         <ActionButton
           icon={<Trash2 size={14} />}

@@ -1,6 +1,6 @@
 import { Cloud, Cpu, Globe, Network, Zap, Server } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import type { ProviderType } from '../../../mock/types'
+import type { ProviderType } from '../../../../../api/aicc_mgr'
 
 const PROVIDER_TYPES: {
   type: ProviderType

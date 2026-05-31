@@ -4,8 +4,8 @@ import {
   useContext,
   useSyncExternalStore,
 } from 'react'
-import { MockDataStore } from '../mock/store'
 import type {
+  AICCMgr,
   AIStatus,
   LocalModel,
   ProviderView,
@@ -14,16 +14,16 @@ import type {
   UsageEvent,
   UsageSummary,
   UsageTrendPoint,
-} from '../mock/types'
+} from '../../../api/aicc_mgr'
 
-export const MockStoreContext = createContext<MockDataStore>(null!)
+export const AICCStoreContext = createContext<AICCMgr>(null!)
 
-export function useMockStore(): MockDataStore {
-  return useContext(MockStoreContext)
+export function useAICCStore(): AICCMgr {
+  return useContext(AICCStoreContext)
 }
 
 function useStoreSnapshot() {
-  const store = useMockStore()
+  const store = useAICCStore()
   return useSyncExternalStore(store.subscribe, store.getSnapshot)
 }
 
@@ -41,14 +41,14 @@ export function useProvider(id: string): ProviderView | undefined {
 }
 
 export function useUsageSummary(): UsageSummary {
-  const store = useMockStore()
+  const store = useAICCStore()
   const subscribe = store.subscribe
   const getSummary = useCallback(() => store.getUsageSummary(), [store])
   return useSyncExternalStore(subscribe, getSummary)
 }
 
 export function useUsageTrend(granularity = 'day'): UsageTrendPoint[] {
-  const store = useMockStore()
+  const store = useAICCStore()
   const subscribe = store.subscribe
   const getTrend = useCallback(() => store.getUsageTrend(granularity), [store, granularity])
   return useSyncExternalStore(subscribe, getTrend)
