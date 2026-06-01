@@ -88,10 +88,6 @@ impl FalProvider {
         for model_id in cfg.image_upscale_models.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageUpscale])
-                    .with_mounts(logical_mounts_for_api(
-                        ApiType::ImageUpscale,
-                        model_id.as_str(),
-                    ))
                     .with_cost(Some(0.05))
                     .with_latency(Some(8000)),
             );
@@ -99,10 +95,6 @@ impl FalProvider {
         for model_id in cfg.image_bg_remove_models.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageBgRemove])
-                    .with_mounts(logical_mounts_for_api(
-                        ApiType::ImageBgRemove,
-                        model_id.as_str(),
-                    ))
                     .with_cost(Some(0.01))
                     .with_latency(Some(4000)),
             );
@@ -110,10 +102,6 @@ impl FalProvider {
         for model_id in cfg.audio_enhance_models.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::AudioEnhance])
-                    .with_mounts(logical_mounts_for_api(
-                        ApiType::AudioEnhance,
-                        model_id.as_str(),
-                    ))
                     .with_cost(Some(0.02))
                     .with_latency(Some(20_000)),
             );
@@ -121,10 +109,6 @@ impl FalProvider {
         for model_id in cfg.video_upscale_models.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::VideoUpscale])
-                    .with_mounts(logical_mounts_for_api(
-                        ApiType::VideoUpscale,
-                        model_id.as_str(),
-                    ))
                     .with_cost(Some(0.50))
                     .with_latency(Some(120_000)),
             );
@@ -481,32 +465,6 @@ impl Provider for FalProvider {
     ) -> std::result::Result<(), ProviderError> {
         Ok(())
     }
-}
-
-fn logical_mounts_for_api(api_type: ApiType, provider_model_id: &str) -> Vec<String> {
-    let base = match api_type {
-        ApiType::ImageUpscale => "image.upscale",
-        ApiType::ImageBgRemove => "image.bg_remove",
-        ApiType::AudioEnhance => "audio.enhance",
-        ApiType::VideoUpscale => "video.upscale",
-        _ => "unknown",
-    };
-    let mut mounts = vec![
-        base.to_string(),
-        format!("{}.{}", base, FAL_PROVIDER_DRIVER),
-    ];
-    let normalized = provider_model_id
-        .trim()
-        .trim_start_matches('/')
-        .replace('/', ".")
-        .to_ascii_lowercase();
-    if !normalized.is_empty() {
-        let mount = format!("{}.{}", base, normalized);
-        if !mounts.iter().any(|item| item == &mount) {
-            mounts.push(mount);
-        }
-    }
-    mounts
 }
 
 fn resource_to_url(resource: &ResourceRef) -> Option<String> {

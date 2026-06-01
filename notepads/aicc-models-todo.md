@@ -57,7 +57,7 @@
 
 ## 2. P0：Provider 发现边界收敛
 
-- [ ] 清理 Provider 侧直接挂用途目录的逻辑假设。
+- [x] 清理 Provider 侧直接挂用途目录的逻辑假设。
   - 目标边界：
     - Provider 只发现物理模型。
     - Driver metadata 负责能力、家族、默认挂载。
@@ -70,12 +70,21 @@
     - `src/frame/aicc/src/minimax.rs`
     - `src/frame/aicc/src/fal.rs`
   - 注意：不要一次性删除所有 role mounts，应先补测试确认用途目录仍可通过家族目录路由。
+  - 已实现：
+    - Gemini / MiniMax / fal provider inventory 构造不再通过 fallback mounts 主动写逻辑目录。
+    - Claude 远端 provider inventory 归一化改为通过 driver metadata 重新解析 logical mounts，并只合并动态 pricing / health。
+    - OpenAI 远端 provider inventory 不再保留 provider 返回的 logical mounts，避免 provider 成为目录真相源。
+    - 新增测试确认 `llm.plan` 可经 driver-owned family mount `llm.gemini-pro` 路由。
 
-- [ ] 区分 provider fallback hints 与 driver-owned logical mounts。
+- [x] 区分 provider fallback hints 与 driver-owned logical mounts。
   - Provider 可以提供 raw hints，但不能成为 `llm.plan`、`llm.chat` 等用途目录的真相源。
   - 需要确定 `DriverModelResolveRequest.fallback_logical_mounts` 的长期边界：
     - 只用于未知 driver 的保守 fallback。
     - 或允许 provider override，但必须标记 source。
+  - 已实现：
+    - `fallback_logical_mounts` 只在没有匹配到 driver rule 时参与保守 fallback，不再覆盖 driver-owned logical mounts。
+    - 对未知 driver 的 fallback hints 会过滤 `llm.plan`、`llm.chat` 等 role path，只保留非用途目录 hint。
+    - 新增 resolver 单测覆盖 known driver 忽略 provider fallback mounts、unknown driver 过滤 role path。
 
 ## 3. P1：家族目录成为主要 driver mount 目标
 

@@ -3253,11 +3253,7 @@ fn normalize_remote_provider_model(
         }
     }
 
-    let mut logical_mounts = model
-        .logical_mounts
-        .into_iter()
-        .filter(|mount| !is_openai_gpt_auto_mount(mount.as_str()))
-        .collect::<Vec<_>>();
+    let mut logical_mounts = Vec::new();
     if api_types.iter().any(is_llm_api_type) {
         for mount in openai_llm_logical_mounts(provider_driver, provider_model_id.as_str()) {
             add_unique_mount(&mut logical_mounts, mount);
@@ -4712,7 +4708,7 @@ data: [DONE]
         assert_model_mount(&inventory, "gpt-5.4", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5.4", "llm.code", false);
         assert_model_mount(&inventory, "gpt-5.4", "llm.gpt-standard", false);
-        assert_model_mount(&inventory, "gpt-5.4", "llm.remote-general-old", true);
+        assert_model_mount(&inventory, "gpt-5.4", "llm.remote-general-old", false);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.plan", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.reason", true);
         assert_model_mount(&inventory, "gpt-5.5-pro", "llm.gpt-pro", false);
@@ -4721,7 +4717,7 @@ data: [DONE]
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.reason", false);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.gpt-pro", false);
         assert_model_mount(&inventory, "gpt-5.4-pro", "llm.openai.gpt-5-4-pro", true);
-        assert_model_mount(&inventory, "gpt-5.4-pro", "llm.remote-old", true);
+        assert_model_mount(&inventory, "gpt-5.4-pro", "llm.remote-old", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.chat", false);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.summarize", true);
         assert_model_mount(&inventory, "gpt-5.4-mini", "llm.gpt-mini", true);
@@ -4740,10 +4736,10 @@ data: [DONE]
         );
         assert_model_mount(&inventory, "gpt-5.4-mini-2026-03-17", "llm.gpt", false);
         assert_model_mount(&inventory, "gpt-5-mini", "llm.summarize", false);
-        assert_model_mount(&inventory, "gpt-5-mini", "llm.remote-mini-old", true);
+        assert_model_mount(&inventory, "gpt-5-mini", "llm.remote-mini-old", false);
         assert_model_mount(&inventory, "o1-2024-12-17", "llm.gpt", true);
         assert_model_mount(&inventory, "o1-2024-12-17", "llm.chat", false);
-        assert_model_mount(&inventory, "o1-2024-12-17", "llm.remote-o1", true);
+        assert_model_mount(&inventory, "o1-2024-12-17", "llm.remote-o1", false);
     }
 
     #[test]

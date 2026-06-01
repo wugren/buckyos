@@ -1,6 +1,6 @@
 use crate::aicc::{
-    llm_logical_mounts, provider_type_from_settings, AIComputeCenter, Provider, ProviderError,
-    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, AIComputeCenter, Provider, ProviderError, ProviderInstance,
+    ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
 use crate::claude_protocol::{convert_complete_request_with_dialect, ProtocolDialect};
 use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
@@ -84,7 +84,6 @@ impl MiniMaxProvider {
             .iter()
             .map(|model| {
                 DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat])
-                    .with_mounts(llm_logical_mounts(provider_driver.as_str(), model.as_str()))
                     .with_cost(Some(0.01))
                     .with_latency(Some(1400))
             })

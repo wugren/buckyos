@@ -2662,60 +2662,6 @@ fn provider_driver_mount_segment(provider_driver: &str) -> String {
     }
 }
 
-fn add_unique_mount(mounts: &mut Vec<String>, mount: String) {
-    if !mount.is_empty() && !mounts.iter().any(|item| item == &mount) {
-        mounts.push(mount);
-    }
-}
-
-pub fn llm_logical_mounts(provider_driver: &str, provider_model_id: &str) -> Vec<String> {
-    // `llm.chat` 是 api_type 的线名（见 doc/aicc/aicc 逻辑模型目录.md §1.2），
-    // workflow 适配层把它当作默认 model_alias 使用（adapters/aicc.rs llm_schema
-    // 传 LLM_CHAT 进去时 default_alias 就是 "llm.chat"）。挂在每个 chat-capable
-    // LLM 模型上，让 `model_alias=llm.chat` 直接命中所有 chat 模型——这与
-    // gimini_method_mounts 给 vision 模型挂 bare `vision.caption` / `vision.ocr`
-    // 是同一思路，避免 router 在 fallback 到 `llm` 父节点时拿不到候选。
-    let mut mounts = vec![
-        "llm.chat".to_string(),
-        format!("llm.{}", provider_driver_mount_segment(provider_driver)),
-    ];
-    let lowered = provider_model_id.to_ascii_lowercase();
-    for family in ["gpt5", "gpt-5", "claude", "gemini", "gimini", "minimax"] {
-        if lowered.contains(family) {
-            let normalized = family.replace('-', "");
-            let mount = if normalized == "gimini" {
-                "llm.gemini".to_string()
-            } else {
-                format!("llm.{}", normalized)
-            };
-            if !mounts.iter().any(|item| item == &mount) {
-                mounts.push(mount);
-            }
-        }
-    }
-    if lowered.contains("claude") {
-        if lowered.contains("opus") {
-            add_unique_mount(&mut mounts, "llm.opus".to_string());
-        } else if lowered.contains("sonnet") {
-            add_unique_mount(&mut mounts, "llm.sonnet".to_string());
-        } else if lowered.contains("haiku") {
-            add_unique_mount(&mut mounts, "llm.haiku".to_string());
-        }
-    }
-    if lowered.contains("gemini") || lowered.contains("gimini") {
-        if lowered.contains("deepthink") || lowered.contains("deep-think") {
-            add_unique_mount(&mut mounts, "llm.gemini-deepthink".to_string());
-        } else if lowered.contains("flash-lite") || lowered.contains("flash_lite") {
-            add_unique_mount(&mut mounts, "llm.gemini-flash-lite".to_string());
-        } else if lowered.contains("flash") {
-            add_unique_mount(&mut mounts, "llm.gemini-flash".to_string());
-        } else if lowered.contains("pro") {
-            add_unique_mount(&mut mounts, "llm.gemini-pro".to_string());
-        }
-    }
-    mounts
-}
-
 pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> Vec<String> {
     let driver_mount = format!(
         "image.txt2img.{}",
@@ -2733,6 +2679,7 @@ pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> V
     mounts
 }
 
+#[allow(dead_code)]
 pub fn provider_model_metadata(
     provider_instance_name: &str,
     provider_type: ProviderType,

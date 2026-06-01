@@ -1,7 +1,6 @@
 use crate::aicc::{
-    image_logical_mounts, llm_logical_mounts, logical_mount_segment, provider_type_from_settings,
-    redacted_json_log, AIComputeCenter, Provider, ProviderError, ProviderInstance,
-    ProviderStartResult, ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
 use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
@@ -254,36 +253,26 @@ impl GoogleGiminiProvider {
         for model in buckets.llm.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat])
-                    .with_mounts(llm_logical_mounts(provider_driver, model.as_str()))
                     .with_cost(Some(0.01))
                     .with_latency(Some(1400)),
             );
         }
         for model in buckets.image.iter() {
-            let mut mounts = image_logical_mounts(provider_driver, model.as_str());
-            mounts.extend(gimini_method_mounts(ApiType::ImageToImage, model.as_str()));
             requests.push(
                 DriverModelResolveRequest::new(
                     model.clone(),
                     vec![ApiType::ImageTextToImage, ApiType::ImageToImage],
                 )
-                .with_mounts(dedupe_strings(mounts))
                 .with_cost(Some(0.04))
                 .with_latency(Some(6000)),
             );
         }
         for model in buckets.embedding.iter() {
-            let mut mounts = gimini_method_mounts(ApiType::Embedding, model.as_str());
-            mounts.extend(gimini_method_mounts(
-                ApiType::EmbeddingMultimodal,
-                model.as_str(),
-            ));
             requests.push(
                 DriverModelResolveRequest::new(
                     model.clone(),
                     vec![ApiType::Embedding, ApiType::EmbeddingMultimodal],
                 )
-                .with_mounts(dedupe_strings(mounts))
                 .with_cost(Some(0.0001))
                 .with_latency(Some(800)),
             );
@@ -291,7 +280,6 @@ impl GoogleGiminiProvider {
         for model in buckets.tts.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioTts])
-                    .with_mounts(gimini_method_mounts(ApiType::AudioTts, model.as_str()))
                     .with_cost(Some(0.01))
                     .with_latency(Some(3000)),
             );
@@ -299,7 +287,6 @@ impl GoogleGiminiProvider {
         for model in buckets.music.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioMusic])
-                    .with_mounts(gimini_method_mounts(ApiType::AudioMusic, model.as_str()))
                     .with_cost(Some(0.10))
                     .with_latency(Some(60_000)),
             );
@@ -307,10 +294,6 @@ impl GoogleGiminiProvider {
         for model in buckets.video.iter() {
             requests.push(
                 DriverModelResolveRequest::new(model.clone(), vec![ApiType::VideoTextToVideo])
-                    .with_mounts(gimini_method_mounts(
-                        ApiType::VideoTextToVideo,
-                        model.as_str(),
-                    ))
                     .with_cost(Some(0.50))
                     .with_latency(Some(120_000)),
             );
@@ -2678,43 +2661,6 @@ fn classify_gimini_model(id: &str, methods: &HashSet<String>) -> Option<GiminiMo
         return Some(GiminiModelKind::Llm);
     }
     None
-}
-
-fn gimini_method_mounts(api_type: ApiType, provider_model_id: &str) -> Vec<String> {
-    let base = match api_type {
-        ApiType::Embedding => "embedding.text",
-        ApiType::EmbeddingMultimodal => "embedding.multimodal",
-        ApiType::ImageToImage => "image.img2img",
-        ApiType::VisionOcr => "vision.ocr",
-        ApiType::VisionCaption => "vision.caption",
-        ApiType::VisionDetect => "vision.detect",
-        ApiType::VisionSegment => "vision.segment",
-        ApiType::AudioTts => "audio.tts",
-        ApiType::AudioMusic => "audio.music",
-        ApiType::VideoTextToVideo => "video.txt2video",
-        ApiType::VideoImageToVideo => "video.img2video",
-        ApiType::VideoToVideo => "video.video2video",
-        ApiType::VideoExtend => "video.extend",
-        _ => api_type.namespace(),
-    };
-    let model = logical_mount_segment(provider_model_id);
-    vec![
-        base.to_string(),
-        format!("{}.google", base),
-        format!("{}.gemini", base),
-        format!("{}.{}", base, model),
-    ]
-}
-
-fn dedupe_strings(values: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::<String>::new();
-    let mut result = Vec::new();
-    for value in values {
-        if seen.insert(value.clone()) {
-            result.push(value);
-        }
-    }
-    result
 }
 
 fn normalize_model_list(models: Vec<String>) -> Vec<String> {

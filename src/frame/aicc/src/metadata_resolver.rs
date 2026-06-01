@@ -32,11 +32,6 @@ impl DriverModelResolveRequest {
         }
     }
 
-    pub fn with_mounts(mut self, mounts: Vec<String>) -> Self {
-        self.fallback_logical_mounts = mounts;
-        self
-    }
-
     pub fn with_cost(mut self, estimated_cost_usd: Option<f64>) -> Self {
         self.fallback_estimated_cost_usd = estimated_cost_usd;
         self
@@ -197,6 +192,7 @@ fn resolve_driver_model(
         None
     };
     let rule = exact_rule.or(pattern_rule).or(default_rule);
+    let driver_rule_found = rule.is_some();
 
     if rule.map(|rule| rule.exclude).unwrap_or(false) {
         return None;
@@ -206,11 +202,7 @@ fn resolve_driver_model(
     if api_types.is_empty() {
         api_types.push(ApiType::LlmChat);
     }
-    let mut logical_mounts = if request.fallback_logical_mounts.is_empty() {
-        generic_mounts(provider_driver, provider_model_id, api_types.as_slice())
-    } else {
-        request.fallback_logical_mounts.clone()
-    };
+    let mut logical_mounts = Vec::new();
 
     let mut capabilities = conservative_capabilities();
     let mut parameter_scale = None;
@@ -233,9 +225,6 @@ fn resolve_driver_model(
                 .iter()
                 .map(|mount| expand_mount_template(mount, provider_driver, provider_model_id))
                 .collect();
-        } else if request.fallback_logical_mounts.is_empty() {
-            logical_mounts =
-                generic_mounts(provider_driver, provider_model_id, api_types.as_slice());
         }
         apply_capabilities_patch(&mut capabilities, &rule.capabilities);
         if rule.parameter_scale.is_some() {
@@ -256,6 +245,12 @@ fn resolve_driver_model(
         if let Some(next) = rule.cost_class.clone() {
             cost_class = next;
         }
+    }
+    if logical_mounts.is_empty() && !driver_rule_found {
+        logical_mounts = provider_fallback_mounts(request.fallback_logical_mounts.as_slice());
+    }
+    if logical_mounts.is_empty() {
+        logical_mounts = generic_mounts(provider_driver, provider_model_id, api_types.as_slice());
     }
 
     logical_mounts = dedupe_strings(logical_mounts);
@@ -655,6 +650,34 @@ fn api_mount_base(api_type: &ApiType) -> &'static str {
     }
 }
 
+fn provider_fallback_mounts(mounts: &[String]) -> Vec<String> {
+    mounts
+        .iter()
+        .filter(|mount| !is_task_role_mount(mount.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn is_task_role_mount(mount: &str) -> bool {
+    const ROLE_MOUNTS: &[&str] = &[
+        "llm.chat",
+        "llm.plan",
+        "llm.code",
+        "llm.reason",
+        "llm.summarize",
+        "llm.swift",
+        "llm.vision",
+        "llm.long",
+        "llm.fallback",
+    ];
+    ROLE_MOUNTS.iter().any(|role| {
+        mount == *role
+            || mount
+                .strip_prefix(*role)
+                .is_some_and(|tail| tail.starts_with('.'))
+    })
+}
+
 fn expand_mount_template(template: &str, provider_driver: &str, provider_model_id: &str) -> String {
     template
         .replace("{driver}", logical_mount_segment(provider_driver).as_str())
@@ -924,6 +947,56 @@ mod tests {
         assert!(!model.capabilities.web_search);
         assert!(!model.capabilities.vision);
         assert!(!model.capabilities.json_schema);
+    }
+
+    #[test]
+    fn known_driver_ignores_provider_fallback_mounts() {
+        let mut request = DriverModelResolveRequest::new("MiniMax-M2.5", vec![ApiType::LlmChat]);
+        request.fallback_logical_mounts = vec![
+            "llm.plan".to_string(),
+            "llm.provider-hint".to_string(),
+            "llm.minimax-provider-hint".to_string(),
+        ];
+        let inventory = resolve_driver_inventory(
+            "minimax-test",
+            ProviderType::CloudApi,
+            "minimax",
+            &[request],
+            None,
+        );
+        let model = &inventory.models[0];
+        assert!(model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.minimax"));
+        assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.plan"));
+        assert!(!model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.provider-hint"));
+        assert!(!model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.minimax-provider-hint"));
+    }
+
+    #[test]
+    fn unknown_driver_fallback_mounts_drop_role_paths() {
+        let mut request = DriverModelResolveRequest::new("future-model", vec![ApiType::LlmChat]);
+        request.fallback_logical_mounts = vec![
+            "llm.plan".to_string(),
+            "llm.chat".to_string(),
+            "llm.future-family".to_string(),
+        ];
+        let inventory = resolve_driver_inventory(
+            "future-test",
+            ProviderType::CloudApi,
+            "future-driver",
+            &[request],
+            None,
+        );
+        let model = &inventory.models[0];
+        assert_eq!(model.logical_mounts, vec!["llm.future-family".to_string()]);
     }
 
     #[test]

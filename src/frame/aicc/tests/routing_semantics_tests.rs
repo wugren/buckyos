@@ -1,11 +1,11 @@
 mod common;
 
 use aicc::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
-use aicc::model_types::ProviderType;
+use aicc::model_types::{ApiType, ProviderType};
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
 use buckyos_api::{
     AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, Capability,
-    LlmChatInvokeRequest, ModelSpec, Requirements, RouteResolveRequest, TaskFilter,
+    LlmChatInvokeRequest, ModelDisable, ModelSpec, Requirements, RouteResolveRequest, TaskFilter,
     TextToImageInvokeRequest,
 };
 use common::*;
@@ -757,6 +757,75 @@ fn openai_resolver_expands_reasoning_variants() {
         .logical_mounts
         .iter()
         .any(|mount| mount == "llm.openai.gpt-5-1.reasoning-high"));
+}
+
+#[test]
+fn purpose_logical_route_reaches_driver_family_mount() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let instance = mock_instance(
+        "google-gemini-main",
+        "google-gemini",
+        vec![Capability::Llm],
+        vec!["plan".to_string()],
+    );
+    let inventory = resolve_driver_inventory(
+        "google-gemini-main",
+        ProviderType::CloudApi,
+        "google-gemini",
+        &[DriverModelResolveRequest::new(
+            "gemini-2.5-pro",
+            vec![ApiType::LlmChat],
+        )],
+        Some("test".to_string()),
+    );
+    let model = inventory
+        .models
+        .iter()
+        .find(|model| model.provider_model_id == "gemini-2.5-pro")
+        .expect("gemini pro model should resolve");
+    assert!(model
+        .logical_mounts
+        .iter()
+        .any(|mount| mount == "llm.gemini-pro"));
+    assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.plan"));
+
+    let provider = Arc::new(MockProvider::with_inventory(
+        instance,
+        inventory,
+        CostEstimate {
+            estimated_cost_usd: Some(0.01),
+            estimated_latency_ms: Some(100),
+        },
+        vec![Ok(ProviderStartResult::Started)],
+    ));
+    registry.add_provider(provider);
+    let center = center_with_taskmgr(registry, catalog);
+    let mut disable = ModelDisable::default();
+    disable.web_search = true;
+
+    let response = center
+        .resolve_route(
+            RouteResolveRequest {
+                request_id: Some("family-route".to_string()),
+                api_type: "llm.chat".to_string(),
+                logical_model: "llm.plan".to_string(),
+                requirements: Requirements::default(),
+                disable,
+                policy: None,
+                estimated_input_tokens: None,
+                estimated_output_tokens: None,
+                session_id: None,
+                session_profile: None,
+            },
+            Default::default(),
+        )
+        .expect("llm.plan should route through llm.gemini-pro family mount");
+
+    assert_eq!(
+        response.selected_exact_model,
+        "gemini-2.5-pro@google-gemini-main"
+    );
 }
 
 #[test]

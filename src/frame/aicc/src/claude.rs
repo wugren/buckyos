@@ -1,13 +1,12 @@
 use crate::aicc::{
-    llm_logical_mounts, provider_model_metadata, provider_type_from_settings, redacted_json_log,
-    AIComputeCenter, Provider, ProviderError, ProviderInstance, ProviderStartResult,
-    ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
 use crate::claude_protocol::convert_complete_request;
 use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
-    ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, HealthStatus, ModelMetadata, PricingMode,
+    ProviderInventory, ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -330,31 +329,65 @@ impl ClaudeProvider {
             return None;
         }
 
-        let model_features =
-            effective_features_for_claude_model(provider_model_id, self.features.as_slice());
-        let mut normalized = provider_model_metadata(
+        let fallback_api_types = if model.api_types.is_empty() {
+            vec![ApiType::LlmChat]
+        } else {
+            model.api_types.clone()
+        };
+        let request = DriverModelResolveRequest::new(provider_model_id, fallback_api_types)
+            .with_cost(model.pricing.estimated_cost_usd)
+            .with_latency(model.health.p50_latency_ms.or(model.health.p95_latency_ms));
+        let inventory = resolve_driver_inventory(
             self.provider_instance_name.as_str(),
             self.provider_type.clone(),
             self.provider_driver.as_str(),
-            provider_model_id,
-            ApiType::LlmChat,
-            llm_logical_mounts(self.provider_driver.as_str(), provider_model_id),
-            model_features.as_slice(),
-            model.pricing.estimated_cost_usd,
-            model.health.p50_latency_ms,
+            &[request],
+            None,
         );
-        normalized.parameter_scale = model.parameter_scale;
-        if !model.api_types.is_empty() {
-            normalized.api_types = model.api_types;
-        }
-        if !model.logical_mounts.is_empty() {
-            normalized.logical_mounts = model.logical_mounts;
-        }
-        normalized.capabilities = model.capabilities;
-        normalized.attributes = model.attributes;
-        normalized.pricing = model.pricing;
-        normalized.health = model.health;
+        let mut normalized = inventory.models.into_iter().next()?;
+        normalized.parameter_scale = model.parameter_scale.clone();
+        Self::merge_remote_pricing(&mut normalized, &model);
+        Self::merge_remote_health(&mut normalized, &model);
         Some(normalized)
+    }
+
+    fn merge_remote_pricing(normalized: &mut ModelMetadata, remote: &ModelMetadata) {
+        if remote.pricing.input_token_usd.is_some() {
+            normalized.pricing.input_token_usd = remote.pricing.input_token_usd;
+        }
+        if remote.pricing.output_token_usd.is_some() {
+            normalized.pricing.output_token_usd = remote.pricing.output_token_usd;
+        }
+        if remote.pricing.cache_input_token_usd.is_some() {
+            normalized.pricing.cache_input_token_usd = remote.pricing.cache_input_token_usd;
+        }
+        if remote.pricing.estimated_cost_usd.is_some() {
+            normalized.pricing.estimated_cost_usd = remote.pricing.estimated_cost_usd;
+        }
+    }
+
+    fn merge_remote_health(normalized: &mut ModelMetadata, remote: &ModelMetadata) {
+        if remote.health.status != HealthStatus::Available {
+            normalized.health.status = remote.health.status.clone();
+        }
+        if remote.health.p50_latency_ms.is_some() {
+            normalized.health.p50_latency_ms = remote.health.p50_latency_ms;
+        }
+        if remote.health.p95_latency_ms.is_some() {
+            normalized.health.p95_latency_ms = remote.health.p95_latency_ms;
+        }
+        if remote.health.error_rate_5m.is_some() {
+            normalized.health.error_rate_5m = remote.health.error_rate_5m;
+        }
+        if remote.health.recent_failures.is_some() {
+            normalized.health.recent_failures = remote.health.recent_failures;
+        }
+        if remote.health.queue_depth.is_some() {
+            normalized.health.queue_depth = remote.health.queue_depth;
+        }
+        if remote.health.quota_state != QuotaState::Unknown {
+            normalized.health.quota_state = remote.health.quota_state.clone();
+        }
     }
 
     fn price_per_1m_tokens(model: &str) -> (f64, f64) {
@@ -1002,6 +1035,7 @@ fn default_features() -> Vec<String> {
 ///
 /// Naming pattern accepted: `claude-{3|3-5|3-7}-{family}-...` for legacy and
 /// `claude-{opus|sonnet|haiku}-{4|5}-...` for Claude 4 onwards.
+#[cfg(test)]
 fn claude_model_family_is_4_or_newer(id: &str) -> bool {
     id.starts_with("claude-opus-4")
         || id.starts_with("claude-sonnet-4")
@@ -1011,11 +1045,13 @@ fn claude_model_family_is_4_or_newer(id: &str) -> bool {
         || id.starts_with("claude-haiku-5")
 }
 
+#[cfg(test)]
 fn claude_model_supports_extended_thinking(model_id: &str) -> bool {
     let id = model_id.trim().to_ascii_lowercase();
     id.starts_with("claude-3-7-") || claude_model_family_is_4_or_newer(id.as_str())
 }
 
+#[cfg(test)]
 fn claude_model_supports_web_search(model_id: &str) -> bool {
     let id = model_id.trim().to_ascii_lowercase();
     id.starts_with("claude-3-5-")
@@ -1023,12 +1059,14 @@ fn claude_model_supports_web_search(model_id: &str) -> bool {
         || claude_model_family_is_4_or_newer(id.as_str())
 }
 
+#[cfg(test)]
 fn claude_model_supports_vision(model_id: &str) -> bool {
     let id = model_id.trim().to_ascii_lowercase();
     // Claude 3.5 Haiku is text-only per Anthropic docs.
     !id.starts_with("claude-3-5-haiku")
 }
 
+#[cfg(test)]
 fn effective_features_for_claude_model(model_id: &str, base: &[Feature]) -> Vec<Feature> {
     let mut out: Vec<Feature> = Vec::with_capacity(base.len() + 3);
     let push_unique = |out: &mut Vec<Feature>, value: &str| {
