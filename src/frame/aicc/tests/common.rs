@@ -281,6 +281,7 @@ fn mock_inventory(instance: &ProviderInstance, cost: &CostEstimate) -> ProviderI
         models.push(provider_model_metadata(
             instance.provider_instance_name.as_str(),
             instance.provider_type.clone(),
+            instance.provider_driver.as_str(),
             provider_model_id,
             api_type,
             mounts.into_iter().map(str::to_string).collect(),

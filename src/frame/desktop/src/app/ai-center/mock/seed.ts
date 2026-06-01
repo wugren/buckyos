@@ -23,6 +23,7 @@ function model(
   return {
     provider_model_id: providerModelId,
     exact_model: exactModel,
+    model_driver: providerInstanceName,
     logical_mounts: mounts,
     api_types: apiTypes,
     capabilities: {

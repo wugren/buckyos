@@ -124,6 +124,7 @@ interface RawProviderInventory {
 interface RawModelMetadata {
   provider_model_id?: unknown
   exact_model?: unknown
+  model_driver?: unknown
   parameter_scale?: unknown
   api_types?: unknown
   logical_mounts?: unknown
@@ -728,7 +729,7 @@ function toProviderInventory(raw: RawProviderInventory): ProviderInventory {
     version: asOptionalString(raw.version),
     inventory_revision: asOptionalString(raw.inventory_revision),
     models: Array.isArray(raw.models)
-      ? raw.models.map((model) => toModelMetadata(model, runtimeType))
+      ? raw.models.map((model) => toModelMetadata(model, runtimeType, driver))
       : [],
   }
 }
@@ -786,7 +787,11 @@ function toLocalModels(inventory: ProviderInventory): LocalModel[] {
   }))
 }
 
-function toModelMetadata(raw: RawModelMetadata, providerRuntimeType: ProviderRuntimeType): ModelMetadata {
+function toModelMetadata(
+  raw: RawModelMetadata,
+  providerRuntimeType: ProviderRuntimeType,
+  providerDriver: string,
+): ModelMetadata {
   const providerModelId = asNonEmptyString(raw.provider_model_id, 'unknown-model')
   const exactModel = asNonEmptyString(raw.exact_model, providerModelId)
   const apiTypes = toApiTypes(raw.api_types)
@@ -803,6 +808,7 @@ function toModelMetadata(raw: RawModelMetadata, providerRuntimeType: ProviderRun
   return {
     provider_model_id: providerModelId,
     exact_model: exactModel,
+    model_driver: asNonEmptyString(raw.model_driver, providerDriver),
     parameter_scale: asOptionalString(raw.parameter_scale),
     api_types: apiTypes,
     logical_mounts: toStringArray(raw.logical_mounts),

@@ -58,6 +58,9 @@ Rules support these fields:
 
 - `id`: exact provider model id for `models`.
 - `pattern`: wildcard provider model id pattern for `patterns`.
+- `model_driver`: optional per-model metadata driver. Defaults to the
+  provider driver, but proxy/aggregator providers can override it when a model
+  should be attributed to its upstream project or publisher.
 - `exclude`: drops the provider model from inventory.
 - `parameter_scale`: optional display/classification string.
 - `api_types`: AICC API types, for example `llm.chat`, `image.txt2img`, `audio.asr`.

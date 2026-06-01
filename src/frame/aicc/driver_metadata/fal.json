@@ -5,6 +5,7 @@
   "models": [
     {
       "id": "fal-ai/esrgan",
+      "model_driver": "real-esrgan",
       "api_types": ["image.upscale"],
       "logical_mounts": ["image.upscale", "image.upscale.fal", "image.upscale.fal-ai.esrgan"],
       "estimated_cost_usd": 0.05,
@@ -12,6 +13,7 @@
     },
     {
       "id": "fal-ai/imageutils/rembg",
+      "model_driver": "rembg",
       "api_types": ["image.bg_remove"],
       "logical_mounts": ["image.bg_remove", "image.bg_remove.fal", "image.bg_remove.fal-ai.imageutils.rembg"],
       "estimated_cost_usd": 0.01,
@@ -19,6 +21,7 @@
     },
     {
       "id": "fal-ai/deepfilternet3",
+      "model_driver": "deepfilternet",
       "api_types": ["audio.enhance"],
       "logical_mounts": ["audio.enhance", "audio.enhance.fal", "audio.enhance.fal-ai.deepfilternet3"],
       "estimated_cost_usd": 0.02,
@@ -26,6 +29,7 @@
     },
     {
       "id": "fal-ai/video-upscaler",
+      "model_driver": "real-esrgan",
       "api_types": ["video.upscale"],
       "logical_mounts": ["video.upscale", "video.upscale.fal", "video.upscale.fal-ai.video-upscaler"],
       "estimated_cost_usd": 0.5,

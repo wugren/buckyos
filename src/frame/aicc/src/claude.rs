@@ -335,6 +335,7 @@ impl ClaudeProvider {
         let mut normalized = provider_model_metadata(
             self.provider_instance_name.as_str(),
             self.provider_type.clone(),
+            self.provider_driver.as_str(),
             provider_model_id,
             ApiType::LlmChat,
             llm_logical_mounts(self.provider_driver.as_str(), provider_model_id),

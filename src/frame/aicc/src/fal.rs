@@ -906,6 +906,39 @@ mod tests {
     }
 
     #[test]
+    fn fal_inventory_models_expose_upstream_model_driver() {
+        let provider = FalProvider::new(
+            FalInstanceConfig {
+                provider_instance_name: "fal-main".to_string(),
+                provider_type: "cloud_api".to_string(),
+                api_token: "test-token".to_string(),
+                base_url: DEFAULT_FAL_BASE_URL.to_string(),
+                timeout_ms: DEFAULT_FAL_TIMEOUT_MS,
+                image_upscale_models: vec!["fal-ai/esrgan".to_string()],
+                image_bg_remove_models: vec!["fal-ai/imageutils/rembg".to_string()],
+                audio_enhance_models: vec!["fal-ai/deepfilternet3".to_string()],
+                video_upscale_models: vec!["fal-ai/video-upscaler".to_string()],
+            },
+            "test-token".to_string(),
+        )
+        .expect("provider");
+
+        let inventory = provider.inventory();
+        let driver_for = |model_id: &str| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == model_id)
+                .map(|model| model.model_driver.as_str())
+        };
+
+        assert_eq!(driver_for("fal-ai/esrgan"), Some("real-esrgan"));
+        assert_eq!(driver_for("fal-ai/imageutils/rembg"), Some("rembg"));
+        assert_eq!(driver_for("fal-ai/deepfilternet3"), Some("deepfilternet"));
+        assert_eq!(driver_for("fal-ai/video-upscaler"), Some("real-esrgan"));
+    }
+
+    #[test]
     fn build_request_body_inserts_image_url_from_resources() {
         let mut req = AiMethodRequest::new(
             Capability::Image,

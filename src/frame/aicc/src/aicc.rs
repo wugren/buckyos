@@ -2736,6 +2736,7 @@ pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> V
 pub fn provider_model_metadata(
     provider_instance_name: &str,
     provider_type: ProviderType,
+    model_driver: &str,
     provider_model_id: &str,
     api_type: ApiType,
     logical_mounts: Vec<String>,
@@ -2746,6 +2747,7 @@ pub fn provider_model_metadata(
     ModelMetadata {
         provider_model_id: provider_model_id.to_string(),
         exact_model: exact_model_name(provider_model_id, provider_instance_name),
+        model_driver: model_driver.to_string(),
         provider_actual_model_id: None,
         provider_options: None,
         parameter_scale: None,
@@ -2976,6 +2978,7 @@ impl AIComputeCenter {
                         json!({
                             "exact_model": model.exact_model,
                             "provider_model_id": model.provider_model_id,
+                            "model_driver": model.model_driver,
                             "api_types": model.api_types,
                             "logical_mounts": model.logical_mounts,
                             "capabilities": model.capabilities,
@@ -6034,6 +6037,7 @@ mod tests {
             models: vec![provider_model_metadata(
                 instance.provider_instance_name.as_str(),
                 instance.provider_type.clone(),
+                instance.provider_driver.as_str(),
                 "gpt-4o-mini",
                 ApiType::LlmChat,
                 vec!["llm.plan.default".to_string()],

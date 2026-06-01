@@ -578,6 +578,8 @@ impl Default for ModelHealth {
 pub struct ModelMetadata {
     pub provider_model_id: String,
     pub exact_model: String,
+    #[serde(default)]
+    pub model_driver: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_actual_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1308,6 +1310,7 @@ mod tests {
         let model = ModelMetadata {
             provider_model_id: "gpt-5.2".to_string(),
             exact_model: "gpt-5.2@openai_primary".to_string(),
+            model_driver: "openai".to_string(),
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,

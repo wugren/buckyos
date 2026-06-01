@@ -36,6 +36,7 @@ export type PricingMode = 'per_token' | 'subscription' | 'free_quota' | 'unknown
 export interface ModelMetadata {
   provider_model_id: string
   exact_model: string
+  model_driver: string
   parameter_scale?: string
   api_types: ApiType[]
   logical_mounts: string[]

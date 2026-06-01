@@ -72,6 +72,8 @@ pub struct DriverModelRule {
     #[serde(default)]
     pub pattern: Option<String>,
     #[serde(default)]
+    pub model_driver: Option<String>,
+    #[serde(default)]
     pub exclude: bool,
     #[serde(default)]
     pub parameter_scale: Option<String>,
@@ -217,8 +219,12 @@ fn resolve_driver_model(
     let mut quality_score = Some(0.75);
     let mut latency_class = LatencyClass::Normal;
     let mut cost_class = CostClass::Medium;
+    let mut model_driver = provider_driver.to_string();
 
     if let Some(rule) = rule {
+        if let Some(next) = rule.model_driver.as_ref() {
+            model_driver = next.clone();
+        }
         if let Some(next_api_types) = rule.api_types.as_ref() {
             api_types = next_api_types.clone();
         }
@@ -256,6 +262,7 @@ fn resolve_driver_model(
     Some(ModelMetadata {
         provider_model_id: provider_model_id.to_string(),
         exact_model: exact_model_name(provider_model_id, provider_instance_name),
+        model_driver,
         provider_actual_model_id: None,
         provider_options: None,
         parameter_scale,

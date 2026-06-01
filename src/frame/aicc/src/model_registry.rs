@@ -29,8 +29,13 @@ impl ModelRegistry {
 
     pub fn apply_inventory_if_changed(
         &mut self,
-        inventory: ProviderInventory,
+        mut inventory: ProviderInventory,
     ) -> Result<bool, RouteError> {
+        for model in inventory.models.iter_mut() {
+            if model.model_driver.trim().is_empty() {
+                model.model_driver = inventory.provider_driver.clone();
+            }
+        }
         validate_inventory(&inventory)?;
         let provider_instance_name = inventory.provider_instance_name.clone();
         if let (Some(current), Some(next_revision)) = (
@@ -436,6 +441,7 @@ mod tests {
         ModelMetadata {
             provider_model_id: provider_model_id.to_string(),
             exact_model: format!("{}@{}", provider_model_id, provider),
+            model_driver: provider.to_string(),
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,
