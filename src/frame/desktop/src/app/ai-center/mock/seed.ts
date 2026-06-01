@@ -571,6 +571,7 @@ function buildSessionConfig(withPhysicalModels: boolean): SessionConfig {
           'qwen2.5-coder-32b@local': 1.2,
         }
       : {},
+    provider_weights: {},
     policy: {
       profile: 'balanced',
       allow_fallback: true,

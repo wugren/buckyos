@@ -76,6 +76,7 @@ const EMPTY_SNAPSHOT: StoreSnapshot = {
   sessionConfig: {
     logical_tree: [],
     global_exact_model_weights: {},
+    provider_weights: {},
     policy: {},
   },
   routeTraces: [],
@@ -144,6 +145,7 @@ interface RawSessionConfig {
   inherit?: unknown
   logical_tree?: Record<string, RawLogicalNode>
   global_exact_model_weights?: unknown
+  provider_weights?: unknown
   policy?: unknown
   revision?: unknown
   ttl_seconds?: unknown
@@ -859,6 +861,7 @@ function toSessionConfig(
     inherit: asOptionalString(raw?.inherit),
     logical_tree: logicalTree,
     global_exact_model_weights: asNumberRecord(raw?.global_exact_model_weights),
+    provider_weights: asNumberRecord(raw?.provider_weights),
     policy: toRoutePolicy(raw?.policy),
     revision: asOptionalString(raw?.revision),
     ttl_seconds: asOptionalNumber(raw?.ttl_seconds),

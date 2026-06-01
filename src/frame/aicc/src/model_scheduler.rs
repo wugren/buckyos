@@ -127,6 +127,7 @@ fn score_candidates(candidates: &[ModelCandidate], policy: &RoutePolicy) -> Vec<
     let latencies = value_range(candidates.iter().map(latency_value));
     let risks = value_range(candidates.iter().map(risk_value));
     let qualities = value_range(candidates.iter().map(quality_penalty));
+    let preferences = value_range(candidates.iter().map(preference_penalty));
 
     candidates
         .iter()
@@ -149,7 +150,7 @@ fn score_candidates(candidates: &[ModelCandidate], policy: &RoutePolicy) -> Vec<
                 .and_then(|profiles| profiles.weights_for(&policy.profile))
                 .cloned()
                 .unwrap_or_else(|| default_weights(&policy.profile));
-            let preference = 1.0 - candidate.exact_model_weight.clamp(0.0, 1.0);
+            let preference = normalize(preference_penalty(&candidate), preferences);
             let cache = 0.0;
             let score = weights.cost * cost
                 + weights.latency * latency
@@ -273,6 +274,11 @@ fn quality_penalty(candidate: &ModelCandidate) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+fn preference_penalty(candidate: &ModelCandidate) -> f64 {
+    let weight = (candidate.exact_model_weight * candidate.provider_weight).max(0.000_001);
+    1.0 / weight
+}
+
 fn value_range(values: impl Iterator<Item = f64>) -> (f64, f64) {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -313,6 +319,7 @@ fn ranked_trace(
                 provider_instance_name: candidate.provider_instance_name.clone(),
                 priority_path: candidate.priority_path.clone(),
                 exact_model_weight: candidate.exact_model_weight,
+                provider_weight: candidate.provider_weight,
                 final_score,
                 selected: selected
                     .map(|item| item.exact_model == candidate.exact_model)
@@ -503,5 +510,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.selected.provider_instance_name, "quality");
+    }
+
+    #[test]
+    fn provider_weight_participates_in_preference_scoring() {
+        let mut items = vec![
+            candidate(
+                "primary",
+                "same-model",
+                0.01,
+                1000,
+                0.90,
+                ProviderType::CloudApi,
+            ),
+            candidate(
+                "backup",
+                "same-model",
+                0.01,
+                1000,
+                0.90,
+                ProviderType::CloudApi,
+            ),
+        ];
+        items[0].provider_weight = 0.3;
+        items[1].provider_weight = 2.0;
+        let policy = RoutePolicy {
+            profile: SchedulerProfile::Balanced,
+            scheduler_profiles: Some(SchedulerProfileConfig {
+                balanced: Some(SchedulerProfileWeights {
+                    cost: 0.0,
+                    latency: 0.0,
+                    reliability: 0.0,
+                    quality: 0.0,
+                    preference: 1.0,
+                    cache: 0.0,
+                    local: 0.0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = ModelScheduler
+            .schedule(&items, &policy, None, None)
+            .unwrap();
+
+        assert_eq!(result.selected.provider_instance_name, "backup");
+        assert_eq!(result.ranked_candidates[1].provider_weight, 2.0);
     }
 }

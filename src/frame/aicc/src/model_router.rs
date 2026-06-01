@@ -257,6 +257,9 @@ impl<'a> ModelRouter<'a> {
             .into_iter()
             .map(|mut candidate| {
                 candidate.priority_path = vec![1.0];
+                candidate.provider_weight = self
+                    .session_config
+                    .provider_weight(candidate.provider_instance_name.as_str());
                 candidate.route_paths = vec![exact_model.to_string()];
                 candidate
             })
@@ -343,6 +346,9 @@ impl<'a> ModelRouter<'a> {
                     candidate.exact_model_weight = self
                         .session_config
                         .node_exact_weight(logical_path, candidate.exact_model.as_str());
+                    candidate.provider_weight = self
+                        .session_config
+                        .provider_weight(candidate.provider_instance_name.as_str());
                     candidate
                         .route_paths
                         .push(format!("{} -> {}", logical_path, item.target));
@@ -459,6 +465,10 @@ impl<'a> ModelRouter<'a> {
                 }
                 if candidate.exact_model_weight <= 0.0 {
                     trace_drop(trace, &candidate, "exact_model_weight_zero");
+                    return None;
+                }
+                if candidate.provider_weight <= 0.0 {
+                    trace_drop(trace, &candidate, "provider_weight_zero");
                     return None;
                 }
                 Some(candidate)
@@ -793,6 +803,31 @@ mod tests {
 
         assert_eq!(resolved.candidates.len(), 1);
         assert_eq!(resolved.candidates[0].exact_model, "gpt-5.2@openai_primary");
+    }
+
+    #[test]
+    fn provider_weight_zero_filters_provider_candidates() {
+        let registry = registry();
+        let mut config = session_config();
+        config
+            .provider_weights
+            .insert("openai_primary".to_string(), 0.0);
+        let router = ModelRouter::new(&registry, &config);
+
+        let resolved = router
+            .resolve(request("llm.plan", RoutePolicy::default()))
+            .unwrap();
+
+        assert_eq!(resolved.candidates.len(), 1);
+        assert_eq!(
+            resolved.candidates[0].exact_model,
+            "claude-sonnet@anthropic"
+        );
+        assert!(resolved
+            .trace
+            .filtered_candidates
+            .iter()
+            .any(|item| item.reason == "provider_weight_zero"));
     }
 
     #[test]

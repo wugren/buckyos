@@ -1,6 +1,7 @@
 use crate::model_types::{
-    FallbackMode, FallbackRule, LockedValue, LogicalItems, ModelDisable, ModelItem, ModelItemPatch,
-    OverlayMergeMode, PolicyConfig, RouteError, RouteErrorCode, SessionOverlayTrace,
+    is_valid_provider_instance_name, FallbackMode, FallbackRule, LockedValue, LogicalItems,
+    ModelDisable, ModelItem, ModelItemPatch, OverlayMergeMode, PolicyConfig, RouteError,
+    RouteErrorCode, SessionOverlayTrace,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,6 +84,8 @@ pub struct SessionConfig {
     #[serde(default)]
     pub global_exact_model_weights: BTreeMap<String, f64>,
     #[serde(default)]
+    pub provider_weights: BTreeMap<String, f64>,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub revision: Option<String>,
@@ -132,6 +135,15 @@ impl SessionConfig {
         for weight in self.global_exact_model_weights.values() {
             validate_weight(*weight)?;
         }
+        for (provider_instance_name, weight) in self.provider_weights.iter() {
+            if !is_valid_provider_instance_name(provider_instance_name) {
+                return Err(RouteError::new(
+                    RouteErrorCode::SessionConfigInvalid,
+                    "provider weight key must be a valid provider instance name",
+                ));
+            }
+            validate_weight(*weight)?;
+        }
         validate_policy_values(&self.policy)?;
         for node in self.logical_tree.values() {
             validate_node(node)?;
@@ -159,6 +171,13 @@ impl SessionConfig {
         self.node(path)
             .and_then(|node| node.exact_model_weights.get(exact_model).copied())
             .or_else(|| self.global_exact_model_weights.get(exact_model).copied())
+            .unwrap_or(1.0)
+    }
+
+    pub fn provider_weight(&self, provider_instance_name: &str) -> f64 {
+        self.provider_weights
+            .get(provider_instance_name)
+            .copied()
             .unwrap_or(1.0)
     }
 }
@@ -204,6 +223,9 @@ pub fn merge_session_config(
     merged
         .global_exact_model_weights
         .extend(child.global_exact_model_weights.clone());
+    merged
+        .provider_weights
+        .extend(child.provider_weights.clone());
     merged
         .logical_profiles
         .extend(child.logical_profiles.clone());
@@ -1059,6 +1081,35 @@ mod tests {
             merged.node_exact_weight("llm.gpt5", "claude-sonnet@anthropic"),
             1.0
         );
+    }
+
+    #[test]
+    fn session_patch_merges_provider_weights() {
+        let parent = SessionConfig {
+            provider_weights: [
+                ("openai_primary".to_string(), 1.0),
+                ("openai_backup".to_string(), 0.5),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let child = SessionConfig {
+            provider_weights: [
+                ("openai_backup".to_string(), 0.0),
+                ("local_llama".to_string(), 2.0),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let merged = merge_session_config(&parent, &child).unwrap();
+
+        assert_eq!(merged.provider_weight("openai_primary"), 1.0);
+        assert_eq!(merged.provider_weight("openai_backup"), 0.0);
+        assert_eq!(merged.provider_weight("local_llama"), 2.0);
+        assert_eq!(merged.provider_weight("missing"), 1.0);
     }
 
     #[test]

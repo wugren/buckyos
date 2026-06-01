@@ -204,6 +204,7 @@ export interface SessionConfig {
   inherit?: string
   logical_tree: LogicalNode[]
   global_exact_model_weights: Record<string, number>
+  provider_weights: Record<string, number>
   policy: RoutePolicy
   revision?: string
   ttl_seconds?: number
@@ -218,7 +219,13 @@ export interface RouteTrace {
   resolved_logical_path?: string
   selected_exact_model?: string
   selected_provider_instance_name?: string
-  ranked_candidates: Array<{ exact_model: string; final_score?: number; selected: boolean }>
+  ranked_candidates: Array<{
+    exact_model: string
+    final_score?: number
+    selected: boolean
+    exact_model_weight?: number
+    provider_weight?: number
+  }>
   filtered_candidates: Array<{ exact_model: string; reason: string }>
   fallback_applied: boolean
   fallback_chain: Array<{ from: string; to: string; reason: string }>

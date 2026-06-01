@@ -1040,6 +1040,8 @@ pub struct ModelCandidate {
     pub priority_path: Vec<f64>,
     #[serde(default = "default_item_weight")]
     pub exact_model_weight: f64,
+    #[serde(default = "default_item_weight")]
+    pub provider_weight: f64,
     #[serde(default)]
     pub route_paths: Vec<String>,
     #[serde(default)]
@@ -1058,6 +1060,7 @@ impl ModelCandidate {
             resolved_logical_path: None,
             priority_path: Vec::new(),
             exact_model_weight: 1.0,
+            provider_weight: 1.0,
             route_paths: Vec::new(),
             dynamic_cost_estimate: None,
         })
@@ -1078,6 +1081,8 @@ pub struct RankedCandidateTrace {
     #[serde(default)]
     pub priority_path: Vec<f64>,
     pub exact_model_weight: f64,
+    #[serde(default = "default_item_weight")]
+    pub provider_weight: f64,
     #[serde(default)]
     pub final_score: Option<f64>,
     pub selected: bool,
