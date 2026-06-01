@@ -32,10 +32,11 @@ function modelHealthVariant(status: ModelMetadata['health']['status']): 'ok' | '
 
 interface ProviderDetailPanelProps {
   provider: ProviderView
+  routingWeight: number
   onDeleted: () => void
 }
 
-export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanelProps) {
+export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: ProviderDetailPanelProps) {
   const { t } = useI18n()
   const store = useAICCStore()
   const [showModels, setShowModels] = useState(true)
@@ -55,6 +56,13 @@ export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanel
   const balanceDisplay = account.balance_supported && account.balance_value != null
     ? `${account.balance_unit === 'usd' ? '$' : ''}${account.balance_value}${account.balance_unit === 'credit' ? ' Credit' : ''}`
     : t('aiCenter.providers.usageOnly', 'Usage only')
+  const routingWeightLabel = routingWeight === 0
+    ? t('aiCenter.providers.routingDisabled', 'Disabled for routing')
+    : routingWeight < 1
+      ? t('aiCenter.providers.routingDownweighted', 'Downweighted')
+      : routingWeight > 1
+        ? t('aiCenter.providers.routingUpweighted', 'Upweighted')
+        : t('aiCenter.providers.routingDefault', 'Default')
 
   return (
     <div className="flex flex-col gap-4">
@@ -67,10 +75,11 @@ export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanel
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
         <Metric label={t('aiCenter.providers.inventoryModels', 'Inventory Models')} value={models.length.toString()} detail={inventory.inventory_revision} />
         <Metric label={t('aiCenter.providers.health', 'Health')} value={`${models.length - degradedCount}/${models.length}`} detail={t('aiCenter.providers.availableModels', 'available models')} />
         <Metric label={t('aiCenter.providers.quota', 'Quota')} value={quotaWarningCount ? `${quotaWarningCount}` : '0'} detail={quotaWarningCount ? t('aiCenter.providers.quotaWarning', 'needs attention') : t('aiCenter.providers.quotaNormal', 'normal')} />
+        <Metric label={t('aiCenter.providers.routingWeight', 'Routing Weight')} value={formatWeight(routingWeight)} detail={routingWeightLabel} />
       </div>
 
       <div
@@ -78,6 +87,7 @@ export function ProviderDetailPanel({ provider, onDeleted }: ProviderDetailPanel
         style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
       >
         <Row label={t('aiCenter.providers.driver', 'Driver')} value={config.provider_driver} />
+        <Row label={t('aiCenter.providers.routingWeight', 'Routing Weight')} value={`${formatWeight(routingWeight)} · ${routingWeightLabel}`} />
         <Row label={t('aiCenter.providers.runtimeType', 'Runtime Type')} value={config.provider_runtime_type} />
         <Row label={t('aiCenter.providers.endpoint', 'Endpoint')} value={config.endpoint || t('aiCenter.providers.default', 'Default')} />
         <Row
@@ -171,6 +181,10 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
       {detail && <div className="text-[11px] truncate" style={{ color: 'var(--cp-muted)' }}>{detail}</div>}
     </div>
   )
+}
+
+function formatWeight(weight: number): string {
+  return weight.toFixed(2).replace(/\.?0+$/, '')
 }
 
 function ModelInventoryRow({ model }: { model: ModelMetadata }) {

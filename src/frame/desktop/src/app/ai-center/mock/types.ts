@@ -225,6 +225,14 @@ export interface RouteTrace {
     selected: boolean
     exact_model_weight?: number
     provider_weight?: number
+    preference_score_inputs?: {
+      exact_model_weight: number
+      provider_weight: number
+      combined_weight: number
+      preference_penalty: number
+      exact_model_weight_effect: string
+      provider_weight_effect: string
+    }
   }>
   filtered_candidates: Array<{ exact_model: string; reason: string }>
   fallback_applied: boolean

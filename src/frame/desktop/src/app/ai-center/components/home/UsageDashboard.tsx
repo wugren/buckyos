@@ -2,6 +2,7 @@ import { Activity, CreditCard, DollarSign, Route, Wallet } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAIStatus, useProviders, useRouteTraces, useUsageEvents, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
 import { SummaryCard } from '../shared/SummaryCard'
+import type { RouteTrace } from '../../../../api/aicc_mgr'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -11,6 +12,18 @@ function formatTokens(n: number): string {
 
 function topEntries(record: Record<string, number>, limit = 4): Array<[string, number]> {
   return Object.entries(record).sort((a, b) => b[1] - a[1]).slice(0, limit)
+}
+
+function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number]): string {
+  const inputs = candidate.preference_score_inputs
+  const exact = inputs?.exact_model_weight ?? candidate.exact_model_weight ?? 1
+  const provider = inputs?.provider_weight ?? candidate.provider_weight ?? 1
+  const combined = inputs?.combined_weight ?? exact * provider
+  return `exact ${formatWeight(exact)} · provider ${formatWeight(provider)} · combined ${formatWeight(combined)}`
+}
+
+function formatWeight(weight: number): string {
+  return weight.toFixed(2).replace(/\.?0+$/, '')
 }
 
 export function UsageDashboard() {
@@ -151,7 +164,7 @@ export function UsageDashboard() {
                     color: candidate.selected ? 'var(--cp-accent)' : 'var(--cp-muted)',
                   }}
                 >
-                  {candidate.exact_model} · {candidate.final_score?.toFixed(2)}
+                  {candidate.exact_model} · {candidate.final_score?.toFixed(2)} · {candidateWeightSummary(candidate)}
                 </span>
               ))}
             </div>

@@ -1084,8 +1084,53 @@ pub struct RankedCandidateTrace {
     #[serde(default = "default_item_weight")]
     pub provider_weight: f64,
     #[serde(default)]
+    pub preference_score_inputs: PreferenceScoreInputs,
+    #[serde(default)]
     pub final_score: Option<f64>,
     pub selected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreferenceScoreInputs {
+    pub exact_model_weight: f64,
+    pub provider_weight: f64,
+    pub combined_weight: f64,
+    pub preference_penalty: f64,
+    pub exact_model_weight_effect: String,
+    pub provider_weight_effect: String,
+}
+
+impl Default for PreferenceScoreInputs {
+    fn default() -> Self {
+        Self::from_weights(1.0, 1.0)
+    }
+}
+
+impl PreferenceScoreInputs {
+    pub fn from_weights(exact_model_weight: f64, provider_weight: f64) -> Self {
+        let combined_weight = (exact_model_weight * provider_weight).max(0.0);
+        let preference_penalty = 1.0 / combined_weight.max(0.000_001);
+        Self {
+            exact_model_weight,
+            provider_weight,
+            combined_weight,
+            preference_penalty,
+            exact_model_weight_effect: weight_effect(exact_model_weight).to_string(),
+            provider_weight_effect: weight_effect(provider_weight).to_string(),
+        }
+    }
+}
+
+fn weight_effect(weight: f64) -> &'static str {
+    if weight <= 0.0 {
+        "disabled"
+    } else if weight < 1.0 {
+        "downweighted"
+    } else if weight > 1.0 {
+        "upweighted"
+    } else {
+        "neutral"
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

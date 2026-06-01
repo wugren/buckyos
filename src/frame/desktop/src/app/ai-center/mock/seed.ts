@@ -571,7 +571,9 @@ function buildSessionConfig(withPhysicalModels: boolean): SessionConfig {
           'qwen2.5-coder-32b@local': 1.2,
         }
       : {},
-    provider_weights: {},
+    provider_weights: {
+      'openai-main': 0.3,
+    },
     policy: {
       profile: 'balanced',
       allow_fallback: true,
@@ -636,9 +638,51 @@ const routeTraces: RouteTrace[] = [
     selected_exact_model: 'claude-opus-4.7@anthropic-work',
     selected_provider_instance_name: 'anthropic-work',
     ranked_candidates: [
-      { exact_model: 'claude-opus-4.7@anthropic-work', final_score: 0.94, selected: true },
-      { exact_model: 'gpt-5.1@openai-main', final_score: 0.9, selected: false },
-      { exact_model: 'qwen2.5-coder-32b@local', final_score: 0.62, selected: false },
+      {
+        exact_model: 'claude-opus-4.7@anthropic-work',
+        final_score: 0.94,
+        selected: true,
+        exact_model_weight: 1,
+        provider_weight: 1,
+        preference_score_inputs: {
+          exact_model_weight: 1,
+          provider_weight: 1,
+          combined_weight: 1,
+          preference_penalty: 1,
+          exact_model_weight_effect: 'neutral',
+          provider_weight_effect: 'neutral',
+        },
+      },
+      {
+        exact_model: 'gpt-5.1@openai-main',
+        final_score: 0.9,
+        selected: false,
+        exact_model_weight: 1,
+        provider_weight: 0.3,
+        preference_score_inputs: {
+          exact_model_weight: 1,
+          provider_weight: 0.3,
+          combined_weight: 0.3,
+          preference_penalty: 3.3333333333333335,
+          exact_model_weight_effect: 'neutral',
+          provider_weight_effect: 'downweighted',
+        },
+      },
+      {
+        exact_model: 'qwen2.5-coder-32b@local',
+        final_score: 0.62,
+        selected: false,
+        exact_model_weight: 1.2,
+        provider_weight: 1,
+        preference_score_inputs: {
+          exact_model_weight: 1.2,
+          provider_weight: 1,
+          combined_weight: 1.2,
+          preference_penalty: 0.8333333333333334,
+          exact_model_weight_effect: 'upweighted',
+          provider_weight_effect: 'neutral',
+        },
+      },
     ],
     filtered_candidates: [
       { exact_model: 'sn-router-balanced@sn-router', reason: 'quality score below llm.plan policy threshold' },

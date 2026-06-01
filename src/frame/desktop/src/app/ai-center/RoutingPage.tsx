@@ -396,8 +396,13 @@ function TraceExplorer({ traces, compact }: { traces: RouteTrace[]; compact: boo
             <div className="flex flex-col gap-1 mt-3">
               {trace.ranked_candidates.length > 0 ? trace.ranked_candidates.map((candidate) => (
                 <div key={candidate.exact_model} className="flex justify-between gap-3 text-xs">
-                  <span style={{ color: candidate.selected ? 'var(--cp-accent)' : 'var(--cp-muted)' }}>{candidate.exact_model}</span>
-                  <span style={{ color: 'var(--cp-muted)' }}>{candidate.final_score?.toFixed(2)}</span>
+                  <span className="min-w-0" style={{ color: candidate.selected ? 'var(--cp-accent)' : 'var(--cp-muted)' }}>
+                    <span className="block truncate">{candidate.exact_model}</span>
+                    <span className="block" style={{ color: 'var(--cp-muted)' }}>
+                      {candidateWeightSummary(candidate)}
+                    </span>
+                  </span>
+                  <span className="shrink-0" style={{ color: 'var(--cp-muted)' }}>{candidate.final_score?.toFixed(2)}</span>
                 </div>
               )) : trace.filtered_candidates.map((candidate) => (
                 <div key={candidate.exact_model} className="flex flex-col gap-0.5 text-xs">
@@ -414,6 +419,26 @@ function TraceExplorer({ traces, compact }: { traces: RouteTrace[]; compact: boo
       </div>
     </section>
   )
+}
+
+function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number]): string {
+  const inputs = candidate.preference_score_inputs
+  const exact = inputs?.exact_model_weight ?? candidate.exact_model_weight ?? 1
+  const provider = inputs?.provider_weight ?? candidate.provider_weight ?? 1
+  const combined = inputs?.combined_weight ?? exact * provider
+  const providerEffect = inputs?.provider_weight_effect ?? weightEffect(provider)
+  return `exact ${formatWeight(exact)} · provider ${formatWeight(provider)} ${providerEffect} · combined ${formatWeight(combined)}`
+}
+
+function weightEffect(weight: number): string {
+  if (weight <= 0) return 'disabled'
+  if (weight < 1) return 'downweighted'
+  if (weight > 1) return 'upweighted'
+  return 'neutral'
+}
+
+function formatWeight(weight: number): string {
+  return weight.toFixed(2).replace(/\.?0+$/, '')
 }
 
 function PolicyFact({ label, value }: { label: string; value: string }) {

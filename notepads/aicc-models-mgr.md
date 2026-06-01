@@ -312,6 +312,8 @@ strict_local
 - scheduler profile 再决定“同一优先级候选集合中选哪个 provider/物理模型”；
 - exact model weight 既能作为路径优先级补充，也能作为 scheduler preference。
 
+当前实现采用的优先级关系是：provider weight 不参与 `select_highest_priority()` 的候选集合筛选，只在候选进入 scheduler 后作为 `preference` 维度的输入；`provider_weight <= 0` 是例外，会在 hard filter 阶段直接禁用该 provider 的候选。这样可以保持用途目录 item weight 与 exact model weight 的路径优先级语义稳定，同时让用户对 provider 的整体偏好在同一最高优先级集合内生效。
+
 ### 3.8 用户自定义配置
 
 用户自定义配置不应该修改系统内置基础逻辑，而应该通过 overlay 表达偏好。
@@ -866,7 +868,7 @@ exact_model_weight 是否 > 0
 
 ### 8.4 目录权重选择候选集合
 
-Router 会比较候选的 `priority_path` 和 `exact_model_weight`，选择最高优先级集合。
+Router 会比较候选的 `priority_path` 和 `exact_model_weight`，选择最高优先级集合。Provider weight 不参与这一步；它只在 hard filter 中处理 `provider_weight <= 0`，并在 scheduler 的 `preference` 维度中影响同一最高优先级集合内的排序。
 
 这一步很重要：如果 `llm.chat -> llm.gpt-standard weight 3.0` 有可用候选，而 `llm.chat -> llm.sonnet weight 2.0` 也有可用候选，那么当前实现会只保留最高权重路径的候选进入 scheduler。
 

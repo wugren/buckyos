@@ -1,6 +1,6 @@
 use crate::model_types::{
-    ModelCandidate, ProviderType, RankedCandidateTrace, RoutePolicy, SchedulerProfile,
-    SchedulerProfileWeights,
+    ModelCandidate, PreferenceScoreInputs, ProviderType, RankedCandidateTrace, RoutePolicy,
+    SchedulerProfile, SchedulerProfileWeights,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -320,6 +320,10 @@ fn ranked_trace(
                 priority_path: candidate.priority_path.clone(),
                 exact_model_weight: candidate.exact_model_weight,
                 provider_weight: candidate.provider_weight,
+                preference_score_inputs: PreferenceScoreInputs::from_weights(
+                    candidate.exact_model_weight,
+                    candidate.provider_weight,
+                ),
                 final_score,
                 selected: selected
                     .map(|item| item.exact_model == candidate.exact_model)
@@ -556,5 +560,29 @@ mod tests {
 
         assert_eq!(result.selected.provider_instance_name, "backup");
         assert_eq!(result.ranked_candidates[1].provider_weight, 2.0);
+        assert_eq!(
+            result.ranked_candidates[0]
+                .preference_score_inputs
+                .provider_weight,
+            0.3
+        );
+        assert_eq!(
+            result.ranked_candidates[0]
+                .preference_score_inputs
+                .provider_weight_effect,
+            "downweighted"
+        );
+        assert_eq!(
+            result.ranked_candidates[1]
+                .preference_score_inputs
+                .provider_weight_effect,
+            "upweighted"
+        );
+        assert_eq!(
+            result.ranked_candidates[1]
+                .preference_score_inputs
+                .combined_weight,
+            2.0
+        );
     }
 }
