@@ -172,7 +172,7 @@
   ],
   "defaults": {
     "api_types": ["llm.chat"],
-    "logical_mounts": ["llm.chat", "llm.{driver}", "llm.{driver}.{model}"],
+    "logical_mounts": ["llm.{driver}", "llm.{driver}.{model}"],
     "capabilities": {
       "streaming": false,
       "tool_call": false,

@@ -89,7 +89,7 @@ const snModels = [
 ]
 
 const openaiModels = [
-  model('gpt-5.1', 'openai-main', ['llm.gpt-frontier', 'llm.code'], ['llm.chat'], {
+  model('gpt-5.1', 'openai-main', ['llm.gpt-standard', 'llm.openai.gpt-5-1'], ['llm.chat'], {
     parameter_scale: 'frontier',
     capabilities: {
       streaming: true,
@@ -114,7 +114,7 @@ const openaiModels = [
       cache_input_token_usd: 0.0000025,
     },
   }),
-  model('gpt-5.1-mini', 'openai-main', ['llm.swift', 'llm.fallback'], ['llm.chat'], {
+  model('gpt-5.1-mini', 'openai-main', ['llm.gpt-mini', 'llm.openai.gpt-5-1-mini'], ['llm.chat'], {
     attributes: {
       local: false,
       privacy: 'public_cloud',
@@ -168,7 +168,7 @@ const anthropicModels = [
       quota_state: 'near_limit',
     },
   }),
-  model('claude-sonnet-4.5', 'anthropic-work', ['llm.sonnet', 'llm.code'], ['llm.chat'], {
+  model('claude-sonnet-4.5', 'anthropic-work', ['llm.sonnet', 'llm.anthropic.claude-sonnet-4-5'], ['llm.chat'], {
     attributes: {
       local: false,
       privacy: 'public_cloud',
@@ -194,7 +194,7 @@ const localModels: LocalModel[] = [
     size_bytes: 21.6 * 1024 * 1024 * 1024,
     status: 'ready',
     last_used_at: '2026-05-29T18:20:00Z',
-    ...model('qwen2.5-coder-32b', 'local', ['llm.local-code', 'llm.code'], ['llm.chat'], {
+    ...model('qwen2.5-coder-32b', 'local', ['llm.qwen-coder', 'llm.local.qwen2-5-coder-32b'], ['llm.chat'], {
       parameter_scale: '32B',
       attributes: {
         local: true,
@@ -397,8 +397,8 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           items: {
             opus: { target: 'llm.opus', weight: 2.5 },
             gemini: { target: 'llm.gemini-pro', weight: 2.4 },
-            gpt: { target: 'llm.gpt-frontier', weight: 2.2 },
-            local_code: { target: 'llm.local-code', weight: 1.1 },
+            gpt: { target: 'llm.gpt-standard', weight: 2.2 },
+            local_code: { target: 'llm.qwen-coder', weight: 1.1 },
           },
           exact_model_weights: {},
           fallback: { mode: 'parent' },
@@ -409,10 +409,10 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
               exactNode(opusExact, 'Anthropic Opus exact model', 'llm.chat', true),
             ] : []),
             mountNode('llm.gemini-pro', 'Gemini planning mount', 'llm.chat', undefined),
-            mountNode('llm.gpt-frontier', 'OpenAI frontier mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
               exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
             ] : []),
-            mountNode('llm.local-code', 'Local code-capable mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
               exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
             ] : []),
           ],
@@ -424,8 +424,8 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           api_type: 'llm.chat',
           items: {
             sonnet: { target: 'llm.sonnet', weight: 2.4 },
-            gpt: { target: 'llm.gpt-frontier', weight: 2.1 },
-            local: { target: 'llm.local-code', weight: 1.8 },
+            gpt: { target: 'llm.gpt-standard', weight: 2.1 },
+            local: { target: 'llm.qwen-coder', weight: 1.8 },
           },
           exact_model_weights: withPhysicalModels ? { [localCodeExact]: 1.2 } : {},
           fallback: { mode: 'target_logical', target: 'llm.fallback' },
@@ -435,10 +435,10 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
             mountNode('llm.sonnet', 'Balanced coding mount', 'llm.chat', withPhysicalModels ? sonnetExact : undefined, withPhysicalModels ? [
               exactNode(sonnetExact, 'Anthropic Sonnet exact model', 'llm.chat', true),
             ] : []),
-            mountNode('llm.gpt-frontier', 'OpenAI frontier mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
               exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
             ] : []),
-            mountNode('llm.local-code', 'Local coding mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
               exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
             ] : []),
           ],
@@ -449,7 +449,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           level: 'L3',
           api_type: 'llm.chat',
           items: {
-            mini: { target: 'llm.nano', weight: 2 },
+            mini: { target: 'llm.gpt-mini', weight: 2 },
             sn: { target: 'llm.sn-balanced', weight: 1.7 },
           },
           exact_model_weights: {},
@@ -457,7 +457,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           policy: { profile: 'latency_first', allow_fallback: true },
           resolved_exact_model: withPhysicalModels ? miniExact : undefined,
           children: [
-            mountNode('llm.nano', 'Low-cost fast mount', 'llm.chat', withPhysicalModels ? miniExact : undefined, withPhysicalModels ? [
+            mountNode('llm.gpt-mini', 'OpenAI GPT mini family mount', 'llm.chat', withPhysicalModels ? miniExact : undefined, withPhysicalModels ? [
               exactNode(miniExact, 'OpenAI mini exact model', 'llm.chat', true),
             ] : []),
             mountNode('llm.sn-balanced', 'SN balanced mount', 'llm.chat', withPhysicalModels ? 'sn-router-balanced@sn-router' : undefined, withPhysicalModels ? [

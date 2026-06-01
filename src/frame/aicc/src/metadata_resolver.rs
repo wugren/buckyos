@@ -252,6 +252,14 @@ fn resolve_driver_model(
     if logical_mounts.is_empty() {
         logical_mounts = generic_mounts(provider_driver, provider_model_id, api_types.as_slice());
     }
+    if api_types
+        .iter()
+        .any(|api_type| matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion))
+    {
+        for mount in semantic_llm_family_mounts(provider_model_id) {
+            add_unique(&mut logical_mounts, mount);
+        }
+    }
 
     logical_mounts = dedupe_strings(logical_mounts);
     Some(ModelMetadata {
@@ -621,6 +629,71 @@ fn generic_mounts(
     mounts
 }
 
+pub(crate) fn semantic_llm_family_mounts(provider_model_id: &str) -> Vec<String> {
+    let normalized = logical_mount_segment(provider_model_id);
+    let mut mounts = Vec::new();
+
+    if normalized.contains("qwen") {
+        if normalized.contains("coder") {
+            add_unique(&mut mounts, "llm.qwen-coder".to_string());
+        } else if normalized.contains("max") {
+            add_unique(&mut mounts, "llm.qwen-max".to_string());
+        } else if normalized.contains("small")
+            || normalized.contains("mini")
+            || normalized.contains("flash")
+            || normalized.contains("turbo")
+        {
+            add_unique(&mut mounts, "llm.qwen-small".to_string());
+        }
+    }
+
+    if normalized.contains("deepseek") {
+        if normalized.contains("reasoner") || normalized.contains("r1") {
+            add_unique(&mut mounts, "llm.deepseek-reasoner".to_string());
+        } else if normalized.contains("pro")
+            || normalized.contains("chat")
+            || normalized.contains("v3")
+        {
+            add_unique(&mut mounts, "llm.deepseek-pro".to_string());
+        }
+    }
+
+    if normalized.contains("kimi") || normalized.contains("moonshot") {
+        if normalized.contains("thinking")
+            || normalized.contains("think")
+            || normalized.contains("k1")
+        {
+            add_unique(&mut mounts, "llm.kimi-thinking".to_string());
+        } else {
+            add_unique(&mut mounts, "llm.kimi".to_string());
+        }
+    }
+
+    if normalized.contains("glm") {
+        if normalized.contains("flash") || normalized.contains("air") {
+            add_unique(&mut mounts, "llm.glm-flash".to_string());
+        } else {
+            add_unique(&mut mounts, "llm.glm".to_string());
+        }
+    }
+
+    if normalized.contains("grok") {
+        if normalized.contains("fast")
+            || normalized.contains("mini")
+            || normalized.contains("small")
+        {
+            add_unique(&mut mounts, "llm.grok-fast".to_string());
+        } else if normalized.contains("heavy")
+            || normalized.contains("reason")
+            || normalized.contains("think")
+        {
+            add_unique(&mut mounts, "llm.grok-heavy".to_string());
+        }
+    }
+
+    mounts
+}
+
 fn api_mount_base(api_type: &ApiType) -> &'static str {
     match api_type {
         ApiType::LlmChat => "llm.chat",
@@ -779,7 +852,7 @@ fn apply_openai_latest_mounts(models: &mut [ModelMetadata]) {
         if matches!(tier, GptTier::General) {
             model.capabilities.vision = true;
         }
-        for mount in gpt_role_mounts(tier) {
+        for mount in gpt_family_mounts(tier) {
             add_unique(&mut model.logical_mounts, mount.to_string());
         }
     }
@@ -910,19 +983,12 @@ fn is_gpt_auto_mount(mount: &str) -> bool {
         || mount == "llm.code"
 }
 
-fn gpt_role_mounts(tier: GptTier) -> &'static [&'static str] {
+fn gpt_family_mounts(tier: GptTier) -> &'static [&'static str] {
     match tier {
-        GptTier::General => &[
-            "llm.chat",
-            "llm.summarize",
-            "llm.plan",
-            "llm.reason",
-            "llm.code",
-            "llm.gpt-standard",
-        ],
-        GptTier::Pro => &["llm.plan", "llm.reason"],
-        GptTier::Mini => &["llm.summarize", "llm.gpt-mini"],
-        GptTier::Nano => &["llm.swift"],
+        GptTier::General => &["llm.gpt-standard"],
+        GptTier::Pro => &["llm.gpt-pro"],
+        GptTier::Mini => &["llm.gpt-mini"],
+        GptTier::Nano => &["llm.gpt-nano"],
     }
 }
 
@@ -1016,6 +1082,68 @@ mod tests {
     }
 
     #[test]
+    fn openai_latest_gpt_mounts_family_only() {
+        let requests = vec![
+            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.5-pro", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.4-mini", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.4-nano", vec![ApiType::LlmChat]),
+        ];
+        let inventory = resolve_driver_inventory(
+            "openai-test",
+            ProviderType::CloudApi,
+            "openai",
+            requests.as_slice(),
+            None,
+        );
+        let by_id = |id: &str| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == id)
+                .expect("model should exist")
+        };
+        let gpt = by_id("gpt-5.5");
+        assert!(gpt
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-standard"));
+        assert!(gpt
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.openai.gpt-5-5"));
+        assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+        assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.code"));
+        assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.plan"));
+
+        let pro = by_id("gpt-5.5-pro");
+        assert!(pro
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-pro"));
+        assert!(!pro.logical_mounts.iter().any(|mount| mount == "llm.plan"));
+        assert!(!pro.logical_mounts.iter().any(|mount| mount == "llm.reason"));
+
+        let mini = by_id("gpt-5.4-mini");
+        assert!(mini
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-mini"));
+        assert!(!mini
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.summarize"));
+
+        let nano = by_id("gpt-5.4-nano");
+        assert!(nano
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-nano"));
+        assert!(!nano.logical_mounts.iter().any(|mount| mount == "llm.swift"));
+    }
+
+    #[test]
     fn claude_haiku_vision_is_not_assumed() {
         let request = DriverModelResolveRequest::new("claude-3-5-haiku-20241022", vec![]);
         let inventory = resolve_driver_inventory(
@@ -1030,6 +1158,135 @@ mod tests {
         assert!(model.capabilities.web_search);
         assert!(!model.capabilities.vision);
         assert!(!model.api_types.contains(&ApiType::VisionCaption));
+        assert!(model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.haiku"));
+        assert!(model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.anthropic.claude-3-5-haiku-20241022"));
+        assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+    }
+
+    #[test]
+    fn claude_family_mounts_do_not_include_role_paths() {
+        let requests = vec![
+            DriverModelResolveRequest::new("claude-opus-4-7", vec![]),
+            DriverModelResolveRequest::new("claude-sonnet-4-6", vec![]),
+            DriverModelResolveRequest::new("claude-haiku-4-5", vec![]),
+        ];
+        let inventory = resolve_driver_inventory(
+            "claude-test",
+            ProviderType::CloudApi,
+            "claude",
+            requests.as_slice(),
+            None,
+        );
+        let by_id = |id: &str| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == id)
+                .expect("model should exist")
+        };
+        let opus = by_id("claude-opus-4-7");
+        assert!(opus.logical_mounts.iter().any(|mount| mount == "llm.opus"));
+        assert!(opus
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.anthropic.claude-opus-4-7"));
+
+        let sonnet = by_id("claude-sonnet-4-6");
+        assert!(sonnet
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.sonnet"));
+
+        let haiku = by_id("claude-haiku-4-5");
+        assert!(haiku
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.haiku"));
+
+        for model in inventory.models.iter() {
+            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.code"));
+            assert!(!model
+                .logical_mounts
+                .iter()
+                .any(|mount| mount == "llm.reason"));
+        }
+    }
+
+    #[test]
+    fn gemini_family_mounts_do_not_include_chat_role() {
+        let requests = vec![
+            DriverModelResolveRequest::new("gemini-2.5-pro", vec![]),
+            DriverModelResolveRequest::new("gemini-2.5-flash", vec![]),
+            DriverModelResolveRequest::new("gemini-2.5-flash-lite", vec![]),
+            DriverModelResolveRequest::new("gemini-2.5-deepthink", vec![]),
+        ];
+        let inventory = resolve_driver_inventory(
+            "gemini-test",
+            ProviderType::CloudApi,
+            "google-gemini",
+            requests.as_slice(),
+            None,
+        );
+        let by_id = |id: &str| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == id)
+                .expect("model should exist")
+        };
+        assert!(by_id("gemini-2.5-pro")
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gemini-pro"));
+        assert!(by_id("gemini-2.5-flash")
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gemini-flash"));
+        assert!(by_id("gemini-2.5-flash-lite")
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gemini-flash-lite"));
+        assert!(by_id("gemini-2.5-deepthink")
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gemini-deepthink"));
+        for model in inventory.models.iter() {
+            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+        }
+    }
+
+    #[test]
+    fn semantic_family_mounts_cover_domestic_and_other_models() {
+        let cases = [
+            ("qwen2.5-coder-32b", "llm.qwen-coder"),
+            ("qwen-max", "llm.qwen-max"),
+            ("qwen-turbo", "llm.qwen-small"),
+            ("deepseek-r1", "llm.deepseek-reasoner"),
+            ("deepseek-v3", "llm.deepseek-pro"),
+            ("kimi-k1-thinking", "llm.kimi-thinking"),
+            ("kimi-latest", "llm.kimi"),
+            ("glm-4-flash", "llm.glm-flash"),
+            ("glm-4-plus", "llm.glm"),
+            ("grok-mini", "llm.grok-fast"),
+            ("grok-4-heavy", "llm.grok-heavy"),
+        ];
+        for (model, expected_mount) in cases {
+            assert!(
+                semantic_llm_family_mounts(model)
+                    .iter()
+                    .any(|mount| mount == expected_mount),
+                "{} should mount to {}",
+                model,
+                expected_mount
+            );
+        }
     }
 
     #[test]

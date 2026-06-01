@@ -138,7 +138,6 @@
       "pattern": "gemini-*flash-lite*",
       "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
-        "llm.chat",
         "llm.google-gemini",
         "llm.gemini",
         "llm.gemini-flash-lite",
@@ -176,7 +175,6 @@
       "pattern": "gemini-*flash*",
       "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
-        "llm.chat",
         "llm.google-gemini",
         "llm.gemini",
         "llm.gemini-flash",
@@ -211,10 +209,83 @@
       "estimated_latency_ms": 1400
     },
     {
+      "pattern": "gemini-*deepthink*",
+      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "logical_mounts": [
+        "llm.google-gemini",
+        "llm.gemini",
+        "llm.gemini-deepthink",
+        "llm.gemini.{model}",
+        "vision.ocr",
+        "vision.ocr.google",
+        "vision.ocr.gemini",
+        "vision.ocr.{model}",
+        "vision.caption",
+        "vision.caption.google",
+        "vision.caption.gemini",
+        "vision.caption.{model}",
+        "vision.detect",
+        "vision.detect.google",
+        "vision.detect.gemini",
+        "vision.detect.{model}",
+        "vision.segment",
+        "vision.segment.google",
+        "vision.segment.gemini",
+        "vision.segment.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": false,
+        "vision": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1400
+    },
+    {
+      "pattern": "gemini-*deep-think*",
+      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "logical_mounts": [
+        "llm.google-gemini",
+        "llm.gemini",
+        "llm.gemini-deepthink",
+        "llm.gemini.{model}",
+        "vision.ocr",
+        "vision.ocr.google",
+        "vision.ocr.gemini",
+        "vision.ocr.{model}",
+        "vision.caption",
+        "vision.caption.google",
+        "vision.caption.gemini",
+        "vision.caption.{model}",
+        "vision.detect",
+        "vision.detect.google",
+        "vision.detect.gemini",
+        "vision.detect.{model}",
+        "vision.segment",
+        "vision.segment.google",
+        "vision.segment.gemini",
+        "vision.segment.{model}"
+      ],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": false,
+        "vision": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 8192
+      },
+      "estimated_cost_usd": 0.01,
+      "estimated_latency_ms": 1400
+    },
+    {
       "pattern": "gemini-*pro*",
       "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
-        "llm.chat",
         "llm.google-gemini",
         "llm.gemini",
         "llm.gemini-pro",
@@ -252,7 +323,6 @@
       "pattern": "gemini-*",
       "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
-        "llm.chat",
         "llm.google-gemini",
         "llm.gemini",
         "llm.gemini.{model}",
@@ -288,7 +358,7 @@
   ],
   "defaults": {
     "api_types": ["llm.chat"],
-    "logical_mounts": ["llm.chat", "llm.google-gemini", "llm.gemini", "llm.gemini.{model}"],
+    "logical_mounts": ["llm.google-gemini", "llm.gemini", "llm.gemini.{model}"],
     "capabilities": {
       "streaming": false,
       "tool_call": false,

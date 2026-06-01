@@ -88,7 +88,7 @@
 
 ## 3. P1：家族目录成为主要 driver mount 目标
 
-- [ ] 调整 OpenAI GPT 的默认挂载策略。
+- [x] 调整 OpenAI GPT 的默认挂载策略。
   - 当前 OpenAI post rule 仍会给最新 GPT 直接增加部分用途目录 mount，例如 `llm.plan`、`llm.code`、`llm.reason`。
   - 目标：
     - current family mount：`llm.gpt-standard`、`llm.gpt-pro`、`llm.gpt-mini`、`llm.gpt-nano`
@@ -97,8 +97,12 @@
   - 风险：
     - 会影响现有 `openai::*latest_gpt_mounts*` 测试。
     - 需要同步 Desktop 目录树展示。
+  - 已实现：
+    - OpenAI / SN-AI GPT latest post rule 只给最新 tier 模型增加 `llm.gpt-standard`、`llm.gpt-pro`、`llm.gpt-mini`、`llm.gpt-nano` family mount，不再增加 `llm.plan`、`llm.code`、`llm.reason`、`llm.swift`、`llm.summarize`。
+    - 版本索引继续保留 `llm.openai.<model>`。
+    - Desktop mock 目录树示例改为展示 family mount。
 
-- [ ] 梳理 Claude family mount。
+- [x] 梳理 Claude family mount。
   - 目标 current family mount：
     - `llm.opus`
     - `llm.sonnet`
@@ -107,16 +111,22 @@
     - `llm.anthropic.claude-opus-4-7`
     - `llm.anthropic.claude-sonnet-4-6`
   - 检查 vision/tool/json 能力不要从 family 名称倒推。
+  - 已实现：
+    - Claude driver metadata 使用 `llm.opus`、`llm.sonnet`、`llm.haiku` 和 `llm.anthropic.<model>`，移除 LLM 用途目录直接挂载。
+    - 保留 vision 相关非 LLM 方法挂载，能力仍来自 metadata capability 字段。
 
-- [ ] 梳理 Gemini family mount。
+- [x] 梳理 Gemini family mount。
   - 目标 current family mount：
     - `llm.gemini-pro`
     - `llm.gemini-flash`
     - `llm.gemini-flash-lite`
     - `llm.gemini-deepthink`
   - 需要沿用已有 Gemini 版本保留/alias 逻辑，避免 versioned model 与 alias 混乱。
+  - 已实现：
+    - Gemini driver metadata 使用 `llm.gemini-pro`、`llm.gemini-flash`、`llm.gemini-flash-lite`、`llm.gemini-deepthink` family mount，移除 LLM `llm.chat` 直接挂载。
+    - 保留已有 `llm.gemini.<model>` 版本/alias 索引样式。
 
-- [ ] 梳理国产/其它模型 family mount。
+- [x] 梳理国产/其它模型 family mount。
   - 目标 family mount 示例：
     - `llm.qwen-max`
     - `llm.qwen-coder`
@@ -129,6 +139,9 @@
     - `llm.glm-flash`
     - `llm.grok-fast`
     - `llm.grok-heavy`
+  - 已实现：
+    - Resolver 增加轻量语义 family classifier，覆盖 qwen/deepseek/kimi/glm/grok 示例 family mount。
+    - OpenAI-compatible / SN provider inventory 归一化复用同一 family classifier。
 
 ## 4. P1：版本排序规则 driver 化
 
