@@ -83,6 +83,21 @@ fal-ai/esrgan@fal-main
 
 精确模型名的语义是“明确指定某个 provider instance 下的某个模型”。它默认不做复杂逻辑路由，也默认不 fallback，除非 request policy 显式允许 `allow_exact_model_fallback`。
 
+reasoning effort 这类会显著改变模型行为、成本和能力边界的参数，应视为模型身份的一部分，而不是普通 request option。当前实现已经通过 driver metadata 的 `variants` 把它展开成独立精确模型名：
+
+```text
+<base_provider_model_id>:<variant>@<provider_instance_name>
+```
+
+例如：
+
+```text
+gpt-5.2:reasoning-high@openai-default
+gpt-5.2:reasoning-low@openai-default
+```
+
+这类 variant exact model 在 AICC 内部是独立模型身份，用于路由、权重、trace、usage 聚合和审计。真正调用 provider 时，再由 data plane lower 成 base model 加 provider options，例如 `provider_model_id=gpt-5.2` 和 `provider_options.reasoning.effort=high`。
+
 ### 3.2 Provider
 
 Provider 是一个可调用的模型能力提供实例，而不是厂商名。一个厂商可以配置多个 provider instance，例如：
@@ -125,6 +140,8 @@ Driver metadata 负责回答：
 - 它属于哪个模型家族或用途挂载点；
 - 它是否需要展开 variant，例如 reasoning effort；
 - 某些模型是否应排除。
+
+Variant 的边界是：如果一个 provider option 会影响路由选择、价格、质量、审计或用户可见模型选择，它就应该进入模型身份。例如 reasoning effort 应展开为 `:reasoning-high`、`:reasoning-low` 这样的 exact model suffix；如果只是一次请求里的普通采样参数，则仍留在 request options 中。
 
 当前 driver metadata 的匹配顺序是：
 
@@ -465,6 +482,52 @@ $BUCKYOS_ROOT/etc/aicc/driver_metadata/remote_cache/<driver>.json
 
 Driver metadata 中的 `logical_mounts` 是默认挂载语义。推荐它优先挂载到模型家族目录，而不是直接把 provider 绑定到用途目录。
 
+这里还需要引入“最新版本发现”的概念：driver metadata 不应该为每个新发布的模型都新增一条 exact metadata。更合理的方式是让 driver metadata 提供匹配表达式，从 provider model id 中提取 family、tier、version、stability 等字段，然后由 resolver/post rule 在同一 family/tier 中自动选出当前推荐版本。
+
+例如 driver metadata 可以表达类似规则：
+
+```text
+pattern: ^gpt-(?<major>\d+)(?:\.(?<minor>\d+))?(?:-(?<tier>mini|nano|pro))?(?:-(?<stability>preview|beta))?$
+family: gpt
+tier: {tier | standard}
+version: [major, minor]
+stability: {stable unless preview/beta}
+current_mount: llm.gpt-{tier}
+version_mount: llm.openai.gpt-{major}-{minor}-{tier}
+```
+
+当 provider 刷出新模型 `gpt-5.3` 时，只要它匹配这条表达式，driver 就能自动知道：
+
+```text
+family = gpt
+tier = standard
+version = 5.3
+current family mount = llm.gpt-standard
+version index mount = llm.openai.gpt-5-3
+```
+
+如果 `gpt-5.3` 比现有 `gpt-5.2` 更新且不是 preview/beta，就自动成为 `llm.gpt-standard` 的 current model。这样模型小版本更新不需要同步更新 driver metadata；只有命名规则、能力边界、tier 分类或稳定性规则变化时，才需要更新 driver metadata。
+
+reasoning effort 这类 variant 在这个流程中应挂在 base model 之后处理：先用匹配表达式识别 base model 的 family/tier/version/stability，再按 driver metadata 的 `variants` 展开出独立 exact model。Variant 不参与 base model 的版本排序，也不改变 current family mount 的版本判断；它只改变 exact model identity 和可选挂载后缀。
+
+例如：
+
+```text
+gpt-5.3
+  -> base exact model: gpt-5.3@openai-default
+  -> variant exact model: gpt-5.3:reasoning-high@openai-default
+  -> provider call lowering: model=gpt-5.3, provider_options.reasoning.effort=high
+```
+
+如果 driver 希望把 reasoning variant 暴露成逻辑目录，也应通过 variant mount 表达，例如：
+
+```text
+llm.gpt-standard.reasoning-high
+llm.reason
+```
+
+这样 `llm.reason` 可以选择 reasoning effort 已经固定的模型，而不是在 request 时临时追加 effort 参数。
+
 例如 OpenAI GPT 模型：
 
 ```text
@@ -483,7 +546,8 @@ llm.swift -> llm.haiku / llm.gemini-flash-lite / llm.qwen-small
 这样做的好处是：
 
 - provider 不知道用途目录；
-- driver 可以根据通配符和版本命名维护家族归属；
+- driver 可以根据匹配表达式和版本命名维护家族归属；
+- driver 可以自动发现同一 family/tier 的最新稳定版本，减少模型更新时的 metadata 维护；
 - 用途目录可以保持稳定；
 - 用户调权重时可以在用途层或家族层分别控制。
 
