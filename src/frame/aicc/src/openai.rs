@@ -1,14 +1,13 @@
 use crate::aicc::{
-    exact_model_name, image_logical_mounts, logical_mount_segment, provider_type_from_settings,
-    redacted_json_log, AIComputeCenter, Provider, ProviderError, ProviderInstance,
-    ProviderStartResult, ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
-use crate::metadata_resolver::{
-    resolve_driver_inventory, semantic_llm_family_mounts, DriverModelResolveRequest,
-};
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
+#[cfg(test)]
+use crate::model_types::ProviderType;
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, PrivacyClass,
-    ProviderInventory, ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
+    ProviderOrigin, ProviderTypeTrustedSource, QuotaState,
 };
 use crate::openai_protocol::{
     apply_provider_model_defaults, merge_options, merge_requirements_response_format,
@@ -31,7 +30,6 @@ use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::hash::{Hash, Hasher};
@@ -362,36 +360,44 @@ impl OpenAIProvider {
         inventory: ProviderInventory,
     ) -> ProviderInventory {
         let version = inventory.version.clone();
-        let mut models = inventory
-            .models
-            .into_iter()
-            .filter_map(|model| {
-                normalize_remote_provider_model(
-                    model,
-                    self.instance.provider_instance_name.as_str(),
-                    self.provider_type.clone(),
-                    self.provider_driver.as_str(),
-                )
-            })
+        let inventory_revision = inventory.inventory_revision.clone();
+        let remote_models = inventory.models;
+        let requests = remote_models
+            .iter()
+            .filter_map(remote_model_resolve_request)
             .collect::<Vec<_>>();
-        apply_openai_latest_llm_mounts(self.provider_driver.as_str(), &mut models);
-
-        ProviderInventory {
-            provider_instance_name: self.instance.provider_instance_name.clone(),
-            provider_type: self.provider_type.clone(),
-            provider_driver: self.provider_driver.clone(),
-            provider_origin: ProviderOrigin::SystemConfig,
-            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
-            provider_type_revision: None,
-            version: version.clone(),
-            inventory_revision: inventory.inventory_revision.or_else(|| {
-                Some(inventory_revision_from_metadata(
-                    models.as_slice(),
-                    version.as_deref(),
-                ))
-            }),
-            models,
+        let remote_by_id = remote_models
+            .iter()
+            .filter_map(|model| {
+                remote_provider_model_id(model)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (id, model))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut normalized = resolve_driver_inventory(
+            self.instance.provider_instance_name.as_str(),
+            self.provider_type.clone(),
+            self.provider_driver.as_str(),
+            requests.as_slice(),
+            inventory_revision,
+        );
+        for model in normalized.models.iter_mut() {
+            let base_model_id = model
+                .provider_actual_model_id
+                .as_deref()
+                .unwrap_or(model.provider_model_id.as_str());
+            if let Some(remote_model) = remote_by_id.get(base_model_id) {
+                merge_remote_dynamic_metadata(model, remote_model);
+            }
         }
+        normalized.version = version.clone();
+        if normalized.inventory_revision.is_none() {
+            normalized.inventory_revision = Some(inventory_revision_from_metadata(
+                normalized.models.as_slice(),
+                version.as_deref(),
+            ));
+        }
+        normalized
     }
 
     fn build_inventory(
@@ -3196,54 +3202,16 @@ fn provider_model_from_exact(exact_model: &str) -> &str {
         .unwrap_or(exact_model)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum OpenAIGptTier {
-    Pro,
-    General,
-    Mini,
-    Nano,
-}
-
-impl OpenAIGptTier {
-    fn family_mounts(self) -> &'static [&'static str] {
-        match self {
-            Self::Pro => &["llm.gpt-pro"],
-            Self::General => &["llm.gpt-standard"],
-            Self::Mini => &["llm.gpt-mini"],
-            Self::Nano => &["llm.gpt-nano"],
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GptModelRank {
-    version: Vec<u64>,
-    stable: bool,
-    model_id: String,
-}
-
-fn normalize_remote_provider_model(
-    mut model: ModelMetadata,
-    provider_instance_name: &str,
-    provider_type: ProviderType,
-    provider_driver: &str,
-) -> Option<ModelMetadata> {
-    let provider_model_id = model.provider_model_id.trim().to_string();
-    let provider_model_id = if provider_model_id.is_empty() {
-        provider_model_from_exact(model.exact_model.as_str())
-            .trim()
-            .to_string()
-    } else {
-        provider_model_id
-    };
+fn remote_model_resolve_request(model: &ModelMetadata) -> Option<DriverModelResolveRequest> {
+    let provider_model_id = remote_provider_model_id(model)?;
     if provider_model_id.is_empty() {
         return None;
     }
-
     let mut api_types = model
         .api_types
-        .into_iter()
-        .filter(is_supported_openai_api_type)
+        .iter()
+        .filter(|api_type| is_supported_openai_api_type(api_type))
+        .cloned()
         .collect::<Vec<_>>();
     if api_types.is_empty() {
         if is_text2image_model_name(provider_model_id.as_str()) {
@@ -3254,53 +3222,56 @@ fn normalize_remote_provider_model(
             return None;
         }
     }
+    Some(
+        DriverModelResolveRequest::new(provider_model_id, api_types)
+            .with_cost(model.pricing.estimated_cost_usd)
+            .with_latency(model.health.p50_latency_ms.or(model.health.p95_latency_ms)),
+    )
+}
 
-    let mut logical_mounts = Vec::new();
-    if api_types.iter().any(is_llm_api_type) {
-        for mount in openai_llm_logical_mounts(provider_driver, provider_model_id.as_str()) {
-            add_unique_mount(&mut logical_mounts, mount);
-        }
+fn remote_provider_model_id(model: &ModelMetadata) -> Option<String> {
+    let provider_model_id = model.provider_model_id.trim();
+    if !provider_model_id.is_empty() {
+        return Some(provider_model_id.to_string());
     }
-    if api_types
-        .iter()
-        .any(|api_type| api_type == &ApiType::ImageTextToImage)
-    {
-        for mount in image_logical_mounts(provider_driver, provider_model_id.as_str()) {
-            add_unique_mount(&mut logical_mounts, mount);
-        }
-    }
-    for api_type in api_types.iter() {
-        if matches!(
-            api_type,
-            ApiType::Embedding
-                | ApiType::Rerank
-                | ApiType::ImageToImage
-                | ApiType::ImageInpaint
-                | ApiType::AudioAsr
-                | ApiType::AudioTts
-        ) {
-            for mount in openai_method_mounts(
-                api_type.clone(),
-                provider_driver,
-                provider_model_id.as_str(),
-            ) {
-                add_unique_mount(&mut logical_mounts, mount);
-            }
-        }
-    }
+    let provider_model_id = provider_model_from_exact(model.exact_model.as_str()).trim();
+    (!provider_model_id.is_empty()).then(|| provider_model_id.to_string())
+}
 
-    model.provider_model_id = provider_model_id.clone();
-    model.exact_model = exact_model_name(provider_model_id.as_str(), provider_instance_name);
-    model.api_types = api_types;
-    model.logical_mounts = logical_mounts;
-    model.attributes.provider_type = provider_type.clone();
-    model.attributes.local = provider_type == ProviderType::LocalInference;
-    model.attributes.privacy = if provider_type == ProviderType::LocalInference {
-        PrivacyClass::Local
-    } else {
-        PrivacyClass::Cloud
-    };
-    Some(model)
+fn merge_remote_dynamic_metadata(model: &mut ModelMetadata, remote_model: &ModelMetadata) {
+    if remote_model.pricing.input_token_usd.is_some() {
+        model.pricing.input_token_usd = remote_model.pricing.input_token_usd;
+    }
+    if remote_model.pricing.output_token_usd.is_some() {
+        model.pricing.output_token_usd = remote_model.pricing.output_token_usd;
+    }
+    if remote_model.pricing.cache_input_token_usd.is_some() {
+        model.pricing.cache_input_token_usd = remote_model.pricing.cache_input_token_usd;
+    }
+    if remote_model.pricing.estimated_cost_usd.is_some() {
+        model.pricing.estimated_cost_usd = remote_model.pricing.estimated_cost_usd;
+    }
+    if remote_model.health.p50_latency_ms.is_some() {
+        model.health.p50_latency_ms = remote_model.health.p50_latency_ms;
+    }
+    if remote_model.health.p95_latency_ms.is_some() {
+        model.health.p95_latency_ms = remote_model.health.p95_latency_ms;
+    }
+    if remote_model.health.error_rate_5m.is_some() {
+        model.health.error_rate_5m = remote_model.health.error_rate_5m;
+    }
+    if remote_model.health.recent_failures.is_some() {
+        model.health.recent_failures = remote_model.health.recent_failures;
+    }
+    if remote_model.health.queue_depth.is_some() {
+        model.health.queue_depth = remote_model.health.queue_depth;
+    }
+    if remote_model.health.status != Default::default() {
+        model.health.status = remote_model.health.status.clone();
+    }
+    if remote_model.health.quota_state != Default::default() {
+        model.health.quota_state = remote_model.health.quota_state.clone();
+    }
 }
 
 fn is_supported_openai_api_type(api_type: &ApiType) -> bool {
@@ -3316,244 +3287,6 @@ fn is_supported_openai_api_type(api_type: &ApiType) -> bool {
             | ApiType::AudioAsr
             | ApiType::AudioTts
     )
-}
-
-fn is_llm_api_type(api_type: &ApiType) -> bool {
-    matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion)
-}
-
-fn openai_llm_logical_mounts(provider_driver: &str, provider_model_id: &str) -> Vec<String> {
-    let mut mounts = vec![
-        format!("llm.{}", logical_mount_segment(provider_driver)),
-        format!("llm.openai.{}", logical_mount_segment(provider_model_id)),
-    ];
-    if classify_openai_gpt_model(provider_model_id).is_none()
-        && !is_openai_gpt_named_model(provider_model_id)
-    {
-        add_unique_mount(&mut mounts, "llm.gpt".to_string());
-    }
-    for mount in semantic_llm_family_mounts(provider_model_id) {
-        add_unique_mount(&mut mounts, mount);
-    }
-    mounts
-}
-
-fn apply_openai_latest_llm_mounts(_provider_driver: &str, models: &mut [ModelMetadata]) {
-    let mut latest = HashMap::<OpenAIGptTier, (usize, GptModelRank)>::new();
-
-    for (index, model) in models.iter_mut().enumerate() {
-        if !model.api_types.iter().any(is_llm_api_type) {
-            continue;
-        }
-        let Some((tier, rank)) = classify_openai_gpt_model(model.provider_model_id.as_str()) else {
-            continue;
-        };
-        remove_openai_gpt_auto_mounts(&mut model.logical_mounts);
-
-        let replace = latest
-            .get(&tier)
-            .map(|(_, current)| compare_gpt_model_rank(&rank, current) == Ordering::Greater)
-            .unwrap_or(true);
-        if replace {
-            latest.insert(tier, (index, rank));
-        }
-    }
-
-    for (tier, (index, _)) in latest {
-        let model = &mut models[index];
-        if matches!(tier, OpenAIGptTier::General) {
-            model.capabilities.vision = true;
-        }
-        for mount in tier.family_mounts() {
-            add_unique_mount(&mut model.logical_mounts, mount.to_string());
-        }
-    }
-}
-
-fn classify_openai_gpt_model(provider_model_id: &str) -> Option<(OpenAIGptTier, GptModelRank)> {
-    if is_text2image_model_name(provider_model_id) {
-        return None;
-    }
-
-    let normalized = provider_model_id
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "-");
-    if !normalized.contains("gpt") {
-        return None;
-    }
-    if has_openai_snapshot_date_suffix(normalized.as_str()) {
-        return None;
-    }
-
-    let tokens = normalized
-        .split(|ch: char| ch == '-' || ch == '.' || ch == '/')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_string())
-        .collect::<HashSet<_>>();
-    let tier = if tokens.contains("pro") {
-        OpenAIGptTier::Pro
-    } else if tokens.contains("mini") {
-        OpenAIGptTier::Mini
-    } else if tokens.contains("nano") || tokens.contains("nono") {
-        OpenAIGptTier::Nano
-    } else {
-        OpenAIGptTier::General
-    };
-
-    Some((
-        tier,
-        GptModelRank {
-            version: parse_gpt_version(normalized.as_str()),
-            stable: !tokens.contains("preview")
-                && !tokens.contains("experimental")
-                && !tokens.contains("beta"),
-            model_id: normalized,
-        },
-    ))
-}
-
-fn is_openai_gpt_named_model(provider_model_id: &str) -> bool {
-    !is_text2image_model_name(provider_model_id)
-        && provider_model_id
-            .trim()
-            .to_ascii_lowercase()
-            .replace('_', "-")
-            .contains("gpt")
-}
-
-fn has_openai_snapshot_date_suffix(normalized_model_id: &str) -> bool {
-    let mut parts = normalized_model_id.rsplitn(4, '-');
-    let Some(day) = parts.next() else {
-        return false;
-    };
-    let Some(month) = parts.next() else {
-        return false;
-    };
-    let Some(year) = parts.next() else {
-        return false;
-    };
-    let Some(prefix) = parts.next() else {
-        return false;
-    };
-
-    !prefix.is_empty()
-        && year.len() == 4
-        && month.len() == 2
-        && day.len() == 2
-        && year.chars().all(|ch| ch.is_ascii_digit())
-        && month.chars().all(|ch| ch.is_ascii_digit())
-        && day.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn parse_gpt_version(normalized_model_id: &str) -> Vec<u64> {
-    let Some(gpt_pos) = normalized_model_id.find("gpt") else {
-        return Vec::new();
-    };
-    let mut chars = normalized_model_id[gpt_pos + "gpt".len()..]
-        .trim_start_matches('-')
-        .chars()
-        .peekable();
-    let mut version = Vec::new();
-
-    loop {
-        let mut value = String::new();
-        while let Some(ch) = chars.peek().copied() {
-            if ch.is_ascii_digit() {
-                value.push(ch);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if value.is_empty() {
-            break;
-        }
-        if let Ok(parsed) = value.parse::<u64>() {
-            version.push(parsed);
-        }
-
-        if chars.peek().copied() == Some('.') {
-            chars.next();
-            continue;
-        }
-        break;
-    }
-
-    version
-}
-
-fn compare_gpt_model_rank(left: &GptModelRank, right: &GptModelRank) -> Ordering {
-    let max_len = left.version.len().max(right.version.len());
-    for index in 0..max_len {
-        let left_value = left.version.get(index).copied().unwrap_or(0);
-        let right_value = right.version.get(index).copied().unwrap_or(0);
-        match left_value.cmp(&right_value) {
-            Ordering::Equal => {}
-            ordering => return ordering,
-        }
-    }
-
-    left.stable
-        .cmp(&right.stable)
-        .then_with(|| left.model_id.cmp(&right.model_id))
-}
-
-fn remove_openai_gpt_auto_mounts(mounts: &mut Vec<String>) {
-    mounts.retain(|mount| !is_openai_gpt_auto_mount(mount.as_str()));
-}
-
-fn is_openai_gpt_auto_mount(mount: &str) -> bool {
-    matches!(
-        mount,
-        "llm.gpt" | "llm.gpt-standard" | "llm.gpt-pro" | "llm.gpt-mini" | "llm.gpt-nano"
-    ) || is_openai_gpt_role_mount(mount)
-}
-
-fn is_openai_gpt_role_mount(mount: &str) -> bool {
-    const ROLE_MOUNTS: &[&str] = &[
-        "llm.chat",
-        "llm.summarize",
-        "llm.swift",
-        "llm.plan",
-        "llm.reason",
-        "llm.code",
-    ];
-    ROLE_MOUNTS.iter().any(|role| {
-        mount == *role
-            || mount
-                .strip_prefix(*role)
-                .is_some_and(|tail| tail.starts_with('.'))
-    })
-}
-
-fn add_unique_mount(mounts: &mut Vec<String>, mount: String) {
-    if !mounts.iter().any(|item| item == &mount) {
-        mounts.push(mount);
-    }
-}
-
-fn openai_method_mounts(
-    api_type: ApiType,
-    provider_driver: &str,
-    provider_model_id: &str,
-) -> Vec<String> {
-    let base = match api_type {
-        ApiType::Embedding => "embedding.text",
-        ApiType::Rerank => "rerank",
-        ApiType::ImageToImage => "image.img2img",
-        ApiType::ImageInpaint => "image.inpaint",
-        ApiType::AudioAsr => "audio.asr",
-        ApiType::AudioTts => "audio.tts",
-        _ => api_type.namespace(),
-    };
-    let driver = logical_mount_segment(provider_driver);
-    let model = logical_mount_segment(provider_model_id);
-    vec![
-        base.to_string(),
-        format!("{}.{}", base, driver),
-        format!("{}.{}", base, model),
-    ]
 }
 
 fn value_to_form_field(value: &Value) -> String {

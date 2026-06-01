@@ -145,12 +145,13 @@
 
 ## 4. P1：版本排序规则 driver 化
 
-- [ ] 抽象 driver post rule。
+- [x] 抽象 driver post rule。
   - 当前 OpenAI 版本排序逻辑是 Rust 代码里的专用 post rule。
   - 目标：把 family/tier/version/stability 的规则逐步 driver 化。
   - 先不要引入新依赖；如果要引入 regex/表达式解析依赖，必须单独确认。
+  - 已实现：resolver 新增通用 `version_rules` post rule，OpenAI / SN-AI 不再通过 provider_driver 分支写死 GPT latest mount。
 
-- [ ] 定义 driver metadata 的版本规则字段。
+- [x] 定义 driver metadata 的版本规则字段。
   - 草案字段：
     - `family`
     - `tier`
@@ -164,18 +165,21 @@
     - builtin driver metadata JSON
     - override schema 校验
     - 文档
+  - 已实现：schema version 保持 1，新增向后兼容的 `version_rules` 字段；内置 `openai.json` 已迁移 GPT standard/pro/mini/nano 规则；文档已同步说明当前字段。
 
-- [ ] 明确 preview/beta/experimental 排序。
+- [x] 明确 preview/beta/experimental 排序。
   - stable 应优先于 preview/beta/experimental。
   - preview 可以进入 version index，但默认不应成为 current family mount，除非 driver 明确允许。
+  - 已实现：OpenAI `version_rules.stability.current_requires_stable=true`，`preview` / `beta` / `experimental` 只保留 version index，不写 current family mount。
 
-- [ ] 明确 variant 不参与 base version 排序。
+- [x] 明确 variant 不参与 base version 排序。
   - reasoning variant 应在 base model 选出 current mount 后展开。
   - variant exact model 应保留独立 identity：
     - `<base_model>:reasoning-high@provider`
   - provider call lowering 继续使用：
     - `provider_actual_model_id`
     - `provider_options`
+  - 已实现：resolver 先对 base models 应用 `version_rules`，再展开 `variants`；variant exact model 继续通过 `provider_actual_model_id` / `provider_options` lowering。
 
 ## 5. P1：用户配置持久化与控制入口
 

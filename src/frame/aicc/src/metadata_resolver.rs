@@ -57,6 +57,8 @@ pub struct DriverMetadataDocument {
     #[serde(default)]
     pub variants: Vec<DriverModelVariant>,
     #[serde(default)]
+    pub version_rules: Vec<DriverVersionRule>,
+    #[serde(default)]
     pub signature: Option<DriverMetadataSignature>,
 }
 
@@ -88,6 +90,48 @@ pub struct DriverModelRule {
     pub latency_class: Option<LatencyClass>,
     #[serde(default)]
     pub cost_class: Option<CostClass>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DriverVersionRule {
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub model_pattern: Option<String>,
+    #[serde(default)]
+    pub tier_tokens: Vec<String>,
+    #[serde(default)]
+    pub exclude_tier_tokens: Vec<String>,
+    #[serde(default)]
+    pub version_rank: DriverVersionRankRule,
+    #[serde(default)]
+    pub stability: DriverVersionStabilityRule,
+    #[serde(default)]
+    pub current_mount: Option<String>,
+    #[serde(default)]
+    pub version_mount: Option<String>,
+    #[serde(default)]
+    pub auto_mounts: Vec<String>,
+    #[serde(default)]
+    pub exclude_snapshot_date_suffix: bool,
+    #[serde(default)]
+    pub capabilities: DriverCapabilitiesPatch,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DriverVersionRankRule {
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DriverVersionStabilityRule {
+    #[serde(default)]
+    pub unstable_tokens: Vec<String>,
+    #[serde(default)]
+    pub current_requires_stable: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -140,8 +184,8 @@ pub fn resolve_driver_inventory(
     requests: &[DriverModelResolveRequest],
     inventory_revision: Option<String>,
 ) -> ProviderInventory {
-    let mut models = Vec::new();
     let sources = load_driver_metadata_sources(provider_driver);
+    let mut models = Vec::new();
     for request in requests.iter() {
         if let Some(metadata) = resolve_driver_model(
             provider_instance_name,
@@ -150,10 +194,14 @@ pub fn resolve_driver_inventory(
             request,
             sources.as_slice(),
         ) {
-            models.extend(expand_model_variants(metadata, sources.as_slice()));
+            models.push(metadata);
         }
     }
-    apply_driver_post_rules(provider_driver, &mut models);
+    apply_driver_post_rules(provider_driver, &mut models, sources.as_slice());
+    models = models
+        .into_iter()
+        .flat_map(|metadata| expand_model_variants(metadata, sources.as_slice()))
+        .collect();
 
     ProviderInventory {
         provider_instance_name: provider_instance_name.to_string(),
@@ -797,35 +845,36 @@ fn add_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum GptTier {
-    General,
-    Pro,
-    Mini,
-    Nano,
-}
-
-#[derive(Clone, Debug)]
-struct GptRank {
-    version: Vec<u64>,
-    stable: bool,
-    model_id: String,
-}
-
-fn apply_driver_post_rules(provider_driver: &str, models: &mut [ModelMetadata]) {
-    let driver = normalize_driver(provider_driver);
-    if driver == "openai" || driver == "sn-ai-provider" {
-        apply_openai_latest_mounts(models);
+fn apply_driver_post_rules(
+    provider_driver: &str,
+    models: &mut [ModelMetadata],
+    sources: &[DriverMetadataSource],
+) {
+    for rule in driver_version_rules(sources) {
+        apply_driver_version_rule(provider_driver, models, &rule);
     }
 }
 
-fn apply_openai_latest_mounts(models: &mut [ModelMetadata]) {
-    use std::cmp::Ordering;
-    let mut latest = std::collections::HashMap::<GptTier, (usize, GptRank)>::new();
-    for (index, model) in models.iter_mut().enumerate() {
-        if model.provider_actual_model_id.is_some() {
+fn driver_version_rules(sources: &[DriverMetadataSource]) -> Vec<DriverVersionRule> {
+    for source in sources.iter().rev() {
+        if source.document.schema_version != DRIVER_METADATA_SCHEMA_VERSION {
             continue;
         }
+        if !source.document.version_rules.is_empty() {
+            return source.document.version_rules.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn apply_driver_version_rule(
+    provider_driver: &str,
+    models: &mut [ModelMetadata],
+    rule: &DriverVersionRule,
+) {
+    use std::cmp::Ordering;
+    let mut latest: Option<(usize, DriverModelRank)> = None;
+    for (index, model) in models.iter_mut().enumerate() {
         if !model
             .api_types
             .iter()
@@ -833,70 +882,113 @@ fn apply_openai_latest_mounts(models: &mut [ModelMetadata]) {
         {
             continue;
         }
-        let Some((tier, rank)) = classify_gpt_model(model.provider_model_id.as_str()) else {
+        let Some(rank) = rank_model_for_version_rule(model.provider_model_id.as_str(), rule) else {
             continue;
         };
-        model
-            .logical_mounts
-            .retain(|mount| !is_gpt_auto_mount(mount));
+        remove_driver_auto_mounts(&mut model.logical_mounts, rule);
+        if let Some(version_mount) = rule.version_mount.as_deref() {
+            add_unique(
+                &mut model.logical_mounts,
+                expand_mount_template(
+                    version_mount,
+                    provider_driver,
+                    model.provider_model_id.as_str(),
+                ),
+            );
+        }
+        if rule.stability.current_requires_stable && !rank.stable {
+            continue;
+        }
         let replace = latest
-            .get(&tier)
-            .map(|(_, current)| compare_gpt_rank(&rank, current) == Ordering::Greater)
+            .as_ref()
+            .map(|entry| compare_gpt_rank(&rank, &entry.1) == Ordering::Greater)
             .unwrap_or(true);
         if replace {
-            latest.insert(tier, (index, rank));
+            latest = Some((index, rank));
         }
     }
-    for (tier, (index, _)) in latest {
+
+    if let Some((index, _)) = latest {
         let model = &mut models[index];
-        if matches!(tier, GptTier::General) {
-            model.capabilities.vision = true;
+        if let Some(current_mount) = rule.current_mount.as_deref() {
+            add_unique(
+                &mut model.logical_mounts,
+                expand_mount_template(
+                    current_mount,
+                    provider_driver,
+                    model.provider_model_id.as_str(),
+                ),
+            );
         }
-        for mount in gpt_family_mounts(tier) {
-            add_unique(&mut model.logical_mounts, mount.to_string());
-        }
+        apply_capabilities_patch(&mut model.capabilities, &rule.capabilities);
     }
 }
 
-fn classify_gpt_model(provider_model_id: &str) -> Option<(GptTier, GptRank)> {
+#[derive(Clone, Debug)]
+struct DriverModelRank {
+    version: Vec<u64>,
+    stable: bool,
+    model_id: String,
+}
+
+fn rank_model_for_version_rule(
+    provider_model_id: &str,
+    rule: &DriverVersionRule,
+) -> Option<DriverModelRank> {
     let normalized = provider_model_id
         .trim()
         .to_ascii_lowercase()
         .replace('_', "-");
-    if !normalized.contains("gpt") || is_openai_image_model(normalized.as_str()) {
+    if rule
+        .model_pattern
+        .as_deref()
+        .is_some_and(|pattern| !wildcard_matches(pattern, normalized.as_str()))
+    {
         return None;
     }
-    if has_snapshot_date_suffix(normalized.as_str()) {
+    if rule.model_pattern.is_none()
+        && !rule.family.is_empty()
+        && !normalized.contains(rule.family.to_ascii_lowercase().as_str())
+    {
         return None;
     }
+    if rule.exclude_snapshot_date_suffix && has_snapshot_date_suffix(normalized.as_str()) {
+        return None;
+    }
+
     let tokens = normalized
         .split(|ch: char| ch == '-' || ch == '.' || ch == '/')
         .filter(|token| !token.is_empty())
         .map(|token| token.to_string())
         .collect::<HashSet<_>>();
-    let tier = if tokens.contains("pro") {
-        GptTier::Pro
-    } else if tokens.contains("mini") {
-        GptTier::Mini
-    } else if tokens.contains("nano") || tokens.contains("nono") {
-        GptTier::Nano
-    } else {
-        GptTier::General
-    };
-    Some((
-        tier,
-        GptRank {
-            version: parse_gpt_version(normalized.as_str()),
-            stable: !tokens.contains("preview")
-                && !tokens.contains("experimental")
-                && !tokens.contains("beta"),
-            model_id: normalized,
-        },
-    ))
-}
-
-fn is_openai_image_model(model: &str) -> bool {
-    model.starts_with("dall-e") || model == "gpt-image-1"
+    if !rule.tier_tokens.is_empty()
+        && !rule
+            .tier_tokens
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .any(|token| tokens.contains(token.as_str()))
+    {
+        return None;
+    }
+    if rule
+        .exclude_tier_tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| tokens.contains(token.as_str()))
+    {
+        return None;
+    }
+    let stable = !rule
+        .stability
+        .unstable_tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| tokens.contains(token.as_str()));
+    Some(DriverModelRank {
+        version: parse_driver_version(normalized.as_str(), rule.version_rank.prefix.as_deref()),
+        stable,
+        model_id: normalized,
+    })
 }
 
 fn has_snapshot_date_suffix(normalized_model_id: &str) -> bool {
@@ -922,11 +1014,15 @@ fn has_snapshot_date_suffix(normalized_model_id: &str) -> bool {
         && day.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn parse_gpt_version(normalized_model_id: &str) -> Vec<u64> {
-    let Some(gpt_pos) = normalized_model_id.find("gpt") else {
-        return Vec::new();
-    };
-    let mut chars = normalized_model_id[gpt_pos + "gpt".len()..]
+fn parse_driver_version(normalized_model_id: &str, prefix: Option<&str>) -> Vec<u64> {
+    let offset = prefix
+        .and_then(|prefix| {
+            normalized_model_id
+                .find(prefix)
+                .map(|pos| pos + prefix.len())
+        })
+        .unwrap_or(0);
+    let mut chars = normalized_model_id[offset..]
         .trim_start_matches('-')
         .chars()
         .peekable();
@@ -956,7 +1052,7 @@ fn parse_gpt_version(normalized_model_id: &str) -> Vec<u64> {
     version
 }
 
-fn compare_gpt_rank(left: &GptRank, right: &GptRank) -> std::cmp::Ordering {
+fn compare_gpt_rank(left: &DriverModelRank, right: &DriverModelRank) -> std::cmp::Ordering {
     let max_len = left.version.len().max(right.version.len());
     for index in 0..max_len {
         let left_value = left.version.get(index).copied().unwrap_or(0);
@@ -971,25 +1067,15 @@ fn compare_gpt_rank(left: &GptRank, right: &GptRank) -> std::cmp::Ordering {
         .then_with(|| left.model_id.cmp(&right.model_id))
 }
 
-fn is_gpt_auto_mount(mount: &str) -> bool {
-    matches!(
-        mount,
-        "llm.gpt" | "llm.gpt-standard" | "llm.gpt-pro" | "llm.gpt-mini" | "llm.gpt-nano"
-    ) || mount == "llm.chat"
-        || mount == "llm.summarize"
-        || mount == "llm.swift"
-        || mount == "llm.plan"
-        || mount == "llm.reason"
-        || mount == "llm.code"
-}
-
-fn gpt_family_mounts(tier: GptTier) -> &'static [&'static str] {
-    match tier {
-        GptTier::General => &["llm.gpt-standard"],
-        GptTier::Pro => &["llm.gpt-pro"],
-        GptTier::Mini => &["llm.gpt-mini"],
-        GptTier::Nano => &["llm.gpt-nano"],
-    }
+fn remove_driver_auto_mounts(mounts: &mut Vec<String>, rule: &DriverVersionRule) {
+    mounts.retain(|mount| {
+        !rule.auto_mounts.iter().any(|auto_mount| {
+            mount == auto_mount
+                || mount
+                    .strip_prefix(auto_mount.as_str())
+                    .is_some_and(|tail| tail.starts_with('.'))
+        })
+    });
 }
 
 #[cfg(test)]
@@ -1141,6 +1227,67 @@ mod tests {
             .iter()
             .any(|mount| mount == "llm.gpt-nano"));
         assert!(!nano.logical_mounts.iter().any(|mount| mount == "llm.swift"));
+    }
+
+    #[test]
+    fn openai_version_rule_prefers_stable_current_mounts() {
+        let requests = vec![
+            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.5-preview", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.6-beta", vec![ApiType::LlmChat]),
+        ];
+        let inventory = resolve_driver_inventory(
+            "openai-test",
+            ProviderType::CloudApi,
+            "openai",
+            requests.as_slice(),
+            None,
+        );
+        let by_id = |id: &str| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == id)
+                .expect("model should exist")
+        };
+        assert!(by_id("gpt-5.4")
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-standard"));
+        for id in ["gpt-5.5-preview", "gpt-5.6-beta"] {
+            let model = by_id(id);
+            assert!(!model
+                .logical_mounts
+                .iter()
+                .any(|mount| mount == "llm.gpt-standard"));
+            assert!(model
+                .logical_mounts
+                .iter()
+                .any(|mount| mount.starts_with("llm.openai.gpt-")));
+        }
+    }
+
+    #[test]
+    fn openai_variants_expand_after_current_mount_selection() {
+        let request = DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::LlmChat]);
+        let inventory = resolve_driver_inventory(
+            "openai-test",
+            ProviderType::CloudApi,
+            "openai",
+            &[request],
+            None,
+        );
+        let variant = inventory
+            .models
+            .iter()
+            .find(|model| model.provider_model_id == "gpt-5.5:reasoning-high")
+            .expect("reasoning variant should exist");
+        assert_eq!(variant.exact_model, "gpt-5.5:reasoning-high@openai-test");
+        assert_eq!(variant.provider_actual_model_id.as_deref(), Some("gpt-5.5"));
+        assert!(variant
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.gpt-standard.reasoning-high"));
     }
 
     #[test]

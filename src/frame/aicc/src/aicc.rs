@@ -2634,6 +2634,7 @@ pub fn exact_model_name(provider_model_id: &str, provider_instance_name: &str) -
     format!("{}@{}", provider_model_id, provider_instance_name)
 }
 
+#[allow(dead_code)]
 pub fn logical_mount_segment(value: &str) -> String {
     let normalized = value
         .trim()
@@ -2648,6 +2649,7 @@ pub fn logical_mount_segment(value: &str) -> String {
         .join("-")
 }
 
+#[allow(dead_code)]
 fn provider_driver_mount_segment(provider_driver: &str) -> String {
     let normalized = provider_driver
         .trim()
@@ -2662,6 +2664,7 @@ fn provider_driver_mount_segment(provider_driver: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> Vec<String> {
     let driver_mount = format!(
         "image.txt2img.{}",
