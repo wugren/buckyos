@@ -695,6 +695,109 @@ impl ControlPanelServer {
             .to_string()
     }
 
+    fn is_valid_provider_instance_name(value: &str) -> bool {
+        !value.trim().is_empty()
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    }
+
+    fn collect_aicc_provider_instance_names(settings: &Value) -> Vec<String> {
+        let sections = [
+            "sn-ai-provider",
+            "openai",
+            "google",
+            "gemini",
+            "gimini",
+            "google_gemini",
+            "google_gimini",
+            "claude",
+            "anthropic",
+            "minimax",
+            "fal",
+        ];
+        let mut names = sections
+            .iter()
+            .filter_map(|section| settings.get(*section))
+            .filter_map(Value::as_object)
+            .filter_map(|section| section.get("instances"))
+            .filter_map(Value::as_array)
+            .flat_map(|instances| instances.iter())
+            .filter_map(|instance| {
+                instance
+                    .get("provider_instance_name")
+                    .or_else(|| instance.get("instance_id"))
+                    .and_then(Value::as_str)
+            })
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    async fn collect_runtime_provider_instance_names(&self) -> Vec<String> {
+        let Ok(runtime) = get_buckyos_api_runtime() else {
+            return vec![];
+        };
+        let Ok(krpc_client) = runtime.get_zone_service_krpc_client("aicc").await else {
+            return vec![];
+        };
+        let Ok(directory) = krpc_client.call("models.list", json!({})).await else {
+            return vec![];
+        };
+        let mut names = directory
+            .get("providers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|provider| {
+                provider
+                    .get("provider_instance_name")
+                    .and_then(Value::as_str)
+            })
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn merge_provider_instance_names(mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+        left.extend(right);
+        left.sort();
+        left.dedup();
+        left
+    }
+
+    fn provider_weights_from_settings(settings: &Value) -> serde_json::Map<String, Value> {
+        settings
+            .get("session_config")
+            .and_then(Value::as_object)
+            .and_then(|session| session.get("provider_weights"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn ensure_settings_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+        if !value.is_object() {
+            *value = json!({});
+        }
+        value.as_object_mut().expect("settings must be object")
+    }
+
+    fn ensure_child_object<'a>(
+        parent: &'a mut serde_json::Map<String, Value>,
+        key: &str,
+    ) -> &'a mut serde_json::Map<String, Value> {
+        let entry = parent.entry(key.to_string()).or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        entry.as_object_mut().expect("child must be object")
+    }
+
     pub(crate) fn build_message_hub_summary_prompt(
         peer_name: Option<&str>,
         peer_did: &str,
@@ -862,6 +965,43 @@ impl ControlPanelServer {
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({ "items": items })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_ai_provider_weight_list(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        let settings =
+            Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
+        let weights = Self::provider_weights_from_settings(&settings);
+        let provider_names = Self::merge_provider_instance_names(
+            Self::collect_aicc_provider_instance_names(&settings),
+            self.collect_runtime_provider_instance_names().await,
+        );
+        let items = provider_names
+            .into_iter()
+            .map(|provider_instance_name| {
+                let weight = weights
+                    .get(provider_instance_name.as_str())
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                json!({
+                    "provider_instance_name": provider_instance_name,
+                    "weight": weight,
+                    "is_default": (weight - 1.0).abs() < f64::EPSILON
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "items": items,
+                "provider_weights": weights
+            })),
             req.seq,
         ))
     }
@@ -1117,7 +1257,7 @@ impl ControlPanelServer {
         ))
     }
 
-    pub(crate) async fn handle_ai_reload(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+    async fn reload_aicc_settings_value(&self) -> Result<Value, RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
         let krpc_client = runtime
             .get_zone_service_krpc_client("aicc")
@@ -1133,13 +1273,16 @@ impl ControlPanelServer {
                 RPCErrors::ReasonError(format!("reload aicc settings failed: {}", error))
             })?;
 
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "result": result,
-            })),
-            req.seq,
-        ))
+        Ok(json!({
+            "ok": true,
+            "result": result,
+        }))
+    }
+
+    pub(crate) async fn handle_ai_reload(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        let result = self.reload_aicc_settings_value().await?;
+
+        Ok(RPCResponse::new(RPCResult::Success(result), req.seq))
     }
 
     pub(crate) async fn handle_ai_provider_set(
@@ -1374,6 +1517,69 @@ impl ControlPanelServer {
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({ "ok": true, "provider": provider_card })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_ai_provider_weight_set(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let provider_instance_name = Self::require_param_str(&req, "provider_instance_name")?;
+        if !Self::is_valid_provider_instance_name(provider_instance_name.as_str()) {
+            return Err(RPCErrors::ReasonError(
+                "provider_instance_name contains invalid characters".to_string(),
+            ));
+        }
+        let weight = req
+            .params
+            .get("weight")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| RPCErrors::ReasonError("weight is required".to_string()))?;
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(RPCErrors::ReasonError(
+                "weight must be a non-negative finite number".to_string(),
+            ));
+        }
+
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        let mut settings =
+            Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
+        let provider_names = Self::merge_provider_instance_names(
+            Self::collect_aicc_provider_instance_names(&settings),
+            self.collect_runtime_provider_instance_names().await,
+        );
+        if !provider_names
+            .iter()
+            .any(|name| name == provider_instance_name.as_str())
+        {
+            return Err(RPCErrors::ReasonError(format!(
+                "provider instance not found: {}",
+                provider_instance_name
+            )));
+        }
+
+        let root = Self::ensure_settings_object(&mut settings);
+        let session_config = Self::ensure_child_object(root, "session_config");
+        let provider_weights = Self::ensure_child_object(session_config, "provider_weights");
+        if (weight - 1.0).abs() < f64::EPSILON {
+            provider_weights.remove(provider_instance_name.as_str());
+        } else {
+            provider_weights.insert(provider_instance_name.clone(), json!(weight));
+        }
+
+        Self::save_json_config(&client, AICC_SETTINGS_KEY, &settings).await?;
+        let reload_result = self.reload_aicc_settings_value().await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "ok": true,
+                "provider_instance_name": provider_instance_name,
+                "weight": weight,
+                "is_default": (weight - 1.0).abs() < f64::EPSILON,
+                "reload": reload_result
+            })),
             req.seq,
         ))
     }

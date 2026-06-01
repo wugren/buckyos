@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore } from '../../hooks/use-aicc-store'
 import { StatusBadge } from '../shared/StatusBadge'
@@ -41,6 +41,9 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
   const store = useAICCStore()
   const [showModels, setShowModels] = useState(true)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [weightDraft, setWeightDraft] = useState(routingWeight.toString())
+  const [savingWeight, setSavingWeight] = useState(false)
+  const [weightError, setWeightError] = useState<string | null>(null)
 
   const { config, status, account, inventory } = provider
   const models = status.discovered_models
@@ -51,6 +54,35 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
     void store.deleteProvider(config.id)
       .then(onDeleted)
       .catch((error) => console.error('aicc.deleteProvider failed', error))
+  }
+
+  useEffect(() => {
+    setWeightDraft(formatWeight(routingWeight))
+    setWeightError(null)
+  }, [config.provider_instance_name, routingWeight])
+
+  const parsedWeight = Number(weightDraft)
+  const weightValid = Number.isFinite(parsedWeight) && parsedWeight >= 0
+  const clampedSliderWeight = weightValid ? Math.min(parsedWeight, 5) : 1
+  const weightChanged = weightValid && Math.abs(parsedWeight - routingWeight) > 0.0001
+
+  const updateWeightDraft = (value: string) => {
+    setWeightDraft(value)
+    setWeightError(null)
+  }
+
+  const handleSaveWeight = () => {
+    if (!weightValid) {
+      setWeightError(t('aiCenter.providers.routingWeightInvalid', 'Use a non-negative number.'))
+      return
+    }
+    setSavingWeight(true)
+    void store.setProviderRoutingWeight(config.provider_instance_name, parsedWeight)
+      .catch((error) => {
+        console.error('aicc.setProviderRoutingWeight failed', error)
+        setWeightError(t('aiCenter.providers.routingWeightSaveFailed', 'Could not save routing weight.'))
+      })
+      .finally(() => setSavingWeight(false))
   }
 
   const balanceDisplay = account.balance_supported && account.balance_value != null
@@ -106,6 +138,63 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
           label={t('aiCenter.providers.autoSync', 'Auto Sync')}
           value={config.auto_sync_models ? t('common.on', 'On') : t('common.off', 'Off')}
         />
+      </div>
+
+      <div
+        className="rounded-xl p-4 flex flex-col gap-3"
+        style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-medium" style={{ color: 'var(--cp-text)' }}>
+              {t('aiCenter.providers.routingWeight', 'Routing Weight')}
+            </div>
+            <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>
+              {routingWeightLabel}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleSaveWeight}
+            disabled={!weightChanged || savingWeight}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-45"
+            style={{
+              border: '1px solid var(--cp-border)',
+              color: 'var(--cp-text)',
+            }}
+          >
+            <Save size={14} />
+            {savingWeight ? t('common.saving', 'Saving') : t('common.save', 'Save')}
+          </button>
+        </div>
+        <div className="grid grid-cols-[1fr_5rem] gap-3 items-center">
+          <input
+            type="range"
+            min="0"
+            max="5"
+            step="0.1"
+            value={clampedSliderWeight}
+            onChange={(event) => updateWeightDraft(event.target.value)}
+            aria-label={t('aiCenter.providers.routingWeight', 'Routing Weight')}
+          />
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            value={weightDraft}
+            onChange={(event) => updateWeightDraft(event.target.value)}
+            className="w-20 rounded-lg px-2 py-1 text-sm"
+            style={{
+              background: 'var(--cp-bg)',
+              color: 'var(--cp-text)',
+              border: '1px solid var(--cp-border)',
+            }}
+            aria-label={t('aiCenter.providers.routingWeightValue', 'Routing weight value')}
+          />
+        </div>
+        <div className="text-xs" style={{ color: weightError ? 'var(--cp-danger)' : 'var(--cp-muted)' }}>
+          {weightError ?? t('aiCenter.providers.routingWeightHint', '0 disables routing, 1 keeps the default, values above 1 prefer this provider.')}
+        </div>
       </div>
 
       {status.model_sync_status !== 'ok' && (

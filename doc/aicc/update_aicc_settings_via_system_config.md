@@ -232,6 +232,7 @@ POST /kapi/aicc
 - `value` 必须是字符串；调用端负责 JSON 序列化。
 - `provider_type=local_inference` 具有安全含义，只能用于可信本地推理实例。
 - 不确定部署边界的代理服务使用 `proxy_unknown`，不要伪装成本地推理。
+- 全局 provider 路由权重持久化在 `services/aicc/settings.session_config.provider_weights`，例如 `"openai-backup": 0.3`、`"local-llama": 2.0`；`1.0` 是默认值，`0.0` 表示禁用该 provider 参与路由。Control Panel 可通过 `ai.provider.weight.set` 写入该字段。
 - 变更后需要调用 `reload_settings` 或 `service.reload_settings`；只写 system_config 不会让运行中的 AICC 立即重建 Provider registry。
 
 ## 11. 参考代码

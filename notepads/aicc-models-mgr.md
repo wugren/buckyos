@@ -334,8 +334,11 @@ Request policy         # 单次请求附带的约束
 - `logical_profile` / `logical_profiles`：一组 overlay；
 - `active_logical_profile`：选择哪个 profile；
 - `global_exact_model_weights`：全局精确模型权重；
+- `provider_weights`：全局 provider instance 权重，`1.0` 为默认，`0.0` 表示禁用该 provider 参与路由；
 - `policy`：全局路由策略；
 - `ttl_seconds` / `revision`：session 配置生命周期和冲突控制。
+
+长期持久化位置是 `services/aicc/settings.session_config.provider_weights`。该位置属于 AICC 全局 session parent 配置，不写入 provider inventory，也不修改 driver metadata。Control Panel 通过 `ai.provider.weight.list` / `ai.provider.weight.set` 读写该字段；保存时会校验 provider instance name、weight 非负有限，并触发 AICC `service.reload_settings` 使 `models.list.session_config` 立即反映新权重。
 
 `LogicalTreeOverlay` 支持：
 

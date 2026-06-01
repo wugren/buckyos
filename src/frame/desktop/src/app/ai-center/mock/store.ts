@@ -225,6 +225,20 @@ export class MockDataStore {
     this.notify()
   }
 
+  setProviderWeight(providerInstanceName: string, weight: number): void {
+    const nextWeights = { ...this.sessionConfig.provider_weights }
+    if (weight === 1) {
+      delete nextWeights[providerInstanceName]
+    } else {
+      nextWeights[providerInstanceName] = weight
+    }
+    this.sessionConfig = {
+      ...this.sessionConfig,
+      provider_weights: nextWeights,
+    }
+    this.notify()
+  }
+
   validateConnection(draft: WizardDraft): ValidationResult {
     const errors: string[] = []
     let endpointReachable = true

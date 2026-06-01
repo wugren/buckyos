@@ -209,6 +209,7 @@ interface AiccDataProvider {
   addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  setProviderWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
@@ -224,6 +225,7 @@ export interface AICCMgr {
   addProvider(draft: WizardDraft): Promise<ProviderView>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
 }
 
@@ -285,6 +287,11 @@ export class AICCModelStore implements AICCMgr {
     await this.refresh()
   }
 
+  async setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void> {
+    await this.provider.setProviderWeight(providerInstanceName, weight)
+    await this.refresh()
+  }
+
   validateConnection(draft: WizardDraft): Promise<ValidationResult> {
     return this.provider.validateConnection(draft)
   }
@@ -326,6 +333,10 @@ class MockAiccProvider implements AiccDataProvider {
     this.store.refreshProviderModels(id)
   }
 
+  async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
+    this.store.setProviderWeight(providerInstanceName, weight)
+  }
+
   async validateConnection(draft: WizardDraft): Promise<ValidationResult> {
     return this.store.validateConnection(draft)
   }
@@ -341,6 +352,7 @@ class MockAiccProvider implements AiccDataProvider {
 
 class BuckyOSAiccProvider implements AiccDataProvider {
   private client: AiccRpcClient | null = null
+  private controlPanelClient: AiccRpcClient | null = null
   private usageSummary = EMPTY_USAGE_SUMMARY
   private usageTrend: UsageTrendPoint[] = []
 
@@ -426,6 +438,16 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     })
   }
 
+  async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
+    const result = await this.callControlPanel<{ ok?: unknown; reason?: unknown }>('ai.provider.weight.set', {
+      provider_instance_name: providerInstanceName,
+      weight,
+    })
+    if (result.ok !== true) {
+      throw new Error(asNonEmptyString(result.reason, 'aicc.provider_weight_set_failed'))
+    }
+  }
+
   async validateConnection(draft: WizardDraft): Promise<ValidationResult> {
     const result = await this.call<Record<string, unknown>>('provider.validate', toProviderWritePayload(draft))
     return {
@@ -453,6 +475,14 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     return result as T
   }
 
+  private async callControlPanel<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const result = await this.getControlPanelClient().call(method, params)
+    if (!isRecord(result)) {
+      throw new Error(`Invalid ${method} response`)
+    }
+    return result as T
+  }
+
   private async queryUsage(params: Record<string, unknown>): Promise<RawUsageQueryResponse> {
     try {
       return await this.call<RawUsageQueryResponse>('usage.query', params)
@@ -467,6 +497,13 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       this.client = buckyos.getServiceRpcClient('aicc') as unknown as AiccRpcClient
     }
     return this.client
+  }
+
+  private getControlPanelClient(): AiccRpcClient {
+    if (!this.controlPanelClient) {
+      this.controlPanelClient = buckyos.getServiceRpcClient('control-panel') as unknown as AiccRpcClient
+    }
+    return this.controlPanelClient
   }
 }
 

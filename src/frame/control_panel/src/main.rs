@@ -1033,6 +1033,8 @@ impl RPCHandler for ControlPanelServer {
             "ai.overview" => self.handle_ai_overview(req).await,
             "ai.provider.list" => self.handle_ai_provider_list(req).await,
             "ai.provider.set" => self.handle_ai_provider_set(req).await,
+            "ai.provider.weight.list" => self.handle_ai_provider_weight_list(req).await,
+            "ai.provider.weight.set" => self.handle_ai_provider_weight_set(req).await,
             "ai.provider.test" => self.handle_ai_provider_test(req).await,
             "ai.message_hub.thread_summary" => {
                 self.handle_ai_message_hub_thread_summary(req, principal.as_ref())

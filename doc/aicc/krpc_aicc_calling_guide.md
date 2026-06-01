@@ -257,6 +257,42 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
 }
 ```
 
+示例：只在当前 session 中调整 provider 整体路由偏好：
+
+```json
+{
+  "method": "llm.chat",
+  "params": {
+    "capability": "llm",
+    "model": {
+      "alias": "llm.plan"
+    },
+    "requirements": {
+      "extra": {
+        "session_config_patch": {
+          "provider_weights": {
+            "openai-backup": 0.3,
+            "local-llama": 2.0
+          }
+        }
+      }
+    },
+    "payload": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [{ "type": "text", "text": "生成一个实施计划" }]
+        }
+      ],
+      "options": {
+        "session_id": "provider-weight-session-001"
+      }
+    }
+  },
+  "sys": [1004, "<session_token>", "trace-aicc-provider-weight"]
+}
+```
+
 ## 6. 取消任务
 
 ```json
@@ -265,7 +301,7 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
   "params": {
     "task_id": "aicc-xxx"
   },
-  "sys": [1004, "<session_token>", "trace-aicc-cancel"]
+  "sys": [1005, "<session_token>", "trace-aicc-cancel"]
 }
 ```
 

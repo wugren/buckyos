@@ -45,6 +45,7 @@ use crate::claude::register_claude_providers;
 use crate::fal::register_fal_providers;
 use crate::gimini::register_google_gimini_providers;
 use crate::minimax::register_minimax_providers;
+use crate::model_session::{merge_session_config, SessionConfig};
 use crate::openai::register_openai_llm_providers;
 use crate::sn_ai_provider::register_sn_ai_provider;
 
@@ -165,19 +166,44 @@ fn apply_provider_settings(
         ));
     }
 
-    match center.apply_default_logical_tree() {
+    match apply_session_config_settings(center, settings) {
         Ok(node_count) => {
             info!(
-                "aicc default level-2 logical tree applied: {} nodes",
+                "aicc session config applied: {} default level-2 nodes",
                 node_count
             );
         }
         Err(err) => {
-            warn!("aicc default logical tree apply failed: {}", err);
+            warn!("aicc session config apply failed: {}", err);
         }
     }
 
     Ok(registered_total)
+}
+
+fn apply_session_config_settings(center: &AIComputeCenter, settings: &Value) -> Result<usize> {
+    let mut config = crate::default_logical_tree::build_default_session_config();
+    let node_count = crate::default_logical_tree::level2_node_count(&config);
+
+    if let Some(raw) = settings
+        .get("session_config")
+        .filter(|value| !value.is_null())
+    {
+        let patch = serde_json::from_value::<SessionConfig>(raw.clone())
+            .map_err(|err| anyhow::anyhow!("parse settings.session_config failed: {}", err))?;
+        config = merge_session_config(&config, &patch)
+            .map_err(|err| anyhow::anyhow!("merge settings.session_config failed: {}", err))?;
+    }
+
+    if let Ok(mut registry) = center.model_registry().write() {
+        registry
+            .set_logical_definitions(
+                crate::default_logical_tree::build_default_logical_definitions(),
+            )
+            .map_err(|err| anyhow::anyhow!("apply logical definitions failed: {}", err))?;
+    }
+    center.set_session_config(config);
+    Ok(node_count)
 }
 
 fn redact_settings_for_log(value: &serde_json::Value) -> serde_json::Value {

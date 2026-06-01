@@ -183,7 +183,7 @@
 
 ## 5. P1：用户配置持久化与控制入口
 
-- [ ] 确定 `provider_weights` 的长期持久化位置。
+- [x] 确定 `provider_weights` 的长期持久化位置。
   - 候选位置：
     - `services/aicc/settings`
     - `services/control_panel/ai_models/provider_overrides`
@@ -192,22 +192,25 @@
     - 不污染 provider inventory。
     - 不修改 driver metadata。
     - 能作为 global/session parent 配置。
+  - 已实现：使用 `services/aicc/settings.session_config.provider_weights`，AICC `reload_settings` 会把该配置合并到默认 global session config。
 
-- [ ] Control Panel 增加 provider weight 配置读写。
+- [x] Control Panel 增加 provider weight 配置读写。
   - 当前 control_panel 有 provider overrides、policies、model catalog 等 key。
   - 需要设计：
     - provider weight 字段位置。
     - 默认值如何返回。
     - 保存时如何校验 provider instance name 与 weight。
+  - 已实现：新增 `ai.provider.weight.list` / `ai.provider.weight.set`，默认权重按 `1.0` 返回；保存时校验 provider instance name 已存在于 AICC settings，weight 为非负有限数，保存后触发 `ai.reload`。
 
-- [ ] Desktop Provider 管理 UI 增加 weight 编辑。
+- [x] Desktop Provider 管理 UI 增加 weight 编辑。
   - 控件建议：
     - slider 或 number input。
     - `0.0` 显示为 disabled for routing。
     - `1.0` 显示为 default。
   - 不要把 provider weight 展开成一堆 exact model weight 展示给用户。
+  - 已实现：Provider 详情页增加 routing weight slider + number input，通过 Control Panel 保存 provider instance 权重。
 
-- [ ] Session patch API 示例补齐。
+- [x] Session patch API 示例补齐。
   - 示例：
     ```json
     {
@@ -219,6 +222,7 @@
       }
     }
     ```
+  - 已实现：`doc/aicc/krpc_aicc_calling_guide.md` 增加 request 级 `session_config_patch.provider_weights` 示例。
 
 ## 6. P1：成本语义拆分
 
