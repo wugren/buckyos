@@ -818,7 +818,7 @@ build_runtime_binaries() {
     -p
     opendan
     -p
-    agent_tool
+    agent_tool_cli_dev
     --release
     --target
     "$rust_target"
@@ -853,7 +853,7 @@ build_runtime_binaries() {
     env_cmd+=("${normalized_env_lines[@]}")
   fi
 
-  log "Building opendan and agent_tool for $arch using target $rust_target via ${cargo_cmd[*]}"
+  log "Building opendan and agent_tool_cli_dev for $arch using target $rust_target via ${cargo_cmd[*]}"
   (
     cd "$SRC_DIR"
     "${env_cmd[@]}" "${cargo_cmd[@]}"
