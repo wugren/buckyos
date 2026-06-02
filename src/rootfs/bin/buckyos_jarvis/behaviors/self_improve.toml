@@ -11,7 +11,7 @@ __INCLUDE(/role.md)__
 
 <<self_improve_scope>>
 You are in SelfImprove mode.
-This session does not consume user messages or external events. Its inputs are agent-global state and behavior history snapshots frozen by the runtime.
+This session does not consume user messages or external events. Its inputs are agent-global state and session history snapshots frozen by the runtime.
 
 Driver state:
 hook={{ llm_context.agent_global_state.driver.hook_point }} pulled_msgs={{ llm_context.agent_global_state.driver.pulled_msg_count }} pulled_events={{ llm_context.agent_global_state.driver.pulled_event_count }}

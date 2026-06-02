@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File as StdFile;
 use std::io::{BufRead, BufReader};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 
 use buckyos_api::{AiContent, AiMessage, AiRole, AiUsage};
@@ -49,6 +49,12 @@ pub enum HistoryError {
     RoundAlreadyOpen(u64),
     #[error("round index must be greater than zero")]
     InvalidRoundIndex,
+    #[error("history page must be -1 or a non-negative integer")]
+    InvalidPage,
+    #[error("history page_size must be greater than zero")]
+    InvalidPageSize,
+    #[error("history time range start must not be greater than end")]
+    InvalidTimeRange,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +269,39 @@ pub enum HistoryView {
 pub struct RoundView {
     pub summary: RoundSummary,
     pub payload: RoundPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryMessage {
+    pub round_index: u64,
+    pub seq: u32,
+    pub ts: DateTime<Utc>,
+    pub role: AiRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionHistoryQuery {
+    TimeRange {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+    Page {
+        page: i64,
+        page_size: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionHistoryReadOptions {
+    pub token_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryReadResult {
+    pub messages: Vec<SessionHistoryMessage>,
+    pub total_candidates: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,6 +776,51 @@ impl SessionHistoryReader {
         Ok(out)
     }
 
+    pub fn read_session_messages(
+        &self,
+        query: SessionHistoryQuery,
+        options: SessionHistoryReadOptions,
+    ) -> HistoryResult<SessionHistoryReadResult> {
+        let mut messages = self.collect_session_messages()?;
+        match query {
+            SessionHistoryQuery::TimeRange { start, end } => {
+                if start > end {
+                    return Err(HistoryError::InvalidTimeRange);
+                }
+                messages.retain(|msg| msg.ts >= start && msg.ts <= end);
+            }
+            SessionHistoryQuery::Page { page, page_size } => {
+                if page < -1 {
+                    return Err(HistoryError::InvalidPage);
+                }
+                if page_size == 0 {
+                    return Err(HistoryError::InvalidPageSize);
+                }
+                messages = slice_history_page(messages, page, page_size);
+            }
+        }
+
+        let total_candidates = messages.len();
+        let (messages, token_truncated) = apply_history_token_limit(messages, options.token_limit);
+        Ok(SessionHistoryReadResult {
+            truncated: token_truncated || messages.len() < total_candidates,
+            messages,
+            total_candidates,
+        })
+    }
+
+    fn collect_session_messages(&self) -> HistoryResult<Vec<SessionHistoryMessage>> {
+        let summaries = self.read_summaries()?;
+        let mut out = Vec::new();
+        for round_index in summaries.keys().copied() {
+            let entries = read_entries(&round_file_path(&self.history_dir(), round_index))?;
+            for entry in entries {
+                out.extend(session_messages_from_entry(round_index, &entry));
+            }
+        }
+        Ok(out)
+    }
+
     fn history_dir(&self) -> PathBuf {
         self.session_dir.join(ROUND_HISTORY_DIR)
     }
@@ -903,6 +987,97 @@ fn msgonly_payload(mode: ContextMode, entries: &[Entry]) -> Vec<AiMessage> {
     }
 }
 
+fn session_messages_from_entry(round_index: u64, entry: &Entry) -> Vec<SessionHistoryMessage> {
+    match &entry.payload {
+        EntryPayload::Message { message, .. } => chat_msgonly_message(message)
+            .map(|message| session_message_from_ai(round_index, entry, message))
+            .into_iter()
+            .collect(),
+        EntryPayload::Step { step, .. } => behavior_step_assistant_text(step)
+            .map(|text| SessionHistoryMessage {
+                round_index,
+                seq: entry.seq,
+                ts: entry.ts,
+                role: AiRole::Assistant,
+                text,
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn session_message_from_ai(
+    round_index: u64,
+    entry: &Entry,
+    message: AiMessage,
+) -> SessionHistoryMessage {
+    SessionHistoryMessage {
+        round_index,
+        seq: entry.seq,
+        ts: entry.ts,
+        role: message.role,
+        text: message.text_content(),
+    }
+}
+
+fn slice_history_page(
+    messages: Vec<SessionHistoryMessage>,
+    page: i64,
+    page_size: usize,
+) -> Vec<SessionHistoryMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let range: RangeInclusive<usize> = if page == -1 {
+        let start = messages.len().saturating_sub(page_size);
+        start..=messages.len() - 1
+    } else {
+        let start = page as usize * page_size;
+        if start >= messages.len() {
+            return Vec::new();
+        }
+        let end = (start + page_size).min(messages.len()) - 1;
+        start..=end
+    };
+    messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| range.contains(&idx).then_some(msg))
+        .collect()
+}
+
+fn apply_history_token_limit(
+    messages: Vec<SessionHistoryMessage>,
+    token_limit: u32,
+) -> (Vec<SessionHistoryMessage>, bool) {
+    if token_limit == 0 {
+        return (Vec::new(), !messages.is_empty());
+    }
+    let mut out = Vec::new();
+    let mut used = 0u32;
+    let mut truncated = false;
+    for msg in messages {
+        let cost = estimate_history_message_tokens(&msg);
+        if used.saturating_add(cost) > token_limit && !out.is_empty() {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(cost);
+        out.push(msg);
+        if used >= token_limit {
+            truncated = true;
+            break;
+        }
+    }
+    (out, truncated)
+}
+
+fn estimate_history_message_tokens(msg: &SessionHistoryMessage) -> u32 {
+    let text_tokens = (msg.text.chars().count() as u32).saturating_add(3) / 4;
+    text_tokens.max(1).saturating_add(1)
+}
+
 fn chat_msgonly_message(message: &AiMessage) -> Option<AiMessage> {
     if !matches!(message.role, AiRole::User | AiRole::Assistant) {
         return None;
@@ -1028,6 +1203,7 @@ fn io_err(path: &Path, err: std::io::Error) -> HistoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::Write;
 
     use buckyos_api::AiToolResultContent;
@@ -1229,5 +1405,211 @@ mod tests {
             RoundPayload::Raw { entries } => assert_eq!(entries.len(), 1),
             _ => panic!("expected raw payload"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_session_messages_filters_pages_and_truncates() {
+        let dir = tempdir().unwrap();
+        let mut writer = SessionHistoryWriter::open(dir.path()).await.unwrap();
+        writer
+            .begin_round(
+                RoundTrigger::UserMsg {
+                    preview: "first".to_string(),
+                },
+                vec!["msg:1".to_string()],
+                ContextMode::Chat,
+            )
+            .await
+            .unwrap();
+        writer
+            .append_message(AiMessage::text(AiRole::User, "first"), None)
+            .await
+            .unwrap();
+        writer
+            .append_message(
+                AiMessage::new(
+                    AiRole::Assistant,
+                    vec![
+                        AiContent::Text {
+                            text: "second".to_string(),
+                        },
+                        AiContent::tool_use("call-1", "lookup", HashMap::new()),
+                    ],
+                ),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        writer
+            .append_message(
+                AiMessage::new(
+                    AiRole::Tool,
+                    vec![AiContent::tool_result_text("call-1", "hidden", false)],
+                ),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        writer.finalize_round(RoundStatus::Completed).await.unwrap();
+
+        writer
+            .begin_round(
+                RoundTrigger::UserMsg {
+                    preview: "third".to_string(),
+                },
+                vec!["msg:2".to_string()],
+                ContextMode::Chat,
+            )
+            .await
+            .unwrap();
+        writer
+            .append_message(AiMessage::text(AiRole::System, "hidden system"), None)
+            .await
+            .unwrap();
+        writer
+            .append_message(AiMessage::text(AiRole::User, "third"), None)
+            .await
+            .unwrap();
+        writer
+            .append_message(AiMessage::text(AiRole::Assistant, "fourth"), Some(2))
+            .await
+            .unwrap();
+        writer.finalize_round(RoundStatus::Completed).await.unwrap();
+        drop(writer);
+
+        let reader = SessionHistoryReader::open(dir.path()).unwrap();
+        let page0 = reader
+            .read_session_messages(
+                SessionHistoryQuery::Page {
+                    page: 0,
+                    page_size: 2,
+                },
+                SessionHistoryReadOptions { token_limit: 4096 },
+            )
+            .unwrap();
+        assert_eq!(page0.total_candidates, 2);
+        assert_eq!(
+            page0
+                .messages
+                .iter()
+                .map(|msg| msg.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+
+        let latest = reader
+            .read_session_messages(
+                SessionHistoryQuery::Page {
+                    page: -1,
+                    page_size: 2,
+                },
+                SessionHistoryReadOptions { token_limit: 4096 },
+            )
+            .unwrap();
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|msg| msg.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "fourth"]
+        );
+
+        let truncated = reader
+            .read_session_messages(
+                SessionHistoryQuery::Page {
+                    page: 0,
+                    page_size: 4,
+                },
+                SessionHistoryReadOptions { token_limit: 2 },
+            )
+            .unwrap();
+        assert!(truncated.truncated);
+        assert_eq!(truncated.messages.len(), 1);
+        assert_eq!(truncated.messages[0].text, "first");
+    }
+
+    #[tokio::test]
+    async fn read_session_messages_filters_exact_time_range() {
+        let dir = tempdir().unwrap();
+        let history_dir = dir.path().join(ROUND_HISTORY_DIR);
+        let meta_dir = dir.path().join(META_DIR);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = DateTime::parse_from_rfc3339("2026-01-01T00:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t2 = DateTime::parse_from_rfc3339("2026-01-01T00:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        append_json_line_to_path(
+            &meta_dir.join(ROUND_LOGS_FILE),
+            &RoundSummary {
+                schema_version: SCHEMA_VERSION,
+                round_index: 1,
+                trigger: RoundTrigger::Resume,
+                input_keys: Vec::new(),
+                started_at: t0,
+                ended_at: Some(t2),
+                status: RoundStatus::Completed,
+                entry_count: 3,
+                mode: ContextMode::Chat,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let round_path = round_file_path(&history_dir, 1);
+        for entry in [
+            Entry {
+                schema_version: SCHEMA_VERSION,
+                seq: 1,
+                ts: t0,
+                mode: ContextMode::Chat,
+                payload: EntryPayload::Message {
+                    message: AiMessage::text(AiRole::User, "outside-before"),
+                    llm_call: None,
+                },
+            },
+            Entry {
+                schema_version: SCHEMA_VERSION,
+                seq: 2,
+                ts: t1,
+                mode: ContextMode::Chat,
+                payload: EntryPayload::Message {
+                    message: AiMessage::text(AiRole::Assistant, "inside"),
+                    llm_call: Some(1),
+                },
+            },
+            Entry {
+                schema_version: SCHEMA_VERSION,
+                seq: 3,
+                ts: t2,
+                mode: ContextMode::Chat,
+                payload: EntryPayload::Message {
+                    message: AiMessage::text(AiRole::User, "outside-after"),
+                    llm_call: None,
+                },
+            },
+        ] {
+            append_json_line_to_path(&round_path, &entry, false)
+                .await
+                .unwrap();
+        }
+
+        let reader = SessionHistoryReader::open(dir.path()).unwrap();
+        let result = reader
+            .read_session_messages(
+                SessionHistoryQuery::TimeRange { start: t1, end: t1 },
+                SessionHistoryReadOptions { token_limit: 4096 },
+            )
+            .unwrap();
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, AiRole::Assistant);
+        assert_eq!(result.messages[0].text, "inside");
     }
 }

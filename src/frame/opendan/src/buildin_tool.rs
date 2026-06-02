@@ -2,13 +2,286 @@ use std::sync::Weak;
 
 use agent_tool::{AgentToolError, AgentToolManager, CallingConventions, ToolCtx, TypedTool};
 use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AIAgent;
+use crate::round_history::{SessionHistoryQuery, SessionHistoryReadOptions, SessionHistoryReader};
 
+pub const TOOL_READ_SESSION_HISTORY: &str = "read_session_history";
 pub const TOOL_SUBSCRIBE_EVENT: &str = "subscribe_event";
 pub const TOOL_UNSUBSCRIBE_EVENT: &str = "unsubscribe_event";
+const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
+const MAX_HISTORY_PAGE_SIZE: usize = 200;
+const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 4096;
+const DEFAULT_HISTORY_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadSessionHistoryArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+    #[serde(default)]
+    pub start_ms: Option<u64>,
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end_ms: Option<u64>,
+    #[serde(default)]
+    pub end: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
+    #[serde(default)]
+    pub page_size: Option<usize>,
+    #[serde(default)]
+    pub token_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SessionHistoryMessageOutput {
+    pub round_index: u64,
+    pub seq: u32,
+    pub ts_ms: u64,
+    pub ts: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReadSessionHistoryOutput {
+    pub session_id: String,
+    pub query: String,
+    pub total_candidates: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub messages: Vec<SessionHistoryMessageOutput>,
+}
+
+pub struct ReadSessionHistoryTool {
+    agent: Weak<AIAgent>,
+}
+
+impl ReadSessionHistoryTool {
+    pub fn new(agent: Weak<AIAgent>) -> Self {
+        Self { agent }
+    }
+}
+
+#[async_trait]
+impl TypedTool for ReadSessionHistoryTool {
+    type Args = ReadSessionHistoryArgs;
+    type Output = ReadSessionHistoryOutput;
+
+    fn name(&self) -> &str {
+        TOOL_READ_SESSION_HISTORY
+    }
+
+    fn description(&self) -> &str {
+        "Read user/assistant text history from a target Agent Session. Supports a centered time window, an exact time range, or page-based reads where page=-1 means the latest page."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM
+    }
+
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        Some(format!(
+            "read_session_history session_id={} {}",
+            args.session_id.trim(),
+            describe_history_args(args)
+        ))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "read {} message(s) from session {} ({})",
+            output.returned, output.session_id, output.query
+        )
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "read_session_history {} => {} message(s)",
+            output.session_id, output.returned
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        let agent = self
+            .agent
+            .upgrade()
+            .ok_or_else(|| AgentToolError::ExecFailed("agent is shutting down".to_string()))?;
+        let session_dir = agent.config.layout.session_dir(session_id);
+        if !session_dir.is_dir() {
+            return Err(AgentToolError::ExecFailed(format!(
+                "session `{session_id}` not found"
+            )));
+        }
+
+        let (query, query_label) = build_history_query(&args)?;
+        let token_limit = args.token_limit.unwrap_or(DEFAULT_HISTORY_TOKEN_LIMIT);
+        let reader = SessionHistoryReader::open(&session_dir)
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let result = reader
+            .read_session_messages(query, SessionHistoryReadOptions { token_limit })
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let messages = result
+            .messages
+            .into_iter()
+            .map(|msg| {
+                let ts_ms = msg.ts.timestamp_millis().max(0) as u64;
+                SessionHistoryMessageOutput {
+                    round_index: msg.round_index,
+                    seq: msg.seq,
+                    ts_ms,
+                    ts: msg.ts.to_rfc3339(),
+                    role: msg.role.as_str().to_string(),
+                    text: msg.text,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(ReadSessionHistoryOutput {
+            session_id: session_id.to_string(),
+            query: query_label,
+            total_candidates: result.total_candidates,
+            returned: messages.len(),
+            truncated: result.truncated,
+            messages,
+        })
+    }
+}
+
+fn validate_session_id_arg(session_id: &str) -> Result<(), AgentToolError> {
+    if session_id.is_empty() {
+        return Err(AgentToolError::InvalidArgs(
+            "`session_id` must not be empty".to_string(),
+        ));
+    }
+    if session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+    {
+        return Err(AgentToolError::InvalidArgs(
+            "`session_id` must be a plain session id, not a path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_history_query(
+    args: &ReadSessionHistoryArgs,
+) -> Result<(SessionHistoryQuery, String), AgentToolError> {
+    let exact_start = parse_optional_time(args.start_ms, args.start.as_deref(), "start")?;
+    let exact_end = parse_optional_time(args.end_ms, args.end.as_deref(), "end")?;
+    if exact_start.is_some() || exact_end.is_some() {
+        let start = exact_start.ok_or_else(|| {
+            AgentToolError::InvalidArgs(
+                "`start`/`start_ms` is required with exact time range".to_string(),
+            )
+        })?;
+        let end = exact_end.ok_or_else(|| {
+            AgentToolError::InvalidArgs(
+                "`end`/`end_ms` is required with exact time range".to_string(),
+            )
+        })?;
+        if start > end {
+            return Err(AgentToolError::InvalidArgs(
+                "`start` must not be greater than `end`".to_string(),
+            ));
+        }
+        return Ok((
+            SessionHistoryQuery::TimeRange { start, end },
+            format!("time_range {}..{}", start.to_rfc3339(), end.to_rfc3339()),
+        ));
+    }
+
+    let at = parse_optional_time(args.at_ms, args.at.as_deref(), "at")?;
+    if let Some(at) = at {
+        let window_ms = args.window_ms.unwrap_or(DEFAULT_HISTORY_WINDOW_MS as u64) as i64;
+        if window_ms <= 0 {
+            return Err(AgentToolError::InvalidArgs(
+                "`window_ms` must be greater than zero".to_string(),
+            ));
+        }
+        let half = Duration::milliseconds(window_ms / 2);
+        let start = at - half;
+        let end = at + Duration::milliseconds(window_ms - window_ms / 2);
+        return Ok((
+            SessionHistoryQuery::TimeRange { start, end },
+            format!("around {} window_ms={window_ms}", at.to_rfc3339()),
+        ));
+    }
+
+    let page = args.page.unwrap_or(0);
+    if page < -1 {
+        return Err(AgentToolError::InvalidArgs(
+            "`page` must be -1 or a non-negative integer".to_string(),
+        ));
+    }
+    let page_size = args.page_size.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE);
+    if page_size == 0 {
+        return Err(AgentToolError::InvalidArgs(
+            "`page_size` must be greater than zero".to_string(),
+        ));
+    }
+    let page_size = page_size.min(MAX_HISTORY_PAGE_SIZE);
+    Ok((
+        SessionHistoryQuery::Page { page, page_size },
+        format!("page={page} page_size={page_size}"),
+    ))
+}
+
+fn parse_optional_time(
+    ms: Option<u64>,
+    rfc3339: Option<&str>,
+    name: &str,
+) -> Result<Option<DateTime<Utc>>, AgentToolError> {
+    match (ms, rfc3339.map(str::trim).filter(|s| !s.is_empty())) {
+        (Some(ms), None) => {
+            let ms = i64::try_from(ms)
+                .map_err(|_| AgentToolError::InvalidArgs(format!("`{name}_ms` is out of range")))?;
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .map(Some)
+                .ok_or_else(|| AgentToolError::InvalidArgs(format!("`{name}_ms` is invalid")))
+        }
+        (None, Some(value)) => DateTime::parse_from_rfc3339(value)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|err| AgentToolError::InvalidArgs(format!("invalid `{name}` time: {err}"))),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(AgentToolError::InvalidArgs(format!(
+            "use either `{name}_ms` or `{name}`, not both"
+        ))),
+    }
+}
+
+fn describe_history_args(args: &ReadSessionHistoryArgs) -> String {
+    if let Some(page) = args.page {
+        return format!("page={page}");
+    }
+    if args.start_ms.is_some()
+        || args.start.is_some()
+        || args.end_ms.is_some()
+        || args.end.is_some()
+    {
+        return "time_range".to_string();
+    }
+    if args.at_ms.is_some() || args.at.is_some() {
+        return "around_time".to_string();
+    }
+    "page=0".to_string()
+}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SubscribeEventArgs {
@@ -241,4 +514,8 @@ pub fn register_event_subscription_tools(
         agent,
         source_session_id.to_string(),
     ));
+}
+
+pub fn register_session_history_tools(manager: &AgentToolManager, agent: Weak<AIAgent>) {
+    let _ = manager.register_typed_tool(ReadSessionHistoryTool::new(agent));
 }
