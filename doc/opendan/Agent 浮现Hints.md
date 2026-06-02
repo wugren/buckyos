@@ -309,9 +309,9 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 
 ### 5.3 调用语义补充
 
-- **覆盖写**（非 append）。一个 Session 同一时刻只有一个 topic；
+- **当前态覆盖写，调用历史 append**。一个 Session 同一时刻只有一个当前 topic；每次成功调用都会进入 session history，形成按时间线排列的 topic/tags 更新记录；
 - **幂等**：相同 topic 内容重复调用对 `topic.md` 是 no-op；但 tags 的变化仍会触发 Tag 集合更新与可能的召回；
-- **历史可追溯但不必暴露给 LLM**：底层把每次更新落到 `topic_log.jsonl`（运维 / 审计用），但工具对外只承诺“当前 topic = 最后一次写入”；
+- **历史可追溯但不必暴露给 LLM**：底层把每次更新落到 `round_history` 的 `session_topic_updated` 事件，并同步保留 `topic_log.jsonl` 作为运维 / 审计用时间线；工具对外仍承诺“当前 topic = 最后一次写入”；
 - **隔离边界**：不允许跨 Session 写他人的 topic（边界 = session_id）；
 - **单行 ≤ 120 字符校验**：topic title 单行、人类可读、对未来的“我”友好。
 
@@ -323,10 +323,10 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 {session_dir}/
   .meta/
     topic.md           # 当前 topic（覆盖写）
-    topic_log.jsonl    # 历次更新审计（append-only，可选）
+    topic_log.jsonl    # 历次更新审计（append-only）
     tag_set.json       # 当前 Tag 集合状态（含权重、时间戳、tier）
     subscriptions.json # 当前活跃的状态订阅（由 LLM 召回路径产生）
-  round_history/       # 见 session-history 设计
+  round_history/       # 见 session-history 设计；含 session_topic_updated 事件
   ...
 ```
 
@@ -1406,7 +1406,7 @@ Tag 淘汰、权重衰减、基础召回应尽量机械、可预测。
 
 ### 22.1 与邻居系统的关系
 
-- **与 session-history**：history 是真理源（事件级），topic 是题眼（语义级）。history 不可写、只追加；topic 可覆盖。两者都挂在 `session_dir` 下，互不依赖。
+- **与 session-history**：history 是真理源（事件级），topic 是题眼（语义级）。每次 `update_session_topic` 成功调用都会追加 `session_topic_updated` 历史事件；`topic.md` 是最后一次调用形成的当前态投影。
 - **与 AgentNotebook**：AgentNotebook 是 Session 内的工作笔记；topic 是 Session 间被浮现的题眼。即便实现层把 topic 作为 AgentNotebook 的一个特化条目，**对外接口必须独立**，避免和普通笔记混淆。
 - **与 auto memory**（跨 Session 的 user / feedback / project / reference 类长期记忆）：topic 不进 auto memory；topic 是“短期 Session 题眼”，由浮现机制时效性消费。
 - **与 LLMContext**：本工具作为 standard tool 注册。Tool Result 遵循 `success | error | pending` 协议，但**永不返回 pending** —— 召回总是同步等待完成。即便召回失败也返回 `success` + `recall_status=Failed`，因为 Tag 更新的保底语义已完成。

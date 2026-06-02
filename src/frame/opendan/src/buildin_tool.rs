@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Weak;
 
 use agent_tool::{AgentToolError, AgentToolManager, CallingConventions, ToolCtx, TypedTool};
@@ -8,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AIAgent;
 use crate::round_history::{SessionHistoryQuery, SessionHistoryReadOptions, SessionHistoryReader};
+use crate::session_model::{AlreadyImprovedState, SessionMeta};
 
+pub const TOOL_COMMIT_SESSION_HISTORY_IMPROVED: &str = "commit_session_history_improved";
 pub const TOOL_READ_SESSION_HISTORY: &str = "read_session_history";
 pub const TOOL_SUBSCRIBE_EVENT: &str = "subscribe_event";
 pub const TOOL_UNSUBSCRIBE_EVENT: &str = "unsubscribe_event";
@@ -40,6 +43,14 @@ pub struct ReadSessionHistoryArgs {
     pub page_size: Option<usize>,
     #[serde(default)]
     pub token_limit: Option<u32>,
+    #[serde(default)]
+    pub from_already_improved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommitSessionHistoryImprovedArgs {
+    pub session_id: String,
+    pub round_index: u64,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -53,20 +64,49 @@ pub struct SessionHistoryMessageOutput {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AlreadyImprovedOutput {
+    pub committed_round_index: u64,
+    pub committed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReadSessionHistoryOutput {
     pub session_id: String,
     pub query: String,
+    pub already_improved: AlreadyImprovedOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_round_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_round_index: Option<u64>,
     pub total_candidates: usize,
     pub returned: usize,
     pub truncated: bool,
     pub messages: Vec<SessionHistoryMessageOutput>,
 }
 
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CommitSessionHistoryImprovedOutput {
+    pub session_id: String,
+    pub committed_round_index: u64,
+    pub previous_committed_round_index: u64,
+    pub latest_round_index: Option<u64>,
+}
+
 pub struct ReadSessionHistoryTool {
     agent: Weak<AIAgent>,
 }
 
+pub struct CommitSessionHistoryImprovedTool {
+    agent: Weak<AIAgent>,
+}
+
 impl ReadSessionHistoryTool {
+    pub fn new(agent: Weak<AIAgent>) -> Self {
+        Self { agent }
+    }
+}
+
+impl CommitSessionHistoryImprovedTool {
     pub fn new(agent: Weak<AIAgent>) -> Self {
         Self { agent }
     }
@@ -129,13 +169,36 @@ impl TypedTool for ReadSessionHistoryTool {
             )));
         }
 
-        let (query, query_label) = build_history_query(&args)?;
         let token_limit = args.token_limit.unwrap_or(DEFAULT_HISTORY_TOKEN_LIMIT);
         let reader = SessionHistoryReader::open(&session_dir)
             .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-        let result = reader
-            .read_session_messages(query, SessionHistoryReadOptions { token_limit })
-            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let already_improved =
+            load_already_improved_state(&agent, session_id, &session_dir).await?;
+        let (result, query_label) = if args.from_already_improved {
+            let start_round_index = already_improved.committed_round_index.saturating_add(1);
+            let result = reader
+                .read_session_messages_from_round_index(
+                    start_round_index,
+                    SessionHistoryReadOptions { token_limit },
+                )
+                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+            (
+                result,
+                format!("already_improved from_round={start_round_index}"),
+            )
+        } else {
+            let (query, query_label) = build_history_query(&args)?;
+            let result = reader
+                .read_session_messages(query, SessionHistoryReadOptions { token_limit })
+                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+            (result, query_label)
+        };
+        let commit_round_index = if args.from_already_improved {
+            result.last_round_index
+        } else {
+            None
+        };
+        let latest_round_index = result.latest_round_index;
         let messages = result
             .messages
             .into_iter()
@@ -154,10 +217,87 @@ impl TypedTool for ReadSessionHistoryTool {
         Ok(ReadSessionHistoryOutput {
             session_id: session_id.to_string(),
             query: query_label,
+            already_improved: already_improved_output(&already_improved),
+            commit_round_index,
+            latest_round_index,
             total_candidates: result.total_candidates,
             returned: messages.len(),
             truncated: result.truncated,
             messages,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CommitSessionHistoryImprovedTool {
+    type Args = CommitSessionHistoryImprovedArgs;
+    type Output = CommitSessionHistoryImprovedOutput;
+
+    fn name(&self) -> &str {
+        TOOL_COMMIT_SESSION_HISTORY_IMPROVED
+    }
+
+    fn description(&self) -> &str {
+        "Commit self-improve history progress for a target Agent Session. The committed round index records that all session history up to that round has been processed."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM
+    }
+
+    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
+        Some(format!(
+            "commit_session_history_improved session_id={} round_index={}",
+            args.session_id.trim(),
+            args.round_index
+        ))
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "committed improved history for session {} through round {}",
+            output.session_id, output.committed_round_index
+        )
+    }
+
+    fn build_title(&self, output: &Self::Output) -> Option<String> {
+        Some(format!(
+            "commit_session_history_improved {} => {}",
+            output.session_id, output.committed_round_index
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        let agent = self
+            .agent
+            .upgrade()
+            .ok_or_else(|| AgentToolError::ExecFailed("agent is shutting down".to_string()))?;
+        let session_dir = agent.config.layout.session_dir(session_id);
+        if !session_dir.is_dir() {
+            return Err(AgentToolError::ExecFailed(format!(
+                "session `{session_id}` not found"
+            )));
+        }
+        let latest_round_index = SessionHistoryReader::open(&session_dir)
+            .and_then(|reader| reader.latest_round_index())
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let target_round_index = latest_round_index
+            .map(|latest| args.round_index.min(latest))
+            .unwrap_or(0);
+        let (previous, committed) =
+            commit_already_improved_state(&agent, session_id, &session_dir, target_round_index)
+                .await?;
+        Ok(CommitSessionHistoryImprovedOutput {
+            session_id: session_id.to_string(),
+            committed_round_index: committed.committed_round_index,
+            previous_committed_round_index: previous.committed_round_index,
+            latest_round_index,
         })
     }
 }
@@ -267,6 +407,9 @@ fn parse_optional_time(
 }
 
 fn describe_history_args(args: &ReadSessionHistoryArgs) -> String {
+    if args.from_already_improved {
+        return "already_improved".to_string();
+    }
     if let Some(page) = args.page {
         return format!("page={page}");
     }
@@ -281,6 +424,110 @@ fn describe_history_args(args: &ReadSessionHistoryArgs) -> String {
         return "around_time".to_string();
     }
     "page=0".to_string()
+}
+
+fn already_improved_output(state: &AlreadyImprovedState) -> AlreadyImprovedOutput {
+    AlreadyImprovedOutput {
+        committed_round_index: state.committed_round_index,
+        committed_at_ms: state.committed_at_ms,
+    }
+}
+
+async fn load_already_improved_state(
+    agent: &AIAgent,
+    session_id: &str,
+    session_dir: &Path,
+) -> Result<AlreadyImprovedState, AgentToolError> {
+    if let Some(session) = agent.get_session(session_id).await {
+        return Ok(session.meta.lock().await.already_improved.clone());
+    }
+    Ok(load_session_meta(session_dir)
+        .await?
+        .map(|meta| meta.already_improved)
+        .unwrap_or_default())
+}
+
+async fn commit_already_improved_state(
+    agent: &AIAgent,
+    session_id: &str,
+    session_dir: &Path,
+    round_index: u64,
+) -> Result<(AlreadyImprovedState, AlreadyImprovedState), AgentToolError> {
+    if let Some(session) = agent.get_session(session_id).await {
+        let previous;
+        let committed;
+        {
+            let mut meta = session.meta.lock().await;
+            previous = meta.already_improved.clone();
+            if round_index > meta.already_improved.committed_round_index {
+                meta.already_improved.committed_round_index = round_index;
+                meta.already_improved.committed_at_ms = agent_tool::now_ms();
+            }
+            committed = meta.already_improved.clone();
+        }
+        session
+            .flush_meta()
+            .await
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        return Ok((previous, committed));
+    }
+
+    let mut meta = load_session_meta(session_dir).await?.ok_or_else(|| {
+        AgentToolError::ExecFailed(format!("session `{session_id}` meta not found"))
+    })?;
+    let previous = meta.already_improved.clone();
+    if round_index > meta.already_improved.committed_round_index {
+        meta.already_improved.committed_round_index = round_index;
+        meta.already_improved.committed_at_ms = agent_tool::now_ms();
+    }
+    let committed = meta.already_improved.clone();
+    write_session_meta(session_dir, &meta).await?;
+    Ok((previous, committed))
+}
+
+async fn load_session_meta(session_dir: &Path) -> Result<Option<SessionMeta>, AgentToolError> {
+    let path = session_meta_path(session_dir);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice::<SessionMeta>(&bytes)
+            .map(Some)
+            .map_err(|err| {
+                AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(AgentToolError::ExecFailed(format!(
+            "read {} failed: {err}",
+            path.display()
+        ))),
+    }
+}
+
+async fn write_session_meta(session_dir: &Path, meta: &SessionMeta) -> Result<(), AgentToolError> {
+    let path = session_meta_path(session_dir);
+    let dir = path.parent().ok_or_else(|| {
+        AgentToolError::ExecFailed(format!("invalid session meta path {}", path.display()))
+    })?;
+    tokio::fs::create_dir_all(dir).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("mkdir {} failed: {err}", dir.display()))
+    })?;
+    let bytes = serde_json::to_vec_pretty(meta).map_err(|err| {
+        AgentToolError::ExecFailed(format!("serialize session meta failed: {err}"))
+    })?;
+    let tmp = dir.join(format!(
+        "session.json.{}.{}.tmp",
+        std::process::id(),
+        agent_tool::now_ms()
+    ));
+    tokio::fs::write(&tmp, &bytes).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("write {} failed: {err}", tmp.display()))
+    })?;
+    tokio::fs::rename(&tmp, &path).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("rename to {} failed: {err}", path.display()))
+    })?;
+    Ok(())
+}
+
+fn session_meta_path(session_dir: &Path) -> std::path::PathBuf {
+    session_dir.join(".meta").join("session.json")
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -517,5 +764,6 @@ pub fn register_event_subscription_tools(
 }
 
 pub fn register_session_history_tools(manager: &AgentToolManager, agent: Weak<AIAgent>) {
-    let _ = manager.register_typed_tool(ReadSessionHistoryTool::new(agent));
+    let _ = manager.register_typed_tool(ReadSessionHistoryTool::new(agent.clone()));
+    let _ = manager.register_typed_tool(CommitSessionHistoryImprovedTool::new(agent));
 }

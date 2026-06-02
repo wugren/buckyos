@@ -52,6 +52,17 @@ pub struct UpdateSessionTopicResult {
     pub recall_status: RecallStatus,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionTopicHistoryRecord {
+    pub session_id: String,
+    pub topic: String,
+    pub tags: Vec<String>,
+    pub tag_reasons: BTreeMap<String, String>,
+    pub current_turn: u32,
+    pub updated_at: String,
+    pub topic_changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct TagSetDiff {
     pub added: Vec<String>,
@@ -226,6 +237,13 @@ impl SessionTopicUpdater {
         &self,
         input: UpdateSessionTopicInput,
     ) -> Result<UpdateSessionTopicResult, SessionTopicError> {
+        Ok(self.update_with_record(input).await?.0)
+    }
+
+    pub async fn update_with_record(
+        &self,
+        input: UpdateSessionTopicInput,
+    ) -> Result<(UpdateSessionTopicResult, SessionTopicHistoryRecord), SessionTopicError> {
         let topic = normalize_topic(&input.topic)?;
         let tags = normalize_tags(&input.tags)?;
         let tag_names: Vec<String> = tags.iter().map(|tag| tag.name.clone()).collect();
@@ -255,15 +273,16 @@ impl SessionTopicUpdater {
                 &now,
             )?;
         }
-        append_topic_log(
-            &meta_dir.join(TOPIC_LOG_FILE),
-            &input.session_id,
-            &topic,
-            &tag_names,
-            &tag_reasons,
+        let topic_record = SessionTopicHistoryRecord {
+            session_id: input.session_id.clone(),
+            topic: topic.clone(),
+            tags: tag_names.clone(),
+            tag_reasons: tag_reasons.clone(),
+            current_turn: input.current_turn,
+            updated_at: now.clone(),
             topic_changed,
-            &now,
-        )?;
+        };
+        append_topic_log(&meta_dir.join(TOPIC_LOG_FILE), &topic_record)?;
 
         let tag_path = meta_dir.join(TAG_SET_FILE);
         let mut tag_set = read_tag_set(&tag_path)?;
@@ -361,15 +380,18 @@ impl SessionTopicUpdater {
             }
         }
 
-        Ok(UpdateSessionTopicResult {
-            tag_set_diff: TagSetDiff {
-                added: tag_set_diff.added,
-                removed: tag_set_diff.removed,
-                current: tag_set.tags,
+        Ok((
+            UpdateSessionTopicResult {
+                tag_set_diff: TagSetDiff {
+                    added: tag_set_diff.added,
+                    removed: tag_set_diff.removed,
+                    current: tag_set.tags,
+                },
+                recall,
+                recall_status,
             },
-            recall,
-            recall_status,
-        })
+            topic_record,
+        ))
     }
 }
 
@@ -688,20 +710,16 @@ fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
 
 fn append_topic_log(
     path: &Path,
-    session_id: &str,
-    topic: &str,
-    tags: &[String],
-    tag_reasons: &BTreeMap<String, String>,
-    topic_changed: bool,
-    now: &str,
+    record: &SessionTopicHistoryRecord,
 ) -> Result<(), SessionTopicError> {
     let line = serde_json::json!({
-        "session_id": session_id,
-        "updated_at": now,
-        "topic": topic,
-        "tags": tags,
-        "tag_reasons": tag_reasons,
-        "topic_changed": topic_changed,
+        "session_id": record.session_id,
+        "updated_at": record.updated_at,
+        "topic": record.topic,
+        "tags": record.tags,
+        "tag_reasons": record.tag_reasons,
+        "current_turn": record.current_turn,
+        "topic_changed": record.topic_changed,
     });
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{}", serde_json::to_string(&line)?)?;
@@ -1075,6 +1093,65 @@ mod tests {
         updater.update(input).await.unwrap();
         let second = fs::read_to_string(path).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn updater_appends_topic_timeline_and_keeps_latest_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let updater = SessionTopicUpdater::new(
+            Arc::new(MockRetrievalService::default()),
+            RecallPolicy {
+                change_threshold: 2.0,
+                distance_threshold_turns: u32::MAX,
+                ..RecallPolicy::default()
+            },
+        );
+        let session_dir = dir.path().join("s1");
+
+        let (_, first_record) = updater
+            .update_with_record(UpdateSessionTopicInput {
+                session_id: "s1".to_string(),
+                session_dir: session_dir.clone(),
+                topic: "Plan storage history".to_string(),
+                tags: vec![tag_input("Storage", "topic history design")],
+                current_turn: 1,
+            })
+            .await
+            .unwrap();
+        let (_, second_record) = updater
+            .update_with_record(UpdateSessionTopicInput {
+                session_id: "s1".to_string(),
+                session_dir: session_dir.clone(),
+                topic: "Implement storage history".to_string(),
+                tags: vec![tag_input("History", "topic timeline implementation")],
+                current_turn: 2,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first_record.topic, "Plan storage history");
+        assert_eq!(first_record.tags, vec!["storage"]);
+        assert_eq!(first_record.current_turn, 1);
+        assert!(first_record.topic_changed);
+        assert_eq!(second_record.topic, "Implement storage history");
+        assert_eq!(second_record.tags, vec!["history"]);
+        assert_eq!(second_record.current_turn, 2);
+        assert!(second_record.topic_changed);
+
+        let topic_doc = fs::read_to_string(session_dir.join(".meta/topic.md")).unwrap();
+        assert!(topic_doc.contains("Implement storage history"));
+        assert!(!topic_doc.contains("Plan storage history"));
+
+        let topic_log = fs::read_to_string(session_dir.join(".meta/topic_log.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = topic_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["topic"], "Plan storage history");
+        assert_eq!(lines[0]["current_turn"], 1);
+        assert_eq!(lines[1]["topic"], "Implement storage history");
+        assert_eq!(lines[1]["current_turn"], 2);
     }
 
     trait ReadToString {

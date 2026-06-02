@@ -1417,6 +1417,7 @@ fn session_meta_round_trips_pending_inputs() {
         }],
         improvement_budget: None,
         pending_improvement_tasks: Vec::new(),
+        already_improved: Default::default(),
         title: "design review".to_string(),
         objective: "draft the rollout plan".to_string(),
         bootstrap_done: true,

@@ -186,6 +186,8 @@ pub struct SessionMeta {
     pub improvement_budget: Option<ImprovementBudget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_improvement_tasks: Vec<ImprovementTask>,
+    #[serde(default, skip_serializing_if = "AlreadyImprovedState::is_empty")]
+    pub already_improved: AlreadyImprovedState,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -246,6 +248,7 @@ impl SessionMeta {
             pending_task_calls: Vec::new(),
             improvement_budget: None,
             pending_improvement_tasks: Vec::new(),
+            already_improved: AlreadyImprovedState::default(),
             title: String::new(),
             objective: String::new(),
             bootstrap_done: false,
@@ -341,6 +344,20 @@ pub struct ImprovementTask {
 pub enum ImprovementTaskStatus {
     Pending,
     Dispatched,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlreadyImprovedState {
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub committed_round_index: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub committed_at_ms: u64,
+}
+
+impl AlreadyImprovedState {
+    pub fn is_empty(&self) -> bool {
+        self.committed_round_index == 0 && self.committed_at_ms == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -163,6 +163,17 @@ pub enum HistoryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    SessionTopicUpdated {
+        session_id: String,
+        topic: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        tag_reasons: BTreeMap<String, String>,
+        current_turn: u32,
+        updated_at: DateTime<Utc>,
+        topic_changed: bool,
+    },
     Fork {
         child_label: String,
     },
@@ -302,6 +313,12 @@ pub struct SessionHistoryReadResult {
     pub messages: Vec<SessionHistoryMessage>,
     pub total_candidates: usize,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_round_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_round_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -804,8 +821,89 @@ impl SessionHistoryReader {
         let (messages, token_truncated) = apply_history_token_limit(messages, options.token_limit);
         Ok(SessionHistoryReadResult {
             truncated: token_truncated || messages.len() < total_candidates,
+            first_round_index: messages.first().map(|msg| msg.round_index),
+            last_round_index: messages.last().map(|msg| msg.round_index),
+            latest_round_index: self.latest_round_index()?,
             messages,
             total_candidates,
+        })
+    }
+
+    pub fn read_session_messages_from_round_index(
+        &self,
+        start_round_index: u64,
+        options: SessionHistoryReadOptions,
+    ) -> HistoryResult<SessionHistoryReadResult> {
+        let summaries = self.read_summaries()?;
+        let latest_round_index = summaries.keys().next_back().copied();
+        if options.token_limit == 0 {
+            let total_candidates = summaries
+                .keys()
+                .copied()
+                .filter(|round_index| *round_index >= start_round_index)
+                .try_fold(0usize, |acc, round_index| {
+                    let entries = read_entries(&round_file_path(&self.history_dir(), round_index))?;
+                    Ok::<usize, HistoryError>(
+                        acc + entries
+                            .iter()
+                            .flat_map(|entry| session_messages_from_entry(round_index, entry))
+                            .count(),
+                    )
+                })?;
+            return Ok(SessionHistoryReadResult {
+                messages: Vec::new(),
+                total_candidates,
+                truncated: total_candidates > 0,
+                first_round_index: None,
+                last_round_index: None,
+                latest_round_index,
+            });
+        }
+        let mut messages = Vec::new();
+        let mut total_candidates = 0usize;
+        let mut used_tokens = 0u32;
+        let mut truncated = false;
+
+        for round_index in summaries.keys().copied() {
+            if round_index < start_round_index {
+                continue;
+            }
+            let entries = read_entries(&round_file_path(&self.history_dir(), round_index))?;
+            let round_messages = entries
+                .iter()
+                .flat_map(|entry| session_messages_from_entry(round_index, entry))
+                .collect::<Vec<_>>();
+            if round_messages.is_empty() {
+                continue;
+            }
+            total_candidates += round_messages.len();
+            let round_tokens = round_messages
+                .iter()
+                .map(estimate_history_message_tokens)
+                .fold(0u32, u32::saturating_add);
+            if !messages.is_empty()
+                && used_tokens.saturating_add(round_tokens) > options.token_limit
+            {
+                truncated = true;
+                break;
+            }
+            used_tokens = used_tokens.saturating_add(round_tokens);
+            messages.extend(round_messages);
+            if used_tokens >= options.token_limit {
+                truncated = summaries.keys().any(|idx| *idx > round_index);
+                break;
+            }
+        }
+
+        let first_round_index = messages.first().map(|msg| msg.round_index);
+        let last_round_index = messages.last().map(|msg| msg.round_index);
+        Ok(SessionHistoryReadResult {
+            messages,
+            total_candidates,
+            truncated,
+            first_round_index,
+            last_round_index,
+            latest_round_index,
         })
     }
 
@@ -1210,6 +1308,30 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    #[test]
+    fn session_topic_event_serializes_stable_type() {
+        let event = HistoryEvent::SessionTopicUpdated {
+            session_id: "s1".to_string(),
+            topic: "Implement topic history".to_string(),
+            tags: vec!["history".to_string()],
+            tag_reasons: BTreeMap::from([(
+                "history".to_string(),
+                "topic timeline implementation".to_string(),
+            )]),
+            current_turn: 2,
+            updated_at: "2026-05-19T00:00:00Z".parse().unwrap(),
+            topic_changed: true,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "session_topic_updated");
+        assert_eq!(value["session_id"], "s1");
+        assert_eq!(value["topic"], "Implement topic history");
+        assert_eq!(value["tags"], json!(["history"]));
+        assert_eq!(value["current_turn"], 2);
+        assert_eq!(value["topic_changed"], true);
+    }
+
     #[tokio::test]
     async fn writer_reader_chat_round() {
         let dir = tempdir().unwrap();
@@ -1611,5 +1733,34 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].role, AiRole::Assistant);
         assert_eq!(result.messages[0].text, "inside");
+    }
+
+    #[tokio::test]
+    async fn read_session_messages_from_round_index_keeps_rounds_whole() {
+        let dir = tempdir().unwrap();
+        let mut writer = SessionHistoryWriter::open(dir.path()).await.unwrap();
+        for idx in 1..=3 {
+            writer
+                .begin_round(RoundTrigger::Resume, Vec::new(), ContextMode::Chat)
+                .await
+                .unwrap();
+            writer
+                .append_message(AiMessage::text(AiRole::User, format!("round-{idx}")), None)
+                .await
+                .unwrap();
+            writer.finalize_round(RoundStatus::Completed).await.unwrap();
+        }
+        drop(writer);
+
+        let reader = SessionHistoryReader::open(dir.path()).unwrap();
+        let result = reader
+            .read_session_messages_from_round_index(2, SessionHistoryReadOptions { token_limit: 3 })
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.first_round_index, Some(2));
+        assert_eq!(result.last_round_index, Some(2));
+        assert_eq!(result.latest_round_index, Some(3));
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].text, "round-2");
     }
 }

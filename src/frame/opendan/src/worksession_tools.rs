@@ -30,6 +30,7 @@ use agent_tool::{
 };
 use async_trait::async_trait;
 use buckyos_api::{AiContent, AiMessage, AiRole};
+use chrono::Utc;
 use llm_context::{
     outcome::ContextOutput,
     request::{OutputSpec, ToolMode, ToolPolicy},
@@ -41,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AIAgent, CreateWorkSessionParams};
 use crate::llm_context_helper::RequestOverrides;
 use crate::local_workspace::{WorkspaceRecord, WorkspaceStatus};
+use crate::round_history::HistoryEvent;
 use crate::session_model::{SessionKind, SessionStatus, SessionSummary};
 use crate::session_topic::{
     RecallPolicy, SessionTopicError, SessionTopicUpdater, TagInput, UpdateSessionTopicInput,
@@ -574,8 +576,9 @@ impl TypedTool for UpdateSessionTopicTool {
                     self.source_session_id
                 ))
             })?;
-        self.updater
-            .update(UpdateSessionTopicInput {
+        let (output, record) = self
+            .updater
+            .update_with_record(UpdateSessionTopicInput {
                 session_id: self.source_session_id.clone(),
                 session_dir: session.session_dir.clone(),
                 topic: args.topic,
@@ -583,7 +586,22 @@ impl TypedTool for UpdateSessionTopicTool {
                 current_turn: ctx.session().step_idx,
             })
             .await
-            .map_err(map_session_topic_error)
+            .map_err(map_session_topic_error)?;
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&record.updated_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        session
+            .append_history_event(HistoryEvent::SessionTopicUpdated {
+                session_id: record.session_id,
+                topic: record.topic,
+                tags: record.tags,
+                tag_reasons: record.tag_reasons,
+                current_turn: record.current_turn,
+                updated_at,
+                topic_changed: record.topic_changed,
+            })
+            .await;
+        Ok(output)
     }
 }
 

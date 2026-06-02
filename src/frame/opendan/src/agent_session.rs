@@ -742,6 +742,10 @@ impl AgentSession {
         }
     }
 
+    pub async fn append_history_event(&self, event: HistoryEvent) {
+        self.history.append_event(event).await;
+    }
+
     /// Snapshot the currently-installed handle (if any). Returns `None` when
     /// no inference is in flight (between turns, parked on PendingTool,
     /// session idle).
