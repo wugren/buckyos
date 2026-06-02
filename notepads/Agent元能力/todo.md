@@ -118,7 +118,11 @@ G_state的定义
 
 ### 内部State的整理 (Self-Improve)
 
->TODO 未实现
+特殊触发：当Agent Session的未处理History到达一定数量时，尝试触发
+按时间逐个 分析这个时间窗口内的Session Hisotry,强调跨Session的总结
+
+
+>**TODO 未实现**
 
 ## Skills 
 
