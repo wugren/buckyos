@@ -139,6 +139,10 @@ publish:
         optional: true
         default_selected: true
         default_target: "/opt/buckyos/"
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
   macos_pkg:
     apps:
       BuckyOSApp:
@@ -160,6 +164,10 @@ publish:
         optional: true
         default_selected: true
         default_target: "/opt/buckyos/"
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
   win_pkg:
     apps:
       BuckyOSApp:
@@ -182,6 +190,10 @@ publish:
         optional: true
         default_selected: true
         default_target: "%APPDATA%\\BuckyOS\\" #window下运行用户选择安装位置
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
 
       
       
