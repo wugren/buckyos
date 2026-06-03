@@ -221,14 +221,14 @@ publish:
         optional: true
         default_selected: true
         src: buckyosapp.exe
-        default_target: "C:\\Program Files\\BuckyOS\\BuckyOSApp"
+        default_target: "C:\\BuckyOS\\BuckyOSApp"
       buckyos:
         name: Buckyos Service
         type: app
         optional: true
         default_selected: true
         system_service: true
-        default_target: "C:\\Program Files\\BuckyOS\\buckyos"
+        default_target: "C:\\BuckyOS"
         deps:
           cyfs-gateway:
             type: buckyos_project
@@ -238,7 +238,7 @@ publish:
         type: app
         optional: true
         default_selected: true
-        default_target: "C:\\Program Files\\BuckyOS\\buckycli"
+        default_target: "C:\\BuckyOS\\buckycli"
 
   linux_pkg:
     apps:
@@ -510,11 +510,12 @@ macOS 组件 hook 命名：
 其中：
 
 - `component` 使用 `publish.{platform}.apps` 的 key，例如 `BuckyOSApp`、`buckyos`、`buckycli`。
-- `step` 支持 `preinstall`、`postinstall`。
+- Windows `step` 支持 `preinstall`、`postinstall`、`preuninstall`。
+- macOS/Linux `step` 支持 `preinstall`、`postinstall`。
 - macOS 只支持无扩展名脚本，例如 `buckyos_preinstall`；不支持 `.sh`、`.ps1` 等扩展形式。
 - Windows 优先使用 PowerShell 脚本。
 
-不支持自定义 `uninstall` hook 文件。Windows 卸载逻辑由 NSIS 卸载器固定实现；Linux 使用包管理器卸载生命周期；macOS pkg 本身不提供卸载入口，手工卸载步骤通过独立 `uninstall_for_macos` 文档说明。
+不支持自定义 `uninstall` hook 文件。Windows 只支持组件级 `preuninstall`，在 NSIS 卸载器删除该组件目录前执行；Linux 使用包管理器卸载生命周期；macOS pkg 本身不提供卸载入口，手工卸载步骤通过独立 `uninstall_for_macos` 文档说明。
 
 Linux 也支持组件 hook script。打包前，脚本将各组件的 `preinstall` hook 拼接到 deb `preinst` 或 rpm `%pre`，将各组件的 `postinstall` hook 拼接到 deb `postinst` 或 rpm `%post`。拼接顺序使用内部 manifest 中的平台组件定义顺序，但 hook script 不得依赖该顺序才能正确执行。
 
@@ -523,9 +524,10 @@ Linux 也支持组件 hook script。打包前，脚本将各组件的 `preinstal
 - 自定义 hook 只随被安装的组件执行。
 - 未选择组件的 hook MUST NOT 执行。
 - Hook 执行顺序为组件安装顺序内的 step 顺序。
-- Hook 返回非 0 时，安装 MUST 失败。
+- Hook 返回非 0 时，当前安装或卸载操作 MUST 失败。
 - 静默安装中 hook MUST 只写日志和返回错误码，不弹窗。
 - 图形安装中 hook 失败 MUST 显示错误。
+- Windows `preuninstall` hook 只随卸载器执行，并且必须在该组件 payload 被删除前执行。
 - 覆盖安装前停止 service、停止 BuckyOS Docker 容器等动作属于 `buckyos_preinstall` 或平台脚本内置安装前逻辑。
 
 不单独设计 `preflight` hook。依赖检测与 Retry/Open/Cancel UI 强绑定，必须写在平台安装器脚本中。
@@ -678,7 +680,7 @@ Linux 不额外处理 Docker 已安装但被用户手动停止的情况。
 | 50 | preinstall/hook 失败 |
 | 60 | payload 写入失败 |
 | 70 | postinstall/hook 失败 |
-| 80 | 卸载失败 |
+| 80 | preuninstall/hook 或卸载失败 |
 
 Windows NSIS 静默安装 MUST 显式 `SetErrorLevel`。macOS 和 Linux 如果无法映射细分 code，脚本至少必须在日志中写明失败原因。
 
@@ -824,7 +826,7 @@ sudo dnf install ./buckyos-linux-{arch}-{version}.rpm
 - 同时写入当前用户 Run 注册项作为兼容启动项。
 - 需要兼容清理旧版本 Windows service `buckyos`。
 
-`buckycli` 是系统级命令行工具，Windows exe 默认安装到 `C:\Program Files\BuckyOS\buckycli`，并把该目录写入当前用户 PATH；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
+`buckycli` 是系统级命令行工具，Windows exe 默认安装到 `C:\BuckyOS\buckycli`，安装后由 `buckycli_postinstall.ps1` 把该目录写入当前用户 PATH，卸载前由 `buckycli_preuninstall.ps1` 从 PATH 删除；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
 
 Windows 不需要写普通图形安装日志。静默安装日志 MUST 写到：
 

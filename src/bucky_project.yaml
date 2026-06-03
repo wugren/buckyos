@@ -176,20 +176,20 @@ publish:
         optional: true
         default_selected: true
         src: buckyosapp.exe # PUBLISH_DIR/$appname/buckyosapp.exe
-        default_target: "C:\\Program Files\\BuckyOS\\BuckyOSApp" #window下运行用户选择安装位置
+        default_target: "C:\\BuckyOS\\BuckyOSApp" #window下运行用户选择安装位置
       buckycli:
         name: BuckyOS CLI
         type: app
         optional: true
         default_selected: true
-        default_target: "%USERPROFILE%\\.buckycli\\" #window下运行用户选择安装位置
+        default_target: "%USERPROFILE%\\buckycli\\" #window下运行用户选择安装位置
       buckyos:
         name: BuckyOS Desktop Service
         type: app
         system_service: true
         optional: true
         default_selected: true
-        default_target: "%APPDATA%\\BuckyOS\\" #window下运行用户选择安装位置
+        default_target: "C:\\BuckyOS\\" #window下运行用户选择安装位置
         deps:
           cyfs-gateway:
             type: buckyos_project
