@@ -2,9 +2,12 @@
 
 站在Agent完整元能力的视角，梳理Todo
 
-## Agent Session 
+## Agent Session Runtime
 
-> TODO 用process-chainl来重新实现hook point
+Agent Session是Agent活着的容器，其历史记录是Agent存在过的证明
+
+> TODO 用process-chain 来重新实现hook point
+
 
 ### UI(Input Route) Session 
 
@@ -22,14 +25,15 @@ UI session会积极的update-session-topic
 Input本身带有Target Session最好，这样就不用Route
 否则: Input -> UI Session -> LLM -Route-> WorkSession
 
-根本性的痛苦之一:LLM调用Route错了
+根本性的痛苦之一:LLM Route错了，目前这类错误造成的伤害是最大的
 
 > TODO: UI Session中识别到机械Forward标签
 > TODO: 重点优化和Route相关的提示词
 
 ### Work(Task) Session
 
-Work(Task) Session 通常专注于一个确定具体的任务(不是long life-time session)
+Work(Task) Session 通常专注于一个确定具体的任务(不是long life-time session)，open DAN的世界观里，Agent应该由大量的worksession和少量的UI Session组成。复杂工作放在Work Session里，能从基本架构上规避Context Windows的问题。
+
 在Plan阶段倾向于“了解更多”状态（有长上下文），并会更新
 在DO阶段，专注于完成特定TODO：假设信息已经在Plan阶段收集够，不探索，专注完成目标，快速失败
 处理Report
@@ -38,7 +42,7 @@ Work(Task) Session 通常专注于一个确定具体的任务(不是long life-ti
 > TODO: **Plan阶段的提示词需要基于元能力框架大幅度的升级**
 > TODO: Report的范式需要调整
 
-## Agent Notebook + Self-Check
+### Agent Notebook + Self-Check
 
 Agent Notebook有2个核心目的
 
@@ -55,6 +59,17 @@ Agent Notebook有2个核心目的
 通过通用的方法(Global Object)定义世界状态,解决Agent主动探索更多信息
 需要定义观察/探索/互动/订阅的标准动作
 这里的核心是read （返回的必然是一个引导文本（提示词）），要考虑风险
+
+> TODO 建立下面标准抽象：
+
+```text
+read(object_id)
+read(indexer_id, filter) //用read代替？
+call(object_id, method, params)// 工具化？
+subscribe(object_id, event_name, options)
+unsubscribe(object_id, event_name)
+read(alias_or_did_or_url) //用read代替？
+```
 
 ### 索引支持
 
@@ -99,10 +114,10 @@ Hint = 时间 + 一句话 + 对象ID
 	
 确认基于LLM的半订阅调用（目前缺失的一环），触发边界在哪？订阅太多触发？能否机械的判断当前session topic应该订阅哪些global object?
 
-### Agent 的内部状态
+### Agent State(Agent的内部状态)
 
 
-发现事件
+发现事件 : 
 发现Object（主语或宾语）
 探索Object之间的关系
 
@@ -113,16 +128,18 @@ G_state的定义
 
 寻找捷径（skills）
 
+
 > TODO：Agent Memory能表达G_State么？（需要例子）
 
 
-### 内部State的整理 (Self-Improve)
+### Agent State的整理和演化 (Self-Improve)
 
 特殊触发：当Agent Session的未处理History到达一定数量时，尝试触发
 按时间逐个 分析这个时间窗口内的Session Hisotry,强调跨Session的总结
 
 
->**TODO 未实现**
+> TODO: 增加一个专门的组件来管理 Attention Signals
+> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统
 
 ## Skills 
 
@@ -151,7 +168,7 @@ skill的分类
 - lifecycle_state
 - verification_status
 
-> TODO 需要定义
+> TODO 需要重新定义skill的格式
 
 ### skills的使用 
 
