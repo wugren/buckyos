@@ -52,6 +52,12 @@ Agent Notebook有2个核心目的
 
 2）记录被声明的事实
 
+> 分类学讨论结论（坑已踩过，避免重推）：
+> - 这两个"目的"是按**消费者**分的（self-check 半 vs 召回半），不是按 itemKind 分的。写入侧其实只有一种 kind：**一条强信号原句**。fact/plan 不是写入时身份，是 self-check 后置、可演化、允许 `unresolved` 的 Review 标注（"做完X再做Y"记下那刻就判不了，必须容忍悬而未决）。
+> - **强/弱信号 = 投递保证 = 资源授权，同一根轴**。所以推断（弱信号）不能直接建计划任务——best-effort 投递没资格授权资源开销。弱信号留 Memory，靠"提纯"升级：Memory 高召回候选 + 确认握手做精度门，用户"好"才写入 Notebook。中间态留 Memory，别在 Notebook 里堆未确认脏条目。确认摩擦 ∝ 解锁的下游承诺（同 Governance approval）。
+> - 计划类 item 建完任务**标记不删**：防重建 + 当查询锚点（是否建任务/是否执行/成没成）。注意两条正交生命周期别合并——note 自身 `active/stale/superseded`（指令还作不作数） vs 派生任务 `pending/done/failed`（挂 Schedule-Task，查询时投影）。
+> - 计划半**不上自动召回**（自寻址、有 self-check 心跳兜底），只保留显式查询；事实/偏好半才走广播式 Hint 召回。
+
 > TODO: 架子已经完成了，需要优化实现
 
 ## Global Object (World State)
