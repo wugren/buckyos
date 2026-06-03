@@ -490,7 +490,7 @@ Hook 不在 YAML 中逐项声明。平台脚本按约定文件名查找，存在
 | --- | --- |
 | Windows | `src/publish/win_pkg/scripts/` |
 | macOS | `src/publish/macos_pkg/scripts/` |
-| deb | `src/publish/deb_template/DEBIAN/` 或 `src/publish/linux_deb/scripts/` |
+| deb | `src/publish/deb_pkg/` |
 | rpm | `src/publish/rpm_template/` 或 `src/publish/linux_rpm/scripts/` |
 
 Windows 组件 hook 命名：
@@ -518,6 +518,14 @@ macOS 组件 hook 命名：
 不支持自定义 `uninstall` hook 文件。Windows 只支持组件级 `preuninstall`，在 NSIS 卸载器删除该组件目录前执行；Linux 使用包管理器卸载生命周期；macOS pkg 本身不提供卸载入口，手工卸载步骤通过独立 `uninstall_for_macos` 文档说明。
 
 Linux 也支持组件 hook script。打包前，脚本将各组件的 `preinstall` hook 拼接到 deb `preinst` 或 rpm `%pre`，将各组件的 `postinstall` hook 拼接到 deb `postinst` 或 rpm `%post`。拼接顺序使用内部 manifest 中的平台组件定义顺序，但 hook script 不得依赖该顺序才能正确执行。
+
+deb 源脚本目录为 `src/publish/deb_pkg/`。该目录包含一个 `control` 模板，以及按 `{component}_{step}` 命名的组件 hook，例如 `buckyos_preinstall`、`buckyos_postinstall`。打包时 `make_local_deb.py` 将这些源文件和 `bucky_project.yaml`/内部 manifest 中的 modules、data_paths 信息拼接成临时 `DEBIAN/control`、`DEBIAN/preinst`、`DEBIAN/postinst`，不直接维护最终 maintainer script 文件。
+
+可用以下命令单独生成最终 control scripts，便于审查或 CI diff：
+
+```sh
+python src/publish/make_local_deb.py render-control amd64 0.6.0+build260603 --out-dir /tmp/buckyos-DEBIAN
+```
 
 ### 8.2 Hook 执行规则
 
@@ -816,14 +824,17 @@ sudo dnf install ./buckyos-linux-{arch}-{version}.rpm
 - 静默安装分支和稳定 exit code。
 - `overwrite` 和 `preserve_existing` payload 写入。
 - `buckyos` 安装前停止旧 service、scheduled task、启动项和进程。
-- `buckyos` postinstall 写入 `BUCKYOS_ROOT`，执行 defaults seed，配置防火墙规则，注册并启动 keepalive scheduled task。
+- `buckyos` 安装时写入 `BUCKYOS_ROOT`，执行 defaults seed，配置防火墙规则。
+- `buckyos_postinstall.ps1` 注册并启动 keepalive scheduled task，同时写入当前用户 Run 启动项。
+- `buckyos_preuninstall.ps1` 在卸载删除 payload 前删除 keepalive scheduled task 和当前用户 Run 启动项。
 - 卸载器。
 - 卸载时默认保留用户数据。
 
 固定 service 机制：
 
-- 本期 Windows 使用 `BuckyOSNodeDaemonKeepAlive` scheduled task 启动 `node_daemon.exe`。
-- 同时写入当前用户 Run 注册项作为兼容启动项。
+- 本期 Windows 使用 `BuckyOSNodeDaemonKeepAlive` scheduled task 启动 `node_daemon.exe`，计划任务生命周期由 `buckyos_postinstall.ps1` 和 `buckyos_preuninstall.ps1` 管理。
+- 同时由同一对 hook 维护当前用户 Run 注册项作为兼容启动项。
+- `node_daemon_loader.vbs` 是单文件隐藏启动器：检查 `node_daemon.exe` 是否已运行，未运行时以隐藏窗口启动 `node_daemon.exe --enable_active`。
 - 需要兼容清理旧版本 Windows service `buckyos`。
 
 `buckycli` 是系统级命令行工具，Windows exe 默认安装到 `C:\BuckyOS\buckycli`，安装后由 `buckycli_postinstall.ps1` 把该目录写入当前用户 PATH，卸载前由 `buckycli_preuninstall.ps1` 从 PATH 删除；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
