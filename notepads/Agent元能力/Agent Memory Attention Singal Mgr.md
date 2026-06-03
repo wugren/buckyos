@@ -1954,7 +1954,169 @@ Relationship:
 
 ---
 
-# 32. 总结
+# 32. Stage-1 / Stage-2 生命周期对接协议（v0.1 补充）
+
+> 本节补齐 §14（生命周期）与 §24（72 小时观察期）之间一直悬空的核心决策：**Stage-2 消费一条 Signal 之后，这条 Signal 默认怎么处置。**
+>
+> 早期讨论没有结论，导致实现里只落了状态词汇表，没有落状态跃迁——所有 Signal 永久停在 `pending_stage2`，`expires_at` 记录但无人执行。本节给出决策与对接契约。注意：跃迁的 **触发判断（promote / merge / drop / watch 决策本身）属于 Stage-2 协议**，本节只规定 **Stage-1 Store 必须暴露的状态机能力**，使 Stage-2 能够实现下述语义。
+
+---
+
+## 32.1 两个候选模型
+
+```text
+模型 A（resolve-by-default，消费即出池）
+  Stage-2 每轮必须把看到的每条 pending 信号 resolve 掉：
+  强信号 → converted/consumed（离开 pending 池），
+  弱信号 → watching（留 72h 等强化），
+  噪音   → dropped。
+  稳态 pending 池 = 新信号 + 一小撮 watching。
+
+模型 B（keep-all，仅靠 timeout 淘汰）
+  Stage-2 读完不改状态，信号一直留到 72h 过期或手工删除。
+  pending 池 = 过去 72h 的全部信号，每轮重复处理。
+```
+
+---
+
+## 32.2 决策：采用模型 A（resolve-by-default）
+
+理由：
+
+```text
+1. 不变量编码为持久状态，而非每轮重新推导。
+   "提升幂等"（同一现实事实最多变成一个 hint）是核心不变量。
+   模型 A 用 converted/consumed 跃迁把它编码进信号生命周期，
+   信号一旦出池物理上无法二次提升；
+   模型 B 只能靠每轮拿信号和已有 hint 比对来重新推导，脆弱且会漂移。
+
+2. 成本规模。Stage-2 是 LLM 推理步，成本 ∝ 每轮要看的信号数 × 判断难度。
+   模型 A 每条信号一生只判一次，每轮成本 ∝ 增量（平）；
+   模型 B 每轮重看全量、且需把已有 hint 一起喂入去重，
+   成本 ∝ 累积信号数 × 已有 hint 数（复利增长）。
+
+3. 模型 B 仅有的两个优点都可被模型 A 吸收：
+   - 崩溃容错：把 convert 跃迁与 hint 落库放进同一事务，
+     或"先持久化 hint、再 mark converted"，加 hint 侧幂等键兜底即可。
+   - 弱信号强化可见性：由 watching 桶承担（见 32.3）。
+```
+
+---
+
+## 32.3 默认行为是"必须 resolve"，不是"必须消费"
+
+每轮 Stage-2 必须把每条 pending 信号 resolve 到一个终态或 watching：
+
+```text
+强证据 / 可直接提升   → converted   （出池，写 hint 回指）
+折叠进已有 hint       → consumed    （出池，写 merge 回指）
+噪音 / 价值不足        → dropped     （出池）
+证据不足 / 有歧义      → watching    （留 72h，可被强化后重新评估）
+```
+
+关键约束：**`watching` 是低质量信号的自动归宿，由信号质量驱动，而不是"手工保留"。**
+
+```text
+自动进入 watching 的典型条件：
+  quality.confidence 低 / ambiguity_level = high
+  stage2_hints.retention_hint = watch_72h
+  stage2_hints.suggested_action = watch
+  §24 列出的"首次出现、跨天展开、暗示性关系"等情形
+```
+
+这样既保住模型 A 的小工作集，又把模型 B 唯一值得要的"复现强化"能力补回来——弱信号留在 watching 桶里，72h 内被新证据强化则重新进 pending 评估，否则 `expired`。
+
+---
+
+## 32.4 Store 必须暴露的状态跃迁 API
+
+Stage-1 §14.3 限制"只能创建 pending_stage2"针对的是 **create** 路径；**跃迁是独立的 update 路径**，供 Stage-2 调用。Store 至少须提供：
+
+```typescript
+mark_converted(id, hint_ref: string)                 // → converted
+mark_consumed(id, merged_into_hint_ref: string)      // → consumed
+mark_watching(id)                                     // → watching, 重算 expires_at = now + watching_ttl
+mark_dropped(id, reason?: string)                     // → dropped
+```
+
+要求：
+
+```text
+1. 所有跃迁 bump updated_at。
+2. 合法跃迁仅允许 pending_stage2 → {converted, consumed, dropped, watching}
+   以及 watching → {pending_stage2, converted, consumed, dropped, expired}。
+   非法跃迁返回 InvalidInput。
+3. converted/consumed 跃迁与 hint 落库的原子性由 Stage-2 保证
+   （同事务，或 hint 先持久化再跃迁 + hint 侧幂等键兜底）。
+4. create 用的 validate_signal "只能 pending_stage2" 约束与 update 路径分离，
+   不得相互绕过。
+```
+
+---
+
+## 32.5 hint 回指与去重支持
+
+为缓解 Stage-2"既要判信号重复、又要判生成 hint 重复"的双重压力，Store 须提供两项：
+
+```text
+1. 回指字段：converted/consumed 跃迁必须持久化 promoted_to_hint_ref，
+   使信号能反查"我已变成哪个 hint / 折叠进哪个 hint"。
+
+2. merge_key 可查：suggested_merge_key 从纯建议字段提升为可查询列 + 索引，
+   让 Stage-2 能 SELECT ... WHERE suggested_merge_key = ? 快速判
+   "这个语义是否已有 hint"，而非全表 JSON 扫或重新 LLM 决策。
+```
+
+对应 §20.1 表结构增量：
+
+```sql
+ALTER TABLE attention_signals ADD COLUMN promoted_to_hint_ref TEXT;
+
+CREATE INDEX idx_attention_signals_merge_key
+  ON attention_signals(agent_scope_id, suggested_merge_key);
+```
+
+---
+
+## 32.6 过期执行（与 §24 配套）
+
+`expires_at` 必须真正生效，否则模型 A 退化成"只进不出"：
+
+```text
+1. list_pending_stage2 查询加过期过滤：
+   WHERE lifecycle_status = 'pending_stage2'
+     AND (expires_at IS NULL OR expires_at > now)
+   （惰性过滤，立刻止血）
+
+2. watching 使用 default_watching_ttl_hours 重算 expires_at，
+   不复用 signal_ttl_hours。
+
+3. 后台 sweep 兜底：把到期的 pending/watching 翻成 expired，
+   回收工作集（参考"定时 sweep 兜底"原则）。
+```
+
+---
+
+## 32.7 当前实现差距（待落地清单）
+
+截至 v0.1 实现（`agent_attention_signal.rs`），相对本节的缺口：
+
+```text
+[ ] 无任何状态跃迁 API（mark_converted/consumed/watching/dropped 全缺）
+[ ] attention_signals 表无 UPDATE 路径，信号永久停在 pending_stage2
+[ ] expires_at 已写入但无任何查询/ sweep 读取，过期信号被无限期返回
+[ ] watching 独立 TTL（default_watching_ttl_hours）从未被应用
+[ ] 无 promoted_to_hint_ref 回指字段
+[ ] suggested_merge_key 未提升为列、未建索引
+[ ] watching 信号的"被强化后重新评估"回路缺失
+[ ] AttentionSignalConfig 的 min_confidence_to_store 等策略旋钮未被 Store 消费
+```
+
+落地优先级：**先补 32.4 跃迁 API + 32.6 过期过滤**（直接解决信号密度与 Stage-2 决策压力），再补 32.5 hint 回指/索引（解决 hint 去重），最后补 watching 再评估回路。
+
+---
+
+# 33. 总结
 
 Agent Memory Attention Signal 组件的第一阶段职责是：
 
