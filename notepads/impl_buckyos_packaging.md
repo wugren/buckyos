@@ -824,7 +824,7 @@ sudo dnf install ./buckyos-linux-{arch}-{version}.rpm
 - 同时写入当前用户 Run 注册项作为兼容启动项。
 - 需要兼容清理旧版本 Windows service `buckyos`。
 
-`buckycli` 固定安装到当前用户 home 下的 `.buckycli` 目录，并通过写入当前用户 PATH 更新命令行访问路径。
+`buckycli` 是系统级命令行工具，Windows exe 默认安装到 `C:\Program Files\BuckyOS\buckycli`，并把该目录写入当前用户 PATH；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
 
 Windows 不需要写普通图形安装日志。静默安装日志 MUST 写到：
 
@@ -852,7 +852,8 @@ Windows 不需要写普通图形安装日志。静默安装日志 MUST 写到：
 - `buckyos` postinstall 安装 LaunchDaemon `buckyos.service` 并启动。
 - `BuckyOSApp` 固定安装到 `/Applications/BuckyOS.app`，使它符合 pkg、未来 App Store 安装和 dmg drag-install 的共同用户预期，并能在 macOS Apps/Launchpad、Finder 和 Spotlight 中被发现。
 - `BuckyOSApp` 的用户身份和配置文件不写入 app bundle，也不写入 `/opt/buckyos`；非 App Store/pkg 形态默认使用用户域配置目录，例如 `~/Library/Application Support/BuckyOSApp/`。未来 App Store/sandbox 形态可迁移到 app container 或 app group。
-- `buckycli` 固定安装到当前用户 home 下的 `.buckycli` 目录，并通过写入当前用户 PATH 更新命令行访问路径。
+- `buckycli` 是系统级命令行工具，macOS pkg MUST 直接安装到 `/usr/local/bin/buckycli`，不通过 postinstall 复制到用户目录，也不修改用户 shell profile。
+- `buckycli` 的身份和配置目录不由安装器创建或迁移；运行时由命令参数显式指定，或默认使用调用者自己的 `~/.buckycli`。
 - 不提供 pkg 卸载入口，也不提供随 pkg 自动执行的卸载脚本。
 - 提供独立 `uninstall_for_macos` 文档；文档默认保留用户数据，并把删除用户数据作为明确的可选步骤。
 

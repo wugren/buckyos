@@ -157,7 +157,7 @@ publish:
         type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
         optional: true
         default_selected: true
-        default_target: "~/.buckycli/"
+        default_target: "/usr/local/bin/"
       buckyos:
         name: BuckyOS Desktop Service
         type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
