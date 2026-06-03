@@ -17,7 +17,11 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
 
-use agent_tool::agent_memory::{AgentMemory, AgentMemoryConfig, AgentMemoryError, LoadOptions};
+use agent_tool::agent_memory::{
+    AddObservationOp, AgentMemory, AgentMemoryConfig, AgentMemoryError, FlatSetOp, LoadOptions,
+    ObjectAliasInput, OccasionAddInput, ReinforceObjectWeightOp, SetStatusOp, SourceRef,
+    UpsertObjectOp, UpsertRelationOp,
+};
 use agent_tool::agent_notebook::{
     self as nb, AgentNotebook, AgentNotebookConfig, AppendItemRemarkInput, AppendNoteInput,
     BuildHintsInput, BuildRegistryContextInput, BuildSystemContextInput, Confidence,
@@ -193,8 +197,8 @@ enum FinishTaskOutcome {
     Failed,
 }
 
-/// Parsed `agent-memory` command before execution. Mirrors §3.1/§4.x of the
-/// v2.8 contract. `root_override` is the resolved `--root` / env / default.
+/// Parsed `agent-memory` command before execution. Mirrors the v2.10 Memory
+/// Graph CLI while preserving the old flat `set/get/list/load` forms.
 #[derive(Clone, Debug)]
 struct AgentMemoryInvocation {
     root_override: Option<PathBuf>,
@@ -205,25 +209,60 @@ struct AgentMemoryInvocation {
 #[derive(Clone, Debug)]
 enum AgentMemoryVerb {
     Init,
+    OccasionAdd {
+        occasion_type: String,
+        summary: String,
+        occurred_at: Option<String>,
+        source_ref: Option<SourceRef>,
+        tags: Vec<String>,
+    },
     Set {
         key: String,
         /// `Some` → content was passed as positional argv (form A).
         /// `None` → content must come from stdin (form B).
         content: Option<String>,
         reason: String,
+        entities: Vec<String>,
+        tags: Vec<String>,
     },
     Remove {
         key: String,
         reason: Option<String>,
     },
     Get {
-        key: String,
+        kind: Option<String>,
+        id: String,
     },
     List {
         prefix: Option<String>,
     },
+    ListObjects {
+        kind: Option<String>,
+    },
+    ObserveAdd {
+        occasion_id: String,
+        op: AddObservationOp,
+    },
+    ObjectUpsert {
+        occasion_id: String,
+        op: UpsertObjectOp,
+    },
+    ObjectReinforce {
+        occasion_id: String,
+        op: ReinforceObjectWeightOp,
+    },
+    Relate {
+        occasion_id: String,
+        op: UpsertRelationOp,
+    },
+    SetStatus {
+        occasion_id: String,
+        op: SetStatusOp,
+    },
     Load {
         tags: Vec<String>,
+        objects: Vec<String>,
+        aliases: Vec<String>,
         max_records: Option<usize>,
         max_bytes: Option<usize>,
     },
@@ -746,7 +785,7 @@ fn parse_task_id_value(raw: &str, tool_name: &str) -> Result<i64, AgentToolError
 // =================================================================
 
 const AGENT_MEMORY_USAGE: &str = "agent-memory [--root <path>] [--quiet] \
-<init|set|remove|get|list|load|verify|compact> [...]";
+<init|occasion|object|observe|relate|set-status|set|remove|get|list|load|verify|compact> [...]";
 
 fn agent_memory_invalid(message: impl Into<String>) -> AgentToolError {
     AgentToolError::InvalidArgs(format!("{}\nUsage: {}", message.into(), AGENT_MEMORY_USAGE))
@@ -795,6 +834,11 @@ fn parse_agent_memory_cli_command(
 
     let verb = match verb_token.as_str() {
         "init" => parse_agent_memory_init(rest)?,
+        "occasion" => parse_agent_memory_occasion(rest)?,
+        "object" => parse_agent_memory_object(rest)?,
+        "observe" => parse_agent_memory_observe(rest)?,
+        "relate" => parse_agent_memory_relate(rest)?,
+        "set-status" => parse_agent_memory_set_status(rest)?,
         "set" => parse_agent_memory_set(rest)?,
         "remove" => parse_agent_memory_remove(rest)?,
         "get" => parse_agent_memory_get(rest)?,
@@ -827,9 +871,319 @@ fn parse_agent_memory_init(rest: &[String]) -> Result<AgentMemoryVerb, AgentTool
     Ok(AgentMemoryVerb::Init)
 }
 
+fn parse_agent_memory_occasion(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    if rest.first().map(String::as_str) != Some("add") {
+        return Err(agent_memory_invalid("`occasion` expects subcommand `add`"));
+    }
+    let mut occasion_type: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut occurred_at: Option<String> = None;
+    let mut source_ref: Option<SourceRef> = None;
+    let mut tags = Vec::new();
+    let mut idx = 1usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--type" => {
+                idx += 1;
+                occasion_type = Some(required_flag_value(rest, idx, "--type")?);
+            }
+            v if v.starts_with("--type=") => occasion_type = Some(v["--type=".len()..].to_string()),
+            "--summary" => {
+                idx += 1;
+                summary = Some(required_flag_value(rest, idx, "--summary")?);
+            }
+            v if v.starts_with("--summary=") => summary = Some(v["--summary=".len()..].to_string()),
+            "--occurred-at" => {
+                idx += 1;
+                occurred_at = Some(required_flag_value(rest, idx, "--occurred-at")?);
+            }
+            v if v.starts_with("--occurred-at=") => {
+                occurred_at = Some(v["--occurred-at=".len()..].to_string())
+            }
+            "--source" => {
+                idx += 1;
+                source_ref = Some(parse_source_ref(&required_flag_value(
+                    rest, idx, "--source",
+                )?)?);
+            }
+            v if v.starts_with("--source=") => {
+                source_ref = Some(parse_source_ref(&v["--source=".len()..])?)
+            }
+            "--tags" => {
+                idx += 1;
+                tags = split_csv(&required_flag_value(rest, idx, "--tags")?);
+            }
+            v if v.starts_with("--tags=") => tags = split_csv(&v["--tags=".len()..]),
+            v => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported argument `{v}` for `occasion add`"
+                )))
+            }
+        }
+        idx += 1;
+    }
+    Ok(AgentMemoryVerb::OccasionAdd {
+        occasion_type: occasion_type
+            .ok_or_else(|| agent_memory_invalid("`occasion add` requires `--type`"))?,
+        summary: summary
+            .ok_or_else(|| agent_memory_invalid("`occasion add` requires `--summary`"))?,
+        occurred_at,
+        source_ref,
+        tags,
+    })
+}
+
+fn parse_agent_memory_object(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    match rest.first().map(String::as_str) {
+        Some("upsert") => parse_agent_memory_object_upsert(&rest[1..]),
+        Some("reinforce") => parse_agent_memory_object_reinforce(&rest[1..]),
+        _ => Err(agent_memory_invalid(
+            "`object` expects subcommand `upsert` or `reinforce`",
+        )),
+    }
+}
+
+fn parse_agent_memory_object_upsert(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    let mut occasion_id = None;
+    let mut kind = None;
+    let mut name = None;
+    let mut object_id = None;
+    let mut aliases: Vec<ObjectAliasInput> = Vec::new();
+    let mut pending_alias: Option<String> = None;
+    let mut pending_alias_type: Option<String> = None;
+    let mut evidence = Vec::new();
+    let mut weight = None;
+    let mut confidence = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--occasion" => {
+                idx += 1;
+                occasion_id = Some(required_flag_value(rest, idx, "--occasion")?);
+            }
+            v if v.starts_with("--occasion=") => {
+                occasion_id = Some(v["--occasion=".len()..].to_string())
+            }
+            "--kind" => {
+                idx += 1;
+                kind = Some(required_flag_value(rest, idx, "--kind")?);
+            }
+            v if v.starts_with("--kind=") => kind = Some(v["--kind=".len()..].to_string()),
+            "--name" => {
+                idx += 1;
+                name = Some(required_flag_value(rest, idx, "--name")?);
+            }
+            v if v.starts_with("--name=") => name = Some(v["--name=".len()..].to_string()),
+            "--object" => {
+                idx += 1;
+                object_id = Some(required_flag_value(rest, idx, "--object")?);
+            }
+            v if v.starts_with("--object=") => object_id = Some(v["--object=".len()..].to_string()),
+            "--alias" => {
+                idx += 1;
+                pending_alias = Some(required_flag_value(rest, idx, "--alias")?);
+            }
+            v if v.starts_with("--alias=") => {
+                pending_alias = Some(v["--alias=".len()..].to_string())
+            }
+            "--alias-type" => {
+                idx += 1;
+                pending_alias_type = Some(required_flag_value(rest, idx, "--alias-type")?);
+            }
+            v if v.starts_with("--alias-type=") => {
+                pending_alias_type = Some(v["--alias-type=".len()..].to_string())
+            }
+            "--evidence" => {
+                idx += 1;
+                evidence = split_csv(&required_flag_value(rest, idx, "--evidence")?);
+            }
+            v if v.starts_with("--evidence=") => evidence = split_csv(&v["--evidence=".len()..]),
+            "--weight" => {
+                idx += 1;
+                weight = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--weight")?,
+                    "weight",
+                )?);
+            }
+            v if v.starts_with("--weight=") => {
+                weight = Some(parse_f64_flag(&v["--weight=".len()..], "weight")?)
+            }
+            "--confidence" => {
+                idx += 1;
+                confidence = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--confidence")?,
+                    "confidence",
+                )?);
+            }
+            v if v.starts_with("--confidence=") => {
+                confidence = Some(parse_f64_flag(&v["--confidence=".len()..], "confidence")?)
+            }
+            v => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported argument `{v}` for `object upsert`"
+                )))
+            }
+        }
+        idx += 1;
+    }
+    if let Some(alias) = pending_alias {
+        aliases.push(ObjectAliasInput {
+            alias,
+            alias_type: pending_alias_type.unwrap_or_else(|| "name".to_string()),
+            confidence: confidence.unwrap_or(0.5),
+        });
+    }
+    Ok(AgentMemoryVerb::ObjectUpsert {
+        occasion_id: occasion_id
+            .ok_or_else(|| agent_memory_invalid("`object upsert` requires `--occasion`"))?,
+        op: UpsertObjectOp {
+            object_id,
+            kind: kind.ok_or_else(|| agent_memory_invalid("`object upsert` requires `--kind`"))?,
+            canonical_name: name
+                .ok_or_else(|| agent_memory_invalid("`object upsert` requires `--name`"))?,
+            aliases,
+            evidence,
+            weight,
+            confidence: confidence
+                .ok_or_else(|| agent_memory_invalid("`object upsert` requires `--confidence`"))?,
+            merge_into: None,
+        },
+    })
+}
+
+fn parse_agent_memory_object_reinforce(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    let mut occasion_id = None;
+    let mut object_id = None;
+    let mut delta = None;
+    let mut evidence = Vec::new();
+    let mut reason = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--occasion" => {
+                idx += 1;
+                occasion_id = Some(required_flag_value(rest, idx, "--occasion")?);
+            }
+            v if v.starts_with("--occasion=") => {
+                occasion_id = Some(v["--occasion=".len()..].to_string())
+            }
+            "--object" => {
+                idx += 1;
+                object_id = Some(required_flag_value(rest, idx, "--object")?);
+            }
+            v if v.starts_with("--object=") => object_id = Some(v["--object=".len()..].to_string()),
+            "--delta" => {
+                idx += 1;
+                delta = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--delta")?,
+                    "delta",
+                )?);
+            }
+            v if v.starts_with("--delta=") => {
+                delta = Some(parse_f64_flag(&v["--delta=".len()..], "delta")?)
+            }
+            "--evidence" => {
+                idx += 1;
+                evidence = split_csv(&required_flag_value(rest, idx, "--evidence")?);
+            }
+            v if v.starts_with("--evidence=") => evidence = split_csv(&v["--evidence=".len()..]),
+            "--reason" => {
+                idx += 1;
+                reason = Some(required_flag_value(rest, idx, "--reason")?);
+            }
+            v if v.starts_with("--reason=") => reason = Some(v["--reason=".len()..].to_string()),
+            v => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported argument `{v}` for `object reinforce`"
+                )))
+            }
+        }
+        idx += 1;
+    }
+    Ok(AgentMemoryVerb::ObjectReinforce {
+        occasion_id: occasion_id
+            .ok_or_else(|| agent_memory_invalid("`object reinforce` requires `--occasion`"))?,
+        op: ReinforceObjectWeightOp {
+            object_id: object_id
+                .ok_or_else(|| agent_memory_invalid("`object reinforce` requires `--object`"))?,
+            delta: delta
+                .ok_or_else(|| agent_memory_invalid("`object reinforce` requires `--delta`"))?,
+            reason: reason
+                .ok_or_else(|| agent_memory_invalid("`object reinforce` requires `--reason`"))?,
+            evidence,
+        },
+    })
+}
+
+fn parse_agent_memory_observe(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    if rest.first().map(String::as_str) != Some("add") {
+        return Err(agent_memory_invalid("`observe` expects subcommand `add`"));
+    }
+    let mut occasion_id = None;
+    let mut kind = None;
+    let mut entities = Vec::new();
+    let mut confidence = None;
+    let mut content_parts = Vec::new();
+    let mut idx = 1usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--occasion" => {
+                idx += 1;
+                occasion_id = Some(required_flag_value(rest, idx, "--occasion")?);
+            }
+            v if v.starts_with("--occasion=") => {
+                occasion_id = Some(v["--occasion=".len()..].to_string())
+            }
+            "--kind" => {
+                idx += 1;
+                kind = Some(required_flag_value(rest, idx, "--kind")?);
+            }
+            v if v.starts_with("--kind=") => kind = Some(v["--kind=".len()..].to_string()),
+            "--entities" => {
+                idx += 1;
+                entities = split_csv(&required_flag_value(rest, idx, "--entities")?);
+            }
+            v if v.starts_with("--entities=") => entities = split_csv(&v["--entities=".len()..]),
+            "--confidence" => {
+                idx += 1;
+                confidence = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--confidence")?,
+                    "confidence",
+                )?);
+            }
+            v if v.starts_with("--confidence=") => {
+                confidence = Some(parse_f64_flag(&v["--confidence=".len()..], "confidence")?)
+            }
+            v if v.starts_with("--") => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported flag `{v}` for `observe add`"
+                )))
+            }
+            v => content_parts.push(v.to_string()),
+        }
+        idx += 1;
+    }
+    Ok(AgentMemoryVerb::ObserveAdd {
+        occasion_id: occasion_id
+            .ok_or_else(|| agent_memory_invalid("`observe add` requires `--occasion`"))?,
+        op: AddObservationOp {
+            observation_id: None,
+            kind: kind.ok_or_else(|| agent_memory_invalid("`observe add` requires `--kind`"))?,
+            entities,
+            content: content_parts.join(" "),
+            source_excerpt: None,
+            source_ref: None,
+            confidence: confidence
+                .ok_or_else(|| agent_memory_invalid("`observe add` requires `--confidence`"))?,
+        },
+    })
+}
+
 fn parse_agent_memory_set(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
     let mut positionals: Vec<String> = Vec::new();
     let mut reason: Option<String> = None;
+    let mut entities = Vec::new();
+    let mut tags = Vec::new();
     let mut idx = 0usize;
     while idx < rest.len() {
         let token = &rest[idx];
@@ -843,6 +1197,20 @@ fn parse_agent_memory_set(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolE
             }
             v if v.starts_with("--reason=") => {
                 reason = Some(v["--reason=".len()..].to_string());
+            }
+            "--entities" => {
+                idx += 1;
+                entities = split_csv(&required_flag_value(rest, idx, "--entities")?);
+            }
+            v if v.starts_with("--entities=") => {
+                entities = split_csv(&v["--entities=".len()..]);
+            }
+            "--tags" => {
+                idx += 1;
+                tags = split_csv(&required_flag_value(rest, idx, "--tags")?);
+            }
+            v if v.starts_with("--tags=") => {
+                tags = split_csv(&v["--tags=".len()..]);
             }
             v if v.starts_with("--") => {
                 return Err(agent_memory_invalid(format!(
@@ -866,6 +1234,8 @@ fn parse_agent_memory_set(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolE
                 key,
                 content: Some(content),
                 reason,
+                entities,
+                tags,
             })
         }
         1 => {
@@ -874,6 +1244,8 @@ fn parse_agent_memory_set(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolE
                 key,
                 content: None,
                 reason,
+                entities,
+                tags,
             })
         }
         n => Err(agent_memory_invalid(format!(
@@ -921,18 +1293,48 @@ fn parse_agent_memory_remove(rest: &[String]) -> Result<AgentMemoryVerb, AgentTo
 }
 
 fn parse_agent_memory_get(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    if rest.len() == 1 {
+        return Ok(AgentMemoryVerb::Get {
+            kind: None,
+            id: rest[0].clone(),
+        });
+    }
+    if rest.len() == 2 {
+        return Ok(AgentMemoryVerb::Get {
+            kind: Some(rest[0].clone()),
+            id: rest[1].clone(),
+        });
+    }
     if rest.len() != 1 {
         return Err(agent_memory_invalid(format!(
-            "`get` expects exactly 1 positional argument (key), got {}",
+            "`get` expects `<key>` or `<item|object|observation> <id>`, got {} arguments",
             rest.len()
         )));
     }
-    Ok(AgentMemoryVerb::Get {
-        key: rest[0].clone(),
-    })
+    unreachable!()
 }
 
 fn parse_agent_memory_list(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    if rest.first().map(String::as_str) == Some("objects") {
+        let mut kind = None;
+        let mut idx = 1usize;
+        while idx < rest.len() {
+            match rest[idx].as_str() {
+                "--kind" => {
+                    idx += 1;
+                    kind = Some(required_flag_value(rest, idx, "--kind")?);
+                }
+                v if v.starts_with("--kind=") => kind = Some(v["--kind=".len()..].to_string()),
+                v => {
+                    return Err(agent_memory_invalid(format!(
+                        "unsupported argument `{v}` for `list objects`"
+                    )))
+                }
+            }
+            idx += 1;
+        }
+        return Ok(AgentMemoryVerb::ListObjects { kind });
+    }
     match rest.len() {
         0 => Ok(AgentMemoryVerb::List { prefix: None }),
         1 => Ok(AgentMemoryVerb::List {
@@ -946,6 +1348,8 @@ fn parse_agent_memory_list(rest: &[String]) -> Result<AgentMemoryVerb, AgentTool
 
 fn parse_agent_memory_load(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
     let mut tags_arg: Option<String> = None;
+    let mut objects = Vec::new();
+    let mut aliases = Vec::new();
     let mut max_records: Option<usize> = None;
     let mut max_bytes: Option<usize> = None;
     let mut idx = 0usize;
@@ -975,6 +1379,21 @@ fn parse_agent_memory_load(rest: &[String]) -> Result<AgentMemoryVerb, AgentTool
             v if v.starts_with("--max-bytes=") => {
                 max_bytes = Some(parse_load_count(&v["--max-bytes=".len()..], "max-bytes")?);
             }
+            "--tags" => {
+                idx += 1;
+                tags_arg = Some(required_flag_value(rest, idx, "--tags")?);
+            }
+            v if v.starts_with("--tags=") => tags_arg = Some(v["--tags=".len()..].to_string()),
+            "--objects" => {
+                idx += 1;
+                objects = split_csv(&required_flag_value(rest, idx, "--objects")?);
+            }
+            v if v.starts_with("--objects=") => objects = split_csv(&v["--objects=".len()..]),
+            "--aliases" => {
+                idx += 1;
+                aliases = split_csv(&required_flag_value(rest, idx, "--aliases")?);
+            }
+            v if v.starts_with("--aliases=") => aliases = split_csv(&v["--aliases=".len()..]),
             v if v.starts_with("--") => {
                 return Err(agent_memory_invalid(format!(
                     "unsupported flag `{v}` for `load`"
@@ -1005,8 +1424,175 @@ fn parse_agent_memory_load(rest: &[String]) -> Result<AgentMemoryVerb, AgentTool
 
     Ok(AgentMemoryVerb::Load {
         tags,
+        objects,
+        aliases,
         max_records,
         max_bytes,
+    })
+}
+
+fn parse_agent_memory_relate(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    let mut occasion_id = None;
+    let mut subject = None;
+    let mut predicate = None;
+    let mut object = None;
+    let mut weight = None;
+    let mut confidence = None;
+    let mut evidence = Vec::new();
+    let mut reason = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--occasion" => {
+                idx += 1;
+                occasion_id = Some(required_flag_value(rest, idx, "--occasion")?);
+            }
+            v if v.starts_with("--occasion=") => {
+                occasion_id = Some(v["--occasion=".len()..].to_string())
+            }
+            "--subject" => {
+                idx += 1;
+                subject = Some(required_flag_value(rest, idx, "--subject")?);
+            }
+            v if v.starts_with("--subject=") => subject = Some(v["--subject=".len()..].to_string()),
+            "--predicate" => {
+                idx += 1;
+                predicate = Some(required_flag_value(rest, idx, "--predicate")?);
+            }
+            v if v.starts_with("--predicate=") => {
+                predicate = Some(v["--predicate=".len()..].to_string())
+            }
+            "--object" => {
+                idx += 1;
+                object = Some(required_flag_value(rest, idx, "--object")?);
+            }
+            v if v.starts_with("--object=") => object = Some(v["--object=".len()..].to_string()),
+            "--weight" => {
+                idx += 1;
+                weight = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--weight")?,
+                    "weight",
+                )?);
+            }
+            v if v.starts_with("--weight=") => {
+                weight = Some(parse_f64_flag(&v["--weight=".len()..], "weight")?)
+            }
+            "--confidence" => {
+                idx += 1;
+                confidence = Some(parse_f64_flag(
+                    &required_flag_value(rest, idx, "--confidence")?,
+                    "confidence",
+                )?);
+            }
+            v if v.starts_with("--confidence=") => {
+                confidence = Some(parse_f64_flag(&v["--confidence=".len()..], "confidence")?)
+            }
+            "--evidence" => {
+                idx += 1;
+                evidence = split_csv(&required_flag_value(rest, idx, "--evidence")?);
+            }
+            v if v.starts_with("--evidence=") => evidence = split_csv(&v["--evidence=".len()..]),
+            "--reason" => {
+                idx += 1;
+                reason = Some(required_flag_value(rest, idx, "--reason")?);
+            }
+            v if v.starts_with("--reason=") => reason = Some(v["--reason=".len()..].to_string()),
+            v => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported argument `{v}` for `relate`"
+                )))
+            }
+        }
+        idx += 1;
+    }
+    Ok(AgentMemoryVerb::Relate {
+        occasion_id: occasion_id
+            .ok_or_else(|| agent_memory_invalid("`relate` requires `--occasion`"))?,
+        op: UpsertRelationOp {
+            subject: subject
+                .ok_or_else(|| agent_memory_invalid("`relate` requires `--subject`"))?,
+            predicate: predicate
+                .ok_or_else(|| agent_memory_invalid("`relate` requires `--predicate`"))?,
+            object: object.ok_or_else(|| agent_memory_invalid("`relate` requires `--object`"))?,
+            weight: weight.ok_or_else(|| agent_memory_invalid("`relate` requires `--weight`"))?,
+            confidence: confidence
+                .ok_or_else(|| agent_memory_invalid("`relate` requires `--confidence`"))?,
+            evidence,
+            write_reason: reason
+                .ok_or_else(|| agent_memory_invalid("`relate` requires `--reason`"))?,
+            replaces: Vec::new(),
+        },
+    })
+}
+
+fn parse_agent_memory_set_status(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
+    let mut occasion_id = None;
+    let mut target_kind = None;
+    let mut target_id = None;
+    let mut status = None;
+    let mut reason = None;
+    let mut replaced_by = None;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--occasion" => {
+                idx += 1;
+                occasion_id = Some(required_flag_value(rest, idx, "--occasion")?);
+            }
+            v if v.starts_with("--occasion=") => {
+                occasion_id = Some(v["--occasion=".len()..].to_string())
+            }
+            "--target-kind" => {
+                idx += 1;
+                target_kind = Some(required_flag_value(rest, idx, "--target-kind")?);
+            }
+            v if v.starts_with("--target-kind=") => {
+                target_kind = Some(v["--target-kind=".len()..].to_string())
+            }
+            "--target" => {
+                idx += 1;
+                target_id = Some(required_flag_value(rest, idx, "--target")?);
+            }
+            v if v.starts_with("--target=") => target_id = Some(v["--target=".len()..].to_string()),
+            "--status" => {
+                idx += 1;
+                status = Some(required_flag_value(rest, idx, "--status")?);
+            }
+            v if v.starts_with("--status=") => status = Some(v["--status=".len()..].to_string()),
+            "--reason" => {
+                idx += 1;
+                reason = Some(required_flag_value(rest, idx, "--reason")?);
+            }
+            v if v.starts_with("--reason=") => reason = Some(v["--reason=".len()..].to_string()),
+            "--replaced-by" => {
+                idx += 1;
+                replaced_by = Some(required_flag_value(rest, idx, "--replaced-by")?);
+            }
+            v if v.starts_with("--replaced-by=") => {
+                replaced_by = Some(v["--replaced-by=".len()..].to_string())
+            }
+            v => {
+                return Err(agent_memory_invalid(format!(
+                    "unsupported argument `{v}` for `set-status`"
+                )))
+            }
+        }
+        idx += 1;
+    }
+    Ok(AgentMemoryVerb::SetStatus {
+        occasion_id: occasion_id
+            .ok_or_else(|| agent_memory_invalid("`set-status` requires `--occasion`"))?,
+        op: SetStatusOp {
+            target_kind: target_kind
+                .ok_or_else(|| agent_memory_invalid("`set-status` requires `--target-kind`"))?,
+            target_id: target_id
+                .ok_or_else(|| agent_memory_invalid("`set-status` requires `--target`"))?,
+            status: status
+                .ok_or_else(|| agent_memory_invalid("`set-status` requires `--status`"))?,
+            reason: reason
+                .ok_or_else(|| agent_memory_invalid("`set-status` requires `--reason`"))?,
+            replaced_by,
+        },
     })
 }
 
@@ -1014,6 +1600,28 @@ fn parse_load_count(raw: &str, name: &str) -> Result<usize, AgentToolError> {
     raw.trim()
         .parse::<usize>()
         .map_err(|_| agent_memory_invalid(format!("invalid `--{name}` value `{raw}`")))
+}
+
+fn parse_f64_flag(raw: &str, name: &str) -> Result<f64, AgentToolError> {
+    raw.trim()
+        .parse::<f64>()
+        .map_err(|_| agent_memory_invalid(format!("invalid `--{name}` value `{raw}`")))
+}
+
+fn required_flag_value(
+    tokens: &[String],
+    idx: usize,
+    flag: &str,
+) -> Result<String, AgentToolError> {
+    tokens
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| agent_memory_invalid(format!("missing value for `{flag}`")))
+}
+
+fn parse_source_ref(raw: &str) -> Result<SourceRef, AgentToolError> {
+    serde_json::from_str(raw)
+        .map_err(|err| agent_memory_invalid(format!("invalid `--source` JSON: {err}")))
 }
 
 fn parse_agent_memory_verify(rest: &[String]) -> Result<AgentMemoryVerb, AgentToolError> {
@@ -1132,6 +1740,8 @@ async fn dispatch_agent_memory(
             key,
             content,
             reason,
+            entities,
+            tags,
         } if content.is_none() => match read_stdin_content(stdin_override).await {
             Ok(content) => {
                 if content.is_empty() {
@@ -1150,6 +1760,8 @@ async fn dispatch_agent_memory(
                     key,
                     content: Some(content),
                     reason,
+                    entities,
+                    tags,
                 }
             }
             Err(err) => {
@@ -1217,16 +1829,34 @@ fn run_agent_memory_blocking(
             key,
             content,
             reason,
+            entities,
+            tags,
         } => {
             let content = content.expect("stdin form resolved earlier");
-            mem.set(&key, &content, &reason)?;
+            mem.set_free(FlatSetOp {
+                key,
+                content,
+                reason,
+                entities,
+                tags,
+                weight: None,
+                confidence: None,
+            })?;
             Ok(String::new())
         }
         AgentMemoryVerb::Remove { key, reason } => {
             mem.remove(&key, reason.as_deref())?;
             Ok(String::new())
         }
-        AgentMemoryVerb::Get { key } => mem.get(&key),
+        AgentMemoryVerb::Get { kind, id } => match kind.as_deref() {
+            None => mem.get(&id),
+            Some("item") => mem.get_item_json(&id),
+            Some("object") => mem.get_object_json(&id),
+            Some("observation") => mem.get_observation_json(&id),
+            Some(other) => Err(AgentMemoryError::Invalid(format!(
+                "unsupported get kind `{other}`"
+            ))),
+        },
         AgentMemoryVerb::List { prefix } => {
             let keys = mem.list(prefix.as_deref())?;
             let mut out = keys.join("\n");
@@ -1235,12 +1865,63 @@ fn run_agent_memory_blocking(
             }
             Ok(out)
         }
+        AgentMemoryVerb::ListObjects { kind } => {
+            let ids = mem.list_objects(kind.as_deref())?;
+            let mut out = ids.join("\n");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        AgentMemoryVerb::OccasionAdd {
+            occasion_type,
+            summary,
+            occurred_at,
+            source_ref,
+            tags,
+        } => {
+            let result = mem.add_occasion(OccasionAddInput {
+                occasion_type,
+                summary,
+                occurred_at,
+                source_ref,
+                tags,
+            })?;
+            Ok(format!(
+                "OCCASION {}\nSEQ {}\n",
+                result.occasion_id, result.seq
+            ))
+        }
+        AgentMemoryVerb::ObserveAdd { occasion_id, op } => {
+            let wrapper = mem.observe(&occasion_id, op)?;
+            Ok(format!("OCCASION {}\nSTATUS added\n", wrapper))
+        }
+        AgentMemoryVerb::ObjectUpsert { occasion_id, op } => {
+            let wrapper = mem.upsert_object(&occasion_id, op)?;
+            Ok(format!("OCCASION {}\nSTATUS updated\n", wrapper))
+        }
+        AgentMemoryVerb::ObjectReinforce { occasion_id, op } => {
+            let wrapper = mem.reinforce_object(&occasion_id, op)?;
+            Ok(format!("OCCASION {}\nSTATUS reinforced\n", wrapper))
+        }
+        AgentMemoryVerb::Relate { occasion_id, op } => {
+            let wrapper = mem.relate(&occasion_id, op)?;
+            Ok(format!("OCCASION {}\nSTATUS related\n", wrapper))
+        }
+        AgentMemoryVerb::SetStatus { occasion_id, op } => {
+            let wrapper = mem.set_status(&occasion_id, op)?;
+            Ok(format!("OCCASION {}\nSTATUS updated\n", wrapper))
+        }
         AgentMemoryVerb::Load {
             tags,
+            objects,
+            aliases,
             max_records,
             max_bytes,
         } => {
             let mut opts = LoadOptions::default();
+            opts.objects = objects;
+            opts.aliases = aliases;
             if let Some(n) = max_records {
                 opts.max_records = n;
             }
@@ -3979,15 +4660,11 @@ mod tests {
         .expect("run agent-memory set");
         assert_eq!(set_output.exit_code, EXIT_SUCCESS);
 
-        let memory_path = root
-            .join("memory")
-            .join("user")
-            .join("preference")
-            .join("style");
-        let content = fs::read_to_string(&memory_path)
-            .await
-            .expect("read memory file");
-        assert_eq!(content, "concise english");
+        let item_dir = root.join("memory").join("item");
+        assert!(
+            fs::metadata(&item_dir).await.is_ok(),
+            "free hints are materialized as canonical item JSON files"
+        );
 
         // get echoes content directly (no envelope, per §4.5)
         let get_output = execute(
@@ -4019,7 +4696,6 @@ mod tests {
         .await
         .expect("run agent-memory remove");
         assert_eq!(remove_output.exit_code, EXIT_SUCCESS);
-        assert!(fs::metadata(&memory_path).await.is_err());
 
         // get after remove → exit 1
         let get_after = execute(
@@ -4061,10 +4737,19 @@ mod tests {
         .expect("run agent-memory set form B");
         assert_eq!(output.exit_code, EXIT_SUCCESS);
 
-        let stored = fs::read_to_string(root.join("memory").join("user").join("note"))
-            .await
-            .expect("read stored content");
-        assert_eq!(stored, body);
+        let get_output = execute(
+            vec![
+                OsString::from("/tmp/agent-memory"),
+                OsString::from("get"),
+                OsString::from("/user/note"),
+            ],
+            test_env(root.clone(), root.join("workspace")),
+            None,
+        )
+        .await
+        .expect("get stored stdin content");
+        assert_eq!(get_output.exit_code, EXIT_SUCCESS);
+        assert_eq!(get_output.stdout, body);
     }
 
     #[tokio::test]
@@ -4103,10 +4788,11 @@ mod tests {
         .await
         .expect("run agent-memory load");
         assert_eq!(load_output.exit_code, EXIT_SUCCESS);
-        assert!(load_output.stdout.contains("KEY /user/dental\n"));
+        assert!(load_output.stdout.contains("ITEM item_"));
+        assert!(load_output.stdout.contains("KIND free\n"));
         assert!(load_output.stdout.contains("---\n"));
         assert!(load_output.stdout.contains("\nEND\n"));
-        assert!(load_output.stdout.contains("MATCHED dental"));
+        assert!(load_output.stdout.contains("MATCHED tag:dental"));
     }
 
     #[tokio::test]
@@ -4196,6 +4882,7 @@ mod tests {
                                 tags,
                                 max_records,
                                 max_bytes,
+                                ..
                             },
                         ..
                     },

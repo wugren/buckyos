@@ -1233,7 +1233,7 @@ impl TypedTool for GetSessionTool {
 
 // NOTE(beta2.2): the legacy MemoryLoadBackend / MemoryMutationBackend traits
 // and their `LoadMemoryTool` / `SetMemoryTool` / `RemoveMemoryTool` wrappers
-// were removed in the v2.8 rewrite. Agents now invoke the `agent-memory`
+// were removed in the v2.10 Memory Graph rewrite. Agents now invoke the `agent-memory`
 // CLI via the standard bash tool; the in-process API lives in
 // `crate::agent_memory`. The TOOL_*_MEMORY constants above are kept only as
 // stable command names for prompt scaffolding.
