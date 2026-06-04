@@ -130,6 +130,15 @@ impl ModelDisableTemplate {
 
 const LLM_TEMPLATES: &[Level2Template] = &[
     Level2Template {
+        path: "llm.chat",
+        fallback: FallbackPreset::Parent,
+        profile: Some(SchedulerProfile::Balanced),
+        min_line: ModelRequirementTemplate::empty(),
+        disable_line: ModelDisableTemplate::empty(),
+        mount_mode: MountMode::Hybrid,
+        tier: "general",
+    },
+    Level2Template {
         path: "llm.plan",
         fallback: FallbackPreset::Parent,
         profile: Some(SchedulerProfile::QualityFirst),
@@ -327,14 +336,13 @@ mod tests {
             .unwrap()
             .get("session_config")
             .is_none());
-        assert!(decoded
-            .logical_definitions
-            .iter()
-            .any(|definition| definition.path == "llm" && definition.api_type == ApiType::Llm));
-        assert!(!decoded
-            .logical_definitions
-            .iter()
-            .any(|definition| definition.path == "llm.chat"));
+        assert!(
+            decoded
+                .logical_definitions
+                .iter()
+                .any(|definition| definition.path == "llm.chat"
+                    && definition.api_type == ApiType::Llm)
+        );
     }
 
     #[test]
@@ -364,9 +372,10 @@ mod tests {
             .iter()
             .map(|definition| definition.path.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 9);
+        assert_eq!(paths.len(), 10);
         for path in [
             "llm",
+            "llm.chat",
             "llm.plan",
             "llm.code",
             "llm.swift",

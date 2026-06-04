@@ -1343,6 +1343,19 @@ mod tests {
             .logical_mounts
             .iter()
             .any(|mount| mount == "llm.anthropic.claude-opus-4-7"));
+        let opus_reasoning = by_id("claude-opus-4-7:reasoning-medium");
+        assert!(opus_reasoning
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "llm.opus.reasoning-medium"));
+        assert_eq!(
+            opus_reasoning
+                .provider_options
+                .as_ref()
+                .and_then(|options| options.pointer("/thinking/budget_tokens"))
+                .and_then(|value| value.as_u64()),
+            Some(4096)
+        );
 
         let sonnet = by_id("claude-sonnet-4-6");
         assert!(sonnet

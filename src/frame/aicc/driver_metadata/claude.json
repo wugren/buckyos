@@ -193,9 +193,9 @@
   },
   "variants": [
     {
-      "name": "thinking",
-      "mount_suffix": "thinking",
-      "provider_options": { "thinking": { "type": "enabled" } }
+      "name": "reasoning.medium",
+      "mount_suffix": "reasoning-medium",
+      "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } }
     }
   ],
   "signature": null
