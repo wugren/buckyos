@@ -1000,7 +1000,7 @@ function logicalTreeFromDirectory(
     })
   }
 
-  return rootNodes.sort((left, right) => left.path.localeCompare(right.path))
+  return rootNodes.sort(compareLogicalRoot)
 }
 
 function logicalTreeFromModels(models: ModelMetadata[]): LogicalNode[] {
@@ -1118,6 +1118,17 @@ function parentLogicalPath(path: string): string | undefined {
 function appendUniqueNode(nodes: LogicalNode[], next: LogicalNode): LogicalNode[] {
   if (nodes.some((node) => node.path === next.path)) return nodes
   return [...nodes, next]
+}
+
+function compareLogicalRoot(left: LogicalNode, right: LogicalNode): number {
+  const leftIndex = LOGICAL_ROOT_ORDER.indexOf(left.path)
+  const rightIndex = LOGICAL_ROOT_ORDER.indexOf(right.path)
+  if (leftIndex !== rightIndex) {
+    if (leftIndex === -1) return 1
+    if (rightIndex === -1) return -1
+    return leftIndex - rightIndex
+  }
+  return left.path.localeCompare(right.path)
 }
 
 function computeAIStatus(
@@ -1423,3 +1434,5 @@ const API_TYPES: ApiType[] = [
   'video.upscale',
   'agent.computer_use',
 ]
+
+const LOGICAL_ROOT_ORDER = ['llm', 'image', 'audio', 'video', 'embedding', 'rerank', 'agent', 'agent_runtime', 'multimodal']

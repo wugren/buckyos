@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMediaQuery } from '@mui/material'
 import {
   AlertTriangle,
@@ -35,7 +35,7 @@ export function RoutingPage() {
   const providers = useProviders()
   const localModels = useLocalModels()
   const isMobile = useMediaQuery('(max-width: 767px)')
-  const [currentPath, setCurrentPath] = useState<string | null>(routingView.logical_tree[0]?.path ?? null)
+  const [currentPath, setCurrentPath] = useState<string | null>(defaultRootPath(routingView.logical_tree))
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
 
   const modelByExactName = useMemo(() => {
@@ -50,6 +50,13 @@ export function RoutingPage() {
   const selectedFile = selectedFilePath ? findNode(routingView.logical_tree, selectedFilePath) : undefined
   const selectedModel = selectedFilePath ? modelByExactName.get(selectedFilePath) : undefined
   const currentEntries = currentNode ? directoryEntries(currentNode) : []
+
+  useEffect(() => {
+    if (!findNode(routingView.logical_tree, currentPath)) {
+      setCurrentPath(defaultRootPath(routingView.logical_tree))
+      setSelectedFilePath(null)
+    }
+  }, [routingView.logical_tree, currentPath])
 
   if (routingView.logical_tree.length === 0 || !currentNode) {
     return (
@@ -143,6 +150,23 @@ function DirectoryToolbar({
           {currentNode.path}
         </h3>
         {currentNode.locked && <Lock size={14} style={{ color: 'var(--cp-warning)' }} />}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1 mb-3">
+        {roots.map((node) => (
+          <button
+            key={node.path}
+            type="button"
+            onClick={() => onOpenFolder(node)}
+            className="min-h-8 rounded-md px-2 text-xs font-mono"
+            style={{
+              background: node.path === currentNode.path ? 'var(--cp-accent)' : 'var(--cp-bg)',
+              color: node.path === currentNode.path ? 'white' : 'var(--cp-muted)',
+            }}
+          >
+            {node.path}
+          </button>
+        ))}
       </div>
 
       <div className="flex flex-wrap items-center gap-1">
@@ -494,6 +518,10 @@ function findNode(nodes: LogicalNode[], path: string | null): LogicalNode | unde
     if (child) return child
   }
   return undefined
+}
+
+function defaultRootPath(nodes: LogicalNode[]): string | null {
+  return nodes.find((node) => node.path === 'llm')?.path ?? nodes[0]?.path ?? null
 }
 
 function findAncestors(nodes: LogicalNode[], path: string): LogicalNode[] {

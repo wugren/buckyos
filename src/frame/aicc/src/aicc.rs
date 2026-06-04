@@ -3001,6 +3001,7 @@ impl AIComputeCenter {
         settings: &Value,
     ) -> std::result::Result<usize, RouteError> {
         let local_config = load_local_logical_tree_for_route()?;
+        let local_revision = local_config.revision.clone();
         let system_config = parse_system_routing_config(settings)?;
         let definition_overrides = system_config.logical_definitions;
         let definitions = merged_logical_definitions(
@@ -3031,7 +3032,8 @@ impl AIComputeCenter {
             *overrides = definition_overrides;
         }
 
-        let base = default_global_session_config();
+        let mut base = default_global_session_config();
+        base.revision = Some(local_revision);
         let merged = merge_session_config(&base, &system_config.session_config)?;
         let session_store = SessionConfigStore::new(merged.clone(), Duration::from_secs(60 * 60))?;
         {

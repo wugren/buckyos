@@ -8,7 +8,7 @@ use buckyos_kit::get_buckyos_system_etc_dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_LOGICAL_TREE_REVISION: &str = "builtin-aicc-router-v2";
+pub const DEFAULT_LOGICAL_TREE_REVISION: &str = "builtin-aicc-router-v3";
 pub const LOCAL_LOGICAL_TREE_SCHEMA_VERSION: u32 = 1;
 pub const LOCAL_LOGICAL_TREE_FILE_NAME: &str = "default_logical_tree.json";
 
@@ -21,6 +21,7 @@ pub struct LocalLogicalTreeConfig {
     pub logical_definitions: Vec<LogicalModelDefinition>,
 }
 
+#[derive(Clone, Copy)]
 enum FallbackPreset {
     Parent,
     #[allow(dead_code)]
@@ -232,33 +233,311 @@ fn fallback_to_rule(preset: &FallbackPreset) -> FallbackRule {
     }
 }
 
-pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
-    let mut definitions = vec![LogicalModelDefinition {
-        path: "llm".to_string(),
-        api_type: ApiType::Llm,
-        min_line: ModelRequirement::default(),
+fn logical_definition(
+    path: &str,
+    api_type: ApiType,
+    fallback: FallbackPreset,
+    profile: Option<SchedulerProfile>,
+    min_line: ModelRequirement,
+    mount_mode: MountMode,
+    tier: &str,
+) -> LogicalModelDefinition {
+    LogicalModelDefinition {
+        path: path.to_string(),
+        api_type,
+        min_line,
         disable_line: ModelDisable::default(),
         default_options: None,
-        mount_mode: MountMode::Auto,
-        scheduler_profile: Some(SchedulerProfile::Balanced),
-        fallback: Some(FallbackRule::parent()),
+        mount_mode,
+        scheduler_profile: profile,
+        fallback: Some(fallback_to_rule(&fallback)),
         route_policy: None,
-        user_visible_tier: Some("general".to_string()),
-    }];
+        user_visible_tier: Some(tier.to_string()),
+    }
+}
+
+pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
+    let mut definitions = vec![logical_definition(
+        "llm",
+        ApiType::Llm,
+        FallbackPreset::Parent,
+        Some(SchedulerProfile::Balanced),
+        ModelRequirement::default(),
+        MountMode::Auto,
+        "general",
+    )];
 
     for template in LLM_TEMPLATES {
-        definitions.push(LogicalModelDefinition {
-            path: template.path.to_string(),
-            api_type: ApiType::Llm,
-            min_line: template.min_line.to_model_requirement(),
-            disable_line: template.disable_line.to_model_disable(),
-            default_options: None,
-            mount_mode: template.mount_mode.clone(),
-            scheduler_profile: template.profile.clone(),
-            fallback: Some(fallback_to_rule(&template.fallback)),
-            route_policy: None,
-            user_visible_tier: Some(template.tier.to_string()),
-        });
+        let mut definition = logical_definition(
+            template.path,
+            ApiType::Llm,
+            template.fallback,
+            template.profile.clone(),
+            template.min_line.to_model_requirement(),
+            template.mount_mode.clone(),
+            template.tier,
+        );
+        definition.disable_line = template.disable_line.to_model_disable();
+        definitions.push(definition);
+    }
+
+    definitions.extend([
+        logical_definition(
+            "llm.summary",
+            ApiType::Llm,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::CostFirst),
+            ModelRequirementTemplate {
+                min_context_tokens: Some(16_384),
+                ..ModelRequirementTemplate::empty()
+            }
+            .to_model_requirement(),
+            MountMode::Hybrid,
+            "utility",
+        ),
+        logical_definition(
+            "llm.translate",
+            ApiType::Llm,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::CostFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "utility",
+        ),
+        logical_definition(
+            "embedding.text",
+            ApiType::Embedding,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "embedding.multilingual",
+            ApiType::Embedding,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "embedding.code",
+            ApiType::Embedding,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "code",
+        ),
+        logical_definition(
+            "embedding.multimodal",
+            ApiType::EmbeddingMultimodal,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "multimodal",
+        ),
+        logical_definition(
+            "rerank.general",
+            ApiType::Rerank,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "rerank.multilingual",
+            ApiType::Rerank,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "image.txt2img",
+            ApiType::ImageTextToImage,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "image.img2img",
+            ApiType::ImageToImage,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "general",
+        ),
+        logical_definition(
+            "image.inpaint",
+            ApiType::ImageInpaint,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "edit",
+        ),
+        logical_definition(
+            "image.upscale",
+            ApiType::ImageUpscale,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "edit",
+        ),
+        logical_definition(
+            "image.bg_remove",
+            ApiType::ImageBgRemove,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "utility",
+        ),
+        logical_definition(
+            "image.ocr",
+            ApiType::VisionOcr,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "vision",
+        ),
+        logical_definition(
+            "image.caption",
+            ApiType::VisionCaption,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "vision",
+        ),
+        logical_definition(
+            "image.detect",
+            ApiType::VisionDetect,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "vision",
+        ),
+        logical_definition(
+            "image.segment",
+            ApiType::VisionSegment,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "vision",
+        ),
+        logical_definition(
+            "audio.tts",
+            ApiType::AudioTts,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "audio",
+        ),
+        logical_definition(
+            "audio.asr",
+            ApiType::AudioAsr,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::LatencyFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "audio",
+        ),
+        logical_definition(
+            "audio.music",
+            ApiType::AudioMusic,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "audio",
+        ),
+        logical_definition(
+            "audio.enhance",
+            ApiType::AudioEnhance,
+            FallbackPreset::Strict,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "audio",
+        ),
+        logical_definition(
+            "video.txt2video",
+            ApiType::VideoTextToVideo,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "video",
+        ),
+        logical_definition(
+            "video.img2video",
+            ApiType::VideoImageToVideo,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "video",
+        ),
+        logical_definition(
+            "video.video2video",
+            ApiType::VideoToVideo,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "video",
+        ),
+        logical_definition(
+            "video.extend",
+            ApiType::VideoExtend,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "video",
+        ),
+        logical_definition(
+            "video.upscale",
+            ApiType::VideoUpscale,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::QualityFirst),
+            ModelRequirement::default(),
+            MountMode::Hybrid,
+            "video",
+        ),
+        logical_definition(
+            "agent.computer_use",
+            ApiType::AgentComputerUse,
+            FallbackPreset::Parent,
+            Some(SchedulerProfile::Balanced),
+            ModelRequirementTemplate::vision(8_192).to_model_requirement(),
+            MountMode::Hybrid,
+            "agent",
+        ),
+    ]);
+
+    definitions.sort_by(|left, right| left.path.cmp(&right.path));
+    if let Some(index) = definitions
+        .iter()
+        .position(|definition| definition.path == "llm")
+    {
+        let llm = definitions.remove(index);
+        definitions.insert(0, llm);
     }
 
     definitions
@@ -281,22 +560,33 @@ pub fn build_builtin_local_logical_tree_config() -> LocalLogicalTreeConfig {
 pub fn load_or_create_local_logical_tree_config() -> Result<LocalLogicalTreeConfig> {
     let path = local_logical_tree_config_path();
     match std::fs::read_to_string(path.as_path()) {
-        Ok(content) => parse_local_logical_tree_config(content.as_str())
-            .with_context(|| format!("parse local logical tree config {}", path.display())),
+        Ok(content) => {
+            let config = parse_local_logical_tree_config(content.as_str())
+                .with_context(|| format!("parse local logical tree config {}", path.display()))?;
+            if config.revision == DEFAULT_LOGICAL_TREE_REVISION {
+                return Ok(config);
+            }
+            let config = build_builtin_local_logical_tree_config();
+            write_local_logical_tree_config(&path, &config)?;
+            Ok(config)
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let config = build_builtin_local_logical_tree_config();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-            let content = serde_json::to_string_pretty(&config)
-                .context("serialize builtin local logical tree config")?;
-            std::fs::write(path.as_path(), content)
-                .with_context(|| format!("write {}", path.display()))?;
+            write_local_logical_tree_config(&path, &config)?;
             Ok(config)
         }
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
+}
+
+fn write_local_logical_tree_config(path: &PathBuf, config: &LocalLogicalTreeConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(config)
+        .context("serialize builtin local logical tree config")?;
+    std::fs::write(path.as_path(), content).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 pub fn parse_local_logical_tree_config(content: &str) -> Result<LocalLogicalTreeConfig> {
@@ -366,13 +656,12 @@ mod tests {
     }
 
     #[test]
-    fn builtin_logical_definitions_have_expected_llm_paths() {
+    fn builtin_logical_definitions_have_expected_paths() {
         let definitions = build_default_logical_definitions();
         let paths = definitions
             .iter()
             .map(|definition| definition.path.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 10);
         for path in [
             "llm",
             "llm.chat",
@@ -384,6 +673,33 @@ mod tests {
             "llm.vision",
             "llm.long",
             "llm.fallback",
+            "llm.summary",
+            "llm.translate",
+            "embedding.text",
+            "embedding.multilingual",
+            "embedding.code",
+            "embedding.multimodal",
+            "rerank.general",
+            "rerank.multilingual",
+            "image.txt2img",
+            "image.img2img",
+            "image.inpaint",
+            "image.upscale",
+            "image.bg_remove",
+            "image.ocr",
+            "image.caption",
+            "image.detect",
+            "image.segment",
+            "audio.tts",
+            "audio.asr",
+            "audio.music",
+            "audio.enhance",
+            "video.txt2video",
+            "video.img2video",
+            "video.video2video",
+            "video.extend",
+            "video.upscale",
+            "agent.computer_use",
         ] {
             assert!(paths.contains(&path), "{} should be present", path);
         }
