@@ -1,14 +1,16 @@
 use crate::model_registry::ModelRegistry;
+use crate::model_session::{LogicalNode, SessionConfig};
 use crate::model_types::{
-    ApiType, FallbackMode, FallbackRule, LogicalModelDefinition, ModelDisable, ModelRequirement,
-    MountMode, SchedulerProfile,
+    ApiType, FallbackMode, FallbackRule, LogicalModelDefinition, ModelDisable, ModelItem,
+    ModelRequirement, MountMode, SchedulerProfile,
 };
 use anyhow::{anyhow, Context, Result};
 use buckyos_kit::get_buckyos_system_etc_dir;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const DEFAULT_LOGICAL_TREE_REVISION: &str = "builtin-aicc-router-v3";
+pub const DEFAULT_LOGICAL_TREE_REVISION: &str = "builtin-aicc-router-v4";
 pub const LOCAL_LOGICAL_TREE_SCHEMA_VERSION: u32 = 1;
 pub const LOCAL_LOGICAL_TREE_FILE_NAME: &str = "default_logical_tree.json";
 
@@ -19,6 +21,8 @@ pub struct LocalLogicalTreeConfig {
     pub revision: String,
     #[serde(default)]
     pub logical_definitions: Vec<LogicalModelDefinition>,
+    #[serde(default)]
+    pub logical_tree: BTreeMap<String, LogicalNode>,
 }
 
 #[derive(Clone, Copy)]
@@ -543,6 +547,151 @@ pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
     definitions
 }
 
+fn model_item(target: &str, weight: f64) -> ModelItem {
+    ModelItem::new(target.to_string(), weight)
+}
+
+fn logical_node_with_items(items: &[(&str, &str, f64)]) -> LogicalNode {
+    LogicalNode {
+        source: Some(DEFAULT_LOGICAL_TREE_REVISION.to_string()),
+        items: Some(
+            items
+                .iter()
+                .map(|(name, target, weight)| ((*name).to_string(), model_item(target, *weight)))
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn empty_logical_node() -> LogicalNode {
+    LogicalNode {
+        source: Some(DEFAULT_LOGICAL_TREE_REVISION.to_string()),
+        ..Default::default()
+    }
+}
+
+pub fn build_default_logical_tree() -> BTreeMap<String, LogicalNode> {
+    let llm_children = [
+        (
+            "chat".to_string(),
+            logical_node_with_items(&[
+                ("gpt", "llm.gpt-standard", 2.2),
+                ("sonnet", "llm.sonnet", 2.1),
+                ("gemini", "llm.gemini-flash", 1.9),
+                ("mini", "llm.gpt-mini", 1.4),
+            ]),
+        ),
+        (
+            "plan".to_string(),
+            logical_node_with_items(&[
+                ("opus", "llm.opus", 2.5),
+                ("gemini", "llm.gemini-pro", 2.4),
+                ("gpt_pro", "llm.gpt-pro", 2.3),
+                ("gpt", "llm.gpt-standard", 2.0),
+                ("local_code", "llm.qwen-coder", 1.1),
+            ]),
+        ),
+        (
+            "code".to_string(),
+            logical_node_with_items(&[
+                ("sonnet", "llm.sonnet", 2.4),
+                ("gpt", "llm.gpt-standard", 2.1),
+                ("local", "llm.qwen-coder", 1.8),
+                ("opus", "llm.opus", 1.4),
+            ]),
+        ),
+        (
+            "swift".to_string(),
+            logical_node_with_items(&[
+                ("mini", "llm.gpt-mini", 2.0),
+                ("haiku", "llm.haiku", 1.9),
+                ("gemini_flash", "llm.gemini-flash", 1.8),
+                ("gemini_flash_lite", "llm.gemini-flash-lite", 1.6),
+                ("local_small", "llm.qwen-small", 1.4),
+            ]),
+        ),
+        (
+            "summarize".to_string(),
+            logical_node_with_items(&[
+                ("mini", "llm.gpt-mini", 2.0),
+                ("gemini_flash", "llm.gemini-flash", 1.8),
+                ("haiku", "llm.haiku", 1.6),
+                ("local_small", "llm.qwen-small", 1.3),
+            ]),
+        ),
+        (
+            "summary".to_string(),
+            logical_node_with_items(&[
+                ("mini", "llm.gpt-mini", 2.0),
+                ("gemini_flash", "llm.gemini-flash", 1.8),
+                ("haiku", "llm.haiku", 1.6),
+                ("local_small", "llm.qwen-small", 1.3),
+            ]),
+        ),
+        (
+            "translate".to_string(),
+            logical_node_with_items(&[
+                ("gemini_flash", "llm.gemini-flash", 1.9),
+                ("mini", "llm.gpt-mini", 1.8),
+                ("haiku", "llm.haiku", 1.6),
+                ("local_small", "llm.qwen-small", 1.2),
+            ]),
+        ),
+        (
+            "reason".to_string(),
+            logical_node_with_items(&[
+                ("gpt_pro", "llm.gpt-pro", 2.5),
+                ("opus", "llm.opus", 2.4),
+                ("gemini", "llm.gemini-pro", 2.2),
+            ]),
+        ),
+        (
+            "vision".to_string(),
+            logical_node_with_items(&[
+                ("gpt", "llm.gpt-standard", 2.2),
+                ("gemini", "llm.gemini-pro", 2.1),
+                ("opus", "llm.opus", 1.9),
+                ("sonnet", "llm.sonnet", 1.8),
+            ]),
+        ),
+        (
+            "long".to_string(),
+            logical_node_with_items(&[
+                ("gemini", "llm.gemini-pro", 2.3),
+                ("opus", "llm.opus", 2.1),
+                ("gpt_pro", "llm.gpt-pro", 2.0),
+                ("gpt", "llm.gpt-standard", 1.8),
+            ]),
+        ),
+        ("fallback".to_string(), empty_logical_node()),
+        ("gpt-standard".to_string(), empty_logical_node()),
+        ("gpt-pro".to_string(), empty_logical_node()),
+        ("gpt-mini".to_string(), empty_logical_node()),
+        ("opus".to_string(), empty_logical_node()),
+        ("sonnet".to_string(), empty_logical_node()),
+        ("haiku".to_string(), empty_logical_node()),
+        ("gemini-pro".to_string(), empty_logical_node()),
+        ("gemini-flash".to_string(), empty_logical_node()),
+        ("gemini-flash-lite".to_string(), empty_logical_node()),
+        ("qwen-coder".to_string(), empty_logical_node()),
+        ("qwen-small".to_string(), empty_logical_node()),
+    ]
+    .into_iter()
+    .collect();
+
+    [(
+        "llm".to_string(),
+        LogicalNode {
+            source: Some(DEFAULT_LOGICAL_TREE_REVISION.to_string()),
+            children: llm_children,
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect()
+}
+
 pub fn local_logical_tree_config_path() -> PathBuf {
     get_buckyos_system_etc_dir()
         .join("aicc")
@@ -554,6 +703,7 @@ pub fn build_builtin_local_logical_tree_config() -> LocalLogicalTreeConfig {
         schema_version: LOCAL_LOGICAL_TREE_SCHEMA_VERSION,
         revision: DEFAULT_LOGICAL_TREE_REVISION.to_string(),
         logical_definitions: build_default_logical_definitions(),
+        logical_tree: build_default_logical_tree(),
     }
 }
 
@@ -561,10 +711,10 @@ pub fn load_or_create_local_logical_tree_config() -> Result<LocalLogicalTreeConf
     let path = local_logical_tree_config_path();
     match std::fs::read_to_string(path.as_path()) {
         Ok(content) => {
-            let config = parse_local_logical_tree_config(content.as_str())
-                .with_context(|| format!("parse local logical tree config {}", path.display()))?;
-            if config.revision == DEFAULT_LOGICAL_TREE_REVISION {
-                return Ok(config);
+            if let Ok(config) = parse_local_logical_tree_config(content.as_str()) {
+                if config.revision == DEFAULT_LOGICAL_TREE_REVISION {
+                    return Ok(config);
+                }
             }
             let config = build_builtin_local_logical_tree_config();
             write_local_logical_tree_config(&path, &config)?;
@@ -603,6 +753,11 @@ pub fn parse_local_logical_tree_config(content: &str) -> Result<LocalLogicalTree
     }
     let mut registry = ModelRegistry::new();
     registry.set_logical_definitions(config.logical_definitions.clone())?;
+    SessionConfig {
+        logical_tree: config.logical_tree.clone(),
+        ..Default::default()
+    }
+    .validate()?;
     Ok(config)
 }
 
@@ -626,6 +781,14 @@ mod tests {
             .unwrap()
             .get("session_config")
             .is_none());
+        assert_eq!(
+            decoded.logical_tree["llm"].children["plan"]
+                .items
+                .as_ref()
+                .unwrap()["opus"]
+                .target,
+            "llm.opus"
+        );
         assert!(
             decoded
                 .logical_definitions
@@ -720,5 +883,19 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn builtin_logical_tree_has_weighted_family_routes() {
+        let tree = build_default_logical_tree();
+        let plan = tree["llm"].children["plan"].items.as_ref().unwrap();
+        assert_eq!(plan["opus"].target, "llm.opus");
+        assert_eq!(plan["gemini"].target, "llm.gemini-pro");
+        assert_eq!(plan["gpt_pro"].target, "llm.gpt-pro");
+        assert!(plan["opus"].weight > plan["local_code"].weight);
+
+        let code = tree["llm"].children["code"].items.as_ref().unwrap();
+        assert_eq!(code["sonnet"].target, "llm.sonnet");
+        assert_eq!(code["local"].target, "llm.qwen-coder");
     }
 }

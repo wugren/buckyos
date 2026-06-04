@@ -24,8 +24,8 @@ use base64::Engine as _;
 use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, AiContent, AiMethodRequest, AiMethodResponse,
     AiMethodStatus, AiPayload, AiResponse, AiccComputeProgress, AiccComputeTaskData,
-    AiccComputeTaskRequest, AiccHandler, AiccUsageEvent, CancelResponse, Capability,
-    CreateTaskOptions, Feature, LlmChatInvokeRequest, LlmChatInvokeResponse, ModelSpec,
+    AiccComputeTaskRequest, AiccHandler, AiccRouteOverlay, AiccUsageEvent, CancelResponse,
+    Capability, CreateTaskOptions, Feature, LlmChatInvokeRequest, LlmChatInvokeResponse, ModelSpec,
     Requirements, ResourceRef, RouteFallbackAttempt, RouteResolveRequest, RouteResolveResponse,
     TaskManagerClient, TaskStatus, TextToImageInvokeRequest, TextToImageInvokeResponse,
     TypedTaskData, AICC_SERVICE_SERVICE_NAME,
@@ -2165,6 +2165,17 @@ fn route_request_from_method_request(
         )
     })?;
     let (estimated_input_tokens, estimated_output_tokens) = estimate_request_tokens(request);
+    let session_overlay = request_control_value(request, "session_overlay")
+        .or_else(|| request_control_value(request, "session_config_patch"))
+        .map(|value| {
+            serde_json::from_value::<AiccRouteOverlay>(value.clone()).map_err(|error| {
+                reason_error(
+                    "invalid_request",
+                    format!("session route overlay is invalid: {}", error),
+                )
+            })
+        })
+        .transpose()?;
     Ok(RouteResolveRequest {
         request_id: None,
         api_type: api_type_string(&api_type).to_string(),
@@ -2174,6 +2185,7 @@ fn route_request_from_method_request(
         policy: request.policy.clone(),
         estimated_input_tokens: Some(estimated_input_tokens),
         estimated_output_tokens: Some(estimated_output_tokens),
+        session_overlay,
         session_id: extract_session_id_from_complete_request(request),
         session_profile: request
             .requirements
@@ -2622,9 +2634,12 @@ fn load_local_logical_tree_for_route(
     })
 }
 
-fn default_global_session_config() -> SessionConfig {
+fn default_global_session_config(
+    local_config: &crate::default_logical_tree::LocalLogicalTreeConfig,
+) -> SessionConfig {
     SessionConfig {
-        revision: Some("aicc-empty-global-session-config-v1".to_string()),
+        logical_tree: local_config.logical_tree.clone(),
+        revision: Some(local_config.revision.clone()),
         ..Default::default()
     }
 }
@@ -2883,6 +2898,7 @@ impl AIComputeCenter {
                 },
             );
         let mut model_registry = ModelRegistry::new();
+        let global_session_config = default_global_session_config(&local_logical_tree_config);
         if let Err(err) =
             model_registry.set_logical_definitions(local_logical_tree_config.logical_definitions)
         {
@@ -2898,7 +2914,6 @@ impl AIComputeCenter {
         }
 
         let model_registry = Arc::new(RwLock::new(model_registry));
-        let global_session_config = default_global_session_config();
         let session_config_store =
             SessionConfigStore::new(global_session_config.clone(), Duration::from_secs(60 * 60))
                 .expect("default session config store should be valid");
@@ -3001,7 +3016,7 @@ impl AIComputeCenter {
         settings: &Value,
     ) -> std::result::Result<usize, RouteError> {
         let local_config = load_local_logical_tree_for_route()?;
-        let local_revision = local_config.revision.clone();
+        let base = default_global_session_config(&local_config);
         let system_config = parse_system_routing_config(settings)?;
         let definition_overrides = system_config.logical_definitions;
         let definitions = merged_logical_definitions(
@@ -3032,8 +3047,6 @@ impl AIComputeCenter {
             *overrides = definition_overrides;
         }
 
-        let mut base = default_global_session_config();
-        base.revision = Some(local_revision);
         let merged = merge_session_config(&base, &system_config.session_config)?;
         let session_store = SessionConfigStore::new(merged.clone(), Duration::from_secs(60 * 60))?;
         {
@@ -3770,6 +3783,24 @@ impl AIComputeCenter {
                 if let Some(output_tokens) = request.estimated_output_tokens {
                     object.insert("estimated_output_tokens".to_string(), json!(output_tokens));
                 }
+            }
+            requirements.extra = Some(extra);
+        }
+        if let Some(session_overlay) = request.session_overlay.clone() {
+            let mut extra = requirements.extra.take().unwrap_or_else(|| json!({}));
+            if !extra.is_object() {
+                extra = json!({ "value": extra });
+            }
+            if let Some(object) = extra.as_object_mut() {
+                object.insert(
+                    "session_config_patch".to_string(),
+                    serde_json::to_value(session_overlay).map_err(|error| {
+                        reason_error(
+                            "invalid_request",
+                            format!("serialize session_overlay failed: {}", error),
+                        )
+                    })?,
+                );
             }
             requirements.extra = Some(extra);
         }
@@ -6284,6 +6315,26 @@ mod tests {
         assert!(definitions
             .iter()
             .any(|definition| definition["path"] == json!("audio.asr")));
+    }
+
+    #[test]
+    fn builtin_logical_tree_is_visible_in_models_list_without_system_config() {
+        let center = AIComputeCenter::new(Registry::default(), ModelCatalog::default());
+        center.apply_system_routing_config(&json!({})).unwrap();
+
+        let directory = center.dump_model_directory().unwrap();
+        assert_eq!(
+            directory["directory"]["llm.plan"]["opus"]["target"],
+            json!("llm.opus")
+        );
+        assert_eq!(
+            directory["directory"]["llm.plan"]["gemini"]["target"],
+            json!("llm.gemini-pro")
+        );
+        assert_eq!(
+            directory["directory"]["llm.code"]["local"]["target"],
+            json!("llm.qwen-coder")
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use ndn_lib::ObjId;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
 pub const AICC_SERVICE_UNIQUE_ID: &str = "aicc";
@@ -250,6 +250,8 @@ pub struct ModelDisable {
     pub web_search: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_context_tokens: Option<u64>,
 }
 
 impl ModelDisable {
@@ -292,12 +294,287 @@ impl ModelDisable {
         if self.vision {
             features.push(features::VISION.to_string());
         }
+        if let Some(tokens) = self.min_context_tokens {
+            features.push(format!("min_context_tokens:{}", tokens));
+        }
         features
     }
 }
 
 fn is_default_model_disable(disable: &ModelDisable) -> bool {
     disable == &ModelDisable::default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelItem {
+    pub target: String,
+    #[serde(default = "default_model_item_weight")]
+    pub weight: f64,
+}
+
+impl ModelItem {
+    pub fn new(target: impl Into<String>, weight: f64) -> Self {
+        Self {
+            target: target.into(),
+            weight,
+        }
+    }
+}
+
+fn default_model_item_weight() -> f64 {
+    1.0
+}
+
+pub type LogicalItems = BTreeMap<String, ModelItem>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelItemPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayMergeMode {
+    Inherit,
+    Replace,
+}
+
+impl Default for OverlayMergeMode {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccFallbackMode {
+    Strict,
+    Parent,
+    TargetExact,
+    TargetLogical,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AiccFallbackRule {
+    pub mode: AiccFallbackMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccSchedulerProfile {
+    CostFirst,
+    LatencyFirst,
+    QualityFirst,
+    Balanced,
+    LocalFirst,
+    StrictLocal,
+}
+
+impl Default for AiccSchedulerProfile {
+    fn default() -> Self {
+        Self::CostFirst
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LockedValue<T> {
+    pub value: T,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+}
+
+impl<'de, T> Deserialize<'de> for LockedValue<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum LockedValueSerde<T> {
+            Raw(T),
+            Object {
+                value: T,
+                #[serde(default)]
+                locked: bool,
+            },
+        }
+
+        match LockedValueSerde::deserialize(deserializer)? {
+            LockedValueSerde::Raw(value) => Ok(Self {
+                value,
+                locked: false,
+            }),
+            LockedValueSerde::Object { value, locked } => Ok(Self { value, locked }),
+        }
+    }
+}
+
+impl<T> LockedValue<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            locked: false,
+        }
+    }
+
+    pub fn locked(value: T) -> Self {
+        Self {
+            value,
+            locked: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccPolicyConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<LockedValue<AiccSchedulerProfile>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_profiles: Option<LockedValue<AiccSchedulerProfileConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_only: Option<LockedValue<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallback: Option<LockedValue<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_exact_model_fallback: Option<LockedValue<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_failover: Option<LockedValue<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<LockedValue<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_provider_instances: Option<LockedValue<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_provider_instances: Option<LockedValue<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_cost_usd: Option<LockedValue<f64>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccSchedulerProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_first: Option<AiccSchedulerProfileWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_first: Option<AiccSchedulerProfileWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_first: Option<AiccSchedulerProfileWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balanced: Option<AiccSchedulerProfileWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_first: Option<AiccSchedulerProfileWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_local: Option<AiccSchedulerProfileWeights>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccSchedulerProfileWeights {
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub latency: f64,
+    #[serde(default)]
+    pub reliability: f64,
+    #[serde(default)]
+    pub quality: f64,
+    #[serde(default)]
+    pub preference: f64,
+    #[serde(default)]
+    pub cache: f64,
+    #[serde(default)]
+    pub local: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccLogicalNodeOverlay {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub children: BTreeMap<String, AiccLogicalNodeOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<LogicalItems>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_overrides: Option<BTreeMap<String, ModelItemPatch>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exact_model_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_line: Option<ModelDisable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<AiccFallbackRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<AiccPolicyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy_override: Option<AiccPolicyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccSessionLogicalProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<AiccLogicalTreeOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy_override: Option<AiccPolicyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccLogicalTreeOverlay {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "is_default_overlay_merge_mode")]
+    pub merge_mode: OverlayMergeMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub items: LogicalItems,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_overrides: BTreeMap<String, ModelItemPatch>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exact_model_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_line: Option<ModelDisable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<AiccFallbackRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_policy_override: Option<AiccPolicyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+fn is_default_overlay_merge_mode(mode: &OverlayMergeMode) -> bool {
+    *mode == OverlayMergeMode::default()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AiccRouteOverlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logical_tree: BTreeMap<String, AiccLogicalNodeOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_profile: Option<AiccSessionLogicalProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logical_profiles: BTreeMap<String, AiccSessionLogicalProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_logical_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub global_exact_model_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "is_default_aicc_policy_config")]
+    pub policy: AiccPolicyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+}
+
+fn is_default_aicc_policy_config(policy: &AiccPolicyConfig) -> bool {
+    policy == &AiccPolicyConfig::default()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1304,6 +1581,8 @@ pub struct RouteResolveRequest {
     pub estimated_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_overlay: Option<AiccRouteOverlay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

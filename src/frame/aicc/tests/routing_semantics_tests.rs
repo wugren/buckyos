@@ -4,11 +4,12 @@ use aicc::metadata_resolver::{resolve_driver_inventory, DriverModelResolveReques
 use aicc::model_types::{ApiType, ProviderType};
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
 use buckyos_api::{
-    AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, Capability,
-    LlmChatInvokeRequest, ModelDisable, ModelSpec, Requirements, RouteResolveRequest, TaskFilter,
-    TextToImageInvokeRequest,
+    AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, AiccLogicalNodeOverlay,
+    AiccRouteOverlay, Capability, LlmChatInvokeRequest, ModelDisable, ModelItem, ModelSpec,
+    Requirements, RouteResolveRequest, TaskFilter, TextToImageInvokeRequest,
 };
 use common::*;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn setup_route_provider(
@@ -447,6 +448,7 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
                 policy: None,
                 estimated_input_tokens: Some(12),
                 estimated_output_tokens: Some(24),
+                session_overlay: None,
                 session_id: None,
                 session_profile: None,
             },
@@ -465,6 +467,104 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
         .any(|capability| capability == buckyos_api::features::WEB_SEARCH));
     assert!(response.disabled_capabilities.is_empty());
     assert_eq!(provider.start_calls(), 0);
+}
+
+#[test]
+fn route_resolve_applies_request_session_overlay_as_top_config_layer() {
+    let registry = Registry::default();
+    let catalog = ModelCatalog::default();
+    let p1 = Arc::new(MockProvider::new(
+        mock_instance(
+            "p-a",
+            "provider-a",
+            vec![Capability::Llm],
+            vec!["plan".into()],
+        ),
+        CostEstimate {
+            estimated_cost_usd: Some(0.01),
+            estimated_latency_ms: Some(100),
+        },
+        vec![Ok(ProviderStartResult::Started)],
+    ));
+    let p2 = Arc::new(MockProvider::new(
+        mock_instance(
+            "p-b",
+            "provider-b",
+            vec![Capability::Llm],
+            vec!["plan".into()],
+        ),
+        CostEstimate {
+            estimated_cost_usd: Some(0.02),
+            estimated_latency_ms: Some(120),
+        },
+        vec![Ok(ProviderStartResult::Started)],
+    ));
+    registry.add_provider(p1);
+    registry.add_provider(p2);
+    let center = center_with_taskmgr(registry, catalog);
+
+    let overlay = AiccRouteOverlay {
+        logical_tree: [(
+            "llm".to_string(),
+            AiccLogicalNodeOverlay {
+                children: [(
+                    "plan".to_string(),
+                    AiccLogicalNodeOverlay {
+                        children: [(
+                            "default".to_string(),
+                            AiccLogicalNodeOverlay {
+                                items: Some(
+                                    [("only".to_string(), ModelItem::new("m@p-b", 1.0))]
+                                        .into_iter()
+                                        .collect::<BTreeMap<_, _>>(),
+                                ),
+                                ..Default::default()
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let response = center
+        .resolve_route(
+            RouteResolveRequest {
+                request_id: Some("route-overlay-test".to_string()),
+                api_type: "llm".to_string(),
+                logical_model: "llm.plan.default".to_string(),
+                requirements: Default::default(),
+                disable: Default::default(),
+                policy: None,
+                estimated_input_tokens: Some(12),
+                estimated_output_tokens: Some(24),
+                session_overlay: Some(overlay),
+                session_id: None,
+                session_profile: None,
+            },
+            Default::default(),
+        )
+        .expect("route.resolve should apply request overlay");
+
+    assert_eq!(response.provider_instance_name, "p-b");
+    assert_eq!(response.selected_exact_model, "m@p-b");
+    assert_eq!(
+        response
+            .route_trace
+            .as_ref()
+            .and_then(|trace| trace.get("session_config_updated"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]
@@ -493,6 +593,7 @@ fn route_resolve_rejects_exact_model_input() {
                 policy: None,
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
+                session_overlay: None,
                 session_id: None,
                 session_profile: None,
             },
@@ -815,6 +916,7 @@ fn purpose_logical_route_reaches_driver_family_mount() {
                 policy: None,
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
+                session_overlay: None,
                 session_id: None,
                 session_profile: None,
             },
@@ -868,6 +970,7 @@ fn route_resolve_outputs_base_provider_model_and_variant_options() {
                 policy: None,
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
+                session_overlay: None,
                 session_id: None,
                 session_profile: None,
             },

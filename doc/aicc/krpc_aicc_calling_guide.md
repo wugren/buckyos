@@ -74,8 +74,20 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
     "api_type": "llm.chat",
     "logical_model": "llm.plan",
     "requirements": { "tool_call": true, "json_schema": true },
-    "policy": { "profile": "quality_first" },
-    "session_id": "s-001"
+    "policy": { "profile": "quality" },
+    "session_overlay": {
+      "logical_tree": {
+        "llm": {
+          "children": {
+            "plan": {
+              "item_overrides": {
+                "local": { "weight": 2.0 }
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "sys": [1001, "<session_token>", "trace-aicc-route"]
 }
@@ -199,57 +211,39 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
 
 如果精确模型不可用且未显式允许精确模型 fallback，AICC 会返回路由错误。
 
-## 5. Request 级 SessionConfig Patch
+## 5. Request 级 Route Overlay
 
-调用方可以在 `requirements.extra`、`payload.options` 或 `payload.input_json` 中携带控制字段。常用字段：
+`route.resolve` 的 RPC 边界暴露 `session_overlay`，表示调用方已经在应用内合成好的本次路由 overlay。AICC 不维护 `session_id -> config` 的映射，也不关心应用内部是 app config、per-session config 还是更多层 overlay；AICC 只把该 overlay 覆盖到“出厂默认配置 + system global config”之上。
 
-- `session_config`：替换当前 session 的完整 `SessionConfig`
-- `session_config_patch`：基于当前 session config 做局部合并
-- `expected_session_config_revision` / `expected_revision`：并发更新校验
-- `local_only`
-- `allow_fallback`
-- `runtime_failover`
+推荐字段：
 
-示例：只允许本地候选，并把 `llm.plan` 的 fallback 改成严格模式：
+- `session_overlay`：本次请求的顶层 route overlay，JSON 形状与 `AiccRouteOverlay` 强类型结构一致。
+- `policy`：本次请求的轻量策略，`profile` 取值为 `cheap`、`fast`、`balanced`、`quality`。
+- `requirements` / `disable`：本次请求的能力要求与禁用能力。
+
+示例：本次请求只允许本地候选，并把 `llm.plan` 的 fallback 改成严格模式：
 
 ```json
 {
-  "method": "llm.chat",
+  "method": "route.resolve",
   "params": {
-    "capability": "llm",
-    "model": {
-      "alias": "llm.plan"
-    },
-    "requirements": {
-      "extra": {
-        "local_only": true,
-        "session_config_patch": {
-          "policy": {
-            "local_only": true
-          },
-          "logical_tree": {
-            "llm": {
-              "children": {
-                "plan": {
-                  "fallback": {
-                    "mode": "strict"
-                  }
-                }
+    "api_type": "llm.chat",
+    "logical_model": "llm.plan",
+    "policy": { "local_only": true },
+    "session_overlay": {
+      "policy": {
+        "local_only": true
+      },
+      "logical_tree": {
+        "llm": {
+          "children": {
+            "plan": {
+              "fallback": {
+                "mode": "strict"
               }
             }
           }
         }
-      }
-    },
-    "payload": {
-      "messages": [
-        {
-          "role": "user",
-          "content": [{ "type": "text", "text": "总结这段本地资料" }]
-        }
-      ],
-      "options": {
-        "session_id": "local-session-001"
       }
     }
   },
@@ -257,41 +251,26 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
 }
 ```
 
-示例：只在当前 session 中调整 provider 整体路由偏好：
+示例：只在本次请求中调整 provider 整体路由偏好：
 
 ```json
 {
-  "method": "llm.chat",
+  "method": "route.resolve",
   "params": {
-    "capability": "llm",
-    "model": {
-      "alias": "llm.plan"
-    },
-    "requirements": {
-      "extra": {
-        "session_config_patch": {
-          "provider_weights": {
-            "openai-backup": 0.3,
-            "local-llama": 2.0
-          }
-        }
-      }
-    },
-    "payload": {
-      "messages": [
-        {
-          "role": "user",
-          "content": [{ "type": "text", "text": "生成一个实施计划" }]
-        }
-      ],
-      "options": {
-        "session_id": "provider-weight-session-001"
+    "api_type": "llm.chat",
+    "logical_model": "llm.plan",
+    "session_overlay": {
+      "provider_weights": {
+        "openai-backup": 0.3,
+        "local-llama": 2.0
       }
     }
   },
   "sys": [1004, "<session_token>", "trace-aicc-provider-weight"]
 }
 ```
+
+legacy all-in-one / helper 兼容层仍可从 `requirements.extra`、`payload.options` 或 `payload.input_json` 读取 `session_overlay`。当前实现也会兼容读取旧名 `session_config_patch`，但新调用方应优先使用 `session_overlay`。
 
 ## 6. 取消任务
 

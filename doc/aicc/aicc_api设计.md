@@ -155,7 +155,19 @@ Request：
     "policy": { "profile": "balanced" },
     "estimated_input_tokens": 1200,
     "estimated_output_tokens": 400,
-    "session_id": "sess-001"
+    "session_overlay": {
+      "logical_tree": {
+        "llm": {
+          "children": {
+            "plan": {
+              "item_overrides": {
+                "local": { "weight": 2.0 }
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "sys": [1001, "<session_token>", "trace-aicc-route-001"]
 }
@@ -188,10 +200,11 @@ Response：
 说明：
 
 1. `selected_exact_model` 是 AICC 语义下的确定物理模型名，形如 `provider_model_id[:variant]@provider_instance_name`。
-2. `provider_model_id` 是 provider wire protocol 中真正使用的模型名（含 variant 后缀时由数据面自动还原，见 §4 与 `aicc_router.md`）。
-3. `provider_options` 是由 route / metadata / variant lowering 得到的 provider 调用参数建议，例如 reasoning effort；它不是 lease，调用方可原样透传，也可与自己的 options 合并后再调用数据面。
-4. `enabled_capabilities` / `disabled_capabilities` 表达本次路由后实际启用 / 禁用的能力集合。
-5. `fallback_attempts` 是路由建议的运行时候选顺序（不含 primary），供调用方在失败后自行决定是否重试，不是 lease，也不保证后续时刻仍可用。
+2. `session_overlay` 是调用方已经合成好的本次请求 route overlay。AICC 不维护应用 session 状态，只把该 overlay 覆盖到系统级 route config 之上。
+3. `provider_model_id` 是 provider wire protocol 中真正使用的模型名（含 variant 后缀时由数据面自动还原，见 §4 与 `aicc_router.md`）。
+4. `provider_options` 是由 route / metadata / variant lowering 得到的 provider 调用参数建议，例如 reasoning effort；它不是 lease，调用方可原样透传，也可与自己的 options 合并后再调用数据面。
+5. `enabled_capabilities` / `disabled_capabilities` 表达本次路由后实际启用 / 禁用的能力集合。
+6. `fallback_attempts` 是路由建议的运行时候选顺序（不含 primary），供调用方在失败后自行决定是否重试，不是 lease，也不保证后续时刻仍可用。
 
 ### 2.2 typed inference（数据面）
 
