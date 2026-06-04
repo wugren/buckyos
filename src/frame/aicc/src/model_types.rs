@@ -1177,12 +1177,6 @@ pub struct SessionOverlayTrace {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteTrace {
     pub request_id: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub session_config_revision: Option<String>,
-    #[serde(default)]
-    pub session_config_updated: bool,
     pub api_type: ApiType,
     pub requested_model: String,
     pub requested_model_type: RequestedModelType,
@@ -1216,8 +1210,6 @@ pub struct RouteTrace {
     pub disabled_capability_sources: Vec<DisabledCapabilityTrace>,
     #[serde(default)]
     pub session_overlays: Vec<SessionOverlayTrace>,
-    #[serde(default)]
-    pub session_sticky_hit: bool,
     pub scheduler_profile: SchedulerProfile,
     #[serde(default)]
     pub runtime_failover_count: u64,

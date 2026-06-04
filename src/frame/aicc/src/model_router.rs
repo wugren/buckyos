@@ -14,12 +14,9 @@ const MAX_FALLBACK_DEPTH: usize = 5;
 #[derive(Clone, Debug)]
 pub struct RouteRequest {
     pub request_id: String,
-    pub session_id: Option<String>,
     pub api_type: ApiType,
     pub model: String,
     pub policy: RoutePolicy,
-    pub session_config_revision: Option<String>,
-    pub session_config_updated: bool,
     pub session_overlay_trace: Vec<SessionOverlayTrace>,
 }
 
@@ -50,9 +47,6 @@ impl<'a> ModelRouter<'a> {
         };
         let mut trace = RouteTrace {
             request_id: request.request_id.clone(),
-            session_id: request.session_id.clone(),
-            session_config_revision: request.session_config_revision.clone(),
-            session_config_updated: request.session_config_updated,
             api_type: request.api_type.clone(),
             requested_model: request.model.clone(),
             requested_model_type,
@@ -71,7 +65,6 @@ impl<'a> ModelRouter<'a> {
             logical_admission: Vec::new(),
             disabled_capability_sources: Vec::new(),
             session_overlays: request.session_overlay_trace.clone(),
-            session_sticky_hit: false,
             scheduler_profile: request.policy.profile.clone(),
             runtime_failover_count: 0,
             user_summary: None,
@@ -781,12 +774,9 @@ mod tests {
     fn request(model: &str, policy: RoutePolicy) -> RouteRequest {
         RouteRequest {
             request_id: "req-1".to_string(),
-            session_id: Some("s1".to_string()),
             api_type: ApiType::Llm,
             model: model.to_string(),
             policy,
-            session_config_revision: Some("rev-1".to_string()),
-            session_config_updated: false,
             session_overlay_trace: Vec::new(),
         }
     }

@@ -1583,10 +1583,6 @@ pub struct RouteResolveRequest {
     pub estimated_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_overlay: Option<AiccRouteOverlay>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_profile: Option<Value>,
 }
 
 impl RouteResolveRequest {
@@ -1625,8 +1621,6 @@ pub struct RouteResolveResponse {
     pub route_trace: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_config_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

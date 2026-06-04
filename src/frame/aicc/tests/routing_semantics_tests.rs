@@ -449,8 +449,6 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
                 estimated_input_tokens: Some(12),
                 estimated_output_tokens: Some(24),
                 session_overlay: None,
-                session_id: None,
-                session_profile: None,
             },
             Default::default(),
         )
@@ -548,8 +546,6 @@ fn route_resolve_applies_request_session_overlay_as_top_config_layer() {
                 estimated_input_tokens: Some(12),
                 estimated_output_tokens: Some(24),
                 session_overlay: Some(overlay),
-                session_id: None,
-                session_profile: None,
             },
             Default::default(),
         )
@@ -557,14 +553,6 @@ fn route_resolve_applies_request_session_overlay_as_top_config_layer() {
 
     assert_eq!(response.provider_instance_name, "p-b");
     assert_eq!(response.selected_exact_model, "m@p-b");
-    assert_eq!(
-        response
-            .route_trace
-            .as_ref()
-            .and_then(|trace| trace.get("session_config_updated"))
-            .and_then(|value| value.as_bool()),
-        Some(true)
-    );
 }
 
 #[test]
@@ -594,8 +582,6 @@ fn route_resolve_rejects_exact_model_input() {
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
                 session_overlay: None,
-                session_id: None,
-                session_profile: None,
             },
             Default::default(),
         )
@@ -917,8 +903,6 @@ fn purpose_logical_route_reaches_driver_family_mount() {
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
                 session_overlay: None,
-                session_id: None,
-                session_profile: None,
             },
             Default::default(),
         )
@@ -971,8 +955,6 @@ fn route_resolve_outputs_base_provider_model_and_variant_options() {
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
                 session_overlay: None,
-                session_id: None,
-                session_profile: None,
             },
             Default::default(),
         )

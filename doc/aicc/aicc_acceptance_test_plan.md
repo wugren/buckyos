@@ -82,7 +82,7 @@
 | 路由解析 | 逻辑模型、精确模型、旧 alias 兼容、非法模型名、目录不存在 | L1/L2/L3 |
 | Fallback | `strict`、`parent`、`target_exact`、`target_logical`、`disabled`、环路检测、最大深度 | L1/L3 |
 | 调度 | `cost_first`、`latency_first`、`quality_first`、`balanced`、`local_first`、`strict_local`、权重优先、同权重 profile 评分 | L1 |
-| Session | session 粘性、session config、patch、revision conflict、TTL expired、policy locked | L1/L3 |
+| Request Overlay | `session_overlay` 合并、逻辑目录覆盖、policy locked | L1/L3 |
 | Task | 同步成功、异步 running、失败 task、cancel、无权限查询/取消、重复 idempotency | L1/L2/L3 |
 | 资源 | `ResourceRef::Url`、`Base64`、`NamedObject`、FileObject meta、artifact 输出、大批量 embedding artifact | L1/L3/L4 |
 | Streaming | Provider-native streaming 转最终 summary；中间态写 task data；AICC response 只返回 `succeeded` 或 `running` | L1/L3/L4 |
@@ -103,17 +103,17 @@
 | R-007 fallback 策略 | `routing_fallback_*` | L1/L3 |
 | R-008 fallback 环路检测 | `routing_fallback_loop_*` | L1 |
 | R-009 权重与 profile 调度 | `scheduler_weight_profile_*` | L1 |
-| R-010 session 粘性 | `session_sticky_*` | L1/L3 |
+| R-010 request overlay | `request_overlay_*` | L1/L3 |
 | R-011 运行时 failover | `runtime_failover_*` | L1/L3/L4 |
 | R-012 route trace | `trace_route_*` | L1/L3/L4 |
-| R-013 配置化策略合并 | `session_config_merge_*` | L1 |
+| R-013 配置化策略合并 | `route_overlay_merge_*` | L1 |
 | R-014 精确模型默认不 fallback | `routing_exact_no_fallback_*` | L1/L2/L3 |
 | R-015 目录 item 权重 | `scheduler_item_weight_*` | L1 |
 | R-016 精确模型权重 | `scheduler_exact_model_weight_*` | L1 |
-| R-017 session config 状态 | `session_config_state_*` | L1/L3 |
-| R-018 session config 继承与覆盖 | `session_config_inherit_patch_*` | L1 |
+| R-017 应用侧 overlay 分层 | `request_overlay_layering_*` | L1/L3 |
+| R-018 request overlay 继承与覆盖 | `request_overlay_inherit_patch_*` | L1 |
 | R-019 目录软链接环检测 | `routing_logical_tree_loop_*` | L1 |
-| R-020 session config 并发一致性 | `session_config_revision_*` | L1 |
+| R-020 删除 AICC 内部 session config 状态 | `request_overlay_stateless_*` | L1 |
 | R-021 用户友好 trace summary | `trace_user_summary_*` | L1/L3/L4 |
 | `aicc_api设计.md` ResourceRef | `resource_ref_*` | L1/L3 |
 | `aicc_api设计.md` idempotency | `idempotency_*` | L1/L2/L3 |
@@ -723,7 +723,7 @@ usage_output_tokens = 3
 | 项目 | 最低要求 | 主要层级 |
 |---|---|---|
 | 路由解析耗时 | Mock 环境下单次普通路由不应成为主要耗时瓶颈；建议记录 p50 / p95，不先设置硬阈值 | L1/L3 |
-| 并发 session config patch | 同一 `session_id` 的并发 patch 必须按 revision 保持一致性；冲突返回明确错误 | L1 |
+| 并发 request overlay 路由 | 多个请求携带不同 `session_overlay` 时互不污染，无共享 session 状态 | L1 |
 | 幂等重试 | 并发重复提交同一 `idempotency_key` 不得重复执行 Provider，不得重复写 usage | L1/L3 |
 | usage 写入 | 多个异步任务并发完成时，usage event 不串任务、不重复、不丢失 | L1/L3 |
 | artifact 输出 | 并发生成 artifact 时 ObjectId、meta、task result 不串 | L3 |
@@ -732,8 +732,8 @@ usage_output_tokens = 3
 
 并发测试建议：
 
-1. 同一 session 多个 request 并发读 route binding。
-2. 同一 session 多个 request 并发提交 session config patch。
+1. 多个 request 携带不同 overlay 并发 route resolve。
+2. 多个 request 携带相同 overlay 并发 route resolve。
 3. 同一 idempotency key 并发提交相同 request。
 4. 同一 idempotency key 并发提交不同 request。
 5. 多个异步 Mock video/audio/image task 并发完成。
@@ -753,8 +753,7 @@ usage_output_tokens = 3
 | `l1_routing_loop_*` | P0 | fallback loop、logical tree loop、最大 fallback depth |
 | `l1_scheduler_weight_*` | P0 | item weight、exact model weight、weight 0 硬过滤、同权重 profile 评分 |
 | `l1_scheduler_profile_*` | P0 | `cost_first`、`latency_first`、`quality_first`、`balanced`、`local_first`、`strict_local` |
-| `l1_session_sticky_*` | P0 | session route binding、binding TTL、Provider 不可用后的重新选择 |
-| `l1_session_config_*` | P0 | full config、patch、inherit、revision conflict、expired、policy locked |
+| `l1_request_overlay_*` | P0 | overlay 合并、逻辑目录覆盖、policy locked、互不污染 |
 | `l1_provider_protocol_openai_*` | P0 | OpenAI request/response 转换、tool call、JSON schema、SSE 聚合 |
 | `l1_provider_protocol_claude_*` | P0 | Claude content block、tool use、vision block、stop reason、usage |
 | `l1_provider_protocol_gemini_*` | P0 | Gemini parts、function call、safety block、operation 状态 |
@@ -1273,7 +1272,7 @@ Fixture 要求：
 
 1. 停止 runner 启动的 Mock Provider。
 2. 恢复或清理测试写入的 AICC settings。
-3. 清理测试 session config 和 session route binding。
+3. 清理测试写入的 route overlay/settings。
 4. 清理未完成的 Mock task 或记录到报告。
 5. 保留报告、输入、输出和脱敏后的 Provider 请求摘要。
 6. 如果是 L4，停止并清理本次 runner 新建的临时 group / VM。
@@ -1373,8 +1372,8 @@ Fixture 要求：
 | `l1_routing_fallback_loop_rejected` | L1 | fallback 环路被拒绝 |
 | `l1_scheduler_weight_priority` | L1 | 目录 item weight 优先级生效 |
 | `l1_scheduler_profile_cost_first` | L1 | 同优先级候选按 cost profile 选择 |
-| `l1_session_sticky_hit` | L1 | 同 session 后续请求复用绑定 |
-| `l1_session_config_revision_conflict` | L1 | session config revision 冲突返回明确错误 |
+| `l1_request_overlay_override_route` | L1 | request overlay 覆盖系统配置并改变最终物理路由 |
+| `l1_request_overlay_stateless` | L1 | 不同 request overlay 互不污染，AICC 不保存 session config |
 | `l1_security_local_only_rejects_cloud` | L1 | `local_only` 硬过滤云端 Provider |
 | `l1_provider_openai_chat_success` | L1 | OpenAI-like `llm.chat` 协议转换成功 |
 | `l1_provider_openai_stream_merge` | L1 | Provider streaming chunks 聚合为最终 summary |

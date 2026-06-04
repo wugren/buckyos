@@ -193,7 +193,7 @@ center
 
 1. Provider inventory 的 `logical_mounts`
 2. 默认逻辑目录配置与 `system_config` 系统配置合并后的 `models.list.logical_definitions` / `models.list.directory`
-3. request/session 级 `session_config_patch`
+3. request 级 `session_overlay`
 4. legacy `ModelCatalog` alias 兼容层
 
 ## 4. Settings 模板

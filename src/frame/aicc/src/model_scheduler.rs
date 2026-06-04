@@ -3,64 +3,10 @@ use crate::model_types::{
     SchedulerProfile, SchedulerProfileWeights,
 };
 use std::cmp::Ordering;
-use std::collections::HashMap;
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct StickyBindingKey {
-    pub session_id: String,
-    pub logical_model: String,
-    pub api_type: crate::model_types::ApiType,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StickyBinding {
-    pub exact_model: String,
-    pub provider_instance_name: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct StickyBindingStore {
-    bindings: HashMap<StickyBindingKey, StickyBinding>,
-}
-
-impl StickyBindingStore {
-    pub fn get(&self, key: &StickyBindingKey) -> Option<&StickyBinding> {
-        self.bindings.get(key)
-    }
-
-    pub fn set(&mut self, key: StickyBindingKey, candidate: &ModelCandidate) {
-        self.set_binding(
-            key,
-            candidate.exact_model.clone(),
-            candidate.provider_instance_name.clone(),
-        );
-    }
-
-    pub fn set_binding(
-        &mut self,
-        key: StickyBindingKey,
-        exact_model: String,
-        provider_instance_name: String,
-    ) {
-        self.bindings.insert(
-            key,
-            StickyBinding {
-                exact_model,
-                provider_instance_name,
-            },
-        );
-    }
-
-    #[allow(dead_code)]
-    pub fn remove(&mut self, key: &StickyBindingKey) {
-        self.bindings.remove(key);
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ScheduledRoute {
     pub selected: ModelCandidate,
-    pub sticky_hit: bool,
     pub ranked_candidates: Vec<RankedCandidateTrace>,
 }
 
@@ -72,26 +18,9 @@ impl ModelScheduler {
         &self,
         candidates: &[ModelCandidate],
         policy: &RoutePolicy,
-        sticky_store: Option<&mut StickyBindingStore>,
-        sticky_key: Option<StickyBindingKey>,
     ) -> Option<ScheduledRoute> {
         if candidates.is_empty() {
             return None;
-        }
-
-        if let (Some(store), Some(key)) = (sticky_store.as_ref(), sticky_key.as_ref()) {
-            if let Some(binding) = store.get(key) {
-                if let Some(candidate) = candidates.iter().find(|candidate| {
-                    candidate.exact_model == binding.exact_model
-                        && candidate.provider_instance_name == binding.provider_instance_name
-                }) {
-                    return Some(ScheduledRoute {
-                        selected: candidate.clone(),
-                        sticky_hit: true,
-                        ranked_candidates: ranked_trace(candidates, Some(candidate), None),
-                    });
-                }
-            }
         }
 
         let scored = score_candidates(candidates, policy);
@@ -104,13 +33,8 @@ impl ModelScheduler {
             })
             .map(|item| item.candidate.clone())?;
 
-        if let (Some(store), Some(key)) = (sticky_store, sticky_key) {
-            store.set(key, &selected);
-        }
-
         Some(ScheduledRoute {
             selected: selected.clone(),
-            sticky_hit: false,
             ranked_candidates: ranked_trace(candidates, Some(&selected), Some(&scored)),
         })
     }
@@ -423,7 +347,7 @@ mod tests {
             ..Default::default()
         };
         ModelScheduler
-            .schedule(&candidates(), &policy, None, None)
+            .schedule(&candidates(), &policy)
             .unwrap()
             .selected
             .provider_instance_name
@@ -450,48 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn session_sticky_hit_reuses_binding() {
-        let mut store = StickyBindingStore::default();
-        let items = candidates();
-        let key = StickyBindingKey {
-            session_id: "s1".to_string(),
-            logical_model: "llm.plan".to_string(),
-            api_type: ApiType::Llm,
-        };
-        store.set(key.clone(), &items[2]);
-        let result = ModelScheduler
-            .schedule(&items, &RoutePolicy::default(), Some(&mut store), Some(key))
-            .unwrap();
-
-        assert!(result.sticky_hit);
-        assert_eq!(result.selected.provider_instance_name, "quality");
-    }
-
-    #[test]
-    fn unavailable_binding_falls_back_to_score() {
-        let mut store = StickyBindingStore::default();
-        let items = candidates();
-        let key = StickyBindingKey {
-            session_id: "s1".to_string(),
-            logical_model: "llm.plan".to_string(),
-            api_type: ApiType::Llm,
-        };
-        store.bindings.insert(
-            key.clone(),
-            StickyBinding {
-                exact_model: "missing@provider".to_string(),
-                provider_instance_name: "provider".to_string(),
-            },
-        );
-        let result = ModelScheduler
-            .schedule(&items, &RoutePolicy::default(), Some(&mut store), Some(key))
-            .unwrap();
-
-        assert!(!result.sticky_hit);
-        assert_eq!(result.selected.provider_instance_name, "local");
-    }
-
-    #[test]
     fn profile_weights_can_be_overridden_by_policy() {
         let policy = RoutePolicy {
             profile: SchedulerProfile::CostFirst,
@@ -509,9 +391,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = ModelScheduler
-            .schedule(&candidates(), &policy, None, None)
-            .unwrap();
+        let result = ModelScheduler.schedule(&candidates(), &policy).unwrap();
 
         assert_eq!(result.selected.provider_instance_name, "quality");
     }
@@ -554,9 +434,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = ModelScheduler
-            .schedule(&items, &policy, None, None)
-            .unwrap();
+        let result = ModelScheduler.schedule(&items, &policy).unwrap();
 
         assert_eq!(result.selected.provider_instance_name, "backup");
         assert_eq!(result.ranked_candidates[1].provider_weight, 2.0);

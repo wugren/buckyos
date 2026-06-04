@@ -4,10 +4,10 @@ use crate::model_registry::{
     InventoryRefreshScheduler, ModelRegistry, DEFAULT_INVENTORY_REFRESH_INTERVAL,
 };
 use crate::model_router::{ModelRouter, RouteRequest};
-use crate::model_scheduler::{ModelScheduler, StickyBindingKey, StickyBindingStore};
+use crate::model_scheduler::ModelScheduler;
 use crate::model_session::{
     build_effective_session_config, merge_session_config, EffectiveSessionConfig, LogicalNode,
-    SessionConfig, SessionConfigStore, SessionLogicalProfile,
+    SessionConfig,
 };
 use crate::model_types::{
     ApiType, CostClass, CostEstimateInput, CostEstimateOutput, ExactModelName, HealthStatus,
@@ -42,7 +42,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_FALLBACK_LIMIT: usize = 2;
@@ -1589,7 +1589,6 @@ pub struct RouteDecision {
     attempts: Vec<RouteAttempt>,
     route_trace: Arc<Mutex<RouteTrace>>,
     runtime_failover_enabled: bool,
-    sticky_key: Option<StickyBindingKey>,
 }
 
 impl RouteDecision {
@@ -1820,7 +1819,6 @@ impl Router {
                 api_type_for_capability(&req.capability).unwrap_or(ApiType::Llm),
             ))),
             runtime_failover_enabled: true,
-            sticky_key: None,
         })
     }
 }
@@ -1828,9 +1826,6 @@ impl Router {
 fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
     RouteTrace {
         request_id: String::new(),
-        session_id: None,
-        session_config_revision: None,
-        session_config_updated: false,
         api_type,
         requested_model: model,
         requested_model_type: crate::model_types::RequestedModelType::Logical,
@@ -1849,7 +1844,6 @@ fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
         logical_admission: Vec::new(),
         disabled_capability_sources: Vec::new(),
         session_overlays: Vec::new(),
-        session_sticky_hit: false,
         scheduler_profile: Default::default(),
         runtime_failover_count: 0,
         user_summary: None,
@@ -2166,7 +2160,6 @@ fn route_request_from_method_request(
     })?;
     let (estimated_input_tokens, estimated_output_tokens) = estimate_request_tokens(request);
     let session_overlay = request_control_value(request, "session_overlay")
-        .or_else(|| request_control_value(request, "session_config_patch"))
         .map(|value| {
             serde_json::from_value::<AiccRouteOverlay>(value.clone()).map_err(|error| {
                 reason_error(
@@ -2186,13 +2179,6 @@ fn route_request_from_method_request(
         estimated_input_tokens: Some(estimated_input_tokens),
         estimated_output_tokens: Some(estimated_output_tokens),
         session_overlay,
-        session_id: extract_session_id_from_complete_request(request),
-        session_profile: request
-            .requirements
-            .extra
-            .as_ref()
-            .and_then(|extra| extra.get("session_profile"))
-            .cloned(),
     })
 }
 
@@ -2845,11 +2831,9 @@ pub struct AIComputeCenter {
     model_catalog: ModelCatalog,
     model_registry: Arc<RwLock<ModelRegistry>>,
     session_config: Arc<RwLock<SessionConfig>>,
-    session_config_store: Arc<RwLock<SessionConfigStore>>,
     system_logical_definition_overrides: Arc<RwLock<Vec<LogicalModelDefinition>>>,
     inventory_refresh_scheduler: Arc<InventoryRefreshScheduler>,
     model_scheduler: ModelScheduler,
-    sticky_bindings: Arc<Mutex<StickyBindingStore>>,
     resource_resolver: Arc<dyn ResourceResolver>,
     sink_factory: Arc<dyn TaskEventSinkFactory>,
     taskmgr: Option<Arc<TaskManagerClient>>,
@@ -2914,11 +2898,7 @@ impl AIComputeCenter {
         }
 
         let model_registry = Arc::new(RwLock::new(model_registry));
-        let session_config_store =
-            SessionConfigStore::new(global_session_config.clone(), Duration::from_secs(60 * 60))
-                .expect("default session config store should be valid");
         let session_config = Arc::new(RwLock::new(global_session_config.clone()));
-        let session_config_store = Arc::new(RwLock::new(session_config_store));
         let system_logical_definition_overrides = Arc::new(RwLock::new(Vec::new()));
         let model_registry_for_refresh = model_registry.clone();
         let logical_definition_overrides_for_refresh = system_logical_definition_overrides.clone();
@@ -2965,11 +2945,9 @@ impl AIComputeCenter {
             model_catalog,
             model_registry,
             session_config,
-            session_config_store,
             system_logical_definition_overrides,
             inventory_refresh_scheduler,
             model_scheduler: ModelScheduler,
-            sticky_bindings: Arc::new(Mutex::new(StickyBindingStore::default())),
             resource_resolver: Arc::new(PassthroughResourceResolver),
             sink_factory: Arc::new(DefaultTaskEventSinkFactory),
             taskmgr: None,
@@ -3005,9 +2983,6 @@ impl AIComputeCenter {
     pub fn reset_model_routes(&self) {
         if let Ok(mut registry) = self.model_registry.write() {
             registry.clear();
-        }
-        if let Ok(mut sticky) = self.sticky_bindings.lock() {
-            *sticky = StickyBindingStore::default();
         }
     }
 
@@ -3048,7 +3023,6 @@ impl AIComputeCenter {
         }
 
         let merged = merge_session_config(&base, &system_config.session_config)?;
-        let session_store = SessionConfigStore::new(merged.clone(), Duration::from_secs(60 * 60))?;
         {
             let mut session_config = self.session_config.write().map_err(|_| {
                 RouteError::new(
@@ -3057,15 +3031,6 @@ impl AIComputeCenter {
                 )
             })?;
             *session_config = merged;
-        }
-        {
-            let mut store = self.session_config_store.write().map_err(|_| {
-                RouteError::new(
-                    RouteErrorCode::ProviderUnavailable,
-                    "session config store lock poisoned",
-                )
-            })?;
-            *store = session_store;
         }
 
         Ok(definition_count)
@@ -3302,9 +3267,8 @@ impl AIComputeCenter {
                 err
             );
         }
-        let session_id = extract_session_id_from_complete_request(request);
-        let (effective_session_config, session_config_updated, session_config_revision) = self
-            .resolve_request_session_config(request, session_id.as_deref())
+        let effective_session_config = self
+            .resolve_request_session_config(request)
             .map_err(route_error_to_rpc)?;
         let mut policy = route_policy_from_request(request);
         apply_policy_config_to_route_policy(&mut policy, &effective_session_config.config.policy);
@@ -3325,12 +3289,9 @@ impl AIComputeCenter {
         let router = ModelRouter::new(&registry, &effective_session_config.config);
         let resolution = router.resolve(RouteRequest {
             request_id: request_id.to_string(),
-            session_id: session_id.clone(),
             api_type: api_type.clone(),
             model: request.model.alias.clone(),
             policy: policy.clone(),
-            session_config_revision,
-            session_config_updated,
             session_overlay_trace: effective_session_config.overlay_trace.clone(),
         });
 
@@ -3352,25 +3313,10 @@ impl AIComputeCenter {
         self.apply_dynamic_budget_filters(&mut resolution, &policy)
             .map_err(route_error_to_rpc)?;
 
-        let sticky_key = session_id.clone().map(|session_id| StickyBindingKey {
-            session_id,
-            logical_model: request.model.alias.clone(),
-            api_type,
-        });
-        let mut sticky_store = self
-            .sticky_bindings
-            .lock()
-            .map_err(|_| reason_error("internal_error", "sticky binding lock poisoned"))?;
         let scheduled = self
             .model_scheduler
-            .schedule(
-                &resolution.candidates,
-                &policy,
-                Some(&mut sticky_store),
-                sticky_key.clone(),
-            )
+            .schedule(&resolution.candidates, &policy)
             .ok_or_else(|| reason_error("no_provider_available", "no route candidate generated"))?;
-        drop(sticky_store);
 
         resolution.trace.selected_exact_model = Some(scheduled.selected.exact_model.clone());
         resolution.trace.selected_provider_instance_name =
@@ -3379,7 +3325,6 @@ impl AIComputeCenter {
             provider_call_from_candidate(&scheduled.selected);
         resolution.trace.selected_provider_model_id = Some(selected_provider_model.clone());
         resolution.trace.provider_options = selected_provider_options.clone();
-        resolution.trace.session_sticky_hit = scheduled.sticky_hit;
         resolution.trace.ranked_candidates = scheduled.ranked_candidates;
         mark_selected_session_overlay(&mut resolution.trace, &scheduled.selected);
         resolution.trace.user_summary = Some(user_summary_for_route(
@@ -3469,7 +3414,6 @@ impl AIComputeCenter {
             attempts,
             route_trace: Arc::new(Mutex::new(resolution.trace)),
             runtime_failover_enabled: policy.runtime_failover,
-            sticky_key,
         })
     }
 
@@ -3487,11 +3431,6 @@ impl AIComputeCenter {
             .lock()
             .ok()
             .and_then(|trace| serde_json::to_value(&*trace).ok());
-        let session_config_revision = trace
-            .as_ref()
-            .and_then(|trace| trace.get("session_config_revision"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let fallback_attempts = decision
             .attempts()
             .iter()
@@ -3515,49 +3454,14 @@ impl AIComputeCenter {
             fallback_attempts,
             route_trace: trace,
             inventory_revision: inventory.and_then(|item| item.inventory_revision),
-            session_config_revision,
         })
     }
 
     fn resolve_request_session_config(
         &self,
         request: &AiMethodRequest,
-        session_id: Option<&str>,
-    ) -> std::result::Result<
-        (EffectiveSessionConfig, bool, Option<String>),
-        crate::model_types::RouteError,
-    > {
-        let request_config = extract_session_config(request, "session_config")?;
-        let request_patch = extract_session_config(request, "session_config_patch")?;
-        let request_profile = extract_session_profile(request)?;
-        let expected_revision = extract_expected_session_config_revision(request);
-
-        if let Some(session_id) = session_id {
-            let store = self.session_config_store.read().map_err(|_| {
-                crate::model_types::RouteError::new(
-                    crate::model_types::RouteErrorCode::ProviderUnavailable,
-                    "session config store lock poisoned",
-                )
-            })?;
-            let stored = if let Some(config) = request_config {
-                store.replace(session_id, config, expected_revision.as_deref())?
-            } else if let Some(patch) = request_patch {
-                store.patch(session_id, patch, expected_revision.as_deref())?
-            } else {
-                store.get_or_create(session_id)?
-            };
-            let mut config = stored.config;
-            apply_request_session_profile(&mut config, request_profile)?;
-            let effective = build_effective_session_config(&config)?;
-            return Ok((
-                effective,
-                expected_revision.is_some()
-                    || extract_has_session_config_update(request)
-                    || request_control_value(request, "session_profile").is_some(),
-                Some(stored.revision),
-            ));
-        }
-
+    ) -> std::result::Result<EffectiveSessionConfig, crate::model_types::RouteError> {
+        let session_overlay = extract_session_config(request, "session_overlay")?;
         let global = self.session_config.read().map_err(|_| {
             crate::model_types::RouteError::new(
                 crate::model_types::RouteErrorCode::ProviderUnavailable,
@@ -3566,22 +3470,11 @@ impl AIComputeCenter {
         })?;
         let mut config = global.clone();
         drop(global);
-        let mut updated = false;
-        if let Some(request_config) = request_config {
-            config = request_config;
-            updated = true;
-        }
-        if let Some(patch) = request_patch {
-            config = merge_session_config(&config, &patch)?;
-            updated = true;
-        }
-        if request_profile.is_some() {
-            apply_request_session_profile(&mut config, request_profile)?;
-            updated = true;
+        if let Some(session_overlay) = session_overlay {
+            config = merge_session_config(&config, &session_overlay)?;
         }
         config.validate()?;
-        let revision = config.revision.clone();
-        Ok((build_effective_session_config(&config)?, updated, revision))
+        build_effective_session_config(&config)
     }
 
     fn legacy_catalog_provider_model(
@@ -3793,7 +3686,7 @@ impl AIComputeCenter {
             }
             if let Some(object) = extra.as_object_mut() {
                 object.insert(
-                    "session_config_patch".to_string(),
+                    "session_overlay".to_string(),
                     serde_json::to_value(session_overlay).map_err(|error| {
                         reason_error(
                             "invalid_request",
@@ -3814,25 +3707,6 @@ impl AIComputeCenter {
         )
         .with_policy(request.policy.clone());
         method_request.disable = request.disable.clone();
-        if request.session_id.is_some() || request.session_profile.is_some() {
-            let mut options = method_request
-                .payload
-                .options
-                .take()
-                .unwrap_or_else(|| json!({}));
-            if !options.is_object() {
-                options = json!({});
-            }
-            if let Some(object) = options.as_object_mut() {
-                if let Some(session_id) = request.session_id.as_ref() {
-                    object.insert("session_id".to_string(), json!(session_id));
-                }
-                if let Some(session_profile) = request.session_profile.clone() {
-                    object.insert("session_profile".to_string(), session_profile);
-                }
-            }
-            method_request.payload.options = Some(options);
-        }
         apply_default_features_for_method(method, &mut method_request);
 
         let route_cfg = self
@@ -4452,17 +4326,6 @@ impl AIComputeCenter {
                     }
                     self.registry
                         .record_start_success(attempt.instance_id.as_str(), elapsed_ms);
-                    if attempt_index > 0 {
-                        if let Some(sticky_key) = decision.sticky_key.clone() {
-                            if let Ok(mut sticky) = self.sticky_bindings.lock() {
-                                sticky.set_binding(
-                                    sticky_key,
-                                    attempt.exact_model.clone(),
-                                    attempt.instance_id.clone(),
-                                );
-                            }
-                        }
-                    }
                     match &start_result {
                         ProviderStartResult::Immediate(summary) => {
                             let summary_log =
@@ -4834,51 +4697,6 @@ fn extract_session_config(
     Ok(Some(config))
 }
 
-fn extract_session_profile(
-    request: &AiMethodRequest,
-) -> std::result::Result<Option<Value>, crate::model_types::RouteError> {
-    Ok(request_control_value(request, "session_profile").cloned())
-}
-
-fn apply_request_session_profile(
-    config: &mut SessionConfig,
-    profile: Option<Value>,
-) -> std::result::Result<(), crate::model_types::RouteError> {
-    let Some(profile) = profile else {
-        return Ok(());
-    };
-    if let Some(name) = profile
-        .as_str()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        config.active_logical_profile = Some(name.to_string());
-        return Ok(());
-    }
-    let profile = serde_json::from_value::<SessionLogicalProfile>(profile).map_err(|err| {
-        crate::model_types::RouteError::new(
-            crate::model_types::RouteErrorCode::SessionConfigInvalid,
-            format!("session_profile is invalid: {}", err),
-        )
-    })?;
-    config.logical_profile = Some(profile);
-    Ok(())
-}
-
-fn extract_expected_session_config_revision(request: &AiMethodRequest) -> Option<String> {
-    request_control_value(request, "expected_session_config_revision")
-        .or_else(|| request_control_value(request, "expected_revision"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
-fn extract_has_session_config_update(request: &AiMethodRequest) -> bool {
-    request_control_value(request, "session_config").is_some()
-        || request_control_value(request, "session_config_patch").is_some()
-}
-
 fn extract_session_id_from_complete_request(request: &AiMethodRequest) -> Option<String> {
     let from_options = request.payload.options.as_ref().and_then(|options| {
         json_non_empty_string(options.get("session_id"))
@@ -4918,9 +4736,7 @@ fn user_summary_for_route(
         ProviderType::CloudApi => UserFacingProviderOrigin::Cloud,
         ProviderType::ProxyUnknown => UserFacingProviderOrigin::ProxyUnknown,
     };
-    let reason_short = if trace.session_sticky_hit {
-        "hit session binding"
-    } else if trace.runtime_failover_count > 0 {
+    let reason_short = if trace.runtime_failover_count > 0 {
         "runtime failover selected next provider"
     } else if trace.fallback_applied {
         "fallback policy selected available model"

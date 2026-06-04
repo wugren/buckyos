@@ -232,7 +232,7 @@ POST /kapi/aicc
 - `value` 必须是字符串；调用端负责 JSON 序列化。
 - `provider_type=local_inference` 具有安全含义，只能用于可信本地推理实例。
 - 不确定部署边界的代理服务使用 `proxy_unknown`，不要伪装成本地推理。
-- AICC 当前不支持 per-user routing config。系统级 routing 配置持久化在 `services/aicc/settings.routing_config`，例如 `provider_weights`、`global_exact_model_weights`、`policy`、`logical_tree` 和 `logical_definitions`；Ai Center UI 的系统级调整写入这里。调用方如果需要临时调整 provider/model 偏好，应在 request/session 级 `session_config_patch` 中表达。
+- AICC 当前不支持 per-user routing config。系统级 routing 配置持久化在 `services/aicc/settings.routing_config`，例如 `provider_weights`、`global_exact_model_weights`、`policy`、`logical_tree` 和 `logical_definitions`；Ai Center UI 的系统级调整写入这里。调用方如果需要临时调整 provider/model 偏好，应在每次 RPC 的 request 级 `session_overlay` 中表达。
 - `models.list` 返回“默认逻辑目录配置 + system_config 中 AICC 系统配置”的合并视图，不包含 per-session overlay。
 - 变更后需要调用 `reload_settings` 或 `service.reload_settings`；只写 system_config 不会让运行中的 AICC 立即重建 Provider registry。
 

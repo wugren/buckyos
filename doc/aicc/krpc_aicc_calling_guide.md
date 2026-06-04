@@ -157,8 +157,7 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
       ],
       "options": {
         "temperature": 0.2,
-        "max_tokens": 256,
-        "session_id": "s-001"
+        "max_tokens": 256
       }
     },
     "idempotency_key": "idem-20260322-001"
@@ -174,7 +173,7 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
 - 新 API 分层下，`route.resolve.logical_model` 只能传逻辑模型名；`chat.completions.create.exact_model` / `images.generate.exact_model` 只能传精确模型名。旧 `llm.chat` 的 all-in-one 形态仅作为 legacy/helper 兼容层保留。
 - `requirements.must_features` 是硬过滤条件，常见值包括 `plan`、`tool_calling`、`json_output`、`web_search`、`vision`。
 - `requirements.max_cost_usd` 会参与动态成本过滤。
-- `payload.options.session_id` 会启用同一 session 内的路由粘性。
+- `payload.options.session_id` 只作为 task/root metadata 使用，不参与路由配置；AICC 不维护 `session_id -> route config`。
 - 当前实现中 request 级路由控制字段从 `requirements.extra`、`payload.options` 或 `payload.input_json` 读取；顶层 `policy` 字段暂不作为路由决策来源。
 - 更细的调度 profile 通过 `SessionConfig.policy.profile` 配置，可用值包括 `cost_first`、`latency_first`、`quality_first`、`balanced`、`local_first`、`strict_local`。
 
@@ -270,7 +269,7 @@ legacy all-in-one method（兼容保留，不再使用 `complete`）：
 }
 ```
 
-legacy all-in-one / helper 兼容层仍可从 `requirements.extra`、`payload.options` 或 `payload.input_json` 读取 `session_overlay`。当前实现也会兼容读取旧名 `session_config_patch`，但新调用方应优先使用 `session_overlay`。
+legacy all-in-one / helper 兼容层仍可从 `requirements.extra`、`payload.options` 或 `payload.input_json` 读取 `session_overlay`。旧的 `session_config` / `session_config_patch` / `expected_session_config_revision` 入口已删除。
 
 ## 6. 取消任务
 

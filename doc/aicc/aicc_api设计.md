@@ -192,8 +192,7 @@ Response：
     }
   ],
   "route_trace": { "...": "见 §3.7" },
-  "inventory_revision": "inv-42",
-  "session_config_revision": "sess-cfg-7"
+  "inventory_revision": "inv-42"
 }
 ```
 
@@ -1730,7 +1729,7 @@ Response：
 
 Fallback：
 
-1. 默认 strict 或 sticky_session。
+1. 默认 strict。
 2. 不允许静默更换 `environment_id`。
 3. 是否可 fallback 由 Agent Runtime 的 session 策略决定，AICC Router 不单独判断 sandbox 可迁移性。
 
@@ -1798,7 +1797,7 @@ Fallback：
 | `image` | `image.*` / `vision.*` | same method parent |
 | `audio` | `audio.*` | strict 或 voice contract |
 | `video` | `video.*` | same method parent |
-| `agent` | `agent.*` | sticky_session |
+| `agent` | `agent.*` | strict |
 
 ### 14.2 调用方选择模型
 

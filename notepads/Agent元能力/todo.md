@@ -144,8 +144,10 @@ G_state的定义
 按时间逐个 分析这个时间窗口内的Session Hisotry,强调跨Session的总结
 
 
-> TODO: 增加一个专门的组件来管理 Attention Signals
-> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统
+> TODO: 增加一个专门的组件来管理 Attention Signals OK 
+> TODO: 如何重点观察skill的两种信号？
+> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统 对象观察
+
 
 ## Skills 
 

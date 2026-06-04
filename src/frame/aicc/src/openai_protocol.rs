@@ -42,14 +42,11 @@ const OPENAI_BUILTIN_TOOL_TYPES: &[&str] = &[
     "mcp",
 ];
 const AICC_CONTROL_OPTION_KEYS: &[&str] = &[
-    "expected_revision",
-    "expected_session_config_revision",
     "owner_session_id",
     "root_id",
     "rootid",
-    "session_config",
-    "session_config_patch",
     "session_id",
+    "session_overlay",
 ];
 
 fn is_valid_openai_function_name(value: &str) -> bool {
@@ -714,7 +711,7 @@ mod tests {
             "rootid": "session-1",
             "session_id": "session-1",
             "owner_session_id": "session-1",
-            "expected_session_config_revision": "rev-1",
+            "session_overlay": {},
             "temperature": 0.2
         });
 
@@ -725,7 +722,7 @@ mod tests {
         assert!(!target.contains_key("rootid"));
         assert!(!target.contains_key("session_id"));
         assert!(!target.contains_key("owner_session_id"));
-        assert!(!target.contains_key("expected_session_config_revision"));
+        assert!(!target.contains_key("session_overlay"));
         assert_eq!(target.get("temperature"), Some(&json!(0.2)));
     }
 

@@ -182,7 +182,7 @@ async fn start_retryable_error_respects_runtime_failover_false() {
 }
 
 #[tokio::test]
-async fn request_session_config_patch_updates_session_policy() {
+async fn request_session_overlay_updates_request_policy() {
     let registry = Registry::default();
     let catalog = ModelCatalog::default();
     catalog.set_mapping(Capability::Llm, "llm.plan.default", "provider-a", "m-a");
@@ -218,9 +218,8 @@ async fn request_session_config_patch_updates_session_policy() {
     let center = center_with_taskmgr(registry, catalog);
 
     let mut req = base_request();
-    req.payload.options = Some(json!({"session_id": "s-policy"}));
     req.requirements.extra = Some(json!({
-        "session_config_patch": {
+        "session_overlay": {
             "policy": {
                 "profile": "latency_first"
             }
