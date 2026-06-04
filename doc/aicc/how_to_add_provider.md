@@ -177,7 +177,7 @@ center
 
 ### 步骤 6：接入默认逻辑目录
 
-默认逻辑目录由 `default_logical_tree` 应用到全局 session config。Provider 不应在代码里硬编码“唯一默认模型”，而应通过 `logical_mounts` 声明自己可作为哪些逻辑目录的候选。
+默认逻辑目录由 `default_logical_tree` 提供，并会先与 `services/aicc/settings.routing_config` 中的系统配置合并，再作为 request/session overlay 的 base。Provider 不应在代码里硬编码“唯一默认模型”，而应通过 `logical_mounts` 声明自己可作为哪些逻辑目录的候选。
 
 如果需要额外的逻辑目录，请同步检查：
 
@@ -192,7 +192,7 @@ center
 优先级建议：
 
 1. Provider inventory 的 `logical_mounts`
-2. 默认 `SessionConfig` 的逻辑目录和 items
+2. 默认逻辑目录配置与 `system_config` 系统配置合并后的 `models.list.logical_definitions` / `models.list.directory`
 3. request/session 级 `session_config_patch`
 4. legacy `ModelCatalog` alias 兼容层
 

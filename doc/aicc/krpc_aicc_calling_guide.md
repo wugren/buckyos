@@ -361,7 +361,7 @@ AI method 成功响应的 `result` 结构：
 }
 ```
 
-返回中会包含当前 Provider inventory、模型 logical mounts、默认 session config 和 legacy aliases。新增路由应优先依赖 inventory 的 `logical_mounts` 和 `SessionConfig`，legacy aliases 只作为兼容层。
+返回中会包含当前 Provider inventory、模型 logical mounts、系统逻辑目录定义、系统 routing settings 和 legacy aliases。`models.list` 表达的是“默认逻辑目录配置 + system_config 中 AICC 系统配置”的合并视图，不包含 per-user config，也不包含 per-session overlay。新增路由应优先依赖 inventory 的 `logical_mounts` 和系统 logical definitions，legacy aliases 只作为兼容层。
 
 ## 9. Mock Provider 对接
 

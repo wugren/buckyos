@@ -942,7 +942,13 @@ impl ControlPanelServer {
         let client = runtime.get_system_config_client().await?;
         let settings =
             Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
-        let weights = serde_json::Map::new();
+        let weights = settings
+            .get("routing_config")
+            .or_else(|| settings.get("routing_settings"))
+            .and_then(|value| value.get("provider_weights"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         let provider_names = Self::merge_provider_instance_names(
             Self::collect_aicc_provider_instance_names(&settings),
             self.collect_runtime_provider_instance_names().await,
@@ -1488,11 +1494,74 @@ impl ControlPanelServer {
 
     pub(crate) async fn handle_ai_provider_weight_set(
         &self,
-        _req: RPCRequest,
+        req: RPCRequest,
     ) -> Result<RPCResponse, RPCErrors> {
-        Err(RPCErrors::ReasonError(
-            "global AICC provider weights are not supported; use caller session_config instead"
-                .to_string(),
+        let provider_instance_name = req
+            .params
+            .get("provider_instance_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("provider_instance_name is required".to_string())
+            })?;
+        let weight = req
+            .params
+            .get("weight")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| RPCErrors::ReasonError("weight is required".to_string()))?;
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(RPCErrors::ReasonError(
+                "weight must be a non-negative finite number".to_string(),
+            ));
+        }
+
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        let mut settings =
+            Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
+        if !settings.is_object() {
+            settings = json!({});
+        }
+        let root = settings.as_object_mut().expect("settings must be object");
+        let routing_config = root
+            .entry("routing_config".to_string())
+            .or_insert_with(|| json!({}));
+        if !routing_config.is_object() {
+            *routing_config = json!({});
+        }
+        let routing_config = routing_config
+            .as_object_mut()
+            .expect("routing_config must be object");
+        let provider_weights = routing_config
+            .entry("provider_weights".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !provider_weights.is_object() {
+            *provider_weights = Value::Object(serde_json::Map::new());
+        }
+        let provider_weights = provider_weights
+            .as_object_mut()
+            .expect("provider_weights must be object");
+        if (weight - 1.0).abs() < f64::EPSILON {
+            provider_weights.remove(provider_instance_name.as_str());
+        } else {
+            provider_weights.insert(provider_instance_name.to_string(), json!(weight));
+        }
+        let next_weights = provider_weights.clone();
+
+        Self::save_json_config(&client, AICC_SETTINGS_KEY, &settings).await?;
+        let reload = self.reload_aicc_settings_value().await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "ok": true,
+                "provider_instance_name": provider_instance_name,
+                "weight": weight,
+                "provider_weights": next_weights,
+                "reload": reload,
+            })),
+            req.seq,
         ))
     }
 

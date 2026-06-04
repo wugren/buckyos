@@ -5,7 +5,7 @@ import type {
   ModelMetadata,
   ProviderView,
   RouteTrace,
-  SessionConfig,
+  GlobalRoutingView,
   StoreSnapshot,
   UsageEvent,
   UsageSummary,
@@ -59,7 +59,7 @@ function modelsForDraft(draft: WizardDraft, instanceName: string): ModelMetadata
 export class MockDataStore {
   private providers: Map<string, ProviderView>
   private usageEvents: UsageEvent[]
-  private sessionConfig: SessionConfig
+  private routingView: GlobalRoutingView
   private routeTraces: RouteTrace[]
   private localModels: LocalModel[]
   private snapshot: StoreSnapshot
@@ -74,7 +74,7 @@ export class MockDataStore {
 
     this.providers = new Map(seed.providers.map((p) => [p.config.id, p]))
     this.usageEvents = seed.usageEvents
-    this.sessionConfig = seed.sessionConfig
+    this.routingView = seed.routingView
     this.routeTraces = seed.routeTraces
     this.localModels = seed.localModels
     this.snapshot = this.buildSnapshot()
@@ -105,7 +105,7 @@ export class MockDataStore {
     return {
       providers: Array.from(this.providers.values()),
       usageEvents: this.usageEvents,
-      sessionConfig: this.sessionConfig,
+      routingView: this.routingView,
       routeTraces: this.routeTraces,
       localModels: this.localModels,
       aiStatus: this.computeAIStatus(),
@@ -139,7 +139,7 @@ export class MockDataStore {
       state,
       provider_count: cloudProviderCount,
       model_count: models.length,
-      default_routing_ok: this.sessionConfig.logical_tree.length > 0,
+      default_routing_ok: this.routingView.logical_tree.length > 0,
       health_counts: healthCounts,
       quota_warnings: quotaWarnings,
       inventory_ok: providers.every((p) => p.status.model_sync_status === 'ok'),
@@ -226,14 +226,14 @@ export class MockDataStore {
   }
 
   setProviderWeight(providerInstanceName: string, weight: number): void {
-    const nextWeights = { ...this.sessionConfig.provider_weights }
+    const nextWeights = { ...this.routingView.provider_weights }
     if (weight === 1) {
       delete nextWeights[providerInstanceName]
     } else {
       nextWeights[providerInstanceName] = weight
     }
-    this.sessionConfig = {
-      ...this.sessionConfig,
+    this.routingView = {
+      ...this.routingView,
       provider_weights: nextWeights,
     }
     this.notify()
@@ -375,8 +375,8 @@ export class MockDataStore {
     return this.localModels
   }
 
-  getSessionConfig(): SessionConfig {
-    return this.sessionConfig
+  getGlobalRoutingView(): GlobalRoutingView {
+    return this.routingView
   }
 
   getRouteTraces(): RouteTrace[] {

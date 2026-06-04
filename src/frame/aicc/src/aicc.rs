@@ -6,15 +6,16 @@ use crate::model_registry::{
 use crate::model_router::{ModelRouter, RouteRequest};
 use crate::model_scheduler::{ModelScheduler, StickyBindingKey, StickyBindingStore};
 use crate::model_session::{
-    build_effective_session_config, merge_session_config, EffectiveSessionConfig, SessionConfig,
-    SessionConfigStore, SessionLogicalProfile,
+    build_effective_session_config, merge_session_config, EffectiveSessionConfig, LogicalNode,
+    SessionConfig, SessionConfigStore, SessionLogicalProfile,
 };
 use crate::model_types::{
     ApiType, CostClass, CostEstimateInput, CostEstimateOutput, ExactModelName, HealthStatus,
-    LatencyClass, ModelAttributes, ModelCandidate, ModelCapabilities, ModelHealth, ModelMetadata,
-    ModelPricing, PolicyConfig, PricingMode, PrivacyClass, ProviderInventory, ProviderOrigin,
-    ProviderType, ProviderTypeTrustedSource, QuotaState, RequiredModelFeatures, RouteError,
-    RouteErrorCode, RoutePolicy, RouteTrace, UserFacingProviderOrigin, UserFacingRouteSummary,
+    LatencyClass, LogicalModelDefinition, ModelAttributes, ModelCandidate, ModelCapabilities,
+    ModelHealth, ModelMetadata, ModelPricing, PolicyConfig, PricingMode, PrivacyClass,
+    ProviderInventory, ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
+    RequiredModelFeatures, RouteError, RouteErrorCode, RoutePolicy, RouteTrace,
+    UserFacingProviderOrigin, UserFacingRouteSummary,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use ndn_lib::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -2628,6 +2629,69 @@ fn default_global_session_config() -> SessionConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SystemRoutingConfig {
+    #[serde(default)]
+    logical_definitions: Vec<LogicalModelDefinition>,
+    #[serde(flatten)]
+    session_config: SessionConfig,
+}
+
+fn parse_system_routing_config(
+    settings: &Value,
+) -> std::result::Result<SystemRoutingConfig, RouteError> {
+    let Some(value) = settings
+        .get("routing_config")
+        .or_else(|| settings.get("routing_settings"))
+    else {
+        return Ok(SystemRoutingConfig::default());
+    };
+    serde_json::from_value::<SystemRoutingConfig>(value.clone()).map_err(|err| {
+        RouteError::new(
+            RouteErrorCode::SessionConfigInvalid,
+            format!("parse system routing config failed: {}", err),
+        )
+    })
+}
+
+fn merged_logical_definitions(
+    defaults: Vec<LogicalModelDefinition>,
+    overrides: &[LogicalModelDefinition],
+) -> Vec<LogicalModelDefinition> {
+    let mut merged = defaults
+        .into_iter()
+        .map(|definition| (definition.path.clone(), definition))
+        .collect::<BTreeMap<_, _>>();
+    for definition in overrides {
+        merged.insert(definition.path.clone(), definition.clone());
+    }
+    merged.into_values().collect()
+}
+
+fn collect_session_nodes<'a>(
+    parent_path: Option<&str>,
+    nodes: &'a BTreeMap<String, LogicalNode>,
+    out: &mut BTreeMap<String, &'a LogicalNode>,
+) {
+    for (name, node) in nodes {
+        let path = match parent_path {
+            Some(parent) => format!("{}.{}", parent, name),
+            None => name.clone(),
+        };
+        out.insert(path.clone(), node);
+        collect_session_nodes(Some(path.as_str()), &node.children, out);
+    }
+}
+
+fn system_routing_settings_json(session_config: &SessionConfig) -> Value {
+    json!({
+        "global_exact_model_weights": session_config.global_exact_model_weights,
+        "provider_weights": session_config.provider_weights,
+        "policy": session_config.policy,
+        "revision": session_config.revision,
+    })
+}
+
 pub fn provider_type_from_settings(value: &str) -> ProviderType {
     match value.trim().to_ascii_lowercase().as_str() {
         "local_inference" | "local" => ProviderType::LocalInference,
@@ -2767,6 +2831,7 @@ pub struct AIComputeCenter {
     model_registry: Arc<RwLock<ModelRegistry>>,
     session_config: Arc<RwLock<SessionConfig>>,
     session_config_store: Arc<RwLock<SessionConfigStore>>,
+    system_logical_definition_overrides: Arc<RwLock<Vec<LogicalModelDefinition>>>,
     inventory_refresh_scheduler: Arc<InventoryRefreshScheduler>,
     model_scheduler: ModelScheduler,
     sticky_bindings: Arc<Mutex<StickyBindingStore>>,
@@ -2839,7 +2904,9 @@ impl AIComputeCenter {
                 .expect("default session config store should be valid");
         let session_config = Arc::new(RwLock::new(global_session_config.clone()));
         let session_config_store = Arc::new(RwLock::new(session_config_store));
+        let system_logical_definition_overrides = Arc::new(RwLock::new(Vec::new()));
         let model_registry_for_refresh = model_registry.clone();
+        let logical_definition_overrides_for_refresh = system_logical_definition_overrides.clone();
         let inventory_registry = model_registry.clone();
         let inventory_source_registry = registry.clone();
         let inventory_refresh_scheduler = Arc::new(
@@ -2850,8 +2917,19 @@ impl AIComputeCenter {
             )
             .with_refresh_hook(Arc::new(move || {
                 let config = load_local_logical_tree_for_route()?;
+                let overrides = logical_definition_overrides_for_refresh
+                    .read()
+                    .map_err(|_| {
+                        RouteError::new(
+                            RouteErrorCode::ProviderUnavailable,
+                            "system logical definition override lock poisoned",
+                        )
+                    })?
+                    .clone();
+                let definitions =
+                    merged_logical_definitions(config.logical_definitions, overrides.as_slice());
                 if let Ok(mut registry) = model_registry_for_refresh.write() {
-                    registry.set_logical_definitions(config.logical_definitions)?;
+                    registry.set_logical_definitions(definitions)?;
                 } else {
                     return Err(RouteError::new(
                         RouteErrorCode::ProviderUnavailable,
@@ -2873,6 +2951,7 @@ impl AIComputeCenter {
             model_registry,
             session_config,
             session_config_store,
+            system_logical_definition_overrides,
             inventory_refresh_scheduler,
             model_scheduler: ModelScheduler,
             sticky_bindings: Arc::new(Mutex::new(StickyBindingStore::default())),
@@ -2917,17 +2996,70 @@ impl AIComputeCenter {
         }
     }
 
-    pub fn apply_default_logical_tree(&self) -> std::result::Result<usize, RPCErrors> {
-        let local_config = crate::default_logical_tree::load_or_create_local_logical_tree_config()
-            .map_err(|err| {
-                RPCErrors::ReasonError(format!("load local logical tree config failed: {}", err))
+    pub fn apply_system_routing_config(
+        &self,
+        settings: &Value,
+    ) -> std::result::Result<usize, RouteError> {
+        let local_config = load_local_logical_tree_for_route()?;
+        let system_config = parse_system_routing_config(settings)?;
+        let definition_overrides = system_config.logical_definitions;
+        let definitions = merged_logical_definitions(
+            local_config.logical_definitions,
+            definition_overrides.as_slice(),
+        );
+        let definition_count = definitions.len();
+
+        {
+            let mut registry = self.model_registry.write().map_err(|_| {
+                RouteError::new(
+                    RouteErrorCode::ProviderUnavailable,
+                    "model registry lock poisoned",
+                )
             })?;
-        let definition_count = local_config.logical_definitions.len();
-        if let Ok(mut registry) = self.model_registry.write() {
-            registry
-                .set_logical_definitions(local_config.logical_definitions)
-                .map_err(route_error_to_rpc)?;
+            registry.set_logical_definitions(definitions)?;
         }
+        {
+            let mut overrides = self
+                .system_logical_definition_overrides
+                .write()
+                .map_err(|_| {
+                    RouteError::new(
+                        RouteErrorCode::ProviderUnavailable,
+                        "system logical definition override lock poisoned",
+                    )
+                })?;
+            *overrides = definition_overrides;
+        }
+
+        let base = default_global_session_config();
+        let merged = merge_session_config(&base, &system_config.session_config)?;
+        let session_store = SessionConfigStore::new(merged.clone(), Duration::from_secs(60 * 60))?;
+        {
+            let mut session_config = self.session_config.write().map_err(|_| {
+                RouteError::new(
+                    RouteErrorCode::ProviderUnavailable,
+                    "session config lock poisoned",
+                )
+            })?;
+            *session_config = merged;
+        }
+        {
+            let mut store = self.session_config_store.write().map_err(|_| {
+                RouteError::new(
+                    RouteErrorCode::ProviderUnavailable,
+                    "session config store lock poisoned",
+                )
+            })?;
+            *store = session_store;
+        }
+
+        Ok(definition_count)
+    }
+
+    pub fn apply_default_logical_tree(&self) -> std::result::Result<usize, RPCErrors> {
+        let definition_count = self
+            .apply_system_routing_config(&json!({}))
+            .map_err(route_error_to_rpc)?;
         info!(
             "aicc.default_logical_tree.applied logical_definitions={}",
             definition_count
@@ -2982,9 +3114,25 @@ impl AIComputeCenter {
             })
             .collect();
 
-        let directory = registry.all_default_items();
+        let default_directory = registry.all_default_items();
+        let session_config = self
+            .session_config
+            .read()
+            .map_err(|_| reason_error("internal_error", "session config lock poisoned"))?;
+        let mut session_nodes = BTreeMap::new();
+        collect_session_nodes(None, &session_config.logical_tree, &mut session_nodes);
+        let mut directory = default_directory.clone();
+        for path in session_nodes.keys() {
+            directory.entry(path.clone()).or_default();
+        }
         let mut directory_json = Map::new();
-        for (logical_path, items) in directory.iter() {
+        for (logical_path, default_items) in directory.iter() {
+            let items = if let Some(node) = session_nodes.get(logical_path) {
+                node.effective_items(Some(default_items))
+                    .map_err(route_error_to_rpc)?
+            } else {
+                default_items.clone()
+            };
             let mut items_json = Map::new();
             for (item_name, item) in items.iter() {
                 items_json.insert(
@@ -2998,17 +3146,41 @@ impl AIComputeCenter {
             directory_json.insert(logical_path.clone(), Value::Object(items_json));
         }
 
+        let mut logical_definitions_json = Vec::new();
+        for definition in registry.logical_definitions() {
+            logical_definitions_json.push(serde_json::to_value(definition).map_err(|err| {
+                reason_error(
+                    "internal_error",
+                    format!("serialize logical definition failed: {}", err),
+                )
+            })?);
+        }
+
         let aliases = self.model_catalog.snapshot();
 
         Ok(json!({
             "providers": providers_json,
             "directory": Value::Object(directory_json),
+            "logical_definitions": logical_definitions_json,
+            "routing_settings": system_routing_settings_json(&session_config),
             "aliases": aliases,
         }))
     }
 
     pub fn reload_local_logical_tree_config(&self) -> std::result::Result<(), RouteError> {
         let config = load_local_logical_tree_for_route()?;
+        let overrides = self
+            .system_logical_definition_overrides
+            .read()
+            .map_err(|_| {
+                RouteError::new(
+                    RouteErrorCode::ProviderUnavailable,
+                    "system logical definition override lock poisoned",
+                )
+            })?
+            .clone();
+        let definitions =
+            merged_logical_definitions(config.logical_definitions, overrides.as_slice());
         self.model_registry
             .write()
             .map_err(|_| {
@@ -3017,7 +3189,7 @@ impl AIComputeCenter {
                     "model registry lock poisoned",
                 )
             })?
-            .set_logical_definitions(config.logical_definitions)?;
+            .set_logical_definitions(definitions)?;
         Ok(())
     }
 
@@ -6053,6 +6225,63 @@ mod tests {
         }));
         center.set_task_manager_client(Arc::new(taskmgr));
         center
+    }
+
+    #[test]
+    fn system_routing_config_is_visible_in_models_list() {
+        let center = AIComputeCenter::new(Registry::default(), ModelCatalog::default());
+        center
+            .apply_system_routing_config(&json!({
+                "routing_config": {
+                    "revision": "sys-routing-rev-1",
+                    "provider_weights": {
+                        "openai_primary": 0.25
+                    },
+                    "logical_tree": {
+                        "llm": {
+                            "children": {
+                                "plan": {
+                                    "items": {
+                                        "fallback": {
+                                            "target": "llm.fallback",
+                                            "weight": 2.0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "logical_definitions": [
+                        {
+                            "path": "audio.asr",
+                            "api_type": "audio.asr"
+                        }
+                    ]
+                }
+            }))
+            .unwrap();
+
+        let directory = center.dump_model_directory().unwrap();
+        assert_eq!(
+            directory["routing_settings"]["revision"],
+            json!("sys-routing-rev-1")
+        );
+        assert_eq!(
+            directory["routing_settings"]["provider_weights"]["openai_primary"],
+            json!(0.25)
+        );
+        assert_eq!(
+            directory["directory"]["llm.plan"]["fallback"]["target"],
+            json!("llm.fallback")
+        );
+        assert_eq!(
+            directory["directory"]["llm.plan"]["fallback"]["weight"],
+            json!(2.0)
+        );
+        let definitions = directory["logical_definitions"].as_array().unwrap();
+        assert!(definitions
+            .iter()
+            .any(|definition| definition["path"] == json!("audio.asr")));
     }
 
     #[tokio::test]

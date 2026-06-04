@@ -424,12 +424,12 @@ video
 
 ---
 
-## 四、配置示例:一份完整 global session config
+## 四、配置示例:一份完整系统全局 routing config
 
-把上面的目录树落到 `aicc_router.md` 第 11 节定义的 SessionConfig schema:
+把上面的目录树落到 AICC 系统配置时，写入 `services/aicc/settings.routing_config`。AICC 读取配置时会先加载默认逻辑目录配置，再叠加这份 system_config 配置；request/session 配置只在调用期继续叠加。
 
 ```yaml
-session_config:
+routing_config:
   schema_version: 1
   revision: 0
   default_profile: balanced

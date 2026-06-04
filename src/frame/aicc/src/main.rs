@@ -165,10 +165,10 @@ fn apply_provider_settings(
         ));
     }
 
-    match apply_logical_directory_settings(center) {
+    match apply_logical_directory_settings(center, settings) {
         Ok(definition_count) => {
             info!(
-                "aicc logical directory applied: {} logical definitions",
+                "aicc system routing applied: {} logical definitions",
                 definition_count
             );
         }
@@ -180,16 +180,13 @@ fn apply_provider_settings(
     Ok(registered_total)
 }
 
-fn apply_logical_directory_settings(center: &AIComputeCenter) -> Result<usize> {
-    let local_config = crate::default_logical_tree::load_or_create_local_logical_tree_config()?;
-    let definition_count = local_config.logical_definitions.len();
-
-    if let Ok(mut registry) = center.model_registry().write() {
-        registry
-            .set_logical_definitions(local_config.logical_definitions)
-            .map_err(|err| anyhow::anyhow!("apply logical definitions failed: {}", err))?;
-    }
-    Ok(definition_count)
+fn apply_logical_directory_settings(
+    center: &AIComputeCenter,
+    settings: &serde_json::Value,
+) -> Result<usize> {
+    center
+        .apply_system_routing_config(settings)
+        .map_err(|err| anyhow::anyhow!("apply system routing config failed: {}", err))
 }
 
 fn redact_settings_for_log(value: &serde_json::Value) -> serde_json::Value {

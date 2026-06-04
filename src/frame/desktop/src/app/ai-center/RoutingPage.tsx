@@ -16,7 +16,7 @@ import {
   useLocalModels,
   useProviders,
   useRouteTraces,
-  useSessionConfig,
+  useGlobalRoutingView,
 } from './hooks/use-aicc-store'
 import { StatusBadge } from './components/shared/StatusBadge'
 import type { LogicalNode, ModelMetadata, RouteTrace } from '../../api/aicc_mgr'
@@ -30,12 +30,12 @@ type DirectoryEntry = {
 
 export function RoutingPage() {
   const { t } = useI18n()
-  const sessionConfig = useSessionConfig()
+  const routingView = useGlobalRoutingView()
   const traces = useRouteTraces()
   const providers = useProviders()
   const localModels = useLocalModels()
   const isMobile = useMediaQuery('(max-width: 767px)')
-  const [currentPath, setCurrentPath] = useState<string | null>(sessionConfig.logical_tree[0]?.path ?? null)
+  const [currentPath, setCurrentPath] = useState<string | null>(routingView.logical_tree[0]?.path ?? null)
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
 
   const modelByExactName = useMemo(() => {
@@ -46,12 +46,12 @@ export function RoutingPage() {
     return new Map(models.map((model) => [model.exact_model, model]))
   }, [providers, localModels])
 
-  const currentNode = findNode(sessionConfig.logical_tree, currentPath) ?? sessionConfig.logical_tree[0]
-  const selectedFile = selectedFilePath ? findNode(sessionConfig.logical_tree, selectedFilePath) : undefined
+  const currentNode = findNode(routingView.logical_tree, currentPath) ?? routingView.logical_tree[0]
+  const selectedFile = selectedFilePath ? findNode(routingView.logical_tree, selectedFilePath) : undefined
   const selectedModel = selectedFilePath ? modelByExactName.get(selectedFilePath) : undefined
   const currentEntries = currentNode ? directoryEntries(currentNode) : []
 
-  if (sessionConfig.logical_tree.length === 0 || !currentNode) {
+  if (routingView.logical_tree.length === 0 || !currentNode) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <GitBranch size={40} style={{ color: 'var(--cp-muted)' }} />
@@ -73,7 +73,7 @@ export function RoutingPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <RoutingHeader revision={sessionConfig.revision} />
+      <RoutingHeader revision={routingView.revision} />
 
       <div className={isMobile ? 'flex flex-col gap-4' : 'grid grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)] gap-5 items-start'}>
         <section
@@ -82,7 +82,7 @@ export function RoutingPage() {
         >
           <DirectoryToolbar
             currentNode={currentNode}
-            roots={sessionConfig.logical_tree}
+            roots={routingView.logical_tree}
             onOpenFolder={handleOpenFolder}
           />
           <FolderInspector node={currentNode} compact={isMobile} />

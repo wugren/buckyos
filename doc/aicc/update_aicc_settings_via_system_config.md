@@ -1,6 +1,6 @@
 # 通过 system_config 更新 AICC 配置
 
-本文说明如何把 AICC Provider settings 写入 `system_config`，并触发 AICC 在线重载。新版模型路由以 `doc/aicc/aicc_router.md` 为准：Provider settings 只负责声明 Provider instance、部署类型、凭据、endpoint 和模型清单；逻辑模型选择由 Provider inventory、默认逻辑目录树、SessionConfig 和 request policy 完成。
+本文说明如何把 AICC Provider settings 写入 `system_config`，并触发 AICC 在线重载。新版模型路由以 `doc/aicc/aicc_router.md` 为准：Provider settings 只负责声明 Provider instance、部署类型、凭据、endpoint 和模型清单；逻辑模型选择由 Provider inventory、默认逻辑目录配置、`system_config` 中的 AICC 系统配置和 request/session 级 overlay 完成。
 
 ## 1. 配置位置
 
@@ -232,7 +232,8 @@ POST /kapi/aicc
 - `value` 必须是字符串；调用端负责 JSON 序列化。
 - `provider_type=local_inference` 具有安全含义，只能用于可信本地推理实例。
 - 不确定部署边界的代理服务使用 `proxy_unknown`，不要伪装成本地推理。
-- 全局 provider 路由权重持久化在 `services/aicc/settings.session_config.provider_weights`，例如 `"openai-backup": 0.3`、`"local-llama": 2.0`；`1.0` 是默认值，`0.0` 表示禁用该 provider 参与路由。Control Panel 可通过 `ai.provider.weight.set` 写入该字段。
+- AICC 当前不支持 per-user routing config。系统级 routing 配置持久化在 `services/aicc/settings.routing_config`，例如 `provider_weights`、`global_exact_model_weights`、`policy`、`logical_tree` 和 `logical_definitions`；Ai Center UI 的系统级调整写入这里。调用方如果需要临时调整 provider/model 偏好，应在 request/session 级 `session_config_patch` 中表达。
+- `models.list` 返回“默认逻辑目录配置 + system_config 中 AICC 系统配置”的合并视图，不包含 per-session overlay。
 - 变更后需要调用 `reload_settings` 或 `service.reload_settings`；只写 system_config 不会让运行中的 AICC 立即重建 Provider registry。
 
 ## 11. 参考代码

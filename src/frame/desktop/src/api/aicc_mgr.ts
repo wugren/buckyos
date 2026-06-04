@@ -19,7 +19,7 @@ import type {
   ProviderView,
   RoutePolicy,
   SchedulerProfile,
-  SessionConfig,
+  GlobalRoutingView,
   StoreSnapshot,
   UsageSummary,
   UsageTrendPoint,
@@ -40,7 +40,7 @@ export type {
   ProviderType,
   RoutePolicy,
   RouteTrace,
-  SessionConfig,
+  GlobalRoutingView,
   StoreSnapshot,
   UsageEvent,
   UsageSummary,
@@ -73,7 +73,7 @@ const EMPTY_USAGE_SUMMARY: UsageSummary = {
 const EMPTY_SNAPSHOT: StoreSnapshot = {
   providers: [],
   usageEvents: [],
-  sessionConfig: {
+  routingView: {
     logical_tree: [],
     global_exact_model_weights: {},
     provider_weights: {},
@@ -107,8 +107,9 @@ interface AiccRpcClient {
 interface RawModelDirectory {
   providers?: RawProviderInventory[]
   directory?: Record<string, Record<string, RawLogicalRouteItem>>
+  logical_definitions?: RawLogicalDefinition[]
+  routing_settings?: RawRoutingSettings
   aliases?: unknown[]
-  session_config?: RawSessionConfig
 }
 
 interface RawProviderInventory {
@@ -141,14 +142,20 @@ interface RawLogicalRouteItem {
   weight?: unknown
 }
 
-interface RawSessionConfig {
-  inherit?: unknown
-  logical_tree?: Record<string, RawLogicalNode>
+interface RawLogicalDefinition {
+  path?: unknown
+  api_type?: unknown
+  min_line?: unknown
+  fallback?: unknown
+  route_policy?: unknown
+  scheduler_profile?: unknown
+}
+
+interface RawRoutingSettings {
   global_exact_model_weights?: unknown
   provider_weights?: unknown
   policy?: unknown
   revision?: unknown
-  ttl_seconds?: unknown
 }
 
 interface RawUsageAggregate {
@@ -191,17 +198,6 @@ interface RawUsageQueryResponse {
   grouped?: RawUsageGroupedRow[]
   buckets?: RawUsageBucketedRow[]
   events?: RawUsageEvent[]
-}
-
-interface RawLogicalNode {
-  children?: Record<string, RawLogicalNode>
-  items?: Record<string, RawLogicalRouteItem>
-  item_overrides?: Record<string, RawLogicalRouteItem>
-  exact_model_weights?: unknown
-  fallback?: unknown
-  policy?: unknown
-  route_policy_override?: unknown
-  source?: unknown
 }
 
 interface AiccDataProvider {
@@ -742,15 +738,20 @@ function toStoreSnapshot(
     ...cloudProviders.flatMap((provider) => provider.status.discovered_models),
     ...localModels,
   ]
-  const sessionConfig = toSessionConfig(directory.session_config, directory.directory, models)
+  const routingView = toGlobalRoutingView(
+    directory.routing_settings,
+    directory.directory,
+    directory.logical_definitions,
+    models,
+  )
 
   return {
     providers: cloudProviders,
     usageEvents,
-    sessionConfig,
+    routingView,
     routeTraces: [],
     localModels,
-    aiStatus: computeAIStatus(cloudProviders, localModels, sessionConfig),
+    aiStatus: computeAIStatus(cloudProviders, localModels, routingView),
   }
 }
 
@@ -883,100 +884,123 @@ function toModelMetadata(
   }
 }
 
-function toSessionConfig(
-  raw: RawSessionConfig | undefined,
+function toGlobalRoutingView(
+  raw: RawRoutingSettings | undefined,
   directory: RawModelDirectory['directory'],
+  logicalDefinitions: RawLogicalDefinition[] | undefined,
   models: ModelMetadata[],
-): SessionConfig {
+): GlobalRoutingView {
   const modelIndex = buildModelIndex(models)
-  const tree = raw?.logical_tree
-    ? Object.entries(raw.logical_tree).map(([key, node]) => toLogicalNode(key, node, '', modelIndex, true))
-    : logicalTreeFromDirectory(directory, modelIndex)
+  const tree = logicalTreeFromDirectory(directory, logicalDefinitions, modelIndex)
   const logicalTree = tree.length > 0 ? tree : logicalTreeFromModels(models)
 
   return {
-    inherit: asOptionalString(raw?.inherit),
     logical_tree: logicalTree,
     global_exact_model_weights: asNumberRecord(raw?.global_exact_model_weights),
     provider_weights: asNumberRecord(raw?.provider_weights),
     policy: toRoutePolicy(raw?.policy),
     revision: asOptionalString(raw?.revision),
-    ttl_seconds: asOptionalNumber(raw?.ttl_seconds),
-  }
-}
-
-function toLogicalNode(
-  key: string,
-  raw: RawLogicalNode,
-  parentPath: string,
-  modelIndex: ModelIndex,
-  treeNode: boolean,
-): LogicalNode {
-  const path = parentPath ? `${parentPath}.${key}` : key
-  const items = toLogicalItems(raw.items ?? raw.item_overrides)
-  const children = Object.entries(raw.children ?? {}).map(([childKey, child]) =>
-    toLogicalNode(childKey, child, path, modelIndex, true),
-  )
-  const childPaths = new Set(children.map((child) => child.path))
-  const apiType = inferApiType(path)
-  const resolvedExactModel = resolveModelForPath(path, modelIndex)
-
-  for (const item of Object.values(items)) {
-    if (childPaths.has(item.target)) continue
-    const itemModels = modelIndex.byMount.get(item.target) ?? []
-    children.push(toMountNode(item.target, apiType, itemModels))
-    childPaths.add(item.target)
-  }
-
-  const directModels = modelIndex.byMount.get(path) ?? []
-  for (const model of directModels) {
-    if (childPaths.has(model.exact_model)) continue
-    children.push(toExactModelNode(model, apiType))
-    childPaths.add(model.exact_model)
-  }
-
-  return {
-    path,
-    label: labelFromPath(path),
-    level: treeNode ? 'L3' : 'L2',
-    api_type: apiType,
-    items,
-    exact_model_weights: asNumberRecord(raw.exact_model_weights),
-    fallback: toFallback(raw.fallback),
-    policy: toRoutePolicy(raw.route_policy_override ?? raw.policy),
-    resolved_exact_model: resolvedExactModel,
-    locked: isLockedPolicy(raw.policy),
-    children,
   }
 }
 
 function logicalTreeFromDirectory(
   directory: RawModelDirectory['directory'],
+  logicalDefinitions: RawLogicalDefinition[] | undefined,
   modelIndex: ModelIndex,
 ): LogicalNode[] {
-  if (!directory) return []
-  return Object.entries(directory)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([path, items]) => {
-      const apiType = inferApiType(path)
-      const children = Object.values(toLogicalItems(items)).map((item) => {
-        const models = modelIndex.byMount.get(item.target) ?? []
-        return toMountNode(item.target, apiType, models)
-      })
+  if (!directory && !logicalDefinitions?.length) return []
+  const rootNodes: LogicalNode[] = []
+  const nodesByPath = new Map<string, LogicalNode>()
+  const definitionsByPath = buildLogicalDefinitionIndex(logicalDefinitions)
 
-      return {
-        path,
-        label: labelFromPath(path),
-        level: 'L3',
-        api_type: apiType,
-        items: toLogicalItems(items),
-        exact_model_weights: {},
-        fallback: { mode: 'parent' },
-        policy: { profile: 'balanced', allow_fallback: true, runtime_failover: true },
-        resolved_exact_model: resolveModelForPath(path, modelIndex),
-        children,
-      }
+  const ensureDirectoryNode = (path: string): LogicalNode => {
+    const existing = nodesByPath.get(path)
+    if (existing) return existing
+
+    const parentPath = parentLogicalPath(path)
+    const definition = definitionsByPath.get(path)
+    const policy = toLogicalDefinitionPolicy(definition)
+    const node: LogicalNode = {
+      path,
+      label: labelFromPath(path),
+      level: 'L3',
+      api_type: apiTypeFromLogicalDefinition(definition) ?? inferApiType(path),
+      exact_model_weights: {},
+      fallback: toFallback(definition?.fallback) ?? { mode: 'parent' },
+      policy: {
+        profile: 'balanced',
+        allow_fallback: true,
+        runtime_failover: true,
+        ...policy,
+      },
+      resolved_exact_model: resolveModelForPath(path, modelIndex),
+      children: [],
+    }
+    nodesByPath.set(path, node)
+
+    if (parentPath) {
+      const parent = ensureDirectoryNode(parentPath)
+      parent.children = appendUniqueNode(parent.children ?? [], node)
+    } else {
+      rootNodes.push(node)
+    }
+
+    return node
+  }
+
+  const entriesByPath = new Map<string, Record<string, RawLogicalRouteItem>>()
+  Object.entries(directory ?? {}).forEach(([path, items]) => {
+    entriesByPath.set(path, items)
+  })
+  for (const path of definitionsByPath.keys()) {
+    if (!entriesByPath.has(path)) {
+      entriesByPath.set(path, {})
+    }
+  }
+
+  const entries = Array.from(entriesByPath.entries()).sort(([left], [right]) => {
+    const depthDiff = left.split('.').length - right.split('.').length
+    return depthDiff !== 0 ? depthDiff : left.localeCompare(right)
+  })
+
+  for (const [path, items] of entries) {
+    const node = ensureDirectoryNode(path)
+    const definition = definitionsByPath.get(path)
+    node.items = toLogicalItems(items)
+    node.api_type = apiTypeFromLogicalDefinition(definition) ?? inferApiType(path)
+    node.fallback = toFallback(definition?.fallback) ?? node.fallback
+    node.policy = {
+      ...node.policy,
+      ...toLogicalDefinitionPolicy(definition),
+    }
+    node.resolved_exact_model = resolveModelForPath(path, modelIndex)
+  }
+
+  for (const [path] of entries) {
+    const node = ensureDirectoryNode(path)
+    const children = node.children ?? []
+    const childPaths = new Set(children.map((child) => child.path))
+    const apiType = node.api_type ?? inferApiType(path)
+
+    for (const item of Object.values(node.items ?? {})) {
+      if (childPaths.has(item.target)) continue
+      children.push(toDirectoryTargetNode(item.target, apiType, modelIndex))
+      childPaths.add(item.target)
+    }
+
+    for (const model of modelIndex.byMount.get(path) ?? []) {
+      if (childPaths.has(model.exact_model)) continue
+      children.push(toExactModelNode(model, apiType))
+      childPaths.add(model.exact_model)
+    }
+
+    node.children = children.sort((left, right) => {
+      if (left.level !== right.level) return left.level === 'L1' ? 1 : -1
+      return left.path.localeCompare(right.path)
     })
+  }
+
+  return rootNodes.sort((left, right) => left.path.localeCompare(right.path))
 }
 
 function logicalTreeFromModels(models: ModelMetadata[]): LogicalNode[] {
@@ -1000,6 +1024,27 @@ function toMountNode(path: string, apiType: ApiType | undefined, models: ModelMe
   }
 }
 
+function toDirectoryTargetNode(
+  target: string,
+  apiType: ApiType | undefined,
+  modelIndex: ModelIndex,
+): LogicalNode {
+  const exactModel = modelIndex.byExact.get(target)
+  if (exactModel) return toExactModelNode(exactModel, apiType)
+  if (target.includes('@')) {
+    return {
+      path: target,
+      label: labelFromPath(target),
+      level: 'L1',
+      api_type: apiType,
+      exact_model_weights: {},
+      resolved_exact_model: target,
+      locked: true,
+    }
+  }
+  return toMountNode(target, apiType, modelIndex.byMount.get(target) ?? [])
+}
+
 function toExactModelNode(model: ModelMetadata, apiType: ApiType | undefined): LogicalNode {
   return {
     path: model.exact_model,
@@ -1014,28 +1059,71 @@ function toExactModelNode(model: ModelMetadata, apiType: ApiType | undefined): L
 
 type ModelIndex = {
   byMount: Map<string, ModelMetadata[]>
+  byExact: Map<string, ModelMetadata>
 }
 
 function buildModelIndex(models: ModelMetadata[]): ModelIndex {
   const byMount = new Map<string, ModelMetadata[]>()
+  const byExact = new Map<string, ModelMetadata>()
   for (const model of models) {
+    byExact.set(model.exact_model, model)
     for (const mount of model.logical_mounts) {
       const current = byMount.get(mount) ?? []
       current.push(model)
       byMount.set(mount, current)
     }
   }
-  return { byMount }
+  return { byMount, byExact }
 }
 
 function resolveModelForPath(path: string, modelIndex: ModelIndex): string | undefined {
   return modelIndex.byMount.get(path)?.[0]?.exact_model
 }
 
+function buildLogicalDefinitionIndex(
+  definitions: RawLogicalDefinition[] | undefined,
+): Map<string, RawLogicalDefinition> {
+  const result = new Map<string, RawLogicalDefinition>()
+  for (const definition of definitions ?? []) {
+    const path = asOptionalString(definition.path)
+    if (path) {
+      result.set(path, definition)
+    }
+  }
+  return result
+}
+
+function apiTypeFromLogicalDefinition(definition?: RawLogicalDefinition): ApiType | undefined {
+  const value = asOptionalString(definition?.api_type)
+  return value && API_TYPES.includes(value as ApiType) ? value as ApiType : undefined
+}
+
+function toLogicalDefinitionPolicy(definition?: RawLogicalDefinition): RoutePolicy {
+  if (!definition) return {}
+  const policy = toRoutePolicy(definition.route_policy)
+  const profile = normalizeSchedulerProfile(definition.scheduler_profile) ?? policy.profile
+  const required = requiredFeatures(asRecord(definition.min_line))
+  return {
+    ...policy,
+    ...(profile ? { profile } : {}),
+    ...(required.length > 0 ? { required_features: required } : {}),
+  }
+}
+
+function parentLogicalPath(path: string): string | undefined {
+  const index = path.lastIndexOf('.')
+  return index > 0 ? path.slice(0, index) : undefined
+}
+
+function appendUniqueNode(nodes: LogicalNode[], next: LogicalNode): LogicalNode[] {
+  if (nodes.some((node) => node.path === next.path)) return nodes
+  return [...nodes, next]
+}
+
 function computeAIStatus(
   providers: ProviderView[],
   localModels: LocalModel[],
-  sessionConfig: SessionConfig,
+  routingView: GlobalRoutingView,
 ): AIStatus {
   const models = [
     ...providers.flatMap((provider) => provider.status.discovered_models),
@@ -1059,7 +1147,7 @@ function computeAIStatus(
         : 'multi_provider',
     provider_count: cloudProviderCount,
     model_count: models.length,
-    default_routing_ok: sessionConfig.logical_tree.length > 0,
+    default_routing_ok: routingView.logical_tree.length > 0,
     health_counts: healthCounts,
     quota_warnings: models.filter((model) =>
       model.health.quota_state === 'near_limit' ||
@@ -1178,11 +1266,6 @@ function labelFromPath(path: string): string {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ')
-}
-
-function isLockedPolicy(raw: unknown): boolean {
-  const value = asRecord(raw)
-  return Object.values(value).some((item) => asRecord(item).locked === true)
 }
 
 function lockedValue(value: unknown): unknown {

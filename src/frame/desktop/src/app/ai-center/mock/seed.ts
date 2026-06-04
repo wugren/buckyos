@@ -7,7 +7,7 @@ import type {
   ProviderView,
   RouteTrace,
   SchedulerProfile,
-  SessionConfig,
+  GlobalRoutingView,
   UsageEvent,
 } from './types'
 
@@ -561,11 +561,9 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
   ]
 }
 
-function buildSessionConfig(withPhysicalModels: boolean): SessionConfig {
+function buildGlobalRoutingView(withPhysicalModels: boolean): GlobalRoutingView {
   return {
-    inherit: 'builtin-aicc-router-v2',
     revision: withPhysicalModels ? 'mock-aicc-router-v2-with-inventory' : 'mock-aicc-router-v2-directory-only',
-    ttl_seconds: 3600,
     global_exact_model_weights: withPhysicalModels
       ? {
           'qwen2.5-coder-32b@local': 1.2,
@@ -765,7 +763,7 @@ const directoryOnlyRouteTraces: RouteTrace[] = [
 export interface SeedData {
   providers: ProviderView[]
   usageEvents: UsageEvent[]
-  sessionConfig: SessionConfig
+  routingView: GlobalRoutingView
   routeTraces: RouteTrace[]
   localModels: LocalModel[]
 }
@@ -774,7 +772,7 @@ export function getEmptySeed(): SeedData {
   return {
     providers: [],
     usageEvents: [],
-    sessionConfig: buildSessionConfig(false),
+    routingView: buildGlobalRoutingView(false),
     routeTraces: directoryOnlyRouteTraces,
     localModels: [],
   }
@@ -784,7 +782,7 @@ export function getPopulatedSeed(): SeedData {
   return {
     providers,
     usageEvents: generateUsageEvents(),
-    sessionConfig: buildSessionConfig(true),
+    routingView: buildGlobalRoutingView(true),
     routeTraces,
     localModels,
   }

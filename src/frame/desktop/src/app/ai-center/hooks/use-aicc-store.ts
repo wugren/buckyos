@@ -10,7 +10,7 @@ import type {
   LocalModel,
   ProviderView,
   RouteTrace,
-  SessionConfig,
+  GlobalRoutingView,
   UsageEvent,
   UsageSummary,
   UsageTrendPoint,
@@ -62,8 +62,8 @@ export function useLocalModels(): LocalModel[] {
   return useStoreSnapshot().localModels
 }
 
-export function useSessionConfig(): SessionConfig {
-  return useStoreSnapshot().sessionConfig
+export function useGlobalRoutingView(): GlobalRoutingView {
+  return useStoreSnapshot().routingView
 }
 
 export function useRouteTraces(): RouteTrace[] {

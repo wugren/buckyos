@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMediaQuery } from '@mui/material'
 import { useI18n } from '../../i18n/provider'
-import { useProviders, useSessionConfig } from './hooks/use-aicc-store'
+import { useProviders, useGlobalRoutingView } from './hooks/use-aicc-store'
 import { ProviderList } from './components/providers/ProviderList'
 import { ProviderDetailPanel } from './components/providers/ProviderDetailPanel'
 import { EmptyState } from './components/shared/EmptyState'
@@ -15,7 +15,7 @@ interface ProvidersPageProps {
 export function ProvidersPage({ navigate }: ProvidersPageProps) {
   const { t } = useI18n()
   const providers = useProviders()
-  const sessionConfig = useSessionConfig()
+  const routingView = useGlobalRoutingView()
   const isMobile = useMediaQuery('(max-width: 767px)')
   const [selectedId, setSelectedId] = useState<string | null>(
     providers.length > 0 ? providers[0].config.id : null,
@@ -52,7 +52,7 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
           </button>
           <ProviderDetailPanel
             provider={selectedProvider}
-            routingWeight={sessionConfig.provider_weights[selectedProvider.config.provider_instance_name] ?? 1}
+            routingWeight={routingView.provider_weights[selectedProvider.config.provider_instance_name] ?? 1}
             onDeleted={() => {
               setShowMobileDetail(false)
               setSelectedId(providers.length > 1 ? providers[0].config.id : null)
@@ -93,7 +93,7 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
         {selectedProvider ? (
           <ProviderDetailPanel
             provider={selectedProvider}
-            routingWeight={sessionConfig.provider_weights[selectedProvider.config.provider_instance_name] ?? 1}
+            routingWeight={routingView.provider_weights[selectedProvider.config.provider_instance_name] ?? 1}
             onDeleted={() => {
               const remaining = providers.filter((p) => p.config.id !== selectedId)
               setSelectedId(remaining.length > 0 ? remaining[0].config.id : null)

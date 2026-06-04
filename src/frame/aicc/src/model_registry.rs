@@ -82,6 +82,10 @@ impl ModelRegistry {
         self.logical_definitions.get(path)
     }
 
+    pub fn logical_definitions(&self) -> impl Iterator<Item = &LogicalModelDefinition> {
+        self.logical_definitions.values()
+    }
+
     pub fn inventory_revision(&self, provider_instance_name: &str) -> Option<&str> {
         self.inventories
             .get(provider_instance_name)
@@ -124,9 +128,7 @@ impl ModelRegistry {
         }
         for path in self.logical_definitions.keys() {
             let items = self.default_items_for_path(path);
-            if !items.is_empty() {
-                mounts.insert(path.clone(), items);
-            }
+            mounts.insert(path.clone(), items);
         }
         mounts
     }
@@ -737,5 +739,23 @@ mod tests {
             .unwrap();
 
         assert!(registry.default_items_for_path("llm.plan").is_empty());
+    }
+
+    #[test]
+    fn all_default_items_keeps_empty_logical_definitions() {
+        let mut registry = ModelRegistry::new();
+        registry
+            .set_logical_definitions(vec![logical_definition(
+                "llm.plan",
+                ModelRequirement::default(),
+            )])
+            .unwrap();
+
+        let defaults = registry.all_default_items();
+        assert!(
+            defaults.contains_key("llm.plan"),
+            "configured logical definitions should remain visible even without admitted models"
+        );
+        assert!(defaults.get("llm.plan").unwrap().is_empty());
     }
 }

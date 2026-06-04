@@ -200,14 +200,12 @@ export interface LogicalNode {
   resolved_exact_model?: string
 }
 
-export interface SessionConfig {
-  inherit?: string
+export interface GlobalRoutingView {
   logical_tree: LogicalNode[]
   global_exact_model_weights: Record<string, number>
   provider_weights: Record<string, number>
   policy: RoutePolicy
   revision?: string
-  ttl_seconds?: number
 }
 
 export interface RouteTrace {
@@ -298,7 +296,7 @@ export interface ValidationResult {
 export interface StoreSnapshot {
   providers: ProviderView[]
   usageEvents: UsageEvent[]
-  sessionConfig: SessionConfig
+  routingView: GlobalRoutingView
   routeTraces: RouteTrace[]
   localModels: LocalModel[]
   aiStatus: AIStatus
