@@ -50,7 +50,7 @@ function modelsForDraft(draft: WizardDraft, instanceName: string): ModelMetadata
   const names = discoveredModelsByType[draft.provider_type ?? 'custom'] ?? []
   return names.map((exactName) => {
     const providerModelId = exactName.split('@')[0] ?? exactName
-    const apiTypes = providerModelId.includes('embedding') ? ['embedding.text' as const] : ['llm.chat' as const]
+    const apiTypes = providerModelId.includes('embedding') ? ['embedding.text' as const] : ['llm' as const]
     const mount = providerModelId.includes('embedding') ? 'embedding.large' : `llm.${draft.provider_type ?? 'custom'}`
     return model(providerModelId, instanceName, [mount], apiTypes)
   })

@@ -287,7 +287,7 @@ export function llmChat(runtime: AiccRuntime, opts: LlmChatOptions): Promise<Cal
     ...opts,
     capability: "llm",
     method: "llm.chat",
-    modelAlias: opts.modelAlias ?? "llm.chat",
+    modelAlias: opts.modelAlias ?? "llm",
     messages: opts.messages,
     toolSpecs: opts.toolSpecs,
     requirements: {

@@ -734,12 +734,6 @@ fn build_aicc_settings_with_sn_models(
                 json!(sn_model_settings.default_model.as_str()),
             );
         }
-        if !sn_ai_provider_alias_map.contains_key("llm.chat.default") {
-            sn_ai_provider_alias_map.insert(
-                "llm.chat.default".to_string(),
-                json!(sn_model_settings.default_model.as_str()),
-            );
-        }
         if !sn_ai_provider_alias_map.contains_key("llm.plan.default") {
             sn_ai_provider_alias_map.insert(
                 "llm.plan.default".to_string(),

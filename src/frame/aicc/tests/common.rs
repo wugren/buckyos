@@ -739,7 +739,7 @@ pub fn string_set(values: &[&str]) -> HashSet<String> {
 
 pub fn localhost_ctx_from_request() -> RPCContext {
     let req = kRPC::RPCRequest {
-        method: "llm.chat".to_string(),
+        method: "llm".to_string(),
         params: json!({}),
         seq: 1,
         token: None,
@@ -1177,7 +1177,6 @@ async fn build_remote_mock_openai_settings(
             }],
             "alias_map": {
                 "llm.default": model.clone(),
-                "llm.chat.default": model.clone(),
                 "llm.plan.default": model.clone(),
                 "llm.code.default": model
             }

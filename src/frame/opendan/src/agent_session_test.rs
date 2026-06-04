@@ -1490,7 +1490,7 @@ fn model_policy_carries_session_profile_to_aicc_options() {
     let profile = SessionLogicalProfile {
         name: Some("prefer-local".to_string()),
         overlays: vec![LogicalTreeOverlay {
-            path: "llm.chat".to_string(),
+            path: "llm".to_string(),
             merge_mode: OverlayMergeMode::Inherit,
             items: [(
                 "local".to_string(),
@@ -1509,7 +1509,7 @@ fn model_policy_carries_session_profile_to_aicc_options() {
     };
     let policy = model_policy_with_session_profile(
         ModelPolicy {
-            preferred: "llm.chat".to_string(),
+            preferred: "llm".to_string(),
             provider_options: Some(serde_json::json!({
                 "temperature": 0.2
             })),
@@ -1654,18 +1654,18 @@ fn model_directory_context_window_resolves_logical_mount() {
             "models": [{
                 "exact_model": "gpt-5@openai",
                 "provider_model_id": "gpt-5",
-                "logical_mounts": ["llm.chat"],
+                "logical_mounts": ["llm"],
                 "capabilities": {"max_context_tokens": 128000}
             }, {
                 "exact_model": "tiny@local",
                 "provider_model_id": "tiny",
-                "logical_mounts": ["llm.chat"],
+                "logical_mounts": ["llm"],
                 "capabilities": {"max_context_tokens": 32000}
             }]
         }]
     });
     assert_eq!(
-        context_window_tokens_from_model_directory(&directory, "llm.chat"),
+        context_window_tokens_from_model_directory(&directory, "llm"),
         Some(32000)
     );
 }

@@ -13,8 +13,8 @@ use crate::model_types::{
     ApiType, CostClass, CostEstimateInput, CostEstimateOutput, ExactModelName, HealthStatus,
     LatencyClass, ModelAttributes, ModelCandidate, ModelCapabilities, ModelHealth, ModelMetadata,
     ModelPricing, PolicyConfig, PricingMode, PrivacyClass, ProviderInventory, ProviderOrigin,
-    ProviderType, ProviderTypeTrustedSource, QuotaState, RequiredModelFeatures, RoutePolicy,
-    RouteTrace, UserFacingProviderOrigin, UserFacingRouteSummary,
+    ProviderType, ProviderTypeTrustedSource, QuotaState, RequiredModelFeatures, RouteError,
+    RouteErrorCode, RoutePolicy, RouteTrace, UserFacingProviderOrigin, UserFacingRouteSummary,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -1952,7 +1952,7 @@ fn api_type_for_method(method: &str) -> Option<ApiType> {
 
 fn method_for_route_api_type(api_type: &str) -> std::result::Result<&'static str, RPCErrors> {
     match api_type {
-        "llm.chat" | "chat.completions.create" => Ok(ai_methods::LLM_CHAT),
+        "llm" | "chat.completions.create" => Ok(ai_methods::LLM_CHAT),
         "llm.completion" | "completions.create" => Ok(ai_methods::LLM_COMPLETION),
         "image.txt2img" | "images.generate" => Ok(ai_methods::IMAGE_TXT2IMG),
         "image.img2img" | "images.edit" => Ok(ai_methods::IMAGE_IMG2IMG),
@@ -2187,7 +2187,7 @@ fn route_request_from_method_request(
 
 fn api_type_string(api_type: &ApiType) -> &'static str {
     match api_type {
-        ApiType::LlmChat => "llm.chat",
+        ApiType::LlmChat => "llm",
         ApiType::LlmCompletion => "llm.completion",
         ApiType::ImageTextToImage => "image.txt2img",
         ApiType::ImageToImage => "image.img2img",
@@ -2614,9 +2614,19 @@ fn json_text_len(value: &Value) -> usize {
     }
 }
 
+fn load_local_logical_tree_for_route(
+) -> std::result::Result<crate::default_logical_tree::LocalLogicalTreeConfig, RouteError> {
+    crate::default_logical_tree::load_or_create_local_logical_tree_config().map_err(|err| {
+        RouteError::new(
+            RouteErrorCode::SessionConfigInvalid,
+            format!("load local logical tree config failed: {}", err),
+        )
+    })
+}
+
 fn default_global_session_config() -> SessionConfig {
     SessionConfig {
-        revision: Some("builtin-aicc-router-v1".to_string()),
+        revision: Some("aicc-empty-global-session-config-v1".to_string()),
         ..Default::default()
     }
 }
@@ -2800,10 +2810,20 @@ impl AIComputeCenter {
             .into_iter()
             .map(|item| item.to_string())
             .collect::<HashSet<_>>();
+        let local_logical_tree_config =
+            crate::default_logical_tree::load_or_create_local_logical_tree_config().unwrap_or_else(
+                |err| {
+                    warn!(
+                        "aicc.default_logical_tree.load_local_failed err={}, use builtin",
+                        err
+                    );
+                    crate::default_logical_tree::build_builtin_local_logical_tree_config()
+                },
+            );
         let mut model_registry = ModelRegistry::new();
-        if let Err(err) = model_registry.set_logical_definitions(
-            crate::default_logical_tree::build_default_logical_definitions(),
-        ) {
+        if let Err(err) =
+            model_registry.set_logical_definitions(local_logical_tree_config.logical_definitions)
+        {
             warn!(
                 "aicc.model_registry.set_default_logical_definitions_failed err={}",
                 err
@@ -2820,13 +2840,30 @@ impl AIComputeCenter {
         let session_config_store =
             SessionConfigStore::new(global_session_config.clone(), Duration::from_secs(60 * 60))
                 .expect("default session config store should be valid");
+        let session_config = Arc::new(RwLock::new(global_session_config.clone()));
+        let session_config_store = Arc::new(RwLock::new(session_config_store));
+        let model_registry_for_refresh = model_registry.clone();
         let inventory_registry = model_registry.clone();
         let inventory_source_registry = registry.clone();
-        let inventory_refresh_scheduler = Arc::new(InventoryRefreshScheduler::new(
-            inventory_registry,
-            Arc::new(move || inventory_source_registry.inventories()),
-            DEFAULT_INVENTORY_REFRESH_INTERVAL,
-        ));
+        let inventory_refresh_scheduler = Arc::new(
+            InventoryRefreshScheduler::new(
+                inventory_registry,
+                Arc::new(move || inventory_source_registry.inventories()),
+                DEFAULT_INVENTORY_REFRESH_INTERVAL,
+            )
+            .with_refresh_hook(Arc::new(move || {
+                let config = load_local_logical_tree_for_route()?;
+                if let Ok(mut registry) = model_registry_for_refresh.write() {
+                    registry.set_logical_definitions(config.logical_definitions)?;
+                } else {
+                    return Err(RouteError::new(
+                        RouteErrorCode::ProviderUnavailable,
+                        "model registry lock poisoned",
+                    ));
+                }
+                Ok(())
+            })),
+        );
         if tokio::runtime::Handle::try_current().is_ok() {
             inventory_refresh_scheduler.start();
         }
@@ -2837,8 +2874,8 @@ impl AIComputeCenter {
             sn_ai_provider_billing: SnAIProviderBillingLedger::default(),
             model_catalog,
             model_registry,
-            session_config: Arc::new(RwLock::new(global_session_config)),
-            session_config_store: Arc::new(RwLock::new(session_config_store)),
+            session_config,
+            session_config_store,
             inventory_refresh_scheduler,
             model_scheduler: ModelScheduler,
             sticky_bindings: Arc::new(Mutex::new(StickyBindingStore::default())),
@@ -2883,26 +2920,22 @@ impl AIComputeCenter {
         }
     }
 
-    /// Install the default level-2 logical tree (per `doc/aicc/aicc 逻辑模型目录.md` §4)
-    /// via `set_session_config`. Builtin entries are applied as item overrides
-    /// so provider inventories can still mount exact models directly to role
-    /// paths. Returns the number of level-2 leaf nodes installed.
     pub fn apply_default_logical_tree(&self) -> std::result::Result<usize, RPCErrors> {
-        let config = crate::default_logical_tree::build_default_session_config();
-        let node_count = crate::default_logical_tree::level2_node_count(&config);
+        let local_config = crate::default_logical_tree::load_or_create_local_logical_tree_config()
+            .map_err(|err| {
+                RPCErrors::ReasonError(format!("load local logical tree config failed: {}", err))
+            })?;
+        let definition_count = local_config.logical_definitions.len();
         if let Ok(mut registry) = self.model_registry.write() {
             registry
-                .set_logical_definitions(
-                    crate::default_logical_tree::build_default_logical_definitions(),
-                )
+                .set_logical_definitions(local_config.logical_definitions)
                 .map_err(route_error_to_rpc)?;
         }
-        self.set_session_config(config);
         info!(
-            "aicc.default_logical_tree.applied level2_nodes={}",
-            node_count
+            "aicc.default_logical_tree.applied logical_definitions={}",
+            definition_count
         );
-        Ok(node_count)
+        Ok(definition_count)
     }
 
     pub fn dump_model_directory(&self) -> std::result::Result<Value, RPCErrors> {
@@ -2970,30 +3003,25 @@ impl AIComputeCenter {
 
         let aliases = self.model_catalog.snapshot();
 
-        let session_config = self
-            .session_config
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|_| reason_error("internal_error", "session_config lock poisoned"))?;
-
         Ok(json!({
             "providers": providers_json,
             "directory": Value::Object(directory_json),
             "aliases": aliases,
-            "session_config": session_config,
         }))
     }
 
-    pub fn set_session_config(&self, config: SessionConfig) {
-        if let Ok(mut current) = self.session_config.write() {
-            *current = config.clone();
-        }
-        if let Ok(mut store) = self.session_config_store.write() {
-            match SessionConfigStore::new(config, Duration::from_secs(60 * 60)) {
-                Ok(next) => *store = next,
-                Err(err) => warn!("aicc.session_config_store.rebuild_failed err={}", err),
-            }
-        }
+    pub fn reload_local_logical_tree_config(&self) -> std::result::Result<(), RouteError> {
+        let config = load_local_logical_tree_for_route()?;
+        self.model_registry
+            .write()
+            .map_err(|_| {
+                RouteError::new(
+                    RouteErrorCode::ProviderUnavailable,
+                    "model registry lock poisoned",
+                )
+            })?
+            .set_logical_definitions(config.logical_definitions)?;
+        Ok(())
     }
 
     pub fn inventory_changed(&self, _provider_instance_name: &str) {
@@ -3010,6 +3038,8 @@ impl AIComputeCenter {
         &self,
         provider_instance_name: &str,
     ) -> std::result::Result<ProviderInventory, RPCErrors> {
+        self.reload_local_logical_tree_config()
+            .map_err(route_error_to_rpc)?;
         let provider = self
             .registry
             .get_provider(provider_instance_name)

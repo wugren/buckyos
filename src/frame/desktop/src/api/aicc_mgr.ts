@@ -710,7 +710,7 @@ function capabilityToApiType(value: string): ApiType {
     case 'video': return 'video.txt2video'
     case 'agent': return 'agent.computer_use'
     case 'llm':
-    default: return 'llm.chat'
+    default: return 'llm'
   }
 }
 
@@ -1158,9 +1158,11 @@ function inferPricingMode(models: ModelMetadata[]): PricingMode {
 }
 
 function inferApiType(path: string): ApiType | undefined {
-  const known = API_TYPES.find((type) => path === type || path.startsWith(`${type}.`))
+  const exact = API_TYPES.find((type) => path === type)
+  if (exact) return exact
+  const known = API_TYPES.find((type) => path.startsWith(`${type}.`))
   if (known) return known
-  if (path.startsWith('llm.')) return 'llm.chat'
+  if (path.startsWith('llm.')) return 'llm'
   if (path.startsWith('embedding.')) return 'embedding.text'
   if (path.startsWith('image.')) return 'image.txt2img'
   if (path.startsWith('vision.')) return 'vision.ocr'
@@ -1265,7 +1267,7 @@ function toApiTypes(value: unknown): ApiType[] {
   const apiTypes = toStringArray(value).filter((item): item is ApiType =>
     API_TYPES.includes(item as ApiType),
   )
-  return apiTypes.length > 0 ? apiTypes : ['llm.chat']
+  return apiTypes.length > 0 ? apiTypes : ['llm']
 }
 
 function toStringArray(value: unknown): string[] {
@@ -1314,7 +1316,7 @@ function asOptionalBoolean(value: unknown): boolean | undefined {
 }
 
 const API_TYPES: ApiType[] = [
-  'llm.chat',
+  'llm',
   'llm.completion',
   'embedding.text',
   'embedding.multimodal',

@@ -695,13 +695,6 @@ impl ControlPanelServer {
             .to_string()
     }
 
-    fn is_valid_provider_instance_name(value: &str) -> bool {
-        !value.trim().is_empty()
-            && value
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    }
-
     fn collect_aicc_provider_instance_names(settings: &Value) -> Vec<String> {
         let sections = [
             "sn-ai-provider",
@@ -768,34 +761,6 @@ impl ControlPanelServer {
         left.sort();
         left.dedup();
         left
-    }
-
-    fn provider_weights_from_settings(settings: &Value) -> serde_json::Map<String, Value> {
-        settings
-            .get("session_config")
-            .and_then(Value::as_object)
-            .and_then(|session| session.get("provider_weights"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn ensure_settings_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
-        if !value.is_object() {
-            *value = json!({});
-        }
-        value.as_object_mut().expect("settings must be object")
-    }
-
-    fn ensure_child_object<'a>(
-        parent: &'a mut serde_json::Map<String, Value>,
-        key: &str,
-    ) -> &'a mut serde_json::Map<String, Value> {
-        let entry = parent.entry(key.to_string()).or_insert_with(|| json!({}));
-        if !entry.is_object() {
-            *entry = json!({});
-        }
-        entry.as_object_mut().expect("child must be object")
     }
 
     pub(crate) fn build_message_hub_summary_prompt(
@@ -977,7 +942,7 @@ impl ControlPanelServer {
         let client = runtime.get_system_config_client().await?;
         let settings =
             Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
-        let weights = Self::provider_weights_from_settings(&settings);
+        let weights = serde_json::Map::new();
         let provider_names = Self::merge_provider_instance_names(
             Self::collect_aicc_provider_instance_names(&settings),
             self.collect_runtime_provider_instance_names().await,
@@ -1523,64 +1488,11 @@ impl ControlPanelServer {
 
     pub(crate) async fn handle_ai_provider_weight_set(
         &self,
-        req: RPCRequest,
+        _req: RPCRequest,
     ) -> Result<RPCResponse, RPCErrors> {
-        let provider_instance_name = Self::require_param_str(&req, "provider_instance_name")?;
-        if !Self::is_valid_provider_instance_name(provider_instance_name.as_str()) {
-            return Err(RPCErrors::ReasonError(
-                "provider_instance_name contains invalid characters".to_string(),
-            ));
-        }
-        let weight = req
-            .params
-            .get("weight")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| RPCErrors::ReasonError("weight is required".to_string()))?;
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(RPCErrors::ReasonError(
-                "weight must be a non-negative finite number".to_string(),
-            ));
-        }
-
-        let runtime = get_buckyos_api_runtime()?;
-        let client = runtime.get_system_config_client().await?;
-        let mut settings =
-            Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
-        let provider_names = Self::merge_provider_instance_names(
-            Self::collect_aicc_provider_instance_names(&settings),
-            self.collect_runtime_provider_instance_names().await,
-        );
-        if !provider_names
-            .iter()
-            .any(|name| name == provider_instance_name.as_str())
-        {
-            return Err(RPCErrors::ReasonError(format!(
-                "provider instance not found: {}",
-                provider_instance_name
-            )));
-        }
-
-        let root = Self::ensure_settings_object(&mut settings);
-        let session_config = Self::ensure_child_object(root, "session_config");
-        let provider_weights = Self::ensure_child_object(session_config, "provider_weights");
-        if (weight - 1.0).abs() < f64::EPSILON {
-            provider_weights.remove(provider_instance_name.as_str());
-        } else {
-            provider_weights.insert(provider_instance_name.clone(), json!(weight));
-        }
-
-        Self::save_json_config(&client, AICC_SETTINGS_KEY, &settings).await?;
-        let reload_result = self.reload_aicc_settings_value().await?;
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "provider_instance_name": provider_instance_name,
-                "weight": weight,
-                "is_default": (weight - 1.0).abs() < f64::EPSILON,
-                "reload": reload_result
-            })),
-            req.seq,
+        Err(RPCErrors::ReasonError(
+            "global AICC provider weights are not supported; use caller session_config instead"
+                .to_string(),
         ))
     }
 

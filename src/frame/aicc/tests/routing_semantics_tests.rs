@@ -440,7 +440,7 @@ fn route_resolve_returns_control_plane_selection_without_starting_provider() {
         .resolve_route(
             RouteResolveRequest {
                 request_id: Some("route-test-1".to_string()),
-                api_type: "llm.chat".to_string(),
+                api_type: "llm".to_string(),
                 logical_model: "llm.plan.default".to_string(),
                 requirements: Default::default(),
                 disable: Default::default(),
@@ -486,7 +486,7 @@ fn route_resolve_rejects_exact_model_input() {
         .resolve_route(
             RouteResolveRequest {
                 request_id: Some("route-test-exact".to_string()),
-                api_type: "llm.chat".to_string(),
+                api_type: "llm".to_string(),
                 logical_model: "m@p-a".to_string(),
                 requirements: Default::default(),
                 disable: Default::default(),
@@ -808,7 +808,7 @@ fn purpose_logical_route_reaches_driver_family_mount() {
         .resolve_route(
             RouteResolveRequest {
                 request_id: Some("family-route".to_string()),
-                api_type: "llm.chat".to_string(),
+                api_type: "llm".to_string(),
                 logical_model: "llm.plan".to_string(),
                 requirements: Requirements::default(),
                 disable,
@@ -861,7 +861,7 @@ fn route_resolve_outputs_base_provider_model_and_variant_options() {
         .resolve_route(
             RouteResolveRequest {
                 request_id: Some("test-route".to_string()),
-                api_type: "llm.chat".to_string(),
+                api_type: "llm".to_string(),
                 logical_model: "llm.openai.gpt-5-1.reasoning-high".to_string(),
                 requirements: Requirements::default(),
                 disable: Default::default(),

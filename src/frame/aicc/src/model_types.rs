@@ -70,7 +70,7 @@ pub fn is_exact_model_name(value: &str) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiType {
-    #[serde(rename = "llm.chat")]
+    #[serde(rename = "llm")]
     LlmChat,
     #[serde(rename = "llm.completion")]
     LlmCompletion,
@@ -1414,7 +1414,7 @@ mod tests {
             "models": [{
                 "provider_model_id": "gpt-5.2",
                 "exact_model": "gpt-5.2@openai_primary",
-                "api_types": ["llm.chat", "llm.completion"],
+                "api_types": ["llm", "llm.completion"],
                 "logical_mounts": ["llm.gpt5"],
                 "capabilities": {
                     "streaming": true,
@@ -1446,6 +1446,6 @@ mod tests {
         );
         assert!(inventory.models[0].supports_api_type(&ApiType::LlmChat));
         let encoded = serde_json::to_value(&inventory).unwrap();
-        assert_eq!(encoded["models"][0]["api_types"][0], "llm.chat");
+        assert_eq!(encoded["models"][0]["api_types"][0], "llm");
     }
 }

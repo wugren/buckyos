@@ -50,7 +50,7 @@ max_rounds = 12
 max_consecutive_errors = 3
 
 [model]
-preferred = "llm.chat"
+preferred = "llm"
 
 [on_context_limit_reached]
 mode = "compress_then_continue"

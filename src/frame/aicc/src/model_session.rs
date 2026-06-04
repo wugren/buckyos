@@ -1117,18 +1117,10 @@ mod tests {
         let global = SessionConfig {
             logical_tree: [(
                 "llm".to_string(),
-                LogicalNode {
-                    children: [(
-                        "chat".to_string(),
-                        node_with_items(vec![
-                            ("quality", "llm.gpt5", 5.0),
-                            ("fast_local", "llm.local", 1.0),
-                        ]),
-                    )]
-                    .into_iter()
-                    .collect(),
-                    ..Default::default()
-                },
+                node_with_items(vec![
+                    ("quality", "llm.gpt5", 5.0),
+                    ("fast_local", "llm.local", 1.0),
+                ]),
             )]
             .into_iter()
             .collect(),
@@ -1140,34 +1132,26 @@ mod tests {
             logical_tree: [(
                 "llm".to_string(),
                 LogicalNode {
-                    children: [(
-                        "chat".to_string(),
-                        LogicalNode {
-                            item_overrides: Some(
-                                [
-                                    (
-                                        "quality".to_string(),
-                                        ModelItemPatch {
-                                            target: None,
-                                            weight: Some(1.0),
-                                        },
-                                    ),
-                                    (
-                                        "fast_local".to_string(),
-                                        ModelItemPatch {
-                                            target: None,
-                                            weight: Some(10.0),
-                                        },
-                                    ),
-                                ]
-                                .into_iter()
-                                .collect(),
+                    item_overrides: Some(
+                        [
+                            (
+                                "quality".to_string(),
+                                ModelItemPatch {
+                                    target: None,
+                                    weight: Some(1.0),
+                                },
                             ),
-                            ..Default::default()
-                        },
-                    )]
-                    .into_iter()
-                    .collect(),
+                            (
+                                "fast_local".to_string(),
+                                ModelItemPatch {
+                                    target: None,
+                                    weight: Some(10.0),
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
                     ..Default::default()
                 },
             )]
@@ -1185,16 +1169,10 @@ mod tests {
             .unwrap();
         let background = store.get_or_create("background-worker").unwrap();
 
-        assert_eq!(
-            item_weight(&interactive.config, "llm.chat", "fast_local"),
-            10.0
-        );
-        assert_eq!(item_weight(&interactive.config, "llm.chat", "quality"), 1.0);
-        assert_eq!(item_weight(&background.config, "llm.chat", "quality"), 5.0);
-        assert_eq!(
-            item_weight(&background.config, "llm.chat", "fast_local"),
-            1.0
-        );
+        assert_eq!(item_weight(&interactive.config, "llm", "fast_local"), 10.0);
+        assert_eq!(item_weight(&interactive.config, "llm", "quality"), 1.0);
+        assert_eq!(item_weight(&background.config, "llm", "quality"), 5.0);
+        assert_eq!(item_weight(&background.config, "llm", "fast_local"), 1.0);
     }
 
     #[test]
@@ -1322,25 +1300,17 @@ mod tests {
         let config = SessionConfig {
             logical_tree: [(
                 "llm".to_string(),
-                LogicalNode {
-                    children: [(
-                        "chat".to_string(),
-                        node_with_items(vec![
-                            ("quality", "gpt-5.2@openai_primary", 2.0),
-                            ("fast", "qwen3@local", 1.0),
-                        ]),
-                    )]
-                    .into_iter()
-                    .collect(),
-                    ..Default::default()
-                },
+                node_with_items(vec![
+                    ("quality", "gpt-5.2@openai_primary", 2.0),
+                    ("fast", "qwen3@local", 1.0),
+                ]),
             )]
             .into_iter()
             .collect(),
             logical_profile: Some(SessionLogicalProfile {
                 name: Some("interactive".to_string()),
                 overlays: vec![LogicalTreeOverlay {
-                    path: "llm.chat".to_string(),
+                    path: "llm".to_string(),
                     merge_mode: OverlayMergeMode::Inherit,
                     item_overrides: [(
                         "fast".to_string(),
@@ -1360,10 +1330,10 @@ mod tests {
 
         let effective = build_effective_session_config(&config).unwrap();
 
-        assert_eq!(item_weight(&effective.config, "llm.chat", "fast"), 8.0);
-        assert_eq!(item_weight(&effective.config, "llm.chat", "quality"), 2.0);
+        assert_eq!(item_weight(&effective.config, "llm", "fast"), 8.0);
+        assert_eq!(item_weight(&effective.config, "llm", "quality"), 2.0);
         assert_eq!(effective.overlay_trace.len(), 1);
-        assert_eq!(effective.overlay_trace[0].overlay_path, "llm.chat");
+        assert_eq!(effective.overlay_trace[0].overlay_path, "llm");
         assert_eq!(
             effective.overlay_trace[0].merge_mode,
             OverlayMergeMode::Inherit
@@ -1375,25 +1345,17 @@ mod tests {
         let config = SessionConfig {
             logical_tree: [(
                 "llm".to_string(),
-                LogicalNode {
-                    children: [(
-                        "chat".to_string(),
-                        node_with_items(vec![
-                            ("quality", "gpt-5.2@openai_primary", 2.0),
-                            ("fast", "qwen3@local", 1.0),
-                        ]),
-                    )]
-                    .into_iter()
-                    .collect(),
-                    ..Default::default()
-                },
+                node_with_items(vec![
+                    ("quality", "gpt-5.2@openai_primary", 2.0),
+                    ("fast", "qwen3@local", 1.0),
+                ]),
             )]
             .into_iter()
             .collect(),
             logical_profile: Some(SessionLogicalProfile {
                 name: Some("only-fast".to_string()),
                 overlays: vec![LogicalTreeOverlay {
-                    path: "llm.chat".to_string(),
+                    path: "llm".to_string(),
                     merge_mode: OverlayMergeMode::Replace,
                     items: [("fast".to_string(), ModelItem::new("qwen3@local", 1.0))]
                         .into_iter()
@@ -1406,7 +1368,7 @@ mod tests {
         };
 
         let effective = build_effective_session_config(&config).unwrap();
-        let node = effective.config.node("llm.chat").unwrap();
+        let node = effective.config.node("llm").unwrap();
         let items = node.items.as_ref().unwrap();
 
         assert_eq!(items.len(), 1);

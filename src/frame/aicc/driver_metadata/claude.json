@@ -6,7 +6,7 @@
   "patterns": [
     {
       "pattern": "claude-3-5-haiku*",
-      "api_types": ["llm.chat"],
+      "api_types": ["llm"],
       "logical_mounts": ["llm.claude", "llm.haiku", "llm.anthropic.{model}"],
       "capabilities": {
         "streaming": true,
@@ -24,7 +24,7 @@
     },
     {
       "pattern": "claude-3-5-*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.sonnet",
@@ -50,7 +50,7 @@
     },
     {
       "pattern": "claude-3-7-*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.sonnet",
@@ -76,7 +76,7 @@
     },
     {
       "pattern": "claude-opus-4*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.opus",
@@ -102,7 +102,7 @@
     },
     {
       "pattern": "claude-sonnet-4*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.sonnet",
@@ -128,7 +128,7 @@
     },
     {
       "pattern": "claude-haiku-4*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.haiku",
@@ -154,7 +154,7 @@
     },
     {
       "pattern": "claude-*",
-      "api_types": ["llm.chat", "vision.caption", "vision.ocr"],
+      "api_types": ["llm", "vision.caption", "vision.ocr"],
       "logical_mounts": [
         "llm.claude",
         "llm.anthropic.{model}",
@@ -179,7 +179,7 @@
     }
   ],
   "defaults": {
-    "api_types": ["llm.chat"],
+    "api_types": ["llm"],
     "logical_mounts": ["llm.claude", "llm.anthropic.{model}"],
     "capabilities": {
       "streaming": false,

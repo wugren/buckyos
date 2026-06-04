@@ -117,7 +117,7 @@
     },
     {
       "pattern": "gpt-*",
-      "api_types": ["llm.chat", "llm.completion", "rerank"],
+      "api_types": ["llm", "llm.completion", "rerank"],
       "logical_mounts": [
         "llm.{driver}",
         "llm.openai.{model}",
@@ -141,7 +141,7 @@
     },
     {
       "pattern": "chatgpt-*",
-      "api_types": ["llm.chat", "llm.completion"],
+      "api_types": ["llm", "llm.completion"],
       "logical_mounts": ["llm.{driver}", "llm.openai.{model}"],
       "capabilities": {
         "streaming": true,
@@ -157,7 +157,7 @@
     },
     {
       "pattern": "o*",
-      "api_types": ["llm.chat", "llm.completion"],
+      "api_types": ["llm", "llm.completion"],
       "logical_mounts": ["llm.{driver}", "llm.gpt", "llm.openai.{model}"],
       "capabilities": {
         "streaming": true,
@@ -171,7 +171,7 @@
     }
   ],
   "defaults": {
-    "api_types": ["llm.chat"],
+    "api_types": ["llm"],
     "logical_mounts": ["llm.{driver}", "llm.{driver}.{model}"],
     "capabilities": {
       "streaming": false,
@@ -214,7 +214,7 @@
         "llm.gpt-pro",
         "llm.gpt-mini",
         "llm.gpt-nano",
-        "llm.chat",
+        "llm",
         "llm.summarize",
         "llm.swift",
         "llm.plan",
@@ -244,7 +244,7 @@
         "llm.gpt-pro",
         "llm.gpt-mini",
         "llm.gpt-nano",
-        "llm.chat",
+        "llm",
         "llm.summarize",
         "llm.swift",
         "llm.plan",
@@ -271,7 +271,7 @@
         "llm.gpt-pro",
         "llm.gpt-mini",
         "llm.gpt-nano",
-        "llm.chat",
+        "llm",
         "llm.summarize",
         "llm.swift",
         "llm.plan",
@@ -298,7 +298,7 @@
         "llm.gpt-pro",
         "llm.gpt-mini",
         "llm.gpt-nano",
-        "llm.chat",
+        "llm",
         "llm.summarize",
         "llm.swift",
         "llm.plan",

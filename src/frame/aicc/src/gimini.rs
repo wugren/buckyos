@@ -2843,12 +2843,7 @@ fn register_default_aliases(
     }
 
     if let Some(default_model) = default_model.filter(|model| !is_text2image_model_name(model)) {
-        for alias in [
-            "llm.default",
-            "llm.chat.default",
-            "llm.plan.default",
-            "llm.code.default",
-        ] {
+        for alias in ["llm.default", "llm.plan.default", "llm.code.default"] {
             center.model_catalog().set_mapping(
                 Capability::Llm,
                 alias,

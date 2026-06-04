@@ -172,6 +172,7 @@ fn build_exact_index<'a>(
 pub struct InventoryRefreshScheduler {
     registry: Arc<RwLock<ModelRegistry>>,
     inventory_source: Arc<dyn Fn() -> Vec<ProviderInventory> + Send + Sync>,
+    refresh_hook: Option<Arc<dyn Fn() -> Result<(), RouteError> + Send + Sync>>,
     interval: Duration,
     notify: Notify,
     started: AtomicBool,
@@ -186,13 +187,25 @@ impl InventoryRefreshScheduler {
         Self {
             registry,
             inventory_source,
+            refresh_hook: None,
             interval,
             notify: Notify::new(),
             started: AtomicBool::new(false),
         }
     }
 
+    pub fn with_refresh_hook(
+        mut self,
+        hook: Arc<dyn Fn() -> Result<(), RouteError> + Send + Sync>,
+    ) -> Self {
+        self.refresh_hook = Some(hook);
+        self
+    }
+
     pub fn refresh_once(&self) -> Result<usize, RouteError> {
+        if let Some(hook) = self.refresh_hook.as_ref() {
+            hook()?;
+        }
         let inventories = (self.inventory_source)();
         let active_providers = inventories
             .iter()
@@ -436,6 +449,7 @@ mod tests {
         CostClass, HealthStatus, LogicalModelDefinition, ModelAttributes, ModelCapabilities,
         ModelHealth, ModelMetadata, ModelRequirement, MountMode, ProviderType,
     };
+    use std::sync::atomic::AtomicUsize;
 
     fn model(provider: &str, provider_model_id: &str, mount: &str) -> ModelMetadata {
         ModelMetadata {
@@ -604,6 +618,30 @@ mod tests {
                 .is_none(),
             "openai inventory should not be applied (it was malformed)"
         );
+    }
+
+    #[test]
+    fn refresh_once_runs_refresh_hook() {
+        let registry = Arc::new(RwLock::new(ModelRegistry::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = calls.clone();
+        let inventories = Arc::new(vec![inventory(
+            "openai_primary",
+            "r1",
+            vec![model("openai_primary", "gpt-5.2", "llm.gpt5")],
+        )]);
+        let scheduler = InventoryRefreshScheduler::new(
+            registry.clone(),
+            Arc::new(move || (*inventories).clone()),
+            Duration::from_secs(60),
+        )
+        .with_refresh_hook(Arc::new(move || {
+            calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+        assert_eq!(scheduler.refresh_once().unwrap(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

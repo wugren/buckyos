@@ -1019,10 +1019,7 @@ mod tests {
         let mut backup = metadata("openai_backup", "gpt-5.2", "", ProviderType::CloudApi);
         backup.logical_mounts = Vec::new();
         registry
-            .set_logical_definitions(vec![auto_definition(
-                "llm.chat",
-                ModelRequirement::default(),
-            )])
+            .set_logical_definitions(vec![auto_definition("llm", ModelRequirement::default())])
             .unwrap();
         registry
             .apply_inventory(ProviderInventory {
@@ -1054,25 +1051,17 @@ mod tests {
             logical_tree: [(
                 "llm".to_string(),
                 LogicalNode {
-                    children: [(
-                        "chat".to_string(),
-                        LogicalNode {
-                            item_overrides: Some(
-                                [(
-                                    "gpt-5_2_openai_primary".to_string(),
-                                    crate::model_types::ModelItemPatch {
-                                        target: None,
-                                        weight: Some(0.0),
-                                    },
-                                )]
-                                .into_iter()
-                                .collect(),
-                            ),
-                            ..Default::default()
-                        },
-                    )]
-                    .into_iter()
-                    .collect(),
+                    item_overrides: Some(
+                        [(
+                            "gpt-5_2_openai_primary".to_string(),
+                            crate::model_types::ModelItemPatch {
+                                target: None,
+                                weight: Some(0.0),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
                     ..Default::default()
                 },
             )]
@@ -1083,7 +1072,7 @@ mod tests {
         let router = ModelRouter::new(&registry, &config);
 
         let resolved = router
-            .resolve(request("llm.chat", RoutePolicy::default()))
+            .resolve(request("llm", RoutePolicy::default()))
             .unwrap();
 
         assert_eq!(resolved.candidates.len(), 1);
@@ -1121,19 +1110,9 @@ mod tests {
     #[test]
     fn inherit_overlay_preserves_fallback_candidates_when_preferred_quota_exhausted() {
         let mut registry = ModelRegistry::new();
-        let mut primary = metadata(
-            "openai_primary",
-            "gpt-5.2",
-            "llm.chat",
-            ProviderType::CloudApi,
-        );
+        let mut primary = metadata("openai_primary", "gpt-5.2", "llm", ProviderType::CloudApi);
         primary.health.quota_state = QuotaState::Exhausted;
-        let backup = metadata(
-            "anthropic",
-            "claude-sonnet",
-            "llm.chat",
-            ProviderType::CloudApi,
-        );
+        let backup = metadata("anthropic", "claude-sonnet", "llm", ProviderType::CloudApi);
         registry
             .apply_inventory(ProviderInventory {
                 provider_instance_name: "openai_primary".to_string(),
@@ -1164,7 +1143,7 @@ mod tests {
             logical_profile: Some(SessionLogicalProfile {
                 name: Some("prefer-primary".to_string()),
                 overlays: vec![LogicalTreeOverlay {
-                    path: "llm.chat".to_string(),
+                    path: "llm".to_string(),
                     merge_mode: OverlayMergeMode::Inherit,
                     items: [(
                         "preferred".to_string(),
@@ -1184,7 +1163,7 @@ mod tests {
         let resolved = router
             .resolve(RouteRequest {
                 session_overlay_trace: effective.overlay_trace,
-                ..request("llm.chat", RoutePolicy::default())
+                ..request("llm", RoutePolicy::default())
             })
             .unwrap();
 
@@ -1198,19 +1177,9 @@ mod tests {
     #[test]
     fn replace_overlay_does_not_fallback_when_only_model_quota_exhausted() {
         let mut registry = ModelRegistry::new();
-        let mut primary = metadata(
-            "openai_primary",
-            "gpt-5.2",
-            "llm.chat",
-            ProviderType::CloudApi,
-        );
+        let mut primary = metadata("openai_primary", "gpt-5.2", "llm", ProviderType::CloudApi);
         primary.health.quota_state = QuotaState::Exhausted;
-        let backup = metadata(
-            "anthropic",
-            "claude-sonnet",
-            "llm.chat",
-            ProviderType::CloudApi,
-        );
+        let backup = metadata("anthropic", "claude-sonnet", "llm", ProviderType::CloudApi);
         registry
             .apply_inventory(ProviderInventory {
                 provider_instance_name: "openai_primary".to_string(),
@@ -1241,7 +1210,7 @@ mod tests {
             logical_profile: Some(SessionLogicalProfile {
                 name: Some("only-primary".to_string()),
                 overlays: vec![LogicalTreeOverlay {
-                    path: "llm.chat".to_string(),
+                    path: "llm".to_string(),
                     merge_mode: OverlayMergeMode::Replace,
                     items: [(
                         "only".to_string(),
@@ -1261,7 +1230,7 @@ mod tests {
         let err = router
             .resolve(RouteRequest {
                 session_overlay_trace: effective.overlay_trace,
-                ..request("llm.chat", RoutePolicy::default())
+                ..request("llm", RoutePolicy::default())
             })
             .unwrap_err();
 

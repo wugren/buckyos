@@ -136,7 +136,7 @@
     },
     {
       "pattern": "gemini-*flash-lite*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -173,7 +173,7 @@
     },
     {
       "pattern": "gemini-*flash*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -210,7 +210,7 @@
     },
     {
       "pattern": "gemini-*deepthink*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -247,7 +247,7 @@
     },
     {
       "pattern": "gemini-*deep-think*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -284,7 +284,7 @@
     },
     {
       "pattern": "gemini-*pro*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -321,7 +321,7 @@
     },
     {
       "pattern": "gemini-*",
-      "api_types": ["llm.chat", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
       "logical_mounts": [
         "llm.google-gemini",
         "llm.gemini",
@@ -357,7 +357,7 @@
     }
   ],
   "defaults": {
-    "api_types": ["llm.chat"],
+    "api_types": ["llm"],
     "logical_mounts": ["llm.google-gemini", "llm.gemini", "llm.gemini.{model}"],
     "capabilities": {
       "streaming": false,

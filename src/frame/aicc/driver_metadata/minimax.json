@@ -6,7 +6,7 @@
   "patterns": [
     {
       "pattern": "MiniMax-*",
-      "api_types": ["llm.chat"],
+      "api_types": ["llm"],
       "logical_mounts": ["llm.minimax", "llm.minimax.{model}"],
       "capabilities": {
         "streaming": true,
@@ -22,7 +22,7 @@
     }
   ],
   "defaults": {
-    "api_types": ["llm.chat"],
+    "api_types": ["llm"],
     "logical_mounts": ["llm.minimax", "llm.minimax.{model}"],
     "capabilities": {
       "streaming": false,

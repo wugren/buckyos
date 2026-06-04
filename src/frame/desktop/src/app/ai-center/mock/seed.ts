@@ -31,7 +31,7 @@ function model(
       tool_call: apiTypes.some((t) => t.startsWith('llm.')),
       json_schema: apiTypes.some((t) => t.startsWith('llm.')),
       web_search: false,
-      vision: apiTypes.some((t) => t.startsWith('vision.') || t === 'llm.chat'),
+      vision: apiTypes.some((t) => t.startsWith('vision.') || t === 'llm'),
       max_context_tokens: 128000,
       max_output_tokens: 8192,
     },
@@ -59,7 +59,7 @@ function model(
 }
 
 const snModels = [
-  model('sn-router-balanced', 'sn-router', ['llm.chat', 'llm.fallback'], ['llm.chat'], {
+  model('sn-router-balanced', 'sn-router', ['llm', 'llm.fallback'], ['llm'], {
     attributes: {
       local: false,
       privacy: 'private_safe',
@@ -89,7 +89,7 @@ const snModels = [
 ]
 
 const openaiModels = [
-  model('gpt-5.1', 'openai-main', ['llm.gpt-standard', 'llm.openai.gpt-5-1'], ['llm.chat'], {
+  model('gpt-5.1', 'openai-main', ['llm.gpt-standard', 'llm.openai.gpt-5-1'], ['llm'], {
     parameter_scale: 'frontier',
     capabilities: {
       streaming: true,
@@ -114,7 +114,7 @@ const openaiModels = [
       cache_input_token_usd: 0.0000025,
     },
   }),
-  model('gpt-5.1-mini', 'openai-main', ['llm.gpt-mini', 'llm.openai.gpt-5-1-mini'], ['llm.chat'], {
+  model('gpt-5.1-mini', 'openai-main', ['llm.gpt-mini', 'llm.openai.gpt-5-1-mini'], ['llm'], {
     attributes: {
       local: false,
       privacy: 'public_cloud',
@@ -150,7 +150,7 @@ const openaiModels = [
 ]
 
 const anthropicModels = [
-  model('claude-opus-4.7', 'anthropic-work', ['llm.opus'], ['llm.chat'], {
+  model('claude-opus-4.7', 'anthropic-work', ['llm.opus'], ['llm'], {
     parameter_scale: 'frontier',
     attributes: {
       local: false,
@@ -168,7 +168,7 @@ const anthropicModels = [
       quota_state: 'near_limit',
     },
   }),
-  model('claude-sonnet-4.5', 'anthropic-work', ['llm.sonnet', 'llm.anthropic.claude-sonnet-4-5'], ['llm.chat'], {
+  model('claude-sonnet-4.5', 'anthropic-work', ['llm.sonnet', 'llm.anthropic.claude-sonnet-4-5'], ['llm'], {
     attributes: {
       local: false,
       privacy: 'public_cloud',
@@ -194,7 +194,7 @@ const localModels: LocalModel[] = [
     size_bytes: 21.6 * 1024 * 1024 * 1024,
     status: 'ready',
     last_used_at: '2026-05-29T18:20:00Z',
-    ...model('qwen2.5-coder-32b', 'local', ['llm.qwen-coder', 'llm.local.qwen2-5-coder-32b'], ['llm.chat'], {
+    ...model('qwen2.5-coder-32b', 'local', ['llm.qwen-coder', 'llm.local.qwen2-5-coder-32b'], ['llm'], {
       parameter_scale: '32B',
       attributes: {
         local: true,
@@ -383,7 +383,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
       path: 'llm',
       label: 'LLM namespace',
       level: 'L3',
-      api_type: 'llm.chat',
+      api_type: 'llm',
       exact_model_weights: {},
       fallback: { mode: 'strict' },
       policy: { profile: 'balanced', allow_fallback: true, runtime_failover: true },
@@ -393,7 +393,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           path: 'llm.plan',
           label: 'Planning',
           level: 'L3',
-          api_type: 'llm.chat',
+          api_type: 'llm',
           items: {
             opus: { target: 'llm.opus', weight: 2.5 },
             gemini: { target: 'llm.gemini-pro', weight: 2.4 },
@@ -405,15 +405,15 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           policy: { profile: 'quality_first', allow_fallback: true, runtime_failover: true },
           resolved_exact_model: withPhysicalModels ? opusExact : undefined,
           children: [
-            mountNode('llm.opus', 'Provider flagship planning mount', 'llm.chat', withPhysicalModels ? opusExact : undefined, withPhysicalModels ? [
-              exactNode(opusExact, 'Anthropic Opus exact model', 'llm.chat', true),
+            mountNode('llm.opus', 'Provider flagship planning mount', 'llm', withPhysicalModels ? opusExact : undefined, withPhysicalModels ? [
+              exactNode(opusExact, 'Anthropic Opus exact model', 'llm', true),
             ] : []),
-            mountNode('llm.gemini-pro', 'Gemini planning mount', 'llm.chat', undefined),
-            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
-              exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
+            mountNode('llm.gemini-pro', 'Gemini planning mount', 'llm', undefined),
+            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+              exactNode(gptExact, 'OpenAI frontier exact model', 'llm', true),
             ] : []),
-            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
-              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
+            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm', true),
             ] : []),
           ],
         },
@@ -421,7 +421,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           path: 'llm.code',
           label: 'Code generation',
           level: 'L3',
-          api_type: 'llm.chat',
+          api_type: 'llm',
           items: {
             sonnet: { target: 'llm.sonnet', weight: 2.4 },
             gpt: { target: 'llm.gpt-standard', weight: 2.1 },
@@ -432,14 +432,14 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           policy: { profile: 'local_first', allow_fallback: true, required_features: ['tool_call'] },
           resolved_exact_model: withPhysicalModels ? sonnetExact : undefined,
           children: [
-            mountNode('llm.sonnet', 'Balanced coding mount', 'llm.chat', withPhysicalModels ? sonnetExact : undefined, withPhysicalModels ? [
-              exactNode(sonnetExact, 'Anthropic Sonnet exact model', 'llm.chat', true),
+            mountNode('llm.sonnet', 'Balanced coding mount', 'llm', withPhysicalModels ? sonnetExact : undefined, withPhysicalModels ? [
+              exactNode(sonnetExact, 'Anthropic Sonnet exact model', 'llm', true),
             ] : []),
-            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm.chat', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
-              exactNode(gptExact, 'OpenAI frontier exact model', 'llm.chat', true),
+            mountNode('llm.gpt-standard', 'OpenAI GPT standard family mount', 'llm', withPhysicalModels ? gptExact : undefined, withPhysicalModels ? [
+              exactNode(gptExact, 'OpenAI frontier exact model', 'llm', true),
             ] : []),
-            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm.chat', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
-              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm.chat', true),
+            mountNode('llm.qwen-coder', 'Qwen coder family mount', 'llm', withPhysicalModels ? localCodeExact : undefined, withPhysicalModels ? [
+              exactNode(localCodeExact, 'Local Qwen coder exact model', 'llm', true),
             ] : []),
           ],
         },
@@ -447,7 +447,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           path: 'llm.swift',
           label: 'Fast responses',
           level: 'L3',
-          api_type: 'llm.chat',
+          api_type: 'llm',
           items: {
             mini: { target: 'llm.gpt-mini', weight: 2 },
             sn: { target: 'llm.sn-balanced', weight: 1.7 },
@@ -457,11 +457,11 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           policy: { profile: 'latency_first', allow_fallback: true },
           resolved_exact_model: withPhysicalModels ? miniExact : undefined,
           children: [
-            mountNode('llm.gpt-mini', 'OpenAI GPT mini family mount', 'llm.chat', withPhysicalModels ? miniExact : undefined, withPhysicalModels ? [
-              exactNode(miniExact, 'OpenAI mini exact model', 'llm.chat', true),
+            mountNode('llm.gpt-mini', 'OpenAI GPT mini family mount', 'llm', withPhysicalModels ? miniExact : undefined, withPhysicalModels ? [
+              exactNode(miniExact, 'OpenAI mini exact model', 'llm', true),
             ] : []),
-            mountNode('llm.sn-balanced', 'SN balanced mount', 'llm.chat', withPhysicalModels ? 'sn-router-balanced@sn-router' : undefined, withPhysicalModels ? [
-              exactNode('sn-router-balanced@sn-router', 'SN balanced exact model', 'llm.chat', true),
+            mountNode('llm.sn-balanced', 'SN balanced mount', 'llm', withPhysicalModels ? 'sn-router-balanced@sn-router' : undefined, withPhysicalModels ? [
+              exactNode('sn-router-balanced@sn-router', 'SN balanced exact model', 'llm', true),
             ] : []),
           ],
         },
@@ -469,7 +469,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           path: 'llm.reason',
           label: 'Deep reasoning',
           level: 'L3',
-          api_type: 'llm.chat',
+          api_type: 'llm',
           items: {
             reasoner: { target: 'llm.reasoner', weight: 2.8 },
           },
@@ -478,7 +478,7 @@ function buildLogicalTree(withPhysicalModels: boolean): LogicalNode[] {
           policy: { profile: 'quality_first', allow_fallback: false },
           resolved_exact_model: undefined,
           children: [
-            mountNode('llm.reasoner', 'Reasoning mount without inventory match', 'llm.chat', undefined),
+            mountNode('llm.reasoner', 'Reasoning mount without inventory match', 'llm', undefined),
           ],
         },
       ],
@@ -588,11 +588,11 @@ function generateUsageEvents(): UsageEvent[] {
   const now = Date.now()
   const day = 24 * 60 * 60 * 1000
   const rows = [
-    { provider: 'openai-main', exact: 'gpt-5.1@openai-main', requested: 'llm.code', api: 'llm.chat' as ApiType, cost: 0.000028 },
-    { provider: 'anthropic-work', exact: 'claude-opus-4.7@anthropic-work', requested: 'llm.plan', api: 'llm.chat' as ApiType, cost: 0.000042 },
+    { provider: 'openai-main', exact: 'gpt-5.1@openai-main', requested: 'llm.code', api: 'llm' as ApiType, cost: 0.000028 },
+    { provider: 'anthropic-work', exact: 'claude-opus-4.7@anthropic-work', requested: 'llm.plan', api: 'llm' as ApiType, cost: 0.000042 },
     { provider: 'openai-main', exact: 'text-embedding-3-large@openai-main', requested: 'embedding', api: 'embedding.text' as ApiType, cost: 0.000001 },
     { provider: 'sn-router', exact: 'sn-router-image@sn-router', requested: 'image.txt2img', api: 'image.txt2img' as ApiType, cost: 0.00005 },
-    { provider: 'local', exact: 'qwen2.5-coder-32b@local', requested: 'llm.code', api: 'llm.chat' as ApiType, cost: 0 },
+    { provider: 'local', exact: 'qwen2.5-coder-32b@local', requested: 'llm.code', api: 'llm' as ApiType, cost: 0 },
   ]
   const apps = ['studio', 'codeassistant', 'messagehub', 'jarvis']
   const agents = ['agent-coder', 'agent-planner', 'agent-analyst', 'jarvis-default']
@@ -631,7 +631,7 @@ const routeTraces: RouteTrace[] = [
   {
     request_id: 'trace-llm-plan-001',
     session_id: 'session-04',
-    api_type: 'llm.chat',
+    api_type: 'llm',
     requested_model: 'llm.plan',
     requested_model_type: 'logical',
     resolved_logical_path: 'llm.plan',
@@ -705,7 +705,7 @@ const routeTraces: RouteTrace[] = [
   {
     request_id: 'trace-llm-code-018',
     session_id: 'session-18',
-    api_type: 'llm.chat',
+    api_type: 'llm',
     requested_model: 'llm.code',
     requested_model_type: 'logical',
     resolved_logical_path: 'llm.code',
@@ -737,7 +737,7 @@ const routeTraces: RouteTrace[] = [
 const directoryOnlyRouteTraces: RouteTrace[] = [
   {
     request_id: 'trace-directory-only-llm-reason',
-    api_type: 'llm.chat',
+    api_type: 'llm',
     requested_model: 'llm.reason',
     requested_model_type: 'logical',
     resolved_logical_path: 'llm.reason',

@@ -670,7 +670,7 @@ mod tests {
         let profile = SessionLogicalProfile {
             name: Some("only-local".to_string()),
             overlays: vec![LogicalTreeOverlay {
-                path: "llm.chat".to_string(),
+                path: "llm".to_string(),
                 merge_mode: OverlayMergeMode::Replace,
                 items: [(
                     "local".to_string(),

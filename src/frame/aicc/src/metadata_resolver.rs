@@ -667,7 +667,7 @@ fn generic_mounts(
             format!("{}.{}", base, logical_mount_segment(provider_model_id)),
         );
         if matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion) {
-            add_unique(&mut mounts, "llm.chat".to_string());
+            add_unique(&mut mounts, "llm".to_string());
             add_unique(
                 &mut mounts,
                 format!("llm.{}", logical_mount_segment(provider_driver)),
@@ -744,7 +744,7 @@ pub(crate) fn semantic_llm_family_mounts(provider_model_id: &str) -> Vec<String>
 
 fn api_mount_base(api_type: &ApiType) -> &'static str {
     match api_type {
-        ApiType::LlmChat => "llm.chat",
+        ApiType::LlmChat => "llm",
         ApiType::LlmCompletion => "llm.completion",
         ApiType::Embedding => "embedding.text",
         ApiType::EmbeddingMultimodal => "embedding.multimodal",
@@ -781,7 +781,7 @@ fn provider_fallback_mounts(mounts: &[String]) -> Vec<String> {
 
 fn is_task_role_mount(mount: &str) -> bool {
     const ROLE_MOUNTS: &[&str] = &[
-        "llm.chat",
+        "llm",
         "llm.plan",
         "llm.code",
         "llm.reason",
@@ -793,9 +793,10 @@ fn is_task_role_mount(mount: &str) -> bool {
     ];
     ROLE_MOUNTS.iter().any(|role| {
         mount == *role
-            || mount
-                .strip_prefix(*role)
-                .is_some_and(|tail| tail.starts_with('.'))
+            || (*role != "llm"
+                && mount
+                    .strip_prefix(*role)
+                    .is_some_and(|tail| tail.starts_with('.')))
     })
 }
 
@@ -1137,7 +1138,7 @@ mod tests {
         let mut request = DriverModelResolveRequest::new("future-model", vec![ApiType::LlmChat]);
         request.fallback_logical_mounts = vec![
             "llm.plan".to_string(),
-            "llm.chat".to_string(),
+            "llm".to_string(),
             "llm.future-family".to_string(),
         ];
         let inventory = resolve_driver_inventory(
@@ -1199,7 +1200,7 @@ mod tests {
             .logical_mounts
             .iter()
             .any(|mount| mount == "llm.openai.gpt-5-5"));
-        assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+        assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm"));
         assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.code"));
         assert!(!gpt.logical_mounts.iter().any(|mount| mount == "llm.plan"));
 
@@ -1313,7 +1314,7 @@ mod tests {
             .logical_mounts
             .iter()
             .any(|mount| mount == "llm.anthropic.claude-3-5-haiku-20241022"));
-        assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+        assert!(!model.logical_mounts.iter().any(|mount| mount == "llm"));
     }
 
     #[test]
@@ -1357,7 +1358,7 @@ mod tests {
             .any(|mount| mount == "llm.haiku"));
 
         for model in inventory.models.iter() {
-            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm"));
             assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.code"));
             assert!(!model
                 .logical_mounts
@@ -1405,7 +1406,7 @@ mod tests {
             .iter()
             .any(|mount| mount == "llm.gemini-deepthink"));
         for model in inventory.models.iter() {
-            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm.chat"));
+            assert!(!model.logical_mounts.iter().any(|mount| mount == "llm"));
         }
     }
 

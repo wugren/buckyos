@@ -15,7 +15,7 @@ export type ApiNamespace =
   | 'llm' | 'embedding' | 'rerank' | 'image' | 'vision' | 'audio' | 'video' | 'agent'
 
 export type ApiType =
-  | 'llm.chat' | 'llm.completion'
+  | 'llm' | 'llm.completion'
   | 'embedding.text' | 'embedding.multimodal'
   | 'rerank'
   | 'image.txt2img' | 'image.img2img' | 'image.inpaint' | 'image.upscale' | 'image.bg_remove'
