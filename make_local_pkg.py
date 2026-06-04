@@ -678,6 +678,15 @@ def detect_target(
     )
 
 
+def _infer_package_format_from_path(pkg_path: str) -> str | None:
+    suffix = Path(pkg_path).suffix.lower()
+    if suffix == ".deb":
+        return "deb"
+    if suffix == ".rpm":
+        return "rpm"
+    return None
+
+
 def _node_daemon_candidates(build_root: Path, target: TargetScript) -> list[Path]:
     candidates = [build_root / "buckyos" / "bin" / "node-daemon" / "node_daemon"]
     if target.platform_key == "windows":
@@ -1196,11 +1205,21 @@ def verify_pkg(argv: list[str]) -> int:
     parser.add_argument("pkg", help="Path to package file")
     parser.add_argument("--arch", default=None, help="Override detected architecture")
     parser.add_argument("--build-root", default=None, help="Override BUCKYOS_BUILD_ROOT")
-    parser.add_argument("--format", choices=("deb", "rpm"), default=None, help="Linux package format (default: deb)")
+    parser.add_argument(
+        "--format",
+        choices=("deb", "rpm"),
+        default=None,
+        help="Linux package format (default: infer from .deb/.rpm, otherwise deb)",
+    )
     parser.add_argument("--project", default=str(SRC_DIR / "bucky_project.yaml"))
     args, forwarded = parser.parse_known_args(argv)
 
-    target = detect_target(args.arch, args.build_root, args.format)
+    suffix_format = _infer_package_format_from_path(args.pkg)
+    if args.format and suffix_format and args.format != suffix_format:
+        raise RuntimeError(f"--format {args.format} conflicts with package extension .{suffix_format}: {args.pkg}")
+    package_format = args.format or suffix_format
+
+    target = detect_target(args.arch, args.build_root, package_format)
     manifest_path = _write_project_manifest(
         project_path=Path(args.project),
         build_root=target.build_root,

@@ -238,7 +238,7 @@ publish:
         type: app
         optional: true
         default_selected: true
-        default_target: "C:\\BuckyOS\\buckycli"
+        default_target: "%USERPROFILE%\\buckycli\\"
 
   linux_pkg:
     apps:
@@ -837,7 +837,7 @@ sudo dnf install ./buckyos-linux-{arch}-{version}.rpm
 - `node_daemon_loader.vbs` 是单文件隐藏启动器：检查 `node_daemon.exe` 是否已运行，未运行时以隐藏窗口启动 `node_daemon.exe --enable_active`。
 - 需要兼容清理旧版本 Windows service `buckyos`。
 
-`buckycli` 是系统级命令行工具，Windows exe 默认安装到 `C:\BuckyOS\buckycli`，安装后由 `buckycli_postinstall.ps1` 把该目录写入当前用户 PATH，卸载前由 `buckycli_preuninstall.ps1` 从 PATH 删除；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
+`buckycli` 是系统级命令行工具，Windows exe 默认安装到当前用户的 `~/buckycli/`（配置中写作 `%USERPROFILE%\buckycli\`），安装后由 `buckycli_postinstall.ps1` 把该目录写入当前用户 PATH，卸载前由 `buckycli_preuninstall.ps1` 从 PATH 删除；身份和配置目录不由安装器创建或迁移，运行时由命令参数显式指定，或默认使用调用者自己的配置目录。
 
 Windows 不需要写普通图形安装日志。静默安装日志 MUST 写到：
 
