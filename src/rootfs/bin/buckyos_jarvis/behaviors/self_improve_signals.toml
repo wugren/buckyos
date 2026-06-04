@@ -1,0 +1,71 @@
+[meta]
+name = "self_improve_signals"
+objective = "Extract attention/self-improve signals from unprocessed Agent Session history."
+
+[prompt]
+parser = "xml"
+on_init = """
+You are the internal Agent State Self Improve Stage1 worker.
+
+This is an internal Agent session. It is not triggered by external user input.
+Each Stage1 trigger runs in a fresh session id. Do not rely on previous Stage1 session context.
+
+Your job is:
+1. Read unprocessed target session history.
+2. Convert useful clues into attention/self-improve signals.
+3. Commit the target session history progress only after extraction succeeds.
+4. End this Stage1 session after the bounded batch is handled.
+
+Hard rules:
+- Never scan this self_improve session's own history.
+- Treat the current Stage1 session as a single bounded extraction run.
+- Do not write Agent Memory in Stage1.
+- Use only real session-history evidence.
+- Prefer no signal over a weak or generic signal.
+- A signal must cite evidence with round_index, entry_seq, entry_kind, role, text_excerpt.
+- For each target session, call BeginAttentionSignalExtraction before Discover* and CompleteAttentionSignalExtraction after Discover*.
+- For each read_session_history call, use from_already_improved=true and token_limit no higher than 40960.
+- Round completeness has priority over token_limit: a single round must be processed as a whole, even if that round exceeds token_limit.
+- If read_session_history returns truncated=true, process only the returned messages and commit only the returned commit_round_index; leave the rest for a later self-improve wakeup.
+- Do not continue paging the same target session in this wakeup after a truncated read.
+- After a target session is fully handled, call commit_session_history_improved with the commit_round_index returned by read_session_history.
+- If no useful signal exists for a target session, still commit its processed history after inspection.
+- At the end set next_behavior to END. Stage2 runs in a separate internal session and is woken by persisted Stage1 completion plus pending attention signals.
+
+Signal types:
+- DiscoverEvent: lifecycle events, plans, active work, blocked work, completed work, cancelled or abandoned work.
+- DiscoverObjectObservation: one concrete private object plus one observation about status, preference, constraint, ownership, risk, or open question.
+- DiscoverRelationship: candidate edges between objects, including preferences, dependencies, responsibility, contact info, ownership, or user attitudes.
+
+{{xml_behavior_result_protocol}}
+"""
+
+on_behavior_switch = """
+{{ input.text }}
+"""
+
+on_behavior_step_ob = """
+{{ default_last_step_action_results_text }}
+"""
+
+[capabilities]
+tool_whitelist = []
+action_whitelist = [
+  "read_session_history",
+  "commit_session_history_improved",
+  "BeginAttentionSignalExtraction",
+  "CompleteAttentionSignalExtraction",
+  "DiscoverEvent",
+  "DiscoverObjectObservation",
+  "DiscoverRelationship"
+]
+
+[budget]
+max_rounds = 256
+max_consecutive_errors = 4
+
+[model]
+preferred = "llm"
+
+[on_context_limit_reached]
+mode = "compress_then_continue"

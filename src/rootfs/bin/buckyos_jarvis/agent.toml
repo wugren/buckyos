@@ -175,10 +175,10 @@ pull_msg = "all"
 pull_event = "timer.*"
 
 [session.self_improve]
-enabled = false
+enabled = true
 kind = "self_improve"
 loop_mode = "behavior"
-default_behavior = "self_improve"
+default_behavior = "self_improve_signals"
 session_id_strategy = "singleton"
 process_stack_limit = 2
 

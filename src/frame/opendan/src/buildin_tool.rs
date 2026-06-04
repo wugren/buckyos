@@ -1,23 +1,37 @@
 use std::path::Path;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
-use agent_tool::{AgentToolError, AgentToolManager, CallingConventions, ToolCtx, TypedTool};
+use agent_tool::{
+    agent_attention_signal::{
+        CreateExtractionWindowInput, DiscoverEventArgs, DiscoverEventTool,
+        DiscoverObjectObservationArgs, DiscoverObjectObservationTool, DiscoverRelationshipArgs,
+        DiscoverRelationshipTool, SignalLifecycleStatus,
+    },
+    AgentAttentionSignalStore, AgentToolError, AgentToolManager, AttentionSignal,
+    AttentionSignalStoreConfig, AttentionSignalToolRuntime, CallingConventions, ExtractionWindow,
+    ToolCtx, TypedTool,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::agent::AIAgent;
 use crate::round_history::{SessionHistoryQuery, SessionHistoryReadOptions, SessionHistoryReader};
 use crate::session_model::{AlreadyImprovedState, SessionMeta};
 
 pub const TOOL_COMMIT_SESSION_HISTORY_IMPROVED: &str = "commit_session_history_improved";
+pub const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtraction";
+pub const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
+pub const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
+pub const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
 pub const TOOL_READ_SESSION_HISTORY: &str = "read_session_history";
 pub const TOOL_SUBSCRIBE_EVENT: &str = "subscribe_event";
 pub const TOOL_UNSUBSCRIBE_EVENT: &str = "unsubscribe_event";
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
 const MAX_HISTORY_PAGE_SIZE: usize = 200;
-const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 4096;
+const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 40 * 1024;
 const DEFAULT_HISTORY_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -92,6 +106,91 @@ pub struct CommitSessionHistoryImprovedOutput {
     pub latest_round_index: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BeginAttentionSignalExtractionArgs {
+    pub session_id: String,
+    pub window_start: String,
+    pub window_end: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BeginAttentionSignalExtractionOutput {
+    pub owner_id: String,
+    pub agent_id: String,
+    pub agent_scope_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub window_start: String,
+    pub window_end: String,
+    pub extraction_window_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CompleteAttentionSignalExtractionArgs {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CompleteAttentionSignalExtractionOutput {
+    pub extraction_window: ExtractionWindow,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ListPendingAttentionSignalsArgs {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ListPendingAttentionSignalsOutput {
+    pub agent_scope_id: String,
+    pub returned: usize,
+    pub signals: Vec<AttentionSignal>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MarkAttentionSignalConsumedArgs {
+    pub signal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct MarkAttentionSignalConsumedOutput {
+    pub signal: AttentionSignal,
+}
+
+#[derive(Clone)]
+struct AttentionSignalToolState {
+    store: Arc<AgentAttentionSignalStore>,
+    runtime: Arc<Mutex<Option<AttentionSignalToolRuntime>>>,
+    agent: Weak<AIAgent>,
+}
+
+pub struct BeginAttentionSignalExtractionTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct CompleteAttentionSignalExtractionTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct ListPendingAttentionSignalsTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct MarkAttentionSignalConsumedTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct ScopedDiscoverEventTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct ScopedDiscoverObjectObservationTool {
+    state: AttentionSignalToolState,
+}
+
+pub struct ScopedDiscoverRelationshipTool {
+    state: AttentionSignalToolState,
+}
+
 pub struct ReadSessionHistoryTool {
     agent: Weak<AIAgent>,
 }
@@ -109,6 +208,48 @@ impl ReadSessionHistoryTool {
 impl CommitSessionHistoryImprovedTool {
     pub fn new(agent: Weak<AIAgent>) -> Self {
         Self { agent }
+    }
+}
+
+impl BeginAttentionSignalExtractionTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl CompleteAttentionSignalExtractionTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl ListPendingAttentionSignalsTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl MarkAttentionSignalConsumedTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl ScopedDiscoverEventTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl ScopedDiscoverObjectObservationTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl ScopedDiscoverRelationshipTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
     }
 }
 
@@ -299,6 +440,316 @@ impl TypedTool for CommitSessionHistoryImprovedTool {
             previous_committed_round_index: previous.committed_round_index,
             latest_round_index,
         })
+    }
+}
+
+#[async_trait]
+impl TypedTool for BeginAttentionSignalExtractionTool {
+    type Args = BeginAttentionSignalExtractionArgs;
+    type Output = BeginAttentionSignalExtractionOutput;
+
+    fn name(&self) -> &str {
+        TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION
+    }
+
+    fn description(&self) -> &str {
+        "Open a Stage-1 attention-signal extraction scope for one target Agent Session history window."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "opened attention extraction window {} for session {}",
+            output.extraction_window_id, output.session_id
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        let window_start = args.window_start.trim();
+        let window_end = args.window_end.trim();
+        if window_start.is_empty() || window_end.is_empty() {
+            return Err(AgentToolError::InvalidArgs(
+                "`window_start` and `window_end` must not be empty".to_string(),
+            ));
+        }
+        let agent = self
+            .state
+            .agent
+            .upgrade()
+            .ok_or_else(|| AgentToolError::ExecFailed("agent is shutting down".to_string()))?;
+        let session_dir = agent.config.layout.session_dir(session_id);
+        let meta = if let Some(session) = agent.get_session(session_id).await {
+            session.meta.lock().await.clone()
+        } else {
+            load_session_meta(&session_dir).await?.ok_or_else(|| {
+                AgentToolError::ExecFailed(format!("session `{session_id}` meta not found"))
+            })?
+        };
+        if matches!(meta.kind, crate::session_model::SessionKind::SelfImprove) {
+            return Err(AgentToolError::InvalidArgs(
+                "self-improve session history cannot be used as self-improve input".to_string(),
+            ));
+        }
+        let agent_id = agent.agent_id();
+        let owner_id = if meta.owner.trim().is_empty() {
+            "system".to_string()
+        } else {
+            meta.owner.clone()
+        };
+        let user_id = owner_id.clone();
+        let agent_scope_id = agent_id.clone();
+        let extraction_window =
+            self.state
+                .store
+                .create_extraction_window(CreateExtractionWindowInput {
+                    owner_id: owner_id.clone(),
+                    agent_id: agent_id.clone(),
+                    agent_scope_id: agent_scope_id.clone(),
+                    user_id: user_id.clone(),
+                    window_start: window_start.to_string(),
+                    window_end: window_end.to_string(),
+                })?;
+        let runtime = AttentionSignalToolRuntime {
+            owner_id: owner_id.clone(),
+            agent_id: agent_id.clone(),
+            agent_scope_id: agent_scope_id.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.to_string(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
+            extraction_window_id: extraction_window.id.clone(),
+            extractor_version: None,
+            prompt_version: None,
+            model_name: None,
+        };
+        *self.state.runtime.lock().await = Some(runtime);
+        Ok(BeginAttentionSignalExtractionOutput {
+            owner_id,
+            agent_id,
+            agent_scope_id,
+            user_id,
+            session_id: session_id.to_string(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
+            extraction_window_id: extraction_window.id,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CompleteAttentionSignalExtractionTool {
+    type Args = CompleteAttentionSignalExtractionArgs;
+    type Output = CompleteAttentionSignalExtractionOutput;
+
+    fn name(&self) -> &str {
+        TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION
+    }
+
+    fn description(&self) -> &str {
+        "Complete the current Stage-1 attention-signal extraction scope."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "completed attention extraction window {}",
+            output.extraction_window.id
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        _args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = self.state.runtime.lock().await.clone().ok_or_else(|| {
+            AgentToolError::InvalidArgs(
+                "call BeginAttentionSignalExtraction before completing extraction".to_string(),
+            )
+        })?;
+        let extraction_window = self
+            .state
+            .store
+            .complete_extraction_window(&runtime.extraction_window_id)?;
+        *self.state.runtime.lock().await = None;
+        Ok(CompleteAttentionSignalExtractionOutput { extraction_window })
+    }
+}
+
+#[async_trait]
+impl TypedTool for ListPendingAttentionSignalsTool {
+    type Args = ListPendingAttentionSignalsArgs;
+    type Output = ListPendingAttentionSignalsOutput;
+
+    fn name(&self) -> &str {
+        TOOL_LIST_PENDING_ATTENTION_SIGNALS
+    }
+
+    fn description(&self) -> &str {
+        "List Stage-1 attention signals waiting for Stage-2 memory graph mining."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!("listed {} pending attention signal(s)", output.returned)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let agent = self
+            .state
+            .agent
+            .upgrade()
+            .ok_or_else(|| AgentToolError::ExecFailed("agent is shutting down".to_string()))?;
+        let agent_scope_id = agent.agent_id();
+        let signals = self
+            .state
+            .store
+            .list_pending_stage2(&agent_scope_id, args.limit)?;
+        Ok(ListPendingAttentionSignalsOutput {
+            agent_scope_id,
+            returned: signals.len(),
+            signals,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for MarkAttentionSignalConsumedTool {
+    type Args = MarkAttentionSignalConsumedArgs;
+    type Output = MarkAttentionSignalConsumedOutput;
+
+    fn name(&self) -> &str {
+        TOOL_MARK_ATTENTION_SIGNAL_CONSUMED
+    }
+
+    fn description(&self) -> &str {
+        "Mark one pending attention signal as consumed after Stage-2 updates Agent Memory."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!("marked attention signal {} consumed", output.signal.id)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let signal = self
+            .state
+            .store
+            .update_lifecycle_status(args.signal_id.trim(), SignalLifecycleStatus::Consumed)?;
+        Ok(MarkAttentionSignalConsumedOutput { signal })
+    }
+}
+
+#[async_trait]
+impl TypedTool for ScopedDiscoverEventTool {
+    type Args = DiscoverEventArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_EVENT
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage-1 event attention signal for the current extraction scope."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = current_attention_runtime(&self.state).await?;
+        DiscoverEventTool::new(self.state.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypedTool for ScopedDiscoverObjectObservationTool {
+    type Args = DiscoverObjectObservationArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage-1 object-observation attention signal for the current extraction scope."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = current_attention_runtime(&self.state).await?;
+        DiscoverObjectObservationTool::new(self.state.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypedTool for ScopedDiscoverRelationshipTool {
+    type Args = DiscoverRelationshipArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_RELATIONSHIP
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage-1 relationship attention signal for the current extraction scope."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = current_attention_runtime(&self.state).await?;
+        DiscoverRelationshipTool::new(self.state.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
     }
 }
 
@@ -528,6 +979,16 @@ async fn write_session_meta(session_dir: &Path, meta: &SessionMeta) -> Result<()
 
 fn session_meta_path(session_dir: &Path) -> std::path::PathBuf {
     session_dir.join(".meta").join("session.json")
+}
+
+async fn current_attention_runtime(
+    state: &AttentionSignalToolState,
+) -> Result<AttentionSignalToolRuntime, AgentToolError> {
+    state.runtime.lock().await.clone().ok_or_else(|| {
+        AgentToolError::InvalidArgs(
+            "call BeginAttentionSignalExtraction before Discover*".to_string(),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -766,4 +1227,28 @@ pub fn register_event_subscription_tools(
 pub fn register_session_history_tools(manager: &AgentToolManager, agent: Weak<AIAgent>) {
     let _ = manager.register_typed_tool(ReadSessionHistoryTool::new(agent.clone()));
     let _ = manager.register_typed_tool(CommitSessionHistoryImprovedTool::new(agent));
+}
+
+pub fn register_attention_signal_tools(
+    manager: &AgentToolManager,
+    agent: Weak<AIAgent>,
+    agent_root: &Path,
+) {
+    let Ok(store) = AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
+        agent_root.join("attention_signals"),
+    )) else {
+        return;
+    };
+    let state = AttentionSignalToolState {
+        store: Arc::new(store),
+        runtime: Arc::new(Mutex::new(None)),
+        agent,
+    };
+    let _ = manager.register_typed_tool(BeginAttentionSignalExtractionTool::new(state.clone()));
+    let _ = manager.register_typed_tool(CompleteAttentionSignalExtractionTool::new(state.clone()));
+    let _ = manager.register_typed_tool(ListPendingAttentionSignalsTool::new(state.clone()));
+    let _ = manager.register_typed_tool(MarkAttentionSignalConsumedTool::new(state.clone()));
+    let _ = manager.register_typed_tool(ScopedDiscoverEventTool::new(state.clone()));
+    let _ = manager.register_typed_tool(ScopedDiscoverObjectObservationTool::new(state.clone()));
+    let _ = manager.register_typed_tool(ScopedDiscoverRelationshipTool::new(state));
 }

@@ -120,32 +120,47 @@ Hint = 时间 + 一句话 + 对象ID
 	
 确认基于LLM的半订阅调用（目前缺失的一环），触发边界在哪？订阅太多触发？能否机械的判断当前session topic应该订阅哪些global object?
 
-### Agent State(Agent的内部状态)
+### Agent State Self Improve
 
-
-发现事件 : 
+Stage1: 从Session History中发现Attention Singal
+发现事件 :
 发现Object（主语或宾语）
 探索Object之间的关系
 
-整理Attention 热度（世界参与度）
+Stage2：整理Attention 热度（世界参与度）
+更新 Agent Memory Graph State (G_State): 当前G_State + Attention Signals => 新G_State 
 
-当前G_State + Session History => 新状态
-G_state的定义
-
-寻找捷径（skills）
-
-
-> TODO：Agent Memory能表达G_State么？（需要例子）
+Stage3:
+寻找捷径（skills）： 独立流程
 
 
-### Agent State的整理和演化 (Self-Improve)
+搭建框架的主要工作还是完成定时的触发，按照设计，定时触发主要分为以下两个机制：
 
-特殊触发：当Agent Session的未处理History到达一定数量时，尝试触发
-按时间逐个 分析这个时间窗口内的Session Hisotry,强调跨Session的总结
+1. 定时检测与触发
+   第一步是用来解析 Session History。系统每 24 小时会进行一次检测，如果 Session History 有更新，那至少会触发一次。
+   这类触发一般是凌晨3点进行检查
+
+
+2. 阈值触发
+   当 Session History 的累计量到达一个阈值的时候，也会触发更新。
+   注意 Self-Improve所在的Session是特殊Session，其History不会触发Self-Improve
+
+
+3. 触发后：
+    UnImprove Session->Stage1 LLM->Attention Signals
+
+4. 第二阶段是独立触发。也就是说，当第一阶段完成之后，只要满足以下两个条件，第二阶段就可以触发：
+
+- 第一阶段已经完成了消费，并且明确标明它已经完成了一次处理。
+- 存在第一阶段的结果。此时，Attention Signal 到 State Miner 的这个阶段就可以触发。
+    Attention Signals->Stage2 LLM->Set Memory
+    按时间逐个 分析这个时间窗口内的Session Hisotry,强调跨Session的总结
 
 
 > TODO: 增加一个专门的组件来管理 Attention Signals OK 
 > TODO: 如何重点观察skill的两种信号？
+    1）使用了skill的session -> 看report
+    2) 使用了skills mgr的selector,但没有选中任何skill
 > TODO: 需要Agent视角的，对Object进行备注和状态管理的系统 对象观察
 
 

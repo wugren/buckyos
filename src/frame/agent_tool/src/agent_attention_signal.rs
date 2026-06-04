@@ -1052,6 +1052,36 @@ impl AgentAttentionSignalStore {
             .transpose()
     }
 
+    pub fn update_lifecycle_status(
+        &self,
+        id: &str,
+        status: SignalLifecycleStatus,
+    ) -> Result<AttentionSignal> {
+        require_non_empty(id, "id")?;
+        let mut signal = self
+            .get_signal(id)?
+            .ok_or_else(|| AttentionSignalError::NotFound(id.to_string()))?;
+        signal.lifecycle_status = status;
+        signal.updated_at = now_iso8601();
+        let full_json = serde_json::to_string(&signal)?;
+        let conn = self.lock_conn()?;
+        let count = conn.execute(
+            "UPDATE attention_signals
+             SET lifecycle_status = ?, updated_at = ?, full_json = ?
+             WHERE id = ?",
+            params![
+                signal.lifecycle_status.as_str(),
+                signal.updated_at,
+                full_json,
+                id,
+            ],
+        )?;
+        if count == 0 {
+            return Err(AttentionSignalError::NotFound(id.to_string()));
+        }
+        Ok(signal)
+    }
+
     pub fn create_extraction_window(
         &self,
         input: CreateExtractionWindowInput,

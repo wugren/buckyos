@@ -20,18 +20,21 @@
 //! `InboundMsg` enum + the `inbox()` accessor.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_tool::{AgentAttentionSignalStore, AttentionSignalStoreConfig};
 use anyhow::{anyhow, Result};
 use buckyos_api::{
     get_buckyos_api_runtime, parse_typed_task_data, AgentDelegateProgress, AgentDelegateTaskData,
     AgentDelegateTaskRequest, AiMessage, AiRole, CreateTaskOptions, Task, TimerOptions,
     TypedTaskData,
 };
-use chrono::{Local, Utc};
+use chrono::{Datelike, Local, Timelike, Utc};
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{sleep, Duration};
 
 use crate::agent_bash::{build_session_tools, SessionBinLayout, SessionToolsBuild};
 use crate::agent_config::AgentConfig;
@@ -46,6 +49,7 @@ use crate::dispatch::{
 use crate::local_workspace::LocalWorkspaceManager;
 use crate::msg_center_pump::{self, PumpConfig};
 use crate::paths;
+use crate::round_history::SessionHistoryReader;
 use crate::session_event_pump::SessionEventPump;
 use crate::session_model::{
     AgentTaskBinding, PendingInput, SessionKind, SessionMeta, SessionStatus, SessionSummary,
@@ -58,6 +62,50 @@ use crate::tool_plan::{self, ResolvedToolPlan, SessionBinRenderer, ToolPlanToml}
 /// "the opendan agent picked this up" apart from other consumers.
 const MSG_ROUTED_REASON: &str = "routed_by_opendan_runtime";
 const SELF_CHECK_HARD_BARRIER_INTERVAL_MS: u64 = 60_000;
+const SELF_IMPROVE_SCHEDULER_INTERVAL_MS: u64 = 60_000;
+const SELF_IMPROVE_THRESHOLD_PENDING_ROUNDS: u64 = 20;
+const SELF_IMPROVE_DAILY_CHECK_HOUR: u32 = 3;
+const SELF_IMPROVE_MAX_TARGET_SESSIONS_PER_WAKE: usize = 4;
+const SELF_IMPROVE_MAX_PENDING_ROUNDS_PER_WAKE: u64 = 20;
+const SELF_IMPROVE_STAGE1_SESSION_PREFIX: &str = "self_improve_signals";
+const SELF_IMPROVE_STAGE2_SESSION_PREFIX: &str = "self_improve_set_memory";
+const SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS: u64 = 72 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SelfImproveSchedulerState {
+    last_daily_check_date: String,
+    last_threshold_trigger_pending_rounds: u64,
+    last_triggered_at_ms: u64,
+    last_stage1_completed_seq: u64,
+    last_stage1_completed_at_ms: u64,
+    next_stage1_session_seq: u64,
+    last_stage1_session_id: String,
+    next_stage2_session_seq: u64,
+    last_stage2_session_id: String,
+    last_stage2_triggered_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SelfImproveTargetSession {
+    session_id: String,
+    owner: String,
+    committed_round_index: u64,
+    latest_round_index: u64,
+    pending_rounds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SelfImproveStage2SessionChoice {
+    session_id: String,
+    rotated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfImproveTriggerKind {
+    Daily,
+    Threshold,
+}
 
 /// One inbound item to route to a session. Tagged so messages and events
 /// share the same tokio queue into the dispatcher — keeping with the
@@ -459,6 +507,7 @@ impl AIAgent {
 
         let pump_handle = self.clone().spawn_msg_center_pump();
         let task_inbox_handle = self.clone().spawn_task_inbox();
+        let self_improve_handle = self.clone().spawn_self_improve_scheduler();
         let event_pump_handle = self.event_pump.as_ref().map(|p| {
             let p = p.clone();
             tokio::spawn(async move { p.run().await })
@@ -479,6 +528,9 @@ impl AIAgent {
             let _ = handle.await;
         }
         if let Some(handle) = task_inbox_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self_improve_handle {
             let _ = handle.await;
         }
         if let Some(handle) = event_pump_handle {
@@ -542,6 +594,237 @@ impl AIAgent {
             contact_lookup,
         };
         Some(tokio::spawn(msg_center_pump::run(cfg)))
+    }
+
+    fn spawn_self_improve_scheduler(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let class = self.config.class_name_for_kind(SessionKind::SelfImprove);
+        if !self.config.session_class_enabled(&class) {
+            info!(
+                "opendan.agent[{}]: self_improve scheduler disabled by config",
+                self.agent_name
+            );
+            return None;
+        }
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = self.pump_shutdown.notified() => break,
+                    _ = sleep(Duration::from_millis(SELF_IMPROVE_SCHEDULER_INTERVAL_MS)) => {
+                        if let Err(err) = self.clone().tick_self_improve_scheduler().await {
+                            warn!("opendan.agent[{}]: self_improve scheduler tick failed: {err:#}", self.agent_name);
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    async fn tick_self_improve_scheduler(self: Arc<Self>) -> Result<()> {
+        let class = self.config.class_name_for_kind(SessionKind::SelfImprove);
+        if !self.config.session_class_enabled(&class) {
+            return Ok(());
+        }
+        let mut state = load_self_improve_scheduler_state(&self.config.layout.root).await;
+        if self
+            .clone()
+            .maybe_wake_self_improve_stage2(&class, &mut state)
+            .await?
+        {
+            return Ok(());
+        }
+        let targets = self.collect_self_improve_targets().await;
+        let pending_rounds: u64 = targets.iter().map(|target| target.pending_rounds).sum();
+        if pending_rounds < state.last_threshold_trigger_pending_rounds {
+            state.last_threshold_trigger_pending_rounds = 0;
+        }
+        let Some(trigger) = choose_self_improve_trigger(&state, pending_rounds, Local::now())
+        else {
+            return Ok(());
+        };
+        if targets.is_empty() {
+            if matches!(trigger, SelfImproveTriggerKind::Daily) {
+                state.last_daily_check_date = local_date_string(Local::now());
+                write_self_improve_scheduler_state(&self.config.layout.root, &state).await;
+            }
+            return Ok(());
+        }
+        let stage1_session_id = next_self_improve_stage1_session_id(&state);
+        let session = self
+            .clone()
+            .get_or_create_session(
+                stage1_session_id.clone(),
+                "system".to_string(),
+                SessionKind::SelfImprove,
+                &class,
+            )
+            .await?;
+        if !self_improve_session_can_start(&session).await {
+            return Ok(());
+        }
+        let batch_targets = select_self_improve_batch(&targets);
+        let batch_pending_rounds: u64 = batch_targets
+            .iter()
+            .map(|target| target.pending_rounds)
+            .sum();
+        let prompt = render_self_improve_stage1_prompt(
+            trigger,
+            pending_rounds,
+            batch_pending_rounds,
+            targets.len(),
+            &batch_targets,
+            &stage1_session_id,
+        );
+        session
+            .enqueue_internal_continuation(
+                format!(
+                    "self_improve_scheduler:{}",
+                    self_improve_trigger_label(trigger)
+                ),
+                vec![AiMessage::text(AiRole::User, prompt)],
+            )
+            .await?;
+        state.next_stage1_session_seq = state.next_stage1_session_seq.saturating_add(1);
+        state.last_stage1_session_id = stage1_session_id.clone();
+        state.last_triggered_at_ms = current_unix_ms();
+        match trigger {
+            SelfImproveTriggerKind::Daily => {
+                state.last_daily_check_date = local_date_string(Local::now());
+            }
+            SelfImproveTriggerKind::Threshold => {
+                state.last_threshold_trigger_pending_rounds = pending_rounds;
+            }
+        }
+        write_self_improve_scheduler_state(&self.config.layout.root, &state).await;
+        info!(
+            "opendan.agent[{}]: self_improve stage1 triggered session={} kind={} targets={}/{} pending_rounds={}/{}",
+            self.agent_name,
+            stage1_session_id,
+            self_improve_trigger_label(trigger),
+            batch_targets.len(),
+            targets.len(),
+            batch_pending_rounds,
+            pending_rounds
+        );
+        Ok(())
+    }
+
+    async fn maybe_wake_self_improve_stage2(
+        self: Arc<Self>,
+        class: &str,
+        state: &mut SelfImproveSchedulerState,
+    ) -> Result<bool> {
+        if state.last_stage1_completed_seq == 0 || !self.has_pending_stage2_signals() {
+            return Ok(false);
+        }
+        let now_ms = current_unix_ms();
+        let stage2_session = choose_self_improve_stage2_session_id(state, now_ms);
+        let session = self
+            .clone()
+            .get_or_create_session(
+                stage2_session.session_id.clone(),
+                "system".to_string(),
+                SessionKind::SelfImprove,
+                class,
+            )
+            .await?;
+        if !self_improve_session_can_start(&session).await {
+            return Ok(false);
+        }
+        let prompt = render_self_improve_stage2_prompt(
+            state,
+            &stage2_session.session_id,
+            stage2_session.rotated,
+        );
+        session
+            .enqueue_behavior_internal_continuation(
+                "self_improve_set_memory".to_string(),
+                "self_improve_scheduler:stage2_after_stage1_complete".to_string(),
+                vec![AiMessage::text(AiRole::User, prompt)],
+            )
+            .await?;
+        if stage2_session.rotated {
+            state.next_stage2_session_seq = state.next_stage2_session_seq.saturating_add(1);
+            state.last_stage2_session_id = stage2_session.session_id.clone();
+        }
+        state.last_stage2_triggered_at_ms = now_ms;
+        write_self_improve_scheduler_state(&self.config.layout.root, state).await;
+        info!(
+            "opendan.agent[{}]: self_improve stage2 triggered session={} rotated={} from persisted stage1 completion seq={}",
+            self.agent_name,
+            stage2_session.session_id,
+            stage2_session.rotated,
+            state.last_stage1_completed_seq
+        );
+        Ok(true)
+    }
+
+    fn has_pending_stage2_signals(&self) -> bool {
+        let Ok(store) = AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
+            self.config.layout.root.join("attention_signals"),
+        )) else {
+            return false;
+        };
+        store
+            .list_pending_stage2(&self.agent_id(), Some(1))
+            .map(|signals| !signals.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub(crate) async fn mark_self_improve_stage1_completed(&self) {
+        let mut state = load_self_improve_scheduler_state(&self.config.layout.root).await;
+        state.last_stage1_completed_seq = state.last_stage1_completed_seq.saturating_add(1);
+        state.last_stage1_completed_at_ms = current_unix_ms();
+        write_self_improve_scheduler_state(&self.config.layout.root, &state).await;
+        info!(
+            "opendan.agent[{}]: self_improve stage1 completion persisted seq={}",
+            self.agent_name, state.last_stage1_completed_seq
+        );
+    }
+
+    async fn collect_self_improve_targets(&self) -> Vec<SelfImproveTargetSession> {
+        let sessions_dir = self.config.layout.sessions_dir.clone();
+        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let session_id = match path.file_name().and_then(|value| value.to_str()) {
+                Some(value) if !value.trim().is_empty() => value.to_string(),
+                _ => continue,
+            };
+            let meta_path = path.join(".meta").join("session.json");
+            let Ok(bytes) = std::fs::read(&meta_path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+                continue;
+            };
+            if matches!(meta.kind, SessionKind::SelfImprove) {
+                continue;
+            }
+            let latest_round_index = SessionHistoryReader::open(&path)
+                .and_then(|reader| reader.latest_round_index())
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let committed_round_index = meta.already_improved.committed_round_index;
+            if latest_round_index <= committed_round_index {
+                continue;
+            }
+            targets.push(SelfImproveTargetSession {
+                session_id,
+                owner: meta.owner,
+                committed_round_index,
+                latest_round_index,
+                pending_rounds: latest_round_index - committed_round_index,
+            });
+        }
+        targets.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        targets
     }
 
     /// Restore lightweight dispatch indexes for non-Ended sessions without
@@ -1468,6 +1751,11 @@ impl AIAgent {
             &session_id,
         );
         crate::buildin_tool::register_session_history_tools(&tools, Arc::downgrade(&self));
+        crate::buildin_tool::register_attention_signal_tools(
+            &tools,
+            Arc::downgrade(&self),
+            &self.config.layout.root,
+        );
 
         let (reply_tx, mut reply_rx) = mpsc::channel(64);
         let (session, inbox_rx) = AgentSession::new(AgentSessionBuild {
@@ -2311,6 +2599,202 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn self_improve_state_path(agent_root: &Path) -> PathBuf {
+    agent_root.join(".meta").join("self_improve_scheduler.json")
+}
+
+async fn load_self_improve_scheduler_state(agent_root: &Path) -> SelfImproveSchedulerState {
+    let path = self_improve_state_path(agent_root);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => SelfImproveSchedulerState::default(),
+    }
+}
+
+async fn write_self_improve_scheduler_state(agent_root: &Path, state: &SelfImproveSchedulerState) {
+    let path = self_improve_state_path(agent_root);
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
+        let _ = tokio::fs::write(path, bytes).await;
+    }
+}
+
+fn choose_self_improve_trigger(
+    state: &SelfImproveSchedulerState,
+    pending_rounds: u64,
+    now: chrono::DateTime<Local>,
+) -> Option<SelfImproveTriggerKind> {
+    if pending_rounds == 0 {
+        return None;
+    }
+    if pending_rounds
+        >= state
+            .last_threshold_trigger_pending_rounds
+            .saturating_add(SELF_IMPROVE_THRESHOLD_PENDING_ROUNDS)
+    {
+        return Some(SelfImproveTriggerKind::Threshold);
+    }
+    let today = local_date_string(now);
+    if now.hour() >= SELF_IMPROVE_DAILY_CHECK_HOUR && state.last_daily_check_date != today {
+        return Some(SelfImproveTriggerKind::Daily);
+    }
+    None
+}
+
+fn local_date_string(now: chrono::DateTime<Local>) -> String {
+    format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
+}
+
+fn next_self_improve_stage1_session_id(state: &SelfImproveSchedulerState) -> String {
+    format!(
+        "{}-{}",
+        SELF_IMPROVE_STAGE1_SESSION_PREFIX,
+        state.next_stage1_session_seq.saturating_add(1)
+    )
+}
+
+fn choose_self_improve_stage2_session_id(
+    state: &SelfImproveSchedulerState,
+    now_ms: u64,
+) -> SelfImproveStage2SessionChoice {
+    let existing = state.last_stage2_session_id.trim();
+    let reuse_existing = !existing.is_empty()
+        && now_ms.saturating_sub(state.last_stage2_triggered_at_ms)
+            <= SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS;
+    if reuse_existing {
+        return SelfImproveStage2SessionChoice {
+            session_id: existing.to_string(),
+            rotated: false,
+        };
+    }
+    SelfImproveStage2SessionChoice {
+        session_id: format!(
+            "{}-{}",
+            SELF_IMPROVE_STAGE2_SESSION_PREFIX,
+            state.next_stage2_session_seq.saturating_add(1)
+        ),
+        rotated: true,
+    }
+}
+
+async fn self_improve_session_can_start(session: &AgentSession) -> bool {
+    let meta = session.meta.lock().await;
+    meta.internal_continuation.is_none()
+        && !matches!(
+            meta.status,
+            SessionStatus::Running | SessionStatus::WaitingTool
+        )
+}
+
+fn self_improve_trigger_label(trigger: SelfImproveTriggerKind) -> &'static str {
+    match trigger {
+        SelfImproveTriggerKind::Daily => "daily",
+        SelfImproveTriggerKind::Threshold => "threshold",
+    }
+}
+
+fn select_self_improve_batch(
+    targets: &[SelfImproveTargetSession],
+) -> Vec<SelfImproveTargetSession> {
+    let mut out = Vec::new();
+    let mut pending_rounds = 0_u64;
+    for target in targets {
+        if out.len() >= SELF_IMPROVE_MAX_TARGET_SESSIONS_PER_WAKE {
+            break;
+        }
+        if !out.is_empty()
+            && pending_rounds.saturating_add(target.pending_rounds)
+                > SELF_IMPROVE_MAX_PENDING_ROUNDS_PER_WAKE
+        {
+            break;
+        }
+        pending_rounds = pending_rounds.saturating_add(target.pending_rounds);
+        out.push(target.clone());
+    }
+    out
+}
+
+fn render_self_improve_stage2_prompt(
+    state: &SelfImproveSchedulerState,
+    session_id: &str,
+    rotated: bool,
+) -> String {
+    format!(
+        "Internal Agent State Self Improve Stage2 wakeup.\n\
+This wakeup is based on a persisted Stage1 completion state, not external user input.\n\
+stage2_session_id: {}\n\
+stage2_session_rotated: {}\n\
+last_stage1_completed_seq: {}\n\
+last_stage1_completed_at_ms: {}\n\
+last_stage2_triggered_at_ms: {}\n\
+\n\
+Condition satisfied: Stage1 has completed at least once and pending attention signals exist.\n\
+Run Stage2 now: Attention Signals -> Agent Memory Graph.\n\
+First call ListPendingAttentionSignals, then consume applicable signals into Agent Memory and mark processed signals consumed.\n",
+        session_id,
+        rotated,
+        state.last_stage1_completed_seq,
+        state.last_stage1_completed_at_ms,
+        state.last_stage2_triggered_at_ms
+    )
+}
+
+fn render_self_improve_stage1_prompt(
+    trigger: SelfImproveTriggerKind,
+    total_pending_rounds: u64,
+    batch_pending_rounds: u64,
+    total_target_sessions: usize,
+    targets: &[SelfImproveTargetSession],
+    session_id: &str,
+) -> String {
+    let now = Utc::now().to_rfc3339();
+    let mut out = format!(
+        "Internal Agent State Self Improve trigger.\n\
+This is an internal Agent session, not an external user input.\n\
+stage1_session_id: {}\n\
+stage1_session_rotated: true\n\
+trigger_type: {}\n\
+triggered_at: {}\n\
+total_target_sessions: {}\n\
+batch_target_sessions: {}\n\
+total_pending_rounds: {}\n\
+batch_pending_rounds: {}\n\
+max_target_sessions_per_wake: {}\n\
+max_pending_rounds_per_wake: {}\n\
+\n\
+Run Stage1 first: session-history => attention/self-improve signals.\n\
+After Stage1, end this session. Stage2 is a separate internal session and is woken by persisted Stage1 completion plus pending signals.\n\
+Do not scan any self_improve session history.\n\
+This wakeup is a bounded batch. Process only the target sessions listed below; unlisted backlog remains for later wakeups.\n\
+\n\
+Target sessions:\n",
+        session_id,
+        self_improve_trigger_label(trigger),
+        now,
+        total_target_sessions,
+        targets.len(),
+        total_pending_rounds,
+        batch_pending_rounds,
+        SELF_IMPROVE_MAX_TARGET_SESSIONS_PER_WAKE,
+        SELF_IMPROVE_MAX_PENDING_ROUNDS_PER_WAKE
+    );
+    for target in targets {
+        out.push_str(&format!(
+            "- session_id: {}\n  owner: {}\n  committed_round_index: {}\n  latest_round_index: {}\n  pending_rounds: {}\n  window_start: after_round_{}\n  window_end: round_{}\n",
+            target.session_id,
+            if target.owner.trim().is_empty() { "system" } else { target.owner.as_str() },
+            target.committed_round_index,
+            target.latest_round_index,
+            target.pending_rounds,
+            target.committed_round_index,
+            target.latest_round_index
+        ));
+    }
+    out
+}
+
 fn truncate(s: &str, limit: usize) -> String {
     if s.chars().count() <= limit {
         return s.to_string();
@@ -2341,6 +2825,41 @@ mod tests {
     fn sanitizes_session_segment() {
         assert_eq!(sanitize_session_segment("did:dev:alice"), "did_dev_alice");
         assert_eq!(sanitize_session_segment(""), "anon");
+    }
+
+    #[test]
+    fn self_improve_stage1_session_id_always_advances() {
+        let mut state = SelfImproveSchedulerState::default();
+        assert_eq!(
+            next_self_improve_stage1_session_id(&state),
+            "self_improve_signals-1"
+        );
+        state.next_stage1_session_seq = state.next_stage1_session_seq.saturating_add(1);
+        assert_eq!(
+            next_self_improve_stage1_session_id(&state),
+            "self_improve_signals-2"
+        );
+    }
+
+    #[test]
+    fn self_improve_stage2_session_id_reuses_within_rotation_window() {
+        let mut state = SelfImproveSchedulerState {
+            next_stage2_session_seq: 1,
+            last_stage2_session_id: "self_improve_set_memory-1".to_string(),
+            last_stage2_triggered_at_ms: 10_000,
+            ..SelfImproveSchedulerState::default()
+        };
+        let choice = choose_self_improve_stage2_session_id(&state, 10_000 + 60_000);
+        assert_eq!(choice.session_id, "self_improve_set_memory-1");
+        assert!(!choice.rotated);
+
+        state.last_stage2_triggered_at_ms = 10_000;
+        let choice = choose_self_improve_stage2_session_id(
+            &state,
+            10_000 + SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS + 1,
+        );
+        assert_eq!(choice.session_id, "self_improve_set_memory-2");
+        assert!(choice.rotated);
     }
 
     #[test]

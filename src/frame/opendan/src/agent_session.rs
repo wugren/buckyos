@@ -862,6 +862,41 @@ impl AgentSession {
         Ok(())
     }
 
+    pub async fn enqueue_internal_continuation(
+        &self,
+        reason: String,
+        user_messages: Vec<AiMessage>,
+    ) -> Result<()> {
+        self.set_internal_continuation(InternalContinuation {
+            reason,
+            user_messages,
+        })
+        .await?;
+        let _ = self.inbox_tx.send(SessionInput::Wakeup).await;
+        Ok(())
+    }
+
+    pub async fn enqueue_behavior_internal_continuation(
+        &self,
+        behavior: String,
+        reason: String,
+        user_messages: Vec<AiMessage>,
+    ) -> Result<()> {
+        {
+            let mut meta = self.meta.lock().await;
+            meta.current_behavior = behavior.clone();
+            meta.process_entry = behavior;
+            meta.process_stack.clear();
+            meta.internal_continuation = Some(InternalContinuation {
+                reason,
+                user_messages,
+            });
+        }
+        self.flush_meta().await?;
+        let _ = self.inbox_tx.send(SessionInput::Wakeup).await;
+        Ok(())
+    }
+
     async fn take_internal_continuation(&self) -> Option<InternalContinuation> {
         let continuation = {
             let mut meta = self.meta.lock().await;
@@ -4316,6 +4351,11 @@ impl AgentSession {
                 }
                 if matches!(self.kind, SessionKind::SelfImprove) {
                     self.dispatch_self_improvement_tasks(&final_snapshot).await;
+                    if behavior.meta.name == "self_improve_signals" {
+                        if let Some(agent) = self.parent_agent.upgrade() {
+                            agent.mark_self_improve_stage1_completed().await;
+                        }
+                    }
                 }
                 if let Some(text) = output_to_text(&output) {
                     let _ = self
@@ -4323,10 +4363,19 @@ impl AgentSession {
                         .send(SessionReply::AssistantText { text })
                         .await;
                 }
-                let next_behavior = behavior_result
+                let mut next_behavior = behavior_result
                     .as_ref()
                     .and_then(|r| r.next_behavior.as_deref())
                     .map(str::to_string);
+                if matches!(self.kind, SessionKind::SelfImprove)
+                    && behavior.meta.name == "self_improve_signals"
+                    && next_behavior
+                        .as_deref()
+                        .map(|next| next.trim().eq_ignore_ascii_case("self_improve_set_memory"))
+                        .unwrap_or(false)
+                {
+                    next_behavior = Some("END".to_string());
+                }
                 if let Some(next) = next_behavior.as_deref() {
                     let trimmed = next.trim();
                     if trimmed.eq_ignore_ascii_case("END") {

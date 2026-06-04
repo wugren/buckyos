@@ -1100,8 +1100,9 @@ mod tests {
         );
         assert_eq!(self_check.driver.on_wakeup.pull_msg, PullMsgPolicy::All);
         let self_improve = cfg.session_class("self_improve").unwrap();
-        assert!(!self_improve.enabled);
+        assert!(self_improve.enabled);
         assert_eq!(self_improve.kind, SessionKind::SelfImprove);
+        assert_eq!(self_improve.default_behavior, "self_improve_signals");
         assert_eq!(
             self_improve.driver.on_behavior_switch.pull_event,
             PullEventPolicy::None
