@@ -37,6 +37,7 @@ pub mod path_utils;
 pub mod read_tool;
 pub mod run_local_llm;
 pub mod runtime_context;
+pub mod skills_mgr;
 pub mod todo_tools;
 pub mod tool;
 pub mod workspace;
@@ -86,6 +87,15 @@ pub use read_tool::{ReadTool, TOOL_READ};
 pub use runtime_context::{
     AgentIdentity, RuntimeContext, RuntimeContextSource, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV,
     OPENDAN_AGENT_ROOT_ENV, OPENDAN_SESSION_ID_ENV, OPENDAN_TRACE_ID_ENV,
+};
+pub use skills_mgr::{
+    CreateCandidateInput as SkillCreateCandidateInput, InstallResult as SkillInstallResult,
+    LifecycleState as SkillLifecycleState, ListSkillsInput, OwnerScope as SkillOwnerScope,
+    PromptFragment as SkillPromptFragment, RenderSelectedInput as SkillRenderSelectedInput,
+    RiskLevel as SkillRiskLevel, SelectedSkillSet, SkillHint, SkillPackageFile,
+    SkillPackageSummary, SkillSelectionValidation, SkillSourceType, SkillTaskResult, SkillType,
+    SkillUsage, SkillUsageCost, SkillsMgr, SkillsMgrConfig, SkillsMgrError, UsageMode,
+    UserFeedback, ValidateSelectionInput as SkillValidateSelectionInput, VerificationStatus,
 };
 pub use todo_tools::{
     DelegateTaskArgs, DelegateTaskOutput, DelegateTaskTool, StubTaskDelegator, TaskDelegator,

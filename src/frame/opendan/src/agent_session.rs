@@ -4157,9 +4157,9 @@ impl AgentSession {
         items
             .into_iter()
             .map(|item| {
-                let key = item.key;
+                let key = item.item_id;
                 let matched_items = item.matched;
-                let ts = item.ts;
+                let ts = item.noticed_at;
                 let size = item.size;
                 let truncated = item.truncated;
                 let content = item.content;
