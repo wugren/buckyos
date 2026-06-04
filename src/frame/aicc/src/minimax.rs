@@ -83,7 +83,7 @@ impl MiniMaxProvider {
             .models
             .iter()
             .map(|model| {
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat])
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
                     .with_cost(Some(0.01))
                     .with_latency(Some(1400))
             })
@@ -346,7 +346,7 @@ impl Provider for MiniMaxProvider {
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         match req.method.as_str() {
-            ai_methods::LLM_CHAT | ai_methods::LLM_COMPLETION => {
+            ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
                     .await
             }

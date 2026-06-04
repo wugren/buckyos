@@ -117,7 +117,7 @@
     },
     {
       "pattern": "gpt-*",
-      "api_types": ["llm", "llm.completion", "rerank"],
+      "api_types": ["llm", "rerank"],
       "logical_mounts": [
         "llm.{driver}",
         "llm.openai.{model}",
@@ -141,7 +141,7 @@
     },
     {
       "pattern": "chatgpt-*",
-      "api_types": ["llm", "llm.completion"],
+      "api_types": ["llm"],
       "logical_mounts": ["llm.{driver}", "llm.openai.{model}"],
       "capabilities": {
         "streaming": true,
@@ -157,7 +157,7 @@
     },
     {
       "pattern": "o*",
-      "api_types": ["llm", "llm.completion"],
+      "api_types": ["llm"],
       "logical_mounts": ["llm.{driver}", "llm.gpt", "llm.openai.{model}"],
       "capabilities": {
         "streaming": true,

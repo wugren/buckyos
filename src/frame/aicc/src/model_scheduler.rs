@@ -357,7 +357,7 @@ mod tests {
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,
-            api_types: vec![ApiType::LlmChat],
+            api_types: vec![ApiType::Llm],
             logical_mounts: vec!["llm.plan".to_string()],
             capabilities: ModelCapabilities::default(),
             attributes: ModelAttributes {
@@ -377,7 +377,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        ModelCandidate::from_metadata(metadata, ApiType::LlmChat).unwrap()
+        ModelCandidate::from_metadata(metadata, ApiType::Llm).unwrap()
     }
 
     fn candidates() -> Vec<ModelCandidate> {
@@ -456,7 +456,7 @@ mod tests {
         let key = StickyBindingKey {
             session_id: "s1".to_string(),
             logical_model: "llm.plan".to_string(),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
         };
         store.set(key.clone(), &items[2]);
         let result = ModelScheduler
@@ -474,7 +474,7 @@ mod tests {
         let key = StickyBindingKey {
             session_id: "s1".to_string(),
             logical_model: "llm.plan".to_string(),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
         };
         store.bindings.insert(
             key.clone(),

@@ -248,7 +248,7 @@ fn resolve_driver_model(
 
     let mut api_types = request.fallback_api_types.clone();
     if api_types.is_empty() {
-        api_types.push(ApiType::LlmChat);
+        api_types.push(ApiType::Llm);
     }
     let mut logical_mounts = Vec::new();
 
@@ -302,7 +302,7 @@ fn resolve_driver_model(
     }
     if api_types
         .iter()
-        .any(|api_type| matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion))
+        .any(|api_type| matches!(api_type, ApiType::Llm))
     {
         for mount in semantic_llm_family_mounts(provider_model_id) {
             add_unique(&mut logical_mounts, mount);
@@ -543,7 +543,7 @@ fn model_supports_variants(model: &ModelMetadata) -> bool {
     model
         .api_types
         .iter()
-        .any(|api_type| matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion))
+        .any(|api_type| matches!(api_type, ApiType::Llm))
         && (model.capabilities.streaming
             || model.capabilities.tool_call
             || model.capabilities.json_schema
@@ -666,7 +666,7 @@ fn generic_mounts(
             &mut mounts,
             format!("{}.{}", base, logical_mount_segment(provider_model_id)),
         );
-        if matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion) {
+        if matches!(api_type, ApiType::Llm) {
             add_unique(&mut mounts, "llm".to_string());
             add_unique(
                 &mut mounts,
@@ -744,8 +744,7 @@ pub(crate) fn semantic_llm_family_mounts(provider_model_id: &str) -> Vec<String>
 
 fn api_mount_base(api_type: &ApiType) -> &'static str {
     match api_type {
-        ApiType::LlmChat => "llm",
-        ApiType::LlmCompletion => "llm.completion",
+        ApiType::Llm => "llm",
         ApiType::Embedding => "embedding.text",
         ApiType::EmbeddingMultimodal => "embedding.multimodal",
         ApiType::Rerank => "rerank",
@@ -879,7 +878,7 @@ fn apply_driver_version_rule(
         if !model
             .api_types
             .iter()
-            .any(|api_type| matches!(api_type, ApiType::LlmChat | ApiType::LlmCompletion))
+            .any(|api_type| matches!(api_type, ApiType::Llm))
         {
             continue;
         }
@@ -1095,7 +1094,7 @@ mod tests {
         );
         assert_eq!(inventory.models.len(), 1);
         let model = &inventory.models[0];
-        assert_eq!(model.api_types, vec![ApiType::LlmChat]);
+        assert_eq!(model.api_types, vec![ApiType::Llm]);
         assert!(!model.capabilities.tool_call);
         assert!(!model.capabilities.web_search);
         assert!(!model.capabilities.vision);
@@ -1104,7 +1103,7 @@ mod tests {
 
     #[test]
     fn known_driver_ignores_provider_fallback_mounts() {
-        let mut request = DriverModelResolveRequest::new("MiniMax-M2.5", vec![ApiType::LlmChat]);
+        let mut request = DriverModelResolveRequest::new("MiniMax-M2.5", vec![ApiType::Llm]);
         request.fallback_logical_mounts = vec![
             "llm.plan".to_string(),
             "llm.provider-hint".to_string(),
@@ -1135,7 +1134,7 @@ mod tests {
 
     #[test]
     fn unknown_driver_fallback_mounts_drop_role_paths() {
-        let mut request = DriverModelResolveRequest::new("future-model", vec![ApiType::LlmChat]);
+        let mut request = DriverModelResolveRequest::new("future-model", vec![ApiType::Llm]);
         request.fallback_logical_mounts = vec![
             "llm.plan".to_string(),
             "llm".to_string(),
@@ -1165,17 +1164,17 @@ mod tests {
         let model = &inventory.models[0];
         assert!(model.api_types.contains(&ApiType::ImageTextToImage));
         assert!(model.api_types.contains(&ApiType::ImageToImage));
-        assert!(!model.api_types.contains(&ApiType::LlmChat));
+        assert!(!model.api_types.contains(&ApiType::Llm));
     }
 
     #[test]
     fn openai_latest_gpt_mounts_family_only() {
         let requests = vec![
-            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.5-pro", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.4-mini", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.4-nano", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.5-pro", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.4-mini", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.4-nano", vec![ApiType::Llm]),
         ];
         let inventory = resolve_driver_inventory(
             "openai-test",
@@ -1233,9 +1232,9 @@ mod tests {
     #[test]
     fn openai_version_rule_prefers_stable_current_mounts() {
         let requests = vec![
-            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.5-preview", vec![ApiType::LlmChat]),
-            DriverModelResolveRequest::new("gpt-5.6-beta", vec![ApiType::LlmChat]),
+            DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.5-preview", vec![ApiType::Llm]),
+            DriverModelResolveRequest::new("gpt-5.6-beta", vec![ApiType::Llm]),
         ];
         let inventory = resolve_driver_inventory(
             "openai-test",
@@ -1270,7 +1269,7 @@ mod tests {
 
     #[test]
     fn openai_variants_expand_after_current_mount_selection() {
-        let request = DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::LlmChat]);
+        let request = DriverModelResolveRequest::new("gpt-5.5", vec![ApiType::Llm]);
         let inventory = resolve_driver_inventory(
             "openai-test",
             ProviderType::CloudApi,

@@ -249,7 +249,7 @@ fn mock_inventory(instance: &ProviderInstance, cost: &CostEstimate) -> ProviderI
     let mut models = Vec::new();
     for capability in instance.capabilities.iter() {
         let (api_type, mounts, provider_model_id) = match capability {
-            Capability::Llm => (ApiType::LlmChat, vec!["llm.plan.default"], "m"),
+            Capability::Llm => (ApiType::Llm, vec!["llm.plan.default"], "m"),
             Capability::Image => (
                 ApiType::ImageTextToImage,
                 vec!["image.txt2img.default", "text2image.default"],

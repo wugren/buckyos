@@ -459,7 +459,7 @@ mod tests {
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,
-            api_types: vec![ApiType::LlmChat],
+            api_types: vec![ApiType::Llm],
             logical_mounts: vec![mount.to_string()],
             capabilities: ModelCapabilities::default(),
             attributes: ModelAttributes {
@@ -493,7 +493,7 @@ mod tests {
     fn logical_definition(path: &str, min_line: ModelRequirement) -> LogicalModelDefinition {
         LogicalModelDefinition {
             path: path.to_string(),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
             min_line,
             disable_line: Default::default(),
             default_options: None,
@@ -570,10 +570,10 @@ mod tests {
 
         assert_eq!(registry.inventory_revision("openai_primary"), Some("r2"));
         assert!(registry
-            .exact_candidate("gpt-5.1@openai_primary", &ApiType::LlmChat)
+            .exact_candidate("gpt-5.1@openai_primary", &ApiType::Llm)
             .is_none());
         assert!(registry
-            .exact_candidate("gpt-5.2@openai_primary", &ApiType::LlmChat)
+            .exact_candidate("gpt-5.2@openai_primary", &ApiType::Llm)
             .is_some());
     }
 
@@ -608,13 +608,13 @@ mod tests {
         let guard = registry.read().unwrap();
         assert!(
             guard
-                .exact_candidate("gemini-2.5-flash@google_primary", &ApiType::LlmChat)
+                .exact_candidate("gemini-2.5-flash@google_primary", &ApiType::Llm)
                 .is_some(),
             "google inventory should be in the registry despite openai failing"
         );
         assert!(
             guard
-                .exact_candidate("gpt-5.2@openai_primary", &ApiType::LlmChat)
+                .exact_candidate("gpt-5.2@openai_primary", &ApiType::Llm)
                 .is_none(),
             "openai inventory should not be applied (it was malformed)"
         );

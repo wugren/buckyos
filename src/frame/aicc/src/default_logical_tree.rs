@@ -226,7 +226,7 @@ fn fallback_to_rule(preset: &FallbackPreset) -> FallbackRule {
 pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
     let mut definitions = vec![LogicalModelDefinition {
         path: "llm".to_string(),
-        api_type: ApiType::LlmChat,
+        api_type: ApiType::Llm,
         min_line: ModelRequirement::default(),
         disable_line: ModelDisable::default(),
         default_options: None,
@@ -240,7 +240,7 @@ pub fn build_default_logical_definitions() -> Vec<LogicalModelDefinition> {
     for template in LLM_TEMPLATES {
         definitions.push(LogicalModelDefinition {
             path: template.path.to_string(),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
             min_line: template.min_line.to_model_requirement(),
             disable_line: template.disable_line.to_model_disable(),
             default_options: None,
@@ -330,7 +330,7 @@ mod tests {
         assert!(decoded
             .logical_definitions
             .iter()
-            .any(|definition| definition.path == "llm" && definition.api_type == ApiType::LlmChat));
+            .any(|definition| definition.path == "llm" && definition.api_type == ApiType::Llm));
         assert!(!decoded
             .logical_definitions
             .iter()

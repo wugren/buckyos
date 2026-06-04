@@ -3147,7 +3147,7 @@ impl Provider for OpenAIProvider {
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         match req.method.as_str() {
-            ai_methods::LLM_CHAT | ai_methods::LLM_COMPLETION => {
+            ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
                     .await
             }
@@ -3217,7 +3217,7 @@ fn remote_model_resolve_request(model: &ModelMetadata) -> Option<DriverModelReso
         if is_text2image_model_name(provider_model_id.as_str()) {
             api_types.push(ApiType::ImageTextToImage);
         } else if is_supported_llm_model_name(provider_model_id.as_str()) {
-            api_types.push(ApiType::LlmChat);
+            api_types.push(ApiType::Llm);
         } else {
             return None;
         }
@@ -3277,8 +3277,7 @@ fn merge_remote_dynamic_metadata(model: &mut ModelMetadata, remote_model: &Model
 fn is_supported_openai_api_type(api_type: &ApiType) -> bool {
     matches!(
         api_type,
-        ApiType::LlmChat
-            | ApiType::LlmCompletion
+        ApiType::Llm
             | ApiType::Embedding
             | ApiType::Rerank
             | ApiType::ImageTextToImage

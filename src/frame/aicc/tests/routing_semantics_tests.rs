@@ -775,7 +775,7 @@ fn purpose_logical_route_reaches_driver_family_mount() {
         "google-gemini",
         &[DriverModelResolveRequest::new(
             "gemini-2.5-pro",
-            vec![ApiType::LlmChat],
+            vec![ApiType::Llm],
         )],
         Some("test".to_string()),
     );

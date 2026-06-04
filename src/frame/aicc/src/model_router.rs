@@ -639,7 +639,7 @@ mod tests {
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,
-            api_types: vec![ApiType::LlmChat],
+            api_types: vec![ApiType::Llm],
             logical_mounts: vec![mount.to_string()],
             capabilities: ModelCapabilities {
                 streaming: true,
@@ -730,7 +730,7 @@ mod tests {
     fn auto_definition(path: &str, min_line: ModelRequirement) -> LogicalModelDefinition {
         LogicalModelDefinition {
             path: path.to_string(),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
             min_line,
             disable_line: ModelDisable::default(),
             default_options: None,
@@ -782,7 +782,7 @@ mod tests {
         RouteRequest {
             request_id: "req-1".to_string(),
             session_id: Some("s1".to_string()),
-            api_type: ApiType::LlmChat,
+            api_type: ApiType::Llm,
             model: model.to_string(),
             policy,
             session_config_revision: Some("rev-1".to_string()),

@@ -134,7 +134,7 @@ impl ClaudeProvider {
     ) -> ProviderInventory {
         let requests = models
             .iter()
-            .map(|model| DriverModelResolveRequest::new(model.clone(), vec![ApiType::LlmChat]))
+            .map(|model| DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm]))
             .collect::<Vec<_>>();
         resolve_driver_inventory(
             provider_instance_name,
@@ -330,7 +330,7 @@ impl ClaudeProvider {
         }
 
         let fallback_api_types = if model.api_types.is_empty() {
-            vec![ApiType::LlmChat]
+            vec![ApiType::Llm]
         } else {
             model.api_types.clone()
         };
@@ -878,7 +878,7 @@ impl Provider for ClaudeProvider {
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         match req.method.as_str() {
-            ai_methods::LLM_CHAT | ai_methods::LLM_COMPLETION => {
+            ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
                     .await
             }

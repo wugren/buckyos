@@ -297,25 +297,6 @@ const allCases: SmokeCase[] = [
     }),
   },
   {
-    method: "llm.completion",
-    capability: "llm",
-    defaultAlias: AICC_MODEL_ALIAS,
-    check: "text",
-    buildPayload: () => ({
-      input_json: {
-        messages: [{
-          role: "user",
-          content: [{
-            type: "text",
-            text: `${AICC_TEST_INPUT}\n请用一句话回答。`,
-          }],
-        }],
-        temperature: 0.2,
-        max_output_tokens: 512,
-      },
-    }),
-  },
-  {
     method: "embedding.text",
     capability: "embedding",
     check: "embedding",

@@ -78,13 +78,6 @@ pub fn aicc_method_schemas() -> Vec<AiccMethodSchema> {
         "Chat completion with optional tool calls.",
         true,
     ));
-    out.push(llm_schema(
-        LLM_COMPLETION,
-        "llm.completion",
-        "Plain text completion / instruction following.",
-        true,
-    ));
-
     // ---- Embedding ----
     out.push(embedding_schema(EMBEDDING_TEXT, "embedding.text", false));
     out.push(embedding_schema(
@@ -1111,7 +1104,6 @@ mod tests {
 
         for expected in [
             ai_methods::LLM_CHAT,
-            ai_methods::LLM_COMPLETION,
             ai_methods::EMBEDDING_TEXT,
             ai_methods::EMBEDDING_MULTIMODAL,
             ai_methods::RERANK,

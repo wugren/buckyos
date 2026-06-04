@@ -1699,7 +1699,7 @@ impl Router {
             };
 
             let estimate = provider.estimate_cost(&CostEstimateInput {
-                api_type: api_type_for_capability(&req.capability).unwrap_or(ApiType::LlmChat),
+                api_type: api_type_for_capability(&req.capability).unwrap_or(ApiType::Llm),
                 exact_model: exact_model_name(provider_model.as_str(), instance_id),
                 input_tokens,
                 estimated_output_tokens: Some(output_tokens),
@@ -1816,7 +1816,7 @@ impl Router {
             attempts: final_attempts,
             route_trace: Arc::new(Mutex::new(legacy_route_trace(
                 req.model.alias.clone(),
-                api_type_for_capability(&req.capability).unwrap_or(ApiType::LlmChat),
+                api_type_for_capability(&req.capability).unwrap_or(ApiType::Llm),
             ))),
             runtime_failover_enabled: true,
             sticky_key: None,
@@ -1892,7 +1892,7 @@ fn default_method_for_capability(capability: &Capability) -> &'static str {
 
 fn capability_for_method(method: &str) -> Option<Capability> {
     match method {
-        ai_methods::LLM_CHAT | ai_methods::LLM_COMPLETION => Some(Capability::Llm),
+        ai_methods::LLM_CHAT => Some(Capability::Llm),
         ai_methods::EMBEDDING_TEXT | ai_methods::EMBEDDING_MULTIMODAL => {
             Some(Capability::Embedding)
         }
@@ -1922,8 +1922,7 @@ fn capability_for_method(method: &str) -> Option<Capability> {
 
 fn api_type_for_method(method: &str) -> Option<ApiType> {
     match method {
-        ai_methods::LLM_CHAT => Some(ApiType::LlmChat),
-        ai_methods::LLM_COMPLETION => Some(ApiType::LlmCompletion),
+        ai_methods::LLM_CHAT => Some(ApiType::Llm),
         ai_methods::EMBEDDING_TEXT => Some(ApiType::Embedding),
         ai_methods::EMBEDDING_MULTIMODAL => Some(ApiType::EmbeddingMultimodal),
         ai_methods::RERANK => Some(ApiType::Rerank),
@@ -1953,7 +1952,6 @@ fn api_type_for_method(method: &str) -> Option<ApiType> {
 fn method_for_route_api_type(api_type: &str) -> std::result::Result<&'static str, RPCErrors> {
     match api_type {
         "llm" | "chat.completions.create" => Ok(ai_methods::LLM_CHAT),
-        "llm.completion" | "completions.create" => Ok(ai_methods::LLM_COMPLETION),
         "image.txt2img" | "images.generate" => Ok(ai_methods::IMAGE_TXT2IMG),
         "image.img2img" | "images.edit" => Ok(ai_methods::IMAGE_IMG2IMG),
         "image.inpaint" => Ok(ai_methods::IMAGE_INPAINT),
@@ -2187,8 +2185,7 @@ fn route_request_from_method_request(
 
 fn api_type_string(api_type: &ApiType) -> &'static str {
     match api_type {
-        ApiType::LlmChat => "llm",
-        ApiType::LlmCompletion => "llm.completion",
+        ApiType::Llm => "llm",
         ApiType::ImageTextToImage => "image.txt2img",
         ApiType::ImageToImage => "image.img2img",
         ApiType::Embedding => "embedding.text",
@@ -5787,7 +5784,7 @@ mod tests {
     #[test]
     fn non_chat_methods_do_not_default_web_search() {
         let mut request = base_request();
-        apply_default_features_for_method(ai_methods::LLM_COMPLETION, &mut request);
+        apply_default_features_for_method(ai_methods::EMBEDDING_TEXT, &mut request);
 
         assert!(!request.requirements.required.web_search);
     }
@@ -6019,7 +6016,7 @@ mod tests {
                 instance.provider_type.clone(),
                 instance.provider_driver.as_str(),
                 "gpt-4o-mini",
-                ApiType::LlmChat,
+                ApiType::Llm,
                 vec!["llm.plan.default".to_string()],
                 &instance.features,
                 Some(0.001),

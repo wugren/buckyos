@@ -71,9 +71,7 @@ pub fn is_exact_model_name(value: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum ApiType {
     #[serde(rename = "llm")]
-    LlmChat,
-    #[serde(rename = "llm.completion")]
-    LlmCompletion,
+    Llm,
     #[serde(rename = "image.txt2img")]
     ImageTextToImage,
     #[serde(rename = "image.img2img")]
@@ -123,7 +121,7 @@ pub enum ApiType {
 impl ApiType {
     pub fn namespace(&self) -> &'static str {
         match self {
-            Self::LlmChat | Self::LlmCompletion => "llm",
+            Self::Llm => "llm",
             Self::Embedding | Self::EmbeddingMultimodal => "embedding",
             Self::Rerank => "rerank",
             Self::ImageTextToImage
@@ -1364,7 +1362,7 @@ mod tests {
             provider_actual_model_id: None,
             provider_options: None,
             parameter_scale: None,
-            api_types: vec![ApiType::LlmChat],
+            api_types: vec![ApiType::Llm],
             logical_mounts: vec!["llm.gpt5".to_string()],
             capabilities: ModelCapabilities {
                 streaming: true,
@@ -1380,7 +1378,7 @@ mod tests {
             health: ModelHealth::default(),
         };
 
-        assert!(model.supports_api_type(&ApiType::LlmChat));
+        assert!(model.supports_api_type(&ApiType::Llm));
         assert!(!model.supports_api_type(&ApiType::ImageTextToImage));
         assert!(model.supports_requirements(&RequiredModelFeatures {
             web_search: true,
@@ -1414,7 +1412,7 @@ mod tests {
             "models": [{
                 "provider_model_id": "gpt-5.2",
                 "exact_model": "gpt-5.2@openai_primary",
-                "api_types": ["llm", "llm.completion"],
+                "api_types": ["llm"],
                 "logical_mounts": ["llm.gpt5"],
                 "capabilities": {
                     "streaming": true,
@@ -1440,11 +1438,8 @@ mod tests {
 
         let inventory: ProviderInventory = serde_json::from_value(value).unwrap();
         assert_eq!(inventory.provider_instance_name, "openai_primary");
-        assert_eq!(
-            inventory.models[0].api_types,
-            vec![ApiType::LlmChat, ApiType::LlmCompletion]
-        );
-        assert!(inventory.models[0].supports_api_type(&ApiType::LlmChat));
+        assert_eq!(inventory.models[0].api_types, vec![ApiType::Llm]);
+        assert!(inventory.models[0].supports_api_type(&ApiType::Llm));
         let encoded = serde_json::to_value(&inventory).unwrap();
         assert_eq!(encoded["models"][0]["api_types"][0], "llm");
     }

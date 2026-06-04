@@ -1317,7 +1317,6 @@ function asOptionalBoolean(value: unknown): boolean | undefined {
 
 const API_TYPES: ApiType[] = [
   'llm',
-  'llm.completion',
   'embedding.text',
   'embedding.multimodal',
   'rerank',

@@ -21,7 +21,6 @@ pub mod ai_methods {
     pub const HELPER_TEXT_TO_IMAGE: &str = "helper.text_to_image";
 
     pub const LLM_CHAT: &str = "llm.chat";
-    pub const LLM_COMPLETION: &str = "llm.completion";
     pub const EMBEDDING_TEXT: &str = "embedding.text";
     pub const EMBEDDING_MULTIMODAL: &str = "embedding.multimodal";
     pub const RERANK: &str = "rerank";
@@ -56,7 +55,6 @@ pub mod ai_methods {
         matches!(
             method,
             LLM_CHAT
-                | LLM_COMPLETION
                 | EMBEDDING_TEXT
                 | EMBEDDING_MULTIMODAL
                 | RERANK
