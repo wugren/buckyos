@@ -1132,6 +1132,7 @@ impl AgentAttentionSignalStore {
                 window.created_at,
             ],
         )?;
+        drop(conn);
         self.get_extraction_window(&window.id)?
             .ok_or_else(|| AttentionSignalError::Storage("created window missing".into()))
     }

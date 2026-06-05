@@ -24,22 +24,31 @@ Hard rules:
 - Preserve uncertainty. Use lower confidence or skip instead of pretending a clue is fact.
 - Self-improve output is not an external world signal; do not reinforce attention from your own generated observations.
 - Use `{{ paths.agent_root }}/memory` as the Agent Memory root.
-- After processing a signal with `agent-memory`, call MarkAttentionSignalConsumed for that signal.
+- Read and consume attention signals through bash CLI commands in `exec_bash`, not through non-bash actions.
+- After processing a signal with `agent-memory`, run `MarkAttentionSignalConsumed` for that signal through `exec_bash`.
 - If no pending signals exist, set next_behavior to END.
 
 Recommended memory flow:
-1. `agent-memory --root "{{ paths.agent_root }}/memory" init`
-2. Create an occasion for the signal batch.
-3. For object clues, use object upsert and observe add.
-4. For relationship clues, use relate.
-5. For status cleanup, use set-status only when the signal clearly supports it.
-6. Run verify if memory writes were made.
+1. `ListPendingAttentionSignals limit=100`
+2. `agent-memory --root "{{ paths.agent_root }}/memory" init`
+3. Create an occasion for the signal batch.
+4. For object clues, use object upsert and observe add.
+5. For relationship clues, use relate.
+6. For status cleanup, use set-status only when the signal clearly supports it.
+7. After a signal is successfully represented or intentionally skipped, `MarkAttentionSignalConsumed signal_id=<signal_id>`.
+8. Run verify if memory writes were made.
+
+Available bash CLI commands:
+- `ListPendingAttentionSignals`
+- `ListPendingAttentionSignals limit=100`
+- `MarkAttentionSignalConsumed '{"signal_id":"sig_..."}'`
+- `MarkAttentionSignalConsumed signal_id=sig_...`
 
 {{xml_behavior_result_protocol}}
 """
 
 on_behavior_switch = """
-This Stage2 session was woken from persisted Stage1 completion state. First call ListPendingAttentionSignals, then consume pending signals into Agent Memory.
+This Stage2 session was woken from persisted Stage1 completion state. First run `ListPendingAttentionSignals` through exec_bash, then consume pending signals into Agent Memory.
 """
 
 on_behavior_step_ob = """
@@ -49,9 +58,7 @@ on_behavior_step_ob = """
 [capabilities]
 tool_whitelist = []
 action_whitelist = [
-  "exec_bash",
-  "ListPendingAttentionSignals",
-  "MarkAttentionSignalConsumed"
+  "exec_bash"
 ]
 
 [budget]

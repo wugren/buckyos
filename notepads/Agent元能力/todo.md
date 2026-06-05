@@ -158,6 +158,53 @@ Stage3:
 
 
 > TODO: 增加一个专门的组件来管理 Attention Signals OK 
+> TODO: 补齐 Attention Signal / Session History 管理操作的 bash CLI 支持
+>
+> 背景：Agent 行为层原则上不继续扩展 action surface，复杂管理操作应通过 Agent Tool bash CLI 暴露给 `exec_bash` 使用。当前 `self_improve_signals` Stage1 需要通过 CLI 完成 session-history 读取、extraction window 管理、Discover* 写入、progress commit；Stage2 也需要通过 CLI list/mark attention signals。现状里这些工具多为 `LLM | ACTION` 或只注册在 live OpenDAN tool manager 中，不能保证 `exec_bash` 命令可用。
+>
+> 目标：Code Agent 实现完整 CLI/BASH 支持，并回改 Jarvis self-improve 行为配置，使 Stage1/Stage2 主要使用 bash CLI，而不是新增 action。
+>
+> 需要支持的 CLI 命令：
+> - `read_session_history`
+> - `commit_session_history_improved`
+> - `BeginAttentionSignalExtraction`
+> - `CompleteAttentionSignalExtraction`
+> - `DiscoverEvent`
+> - `DiscoverObjectObservation`
+> - `DiscoverRelationship`
+> - `ListPendingAttentionSignals`
+> - `MarkAttentionSignalConsumed`
+>
+> 实现要求：
+> - 优先复用现有类型和 store：`src/frame/agent_tool/src/agent_attention_signal.rs`、`src/frame/opendan/src/buildin_tool.rs`、`src/frame/opendan/src/round_history.rs`。
+> - CLI 可以接受一整个 JSON object 参数，例如 `DiscoverEvent '{"title":"...","phase":"active","evidence":[...],"confidence":0.9}'`；简单命令可以同时支持 `key=value`。
+> - 不能只改 prompt。必须让 `exec_bash` 在实际 session PATH 中能找到这些命令并成功 dispatch。
+> - 如需给 `agent_tool` CLI registry 增加实现，必须从 `OPENDAN_AGENT_ROOT` / `OPENDAN_SESSION_ID` 推导 root、session、attention_signals store；不能依赖 live `AIAgent` 指针。
+> - `read_session_history` 必须能读取 `<agent_root>/sessions/<session_id>/round_history`，并保持 round completeness、`from_already_improved`、`commit_round_index` 语义。
+> - `commit_session_history_improved` 必须更新目标 session `.meta/session.json` 中的 already_improved 状态。
+> - `BeginAttentionSignalExtraction` / `Discover*` / `CompleteAttentionSignalExtraction` 在 CLI 形态下必须能维护同一次 Stage1 run 的 extraction runtime 状态。可用 session-local runtime 文件保存当前 window，不要依赖进程内全局状态。
+> - `ListPendingAttentionSignals` / `MarkAttentionSignalConsumed` 必须对 `<agent_root>/attention_signals` 的 store 生效。
+> - 把上述命令加入 session bin 自动链接列表或等价机制，确保 Jarvis 的 `exec_bash` 可以直接调用。
+> - 回改 `src/rootfs/bin/buckyos_jarvis/behaviors/self_improve_signals.toml`：`action_whitelist` 只保留 `exec_bash`，prompt 中列出 CLI 命令和 JSON 用法。
+> - 同步检查 `src/rootfs/bin/buckyos_jarvis/behaviors/self_improve_set_memory.toml`，如果 Stage2 仍依赖 `ListPendingAttentionSignals` / `MarkAttentionSignalConsumed` action，也改为 CLI。
+>
+> 验收标准：
+> - 在一个 Agent session 的 `exec_bash` 中，所有上述命令都能 `command -v` 找到。
+> - 能用 CLI 完成最小 Stage1 流程：read history -> begin extraction -> DiscoverObjectObservation -> complete extraction -> commit progress。
+> - 能用 CLI 完成最小 Stage2 管理流程：list pending signals -> mark one consumed。
+> - `self_improve_signals.toml` 不再暴露 attention/session-history action。
+> - 必须补充或更新 Rust 单元测试，至少覆盖 CLI 参数解析、store 写入、pending list、consumed mark、session history progress commit。
+> - 验证命令至少包括：
+>   - `cargo test -p agent_tool agent_attention_signal`
+>   - `cargo test -p agent_tool_cli_dev`
+>   - `cargo test -p opendan behavior_cfg --lib`
+>   - 如改动 OpenDAN runtime wiring，再跑相关 `opendan` 单测。
+>
+> 风险点：
+> - 不要把 CLI 支持做成只在 provider tool/action 里可用。
+> - 不要让 CLI Discover* 丢失 source/evidence/extraction_window_id。
+> - 不要扫描 self_improve session 自己的 history。
+> - 不要在 Stage1 直接写 Agent Memory。
 > TODO: 如何重点观察skill的两种信号？
     1）使用了skill的session -> 看report
     2) 使用了skills mgr的selector,但没有选中任何skill

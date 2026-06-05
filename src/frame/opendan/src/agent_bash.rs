@@ -77,6 +77,15 @@ const BUILTIN_AGENT_TOOL_BINS: &[&str] = &[
     "check_task",
     "cancel_task",
     "finish_task",
+    "read_session_history",
+    "commit_session_history_improved",
+    "BeginAttentionSignalExtraction",
+    "CompleteAttentionSignalExtraction",
+    "DiscoverEvent",
+    "DiscoverObjectObservation",
+    "DiscoverRelationship",
+    "ListPendingAttentionSignals",
+    "MarkAttentionSignalConsumed",
 ];
 
 static EXEC_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1035,6 +1044,26 @@ mod tests {
 
         let linked = std::fs::read_link(session_bin.join("read_file")).expect("read symlink");
         assert_eq!(linked, fake_agent_tool);
+    }
+
+    #[test]
+    fn builtin_agent_tool_bins_include_attention_and_history_cli() {
+        for name in [
+            "read_session_history",
+            "commit_session_history_improved",
+            "BeginAttentionSignalExtraction",
+            "CompleteAttentionSignalExtraction",
+            "DiscoverEvent",
+            "DiscoverObjectObservation",
+            "DiscoverRelationship",
+            "ListPendingAttentionSignals",
+            "MarkAttentionSignalConsumed",
+        ] {
+            assert!(
+                BUILTIN_AGENT_TOOL_BINS.contains(&name),
+                "missing builtin Agent Tool bin {name}"
+            );
+        }
     }
 
     #[test]

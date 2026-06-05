@@ -17,6 +17,10 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
 
+use agent_tool::agent_attention_signal::{
+    CreateExtractionWindowInput, DiscoverEventArgs, DiscoverObjectObservationArgs,
+    DiscoverRelationshipArgs, SignalLifecycleStatus,
+};
 use agent_tool::agent_memory::{
     AddObservationOp, AgentMemory, AgentMemoryConfig, AgentMemoryError, FlatSetOp, LoadOptions,
     ObjectAliasInput, OccasionAddInput, ReinforceObjectWeightOp, SetStatusOp, SourceRef,
@@ -41,13 +45,29 @@ use agent_tool::skills_mgr::{
 };
 use agent_tool::{
     cli_error_result, cli_exit_code_for_error, cli_result_from_tool_result, cli_success_result,
-    normalize_abs_path, now_ms, render_cli_output, session_record_path, AgentToolError,
-    AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus, BindWorkspaceTool,
-    CliRunOutput, CreateWorkspaceTool, DcrontabTool, EditFileTool, FileToolConfig, GetSessionTool,
-    GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext, SessionRuntimeContext,
-    SessionViewBackend, TodoTool, TodoToolConfig, WorkspaceToolBackend, WriteFileTool,
+    normalize_abs_path, now_ms, render_cli_output, session_record_path, AgentAttentionSignalStore,
+    AgentToolError, AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus,
+    AttentionSignalStoreConfig, AttentionSignalToolRuntime, BindWorkspaceTool, CliRunOutput,
+    CreateWorkspaceTool, DcrontabTool, DiscoverEventTool, DiscoverObjectObservationTool,
+    DiscoverRelationshipTool, EditFileTool, FileToolConfig, GetSessionTool, GlobTool, GrepTool,
+    NoopFileWriteAudit, ReadFileTool, RuntimeContext, SessionRuntimeContext, SessionViewBackend,
+    TodoTool, TodoToolConfig, ToolCtx, TypedTool, WorkspaceToolBackend, WriteFileTool,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
+use chrono::{DateTime, Duration, Utc};
+use opendan::buildin_tool::{
+    AlreadyImprovedOutput, BeginAttentionSignalExtractionArgs,
+    BeginAttentionSignalExtractionOutput, CommitSessionHistoryImprovedArgs,
+    CommitSessionHistoryImprovedOutput, CompleteAttentionSignalExtractionArgs,
+    CompleteAttentionSignalExtractionOutput, ListPendingAttentionSignalsArgs,
+    ListPendingAttentionSignalsOutput, MarkAttentionSignalConsumedArgs,
+    MarkAttentionSignalConsumedOutput, ReadSessionHistoryArgs, ReadSessionHistoryOutput,
+    SessionHistoryMessageOutput,
+};
+use opendan::round_history::{
+    SessionHistoryQuery, SessionHistoryReadOptions, SessionHistoryReader,
+};
+use opendan::session_model::{AlreadyImprovedState, SessionKind, SessionMeta};
 
 const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
@@ -58,7 +78,13 @@ const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
 const TOOL_AGENT_SKILLS: &str = "agent-skills";
 const TOOL_AGENT_SKILLS_SNAKE: &str = "agent_skills";
-const TOOL_NAMES: [&str; 19] = [
+const TOOL_READ_SESSION_HISTORY: &str = "read_session_history";
+const TOOL_COMMIT_SESSION_HISTORY_IMPROVED: &str = "commit_session_history_improved";
+const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtraction";
+const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
+const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
+const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
+const TOOL_NAMES: [&str; 28] = [
     "Glob",
     "Grep",
     "dcrontab",
@@ -78,6 +104,15 @@ const TOOL_NAMES: [&str; 19] = [
     TOOL_CHECK_TASK,
     TOOL_CANCEL_TASK,
     TOOL_FINISH_TASK,
+    TOOL_READ_SESSION_HISTORY,
+    TOOL_COMMIT_SESSION_HISTORY_IMPROVED,
+    TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION,
+    TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION,
+    agent_tool::TOOL_DISCOVER_EVENT,
+    agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION,
+    agent_tool::TOOL_DISCOVER_RELATIONSHIP,
+    TOOL_LIST_PENDING_ATTENTION_SIGNALS,
+    TOOL_MARK_ATTENTION_SIGNAL_CONSUMED,
 ];
 const AGENT_MEMORY_ROOT_ENV: &str = "AGENT_MEMORY_ROOT";
 const AGENT_MEMORY_DIR_NAME: &str = "memory";
@@ -93,6 +128,12 @@ const DEFAULT_BEHAVIOR: &str = "cli";
 const SESSION_RECORD_FILE: &str = "session.json";
 const SESSION_WORKSPACE_BINDINGS_REL_PATH: &str = "workspaces/session_workspace_bindings.json";
 const WORKSPACE_INDEX_FILE: &str = "index.json";
+const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
+const MAX_HISTORY_PAGE_SIZE: usize = 200;
+const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 40 * 1024;
+const DEFAULT_HISTORY_WINDOW_MS: i64 = 10 * 60 * 1000;
+const ATTENTION_EXTRACTION_RUNTIME_REL_PATH: &str =
+    ".runtime/attention_signal_extraction/current.json";
 
 #[derive(Clone, Debug)]
 struct CliRuntimeEnv {
@@ -4684,6 +4725,781 @@ struct CliWorkspaceBackend {
     agent_id: String,
 }
 
+struct CliReadSessionHistoryTool {
+    agent_root: PathBuf,
+}
+
+struct CliCommitSessionHistoryImprovedTool {
+    agent_root: PathBuf,
+}
+
+struct CliBeginAttentionSignalExtractionTool {
+    agent_root: PathBuf,
+    current_session_id: String,
+    agent_id: String,
+}
+
+struct CliCompleteAttentionSignalExtractionTool {
+    agent_root: PathBuf,
+    current_session_id: String,
+}
+
+struct CliListPendingAttentionSignalsTool {
+    store: Arc<AgentAttentionSignalStore>,
+    agent_scope_id: String,
+}
+
+struct CliMarkAttentionSignalConsumedTool {
+    store: Arc<AgentAttentionSignalStore>,
+}
+
+struct CliDiscoverEventTool {
+    store: Arc<AgentAttentionSignalStore>,
+    agent_root: PathBuf,
+    current_session_id: String,
+}
+
+struct CliDiscoverObjectObservationTool {
+    store: Arc<AgentAttentionSignalStore>,
+    agent_root: PathBuf,
+    current_session_id: String,
+}
+
+struct CliDiscoverRelationshipTool {
+    store: Arc<AgentAttentionSignalStore>,
+    agent_root: PathBuf,
+    current_session_id: String,
+}
+
+#[async_trait]
+impl TypedTool for CliReadSessionHistoryTool {
+    type Args = ReadSessionHistoryArgs;
+    type Output = ReadSessionHistoryOutput;
+
+    fn name(&self) -> &str {
+        TOOL_READ_SESSION_HISTORY
+    }
+
+    fn description(&self) -> &str {
+        "Read target Agent Session history from <agent_root>/sessions/<session_id>/round_history."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some(
+            "read_session_history '{\"session_id\":\"...\",\"from_already_improved\":true,\"token_limit\":40960}' | read_session_history session_id=<id> already_improved token_limit=40960".to_string(),
+        )
+    }
+
+    fn parse_bash_args(
+        &self,
+        tokens: &[String],
+        _shell_cwd: Option<&Path>,
+    ) -> Result<Json, AgentToolError> {
+        parse_read_session_history_cli_args(tokens)
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "read {} message(s) from session {} ({})",
+            output.returned, output.session_id, output.query
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        let session_dir = session_dir(&self.agent_root, session_id);
+        if !session_dir.is_dir() {
+            return Err(AgentToolError::ExecFailed(format!(
+                "session `{session_id}` not found"
+            )));
+        }
+
+        let token_limit = args.token_limit.unwrap_or(DEFAULT_HISTORY_TOKEN_LIMIT);
+        let reader = SessionHistoryReader::open(&session_dir)
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let already_improved = load_already_improved_state(&session_dir).await?;
+        let (result, query_label) = if args.from_already_improved {
+            let start_round_index = already_improved.committed_round_index.saturating_add(1);
+            let result = reader
+                .read_session_messages_from_round_index(
+                    start_round_index,
+                    SessionHistoryReadOptions { token_limit },
+                )
+                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+            (
+                result,
+                format!("already_improved from_round={start_round_index}"),
+            )
+        } else {
+            let (query, query_label) = build_history_query(&args)?;
+            let result = reader
+                .read_session_messages(query, SessionHistoryReadOptions { token_limit })
+                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+            (result, query_label)
+        };
+        let commit_round_index = args
+            .from_already_improved
+            .then_some(result.last_round_index)
+            .flatten();
+        let latest_round_index = result.latest_round_index;
+        let messages = result
+            .messages
+            .into_iter()
+            .map(|msg| {
+                let ts_ms = msg.ts.timestamp_millis().max(0) as u64;
+                SessionHistoryMessageOutput {
+                    round_index: msg.round_index,
+                    seq: msg.seq,
+                    ts_ms,
+                    ts: msg.ts.to_rfc3339(),
+                    role: msg.role.as_str().to_string(),
+                    text: msg.text,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(ReadSessionHistoryOutput {
+            session_id: session_id.to_string(),
+            query: query_label,
+            already_improved: already_improved_output(&already_improved),
+            commit_round_index,
+            latest_round_index,
+            total_candidates: result.total_candidates,
+            returned: messages.len(),
+            truncated: result.truncated,
+            messages,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliCommitSessionHistoryImprovedTool {
+    type Args = CommitSessionHistoryImprovedArgs;
+    type Output = CommitSessionHistoryImprovedOutput;
+
+    fn name(&self) -> &str {
+        TOOL_COMMIT_SESSION_HISTORY_IMPROVED
+    }
+
+    fn description(&self) -> &str {
+        "Commit self-improve processing progress into target session .meta/session.json."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some(
+            "commit_session_history_improved '{\"session_id\":\"...\",\"round_index\":3}' | commit_session_history_improved session_id=<id> round_index=3".to_string(),
+        )
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "committed improved history for session {} through round {}",
+            output.session_id, output.committed_round_index
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        let session_dir = session_dir(&self.agent_root, session_id);
+        if !session_dir.is_dir() {
+            return Err(AgentToolError::ExecFailed(format!(
+                "session `{session_id}` not found"
+            )));
+        }
+        let latest_round_index = SessionHistoryReader::open(&session_dir)
+            .and_then(|reader| reader.latest_round_index())
+            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
+        let target_round_index = latest_round_index
+            .map(|latest| args.round_index.min(latest))
+            .unwrap_or(0);
+        let (previous, committed) =
+            commit_already_improved_state(&session_dir, target_round_index).await?;
+        Ok(CommitSessionHistoryImprovedOutput {
+            session_id: session_id.to_string(),
+            committed_round_index: committed.committed_round_index,
+            previous_committed_round_index: previous.committed_round_index,
+            latest_round_index,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliBeginAttentionSignalExtractionTool {
+    type Args = BeginAttentionSignalExtractionArgs;
+    type Output = BeginAttentionSignalExtractionOutput;
+
+    fn name(&self) -> &str {
+        TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION
+    }
+
+    fn description(&self) -> &str {
+        "Open a persisted Stage1 extraction scope for subsequent Discover* CLI commands."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some(
+            "BeginAttentionSignalExtraction '{\"session_id\":\"...\",\"window_start\":\"...\",\"window_end\":\"...\"}'".to_string(),
+        )
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "opened attention extraction window {} for session {}",
+            output.extraction_window_id, output.session_id
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let session_id = args.session_id.trim();
+        validate_session_id_arg(session_id)?;
+        if session_id == self.current_session_id {
+            return Err(AgentToolError::InvalidArgs(
+                "current self-improve session history cannot be used as self-improve input"
+                    .to_string(),
+            ));
+        }
+        let window_start = args.window_start.trim();
+        let window_end = args.window_end.trim();
+        if window_start.is_empty() || window_end.is_empty() {
+            return Err(AgentToolError::InvalidArgs(
+                "`window_start` and `window_end` must not be empty".to_string(),
+            ));
+        }
+
+        let target_session_dir = session_dir(&self.agent_root, session_id);
+        let meta = load_session_meta(&target_session_dir)
+            .await?
+            .ok_or_else(|| {
+                AgentToolError::ExecFailed(format!("session `{session_id}` meta not found"))
+            })?;
+        if matches!(meta.kind, SessionKind::SelfImprove) {
+            return Err(AgentToolError::InvalidArgs(
+                "self-improve session history cannot be used as self-improve input".to_string(),
+            ));
+        }
+
+        let owner_id = if meta.owner.trim().is_empty() {
+            "system".to_string()
+        } else {
+            meta.owner.clone()
+        };
+        let user_id = owner_id.clone();
+        let agent_scope_id = self.agent_id.clone();
+        let store = open_attention_store(&self.agent_root)?;
+        let extraction_window = store.create_extraction_window(CreateExtractionWindowInput {
+            owner_id: owner_id.clone(),
+            agent_id: self.agent_id.clone(),
+            agent_scope_id: agent_scope_id.clone(),
+            user_id: user_id.clone(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
+        })?;
+        let runtime = AttentionSignalToolRuntime {
+            owner_id: owner_id.clone(),
+            agent_id: self.agent_id.clone(),
+            agent_scope_id: agent_scope_id.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.to_string(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
+            extraction_window_id: extraction_window.id.clone(),
+            extractor_version: None,
+            prompt_version: None,
+            model_name: None,
+        };
+        save_attention_runtime(&self.agent_root, &self.current_session_id, &runtime).await?;
+        Ok(BeginAttentionSignalExtractionOutput {
+            owner_id,
+            agent_id: self.agent_id.clone(),
+            agent_scope_id,
+            user_id,
+            session_id: session_id.to_string(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
+            extraction_window_id: extraction_window.id,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliCompleteAttentionSignalExtractionTool {
+    type Args = CompleteAttentionSignalExtractionArgs;
+    type Output = CompleteAttentionSignalExtractionOutput;
+
+    fn name(&self) -> &str {
+        TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION
+    }
+
+    fn description(&self) -> &str {
+        "Complete the persisted Stage1 extraction scope for this session."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("CompleteAttentionSignalExtraction".to_string())
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!(
+            "completed attention extraction window {}",
+            output.extraction_window.id
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        _args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        let store = open_attention_store(&self.agent_root)?;
+        let extraction_window = store.complete_extraction_window(&runtime.extraction_window_id)?;
+        remove_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        Ok(CompleteAttentionSignalExtractionOutput { extraction_window })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliListPendingAttentionSignalsTool {
+    type Args = ListPendingAttentionSignalsArgs;
+    type Output = ListPendingAttentionSignalsOutput;
+
+    fn name(&self) -> &str {
+        TOOL_LIST_PENDING_ATTENTION_SIGNALS
+    }
+
+    fn description(&self) -> &str {
+        "List pending Stage2 attention signals from <agent_root>/attention_signals."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("ListPendingAttentionSignals [limit=100]".to_string())
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!("listed {} pending attention signal(s)", output.returned)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let signals = self
+            .store
+            .list_pending_stage2(&self.agent_scope_id, args.limit)?;
+        Ok(ListPendingAttentionSignalsOutput {
+            agent_scope_id: self.agent_scope_id.clone(),
+            returned: signals.len(),
+            signals,
+        })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliMarkAttentionSignalConsumedTool {
+    type Args = MarkAttentionSignalConsumedArgs;
+    type Output = MarkAttentionSignalConsumedOutput;
+
+    fn name(&self) -> &str {
+        TOOL_MARK_ATTENTION_SIGNAL_CONSUMED
+    }
+
+    fn description(&self) -> &str {
+        "Mark one pending attention signal consumed in <agent_root>/attention_signals."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some(
+            "MarkAttentionSignalConsumed '{\"signal_id\":\"sig_...\"}' | MarkAttentionSignalConsumed signal_id=sig_...".to_string(),
+        )
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format!("marked attention signal {} consumed", output.signal.id)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let signal = self
+            .store
+            .update_lifecycle_status(args.signal_id.trim(), SignalLifecycleStatus::Consumed)?;
+        Ok(MarkAttentionSignalConsumedOutput { signal })
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliDiscoverEventTool {
+    type Args = DiscoverEventArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_EVENT
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage1 event attention signal for the current extraction scope."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("DiscoverEvent '{\"title\":\"...\",\"phase\":\"active\",\"evidence\":[...],\"confidence\":0.9}'".to_string())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        DiscoverEventTool::new(self.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliDiscoverObjectObservationTool {
+    type Args = DiscoverObjectObservationArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage1 object-observation attention signal for the current extraction scope."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("DiscoverObjectObservation '{\"object\":{\"mention_text\":\"...\",\"entity_type\":\"project\"},\"observation\":\"...\",\"evidence\":[...],\"confidence\":0.9}'".to_string())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        DiscoverObjectObservationTool::new(self.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliDiscoverRelationshipTool {
+    type Args = DiscoverRelationshipArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_RELATIONSHIP
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage1 relationship attention signal for the current extraction scope."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("DiscoverRelationship '{\"subject\":{\"name\":\"...\"},\"predicate\":\"uses\",\"object\":{\"name\":\"...\"},\"evidence\":[...],\"confidence\":0.9}'".to_string())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        DiscoverRelationshipTool::new(self.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+fn validate_session_id_arg(session_id: &str) -> Result<(), AgentToolError> {
+    if session_id.is_empty() {
+        return Err(AgentToolError::InvalidArgs(
+            "`session_id` must not be empty".to_string(),
+        ));
+    }
+    if session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+    {
+        return Err(AgentToolError::InvalidArgs(
+            "`session_id` must be a plain session id, not a path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn session_dir(agent_root: &Path, session_id: &str) -> PathBuf {
+    agent_root.join("sessions").join(session_id)
+}
+
+fn session_meta_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(".meta").join("session.json")
+}
+
+async fn load_session_meta(session_dir: &Path) -> Result<Option<SessionMeta>, AgentToolError> {
+    let path = session_meta_path(session_dir);
+    match fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice::<SessionMeta>(&bytes)
+            .map(Some)
+            .map_err(|err| {
+                AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(AgentToolError::ExecFailed(format!(
+            "read {} failed: {err}",
+            path.display()
+        ))),
+    }
+}
+
+async fn write_session_meta(session_dir: &Path, meta: &SessionMeta) -> Result<(), AgentToolError> {
+    let path = session_meta_path(session_dir);
+    let dir = path.parent().ok_or_else(|| {
+        AgentToolError::ExecFailed(format!("invalid session meta path {}", path.display()))
+    })?;
+    fs::create_dir_all(dir).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("mkdir {} failed: {err}", dir.display()))
+    })?;
+    let bytes = serde_json::to_vec_pretty(meta).map_err(|err| {
+        AgentToolError::ExecFailed(format!("serialize session meta failed: {err}"))
+    })?;
+    let tmp = dir.join(format!(
+        "session.json.{}.{}.tmp",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&tmp, &bytes).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("write {} failed: {err}", tmp.display()))
+    })?;
+    fs::rename(&tmp, &path).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("rename to {} failed: {err}", path.display()))
+    })?;
+    Ok(())
+}
+
+async fn load_already_improved_state(
+    session_dir: &Path,
+) -> Result<AlreadyImprovedState, AgentToolError> {
+    Ok(load_session_meta(session_dir)
+        .await?
+        .map(|meta| meta.already_improved)
+        .unwrap_or_default())
+}
+
+async fn commit_already_improved_state(
+    session_dir: &Path,
+    round_index: u64,
+) -> Result<(AlreadyImprovedState, AlreadyImprovedState), AgentToolError> {
+    let mut meta = load_session_meta(session_dir).await?.ok_or_else(|| {
+        AgentToolError::ExecFailed(format!(
+            "session meta not found under {}",
+            session_dir.display()
+        ))
+    })?;
+    let previous = meta.already_improved.clone();
+    if round_index > meta.already_improved.committed_round_index {
+        meta.already_improved.committed_round_index = round_index;
+        meta.already_improved.committed_at_ms = now_ms();
+    }
+    let committed = meta.already_improved.clone();
+    write_session_meta(session_dir, &meta).await?;
+    Ok((previous, committed))
+}
+
+fn already_improved_output(state: &AlreadyImprovedState) -> AlreadyImprovedOutput {
+    AlreadyImprovedOutput {
+        committed_round_index: state.committed_round_index,
+        committed_at_ms: state.committed_at_ms,
+    }
+}
+
+fn parse_read_session_history_cli_args(tokens: &[String]) -> Result<Json, AgentToolError> {
+    if tokens.len() == 1 && tokens[0].trim().starts_with('{') {
+        return agent_tool::parse_default_bash_exec_args(tokens);
+    }
+    let mut normalized = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match token.as_str() {
+            "already_improved" | "from_already_improved" => {
+                normalized.push("from_already_improved=true".to_string())
+            }
+            _ => normalized.push(token.clone()),
+        }
+    }
+    agent_tool::parse_default_bash_exec_args(&normalized)
+}
+
+fn build_history_query(
+    args: &ReadSessionHistoryArgs,
+) -> Result<(SessionHistoryQuery, String), AgentToolError> {
+    let exact_start = parse_optional_time(args.start_ms, args.start.as_deref(), "start")?;
+    let exact_end = parse_optional_time(args.end_ms, args.end.as_deref(), "end")?;
+    if exact_start.is_some() || exact_end.is_some() {
+        let start = exact_start.ok_or_else(|| {
+            AgentToolError::InvalidArgs(
+                "`start`/`start_ms` is required with exact time range".to_string(),
+            )
+        })?;
+        let end = exact_end.ok_or_else(|| {
+            AgentToolError::InvalidArgs(
+                "`end`/`end_ms` is required with exact time range".to_string(),
+            )
+        })?;
+        if start > end {
+            return Err(AgentToolError::InvalidArgs(
+                "`start` must not be greater than `end`".to_string(),
+            ));
+        }
+        return Ok((
+            SessionHistoryQuery::TimeRange { start, end },
+            format!("time_range {}..{}", start.to_rfc3339(), end.to_rfc3339()),
+        ));
+    }
+
+    let at = parse_optional_time(args.at_ms, args.at.as_deref(), "at")?;
+    if let Some(at) = at {
+        let window_ms = args.window_ms.unwrap_or(DEFAULT_HISTORY_WINDOW_MS as u64) as i64;
+        if window_ms <= 0 {
+            return Err(AgentToolError::InvalidArgs(
+                "`window_ms` must be greater than zero".to_string(),
+            ));
+        }
+        let half = Duration::milliseconds(window_ms / 2);
+        let start = at - half;
+        let end = at + Duration::milliseconds(window_ms - window_ms / 2);
+        return Ok((
+            SessionHistoryQuery::TimeRange { start, end },
+            format!("around {} window_ms={window_ms}", at.to_rfc3339()),
+        ));
+    }
+
+    let page = args.page.unwrap_or(0);
+    if page < -1 {
+        return Err(AgentToolError::InvalidArgs(
+            "`page` must be -1 or a non-negative integer".to_string(),
+        ));
+    }
+    let page_size = args.page_size.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE);
+    if page_size == 0 {
+        return Err(AgentToolError::InvalidArgs(
+            "`page_size` must be greater than zero".to_string(),
+        ));
+    }
+    let page_size = page_size.min(MAX_HISTORY_PAGE_SIZE);
+    Ok((
+        SessionHistoryQuery::Page { page, page_size },
+        format!("page={page} page_size={page_size}"),
+    ))
+}
+
+fn parse_optional_time(
+    ms: Option<u64>,
+    rfc3339: Option<&str>,
+    name: &str,
+) -> Result<Option<DateTime<Utc>>, AgentToolError> {
+    match (ms, rfc3339.map(str::trim).filter(|s| !s.is_empty())) {
+        (Some(ms), None) => {
+            let ms = i64::try_from(ms)
+                .map_err(|_| AgentToolError::InvalidArgs(format!("`{name}_ms` is out of range")))?;
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .map(Some)
+                .ok_or_else(|| AgentToolError::InvalidArgs(format!("`{name}_ms` is invalid")))
+        }
+        (None, Some(value)) => DateTime::parse_from_rfc3339(value)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|err| AgentToolError::InvalidArgs(format!("invalid `{name}` time: {err}"))),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(AgentToolError::InvalidArgs(format!(
+            "use either `{name}_ms` or `{name}`, not both"
+        ))),
+    }
+}
+
+fn open_attention_store(agent_root: &Path) -> Result<AgentAttentionSignalStore, AgentToolError> {
+    AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
+        agent_root.join("attention_signals"),
+    ))
+    .map_err(AgentToolError::from)
+}
+
+fn attention_runtime_path(agent_root: &Path, current_session_id: &str) -> PathBuf {
+    session_dir(agent_root, current_session_id).join(ATTENTION_EXTRACTION_RUNTIME_REL_PATH)
+}
+
+async fn save_attention_runtime(
+    agent_root: &Path,
+    current_session_id: &str,
+    runtime: &AttentionSignalToolRuntime,
+) -> Result<(), AgentToolError> {
+    let path = attention_runtime_path(agent_root, current_session_id);
+    let dir = path.parent().ok_or_else(|| {
+        AgentToolError::ExecFailed(format!("invalid runtime path {}", path.display()))
+    })?;
+    fs::create_dir_all(dir).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("mkdir {} failed: {err}", dir.display()))
+    })?;
+    let bytes = serde_json::to_vec_pretty(runtime).map_err(|err| {
+        AgentToolError::ExecFailed(format!("serialize extraction runtime failed: {err}"))
+    })?;
+    fs::write(&path, bytes).await.map_err(|err| {
+        AgentToolError::ExecFailed(format!("write {} failed: {err}", path.display()))
+    })
+}
+
+async fn load_attention_runtime(
+    agent_root: &Path,
+    current_session_id: &str,
+) -> Result<AttentionSignalToolRuntime, AgentToolError> {
+    let path = attention_runtime_path(agent_root, current_session_id);
+    let bytes = fs::read(&path).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            AgentToolError::InvalidArgs(
+                "call BeginAttentionSignalExtraction before Discover* or CompleteAttentionSignalExtraction".to_string(),
+            )
+        } else {
+            AgentToolError::ExecFailed(format!("read {} failed: {err}", path.display()))
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
+    })
+}
+
+async fn remove_attention_runtime(
+    agent_root: &Path,
+    current_session_id: &str,
+) -> Result<(), AgentToolError> {
+    let path = attention_runtime_path(agent_root, current_session_id);
+    match fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(AgentToolError::ExecFailed(format!(
+            "remove {} failed: {err}",
+            path.display()
+        ))),
+    }
+}
+
 #[async_trait]
 impl WorkspaceToolBackend for CliWorkspaceBackend {
     async fn create_workspace(
@@ -4939,6 +5755,44 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
     mgr.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()))?;
     mgr.register_typed_tool(EditFileTool::new(file_cfg, audit))?;
     mgr.register_typed_tool(TodoTool::new(TodoToolConfig::new(state_root)))?;
+    mgr.register_typed_tool(CliReadSessionHistoryTool {
+        agent_root: env.agent_env_root.clone(),
+    })?;
+    mgr.register_typed_tool(CliCommitSessionHistoryImprovedTool {
+        agent_root: env.agent_env_root.clone(),
+    })?;
+    mgr.register_typed_tool(CliBeginAttentionSignalExtractionTool {
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+        agent_id: env.call_ctx.agent_name.clone(),
+    })?;
+    mgr.register_typed_tool(CliCompleteAttentionSignalExtractionTool {
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+    })?;
+    let attention_store = Arc::new(open_attention_store(&env.agent_env_root)?);
+    mgr.register_typed_tool(CliDiscoverEventTool {
+        store: attention_store.clone(),
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+    })?;
+    mgr.register_typed_tool(CliDiscoverObjectObservationTool {
+        store: attention_store.clone(),
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+    })?;
+    mgr.register_typed_tool(CliDiscoverRelationshipTool {
+        store: attention_store.clone(),
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+    })?;
+    mgr.register_typed_tool(CliListPendingAttentionSignalsTool {
+        store: attention_store.clone(),
+        agent_scope_id: env.call_ctx.agent_name.clone(),
+    })?;
+    mgr.register_typed_tool(CliMarkAttentionSignalConsumedTool {
+        store: attention_store,
+    })?;
 
     Ok(mgr)
 }
@@ -5678,6 +6532,8 @@ mod tests {
     use std::sync::Mutex;
 
     use agent_tool::RuntimeContextSource;
+    use buckyos_api::{AiMessage, AiRole};
+    use opendan::round_history::{ContextMode, RoundStatus, RoundTrigger, SessionHistoryWriter};
     use tempfile::tempdir;
     use tokio::fs;
 
@@ -5787,6 +6643,48 @@ mod tests {
         .expect("write agent identity");
     }
 
+    async fn seed_opendan_session_meta(agent_root: &Path, session_id: &str, kind: SessionKind) {
+        let session_dir = agent_root.join("sessions").join(session_id);
+        fs::create_dir_all(session_dir.join(".meta"))
+            .await
+            .expect("create session meta dir");
+        let meta = SessionMeta::new(
+            session_id.to_string(),
+            kind,
+            "chat_route".to_string(),
+            "alice".to_string(),
+        );
+        let bytes = serde_json::to_vec_pretty(&meta).expect("serialize session meta");
+        fs::write(session_dir.join(".meta").join("session.json"), bytes)
+            .await
+            .expect("write session meta");
+    }
+
+    async fn seed_round_history(agent_root: &Path, session_id: &str, text: &str) {
+        let session_dir = agent_root.join("sessions").join(session_id);
+        let mut writer = SessionHistoryWriter::open(&session_dir)
+            .await
+            .expect("open history writer");
+        writer
+            .begin_round(
+                RoundTrigger::UserMsg {
+                    preview: text.to_string(),
+                },
+                Vec::new(),
+                ContextMode::Chat,
+            )
+            .await
+            .expect("begin round");
+        writer
+            .append_message(AiMessage::text(AiRole::User, text), None)
+            .await
+            .expect("append message");
+        writer
+            .finalize_round(RoundStatus::Completed)
+            .await
+            .expect("finalize round");
+    }
+
     #[tokio::test]
     async fn read_file_alias_returns_structured_json() {
         let temp = tempdir().expect("create tempdir");
@@ -5865,6 +6763,243 @@ mod tests {
             .await
             .expect("read updated file");
         assert_eq!(content, "hello buckyos\n");
+    }
+
+    #[tokio::test]
+    async fn attention_stage1_cli_flow_reads_discovers_completes_and_commits() {
+        let _guard = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await.expect("create cwd");
+        let target_session = "target-session";
+        seed_opendan_session_meta(&root, target_session, SessionKind::Ui).await;
+        seed_round_history(
+            &root,
+            target_session,
+            "Project Atlas is blocked on DNS verification.",
+        )
+        .await;
+
+        let env = test_env(root.clone(), cwd.clone());
+        let read_output = execute(
+            vec![
+                OsString::from("/tmp/read_session_history"),
+                OsString::from(format!("session_id={target_session}")),
+                OsString::from("already_improved"),
+                OsString::from("token_limit=4096"),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("read session history");
+        assert_eq!(read_output.exit_code, EXIT_SUCCESS);
+        let read_payload: Json = serde_json::from_str(&read_output.stdout).expect("read json");
+        assert_eq!(read_payload["detail"]["returned"], 1);
+        assert_eq!(read_payload["detail"]["commit_round_index"], 1);
+        let message_ts = read_payload["detail"]["messages"][0]["ts"]
+            .as_str()
+            .expect("message ts")
+            .to_string();
+
+        let begin_args = json!({
+            "session_id": target_session,
+            "window_start": message_ts,
+            "window_end": message_ts,
+        });
+        let begin_output = execute(
+            vec![
+                OsString::from("/tmp/BeginAttentionSignalExtraction"),
+                OsString::from(begin_args.to_string()),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("begin extraction");
+        assert_eq!(begin_output.exit_code, EXIT_SUCCESS);
+
+        let discover_args = json!({
+            "object": {
+                "mention_text": "Project Atlas",
+                "entity_type": "project",
+                "is_user_private_entity": true
+            },
+            "observation": "Project Atlas is blocked on DNS verification.",
+            "observation_type": "status",
+            "evidence": [{
+                "round_index": 1,
+                "entry_seq": 1,
+                "entry_kind": "message",
+                "role": "user",
+                "text_excerpt": "Project Atlas is blocked on DNS verification."
+            }],
+            "confidence": 0.92
+        });
+        let discover_output = execute(
+            vec![
+                OsString::from("/tmp/DiscoverObjectObservation"),
+                OsString::from(discover_args.to_string()),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("discover object observation");
+        assert_eq!(discover_output.exit_code, EXIT_SUCCESS);
+        let discover_payload: Json =
+            serde_json::from_str(&discover_output.stdout).expect("discover json");
+        let signal_id = discover_payload["detail"]["signal"]["id"]
+            .as_str()
+            .expect("signal id")
+            .to_string();
+        assert_eq!(
+            discover_payload["detail"]["signal"]["source"]["session_id"],
+            target_session
+        );
+        assert_eq!(
+            discover_payload["detail"]["signal"]["extraction"]["extraction_window_id"],
+            begin_output_json(&begin_output)["detail"]["extraction_window_id"]
+        );
+
+        let complete_output = execute(
+            vec![OsString::from("/tmp/CompleteAttentionSignalExtraction")],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("complete extraction");
+        assert_eq!(complete_output.exit_code, EXIT_SUCCESS);
+
+        let commit_output = execute(
+            vec![
+                OsString::from("/tmp/commit_session_history_improved"),
+                OsString::from(format!("session_id={target_session}")),
+                OsString::from("round_index=1"),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("commit history progress");
+        assert_eq!(commit_output.exit_code, EXIT_SUCCESS);
+        let committed_meta = load_session_meta(&root.join("sessions").join(target_session))
+            .await
+            .expect("load meta")
+            .expect("meta exists");
+        assert_eq!(committed_meta.already_improved.committed_round_index, 1);
+
+        let list_output = execute(
+            vec![
+                OsString::from("/tmp/ListPendingAttentionSignals"),
+                OsString::from("limit=10"),
+            ],
+            env,
+            None,
+        )
+        .await
+        .expect("list pending signals");
+        assert_eq!(list_output.exit_code, EXIT_SUCCESS);
+        let list_payload: Json = serde_json::from_str(&list_output.stdout).expect("list json");
+        assert_eq!(list_payload["detail"]["returned"], 1);
+        assert_eq!(list_payload["detail"]["signals"][0]["id"], signal_id);
+    }
+
+    #[tokio::test]
+    async fn attention_stage2_cli_lists_and_marks_consumed() {
+        let _guard = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await.expect("create cwd");
+        let target_session = "target-session";
+        seed_opendan_session_meta(&root, target_session, SessionKind::Ui).await;
+        let env = test_env(root.clone(), cwd);
+
+        let begin_args = json!({
+            "session_id": target_session,
+            "window_start": "2026-01-01T00:00:00Z",
+            "window_end": "2026-01-01T00:01:00Z",
+        });
+        execute(
+            vec![
+                OsString::from("/tmp/BeginAttentionSignalExtraction"),
+                OsString::from(begin_args.to_string()),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("begin extraction");
+        let discover_args = json!({
+            "title": "Project Atlas DNS verification blocked",
+            "phase": "blocked",
+            "evidence": [{
+                "round_index": 1,
+                "entry_seq": 1,
+                "entry_kind": "message",
+                "role": "user",
+                "text_excerpt": "Project Atlas is blocked on DNS verification."
+            }],
+            "confidence": 0.9
+        });
+        let discover_output = execute(
+            vec![
+                OsString::from("/tmp/DiscoverEvent"),
+                OsString::from(discover_args.to_string()),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("discover event");
+        let signal_id = serde_json::from_str::<Json>(&discover_output.stdout)
+            .expect("discover json")["detail"]["signal"]["id"]
+            .as_str()
+            .expect("signal id")
+            .to_string();
+
+        let list_output = execute(
+            vec![OsString::from("/tmp/ListPendingAttentionSignals")],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("list pending");
+        let list_payload: Json = serde_json::from_str(&list_output.stdout).expect("list json");
+        assert_eq!(list_payload["detail"]["returned"], 1);
+
+        let mark_output = execute(
+            vec![
+                OsString::from("/tmp/MarkAttentionSignalConsumed"),
+                OsString::from(format!("signal_id={signal_id}")),
+            ],
+            env.clone(),
+            None,
+        )
+        .await
+        .expect("mark consumed");
+        assert_eq!(mark_output.exit_code, EXIT_SUCCESS);
+        let mark_payload: Json = serde_json::from_str(&mark_output.stdout).expect("mark json");
+        assert_eq!(
+            mark_payload["detail"]["signal"]["lifecycle_status"],
+            "consumed"
+        );
+
+        let after_output = execute(
+            vec![OsString::from("/tmp/ListPendingAttentionSignals")],
+            env,
+            None,
+        )
+        .await
+        .expect("list after consumed");
+        let after_payload: Json = serde_json::from_str(&after_output.stdout).expect("after json");
+        assert_eq!(after_payload["detail"]["returned"], 0);
+    }
+
+    fn begin_output_json(output: &CliRunOutput) -> Json {
+        serde_json::from_str(&output.stdout).expect("begin json")
     }
 
     #[tokio::test]
