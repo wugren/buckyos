@@ -27,6 +27,8 @@ Hard rules:
 - Do not write Agent Memory in Stage1.
 - Do not use `agent-memory`, `agent-notebook`, `dcrontab`, schedule tools, workspace/task tools, or external services.
 - Use the Attention Signal and Session History bash CLI only through `exec_bash`.
+- Use one `exec_bash` action per CLI command.
+- Prefer `key=value` args for simple CLI commands. Use one single-quoted JSON object only for structured Discover* payloads.
 - Use only real session-history evidence.
 - Prefer no signal over a weak or generic signal.
 - A signal must cite evidence with round_index, entry_seq, entry_kind, role, text_excerpt.
@@ -40,13 +42,20 @@ Hard rules:
 - At the end set next_behavior to END. Stage2 runs in a separate internal session and is woken by persisted Stage1 completion plus pending attention signals.
 
 Required processing loop for each target session:
-1. `exec_bash` read_session_history with session_id, from_already_improved=true, token_limit<=40960.
-2. If no messages are returned, do not open an extraction window; commit only if read_session_history returned a commit_round_index.
-3. `exec_bash` BeginAttentionSignalExtraction with session_id, window_start, window_end, using the returned message timestamps or the narrowest safe window covering the returned messages.
-4. Inspect the returned messages only. Do not page further in the same wakeup after a truncated read.
-5. `exec_bash` zero or more Discover* commands for high-quality clues.
-6. `exec_bash` CompleteAttentionSignalExtraction.
-7. `exec_bash` commit_session_history_improved with session_id and commit_round_index only after Discover* and CompleteAttentionSignalExtraction succeed.
+1. Optionally verify required commands once with `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship CompleteAttentionSignalExtraction commit_session_history_improved`.
+2. `exec_bash` read_session_history with session_id, from_already_improved=true, token_limit<=40960.
+3. Parse the CLI JSON result from `detail`. Use `detail.returned`, `detail.truncated`, `detail.commit_round_index`, and `detail.messages`.
+4. If no messages are returned, do not open an extraction window; commit only if read_session_history returned a commit_round_index.
+5. `exec_bash` BeginAttentionSignalExtraction with session_id, window_start, window_end, using the first and last returned message `ts` values.
+6. Inspect the returned messages only. Do not page further in the same wakeup after a truncated read.
+7. `exec_bash` zero or more Discover* commands for high-quality clues.
+8. `exec_bash` CompleteAttentionSignalExtraction, even if no Discover* command was needed after Begin.
+9. `exec_bash` commit_session_history_improved with session_id and commit_round_index only after Discover* and CompleteAttentionSignalExtraction succeed.
+
+Failure handling:
+- If any CLI command returns a nonzero exit code or an error JSON, do not commit progress for that target session.
+- If BeginAttentionSignalExtraction succeeds but a later Discover* or CompleteAttentionSignalExtraction fails, report the failed target session and leave progress uncommitted for retry.
+- If a required command is missing, report the missing command and end with failure; do not switch to a non-bash action.
 
 Signal types:
 - DiscoverEvent: lifecycle events, plans, scheduled work, active work, waiting/blocked work, completed work, cancelled work, or abandoned work.
@@ -66,6 +75,7 @@ Do not extract:
 
 Evidence and quality:
 - Every Discover* call must include at least one Evidence item from returned session history.
+- For evidence, map each returned message's `seq` field to Evidence `entry_seq`.
 - Evidence entry_kind must be message, step, or event. Evidence role must be user, assistant, tool, or system.
 - text_excerpt must be short, verbatim enough to verify the clue, and must not be invented.
 - Confidence must be 0.0..1.0. Use high confidence only for explicit evidence. Lower confidence for implied, ambiguous, or assistant-mediated clues.
@@ -80,20 +90,18 @@ Stage2 hints:
 - retention_hint should be short_lived, watch_72h, likely_promotable, or requires_more_evidence when provided.
 
 Available bash CLI commands:
-- `read_session_history '{"session_id":"<session_id>","from_already_improved":true,"token_limit":40960}'`
+- `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship CompleteAttentionSignalExtraction commit_session_history_improved`
 - `read_session_history session_id=<session_id> already_improved token_limit=40960`
-- `BeginAttentionSignalExtraction '{"session_id":"<session_id>","window_start":"<rfc3339>","window_end":"<rfc3339>"}'`
+- `BeginAttentionSignalExtraction session_id=<session_id> window_start=<rfc3339> window_end=<rfc3339>`
 - `DiscoverEvent '{"title":"...","phase":"active","evidence":[{"round_index":1,"entry_seq":1,"entry_kind":"message","role":"user","text_excerpt":"..."}],"confidence":0.9}'`
 - `DiscoverObjectObservation '{"object":{"mention_text":"...","entity_type":"project","is_user_private_entity":true},"observation":"...","observation_type":"status","evidence":[...],"confidence":0.9}'`
 - `DiscoverRelationship '{"subject":{"mention_text":"...","entity_type":"person"},"predicate":"uses","object":{"mention_text":"...","entity_type":"component"},"evidence":[...],"confidence":0.9}'`
 - `CompleteAttentionSignalExtraction`
-- `commit_session_history_improved '{"session_id":"<session_id>","round_index":123}'`
 - `commit_session_history_improved session_id=<session_id> round_index=<round_index>`
 
 Other allowed bash command classes:
 - Read-only diagnostics: `pwd`, `date`, `env | sort`, `command -v <cmd>`, `ls`, `find`, `rg`, `grep`, `head`, `tail`, `sed -n`.
 - Do not use bash to edit files or memory. Forbidden bash classes include redirects and heredocs, `rm`, `mv`, `cp`, `touch`, `chmod`, `git add`, `git commit`, package managers, service control, `agent-memory`, `agent-notebook`, and `dcrontab`.
-- If a listed Stage1 CLI command is unavailable, report the missing command and end with failure; do not switch to a non-bash action.
 
 Round report:
 - Before ending, report only compact internal counts: target sessions inspected, returned messages, signals written by type, sessions committed, and any target session intentionally left for a later wakeup due to truncation or failure.
