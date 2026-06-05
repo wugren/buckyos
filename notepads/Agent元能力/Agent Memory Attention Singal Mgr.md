@@ -2,7 +2,7 @@
 
 版本：v0.1
 目标阶段：支持 **Self Improve Stage-1：Clue Discovery / Attention Signal Extraction**
-设计目标：为 **Stage-2：Signal Consumption / Attention State Merge** 做好数据准备
+设计目标：为 **Memory Stage-2：Signal Consumption / Attention State Merge** 和 **Skill Signal Consumer** 做好数据准备
 
 ---
 
@@ -15,6 +15,7 @@ Agent Memory 的长期目标不是简单保存对话摘要，而是让 Agent 能
 * 对对象的观察
 * 对象之间的关系线索
 * 用户世界中值得继续关注的语义结构
+* Skill 系统中值得后续独立分析的 coverage gap 线索
 
 当前设计将 Self Improve 拆成两个阶段：
 
@@ -37,6 +38,20 @@ Attention State / Memory Graph Candidate / Recallable Memory
 第一阶段的核心职责是：
 
 > 把 Session History 翻译成结构化的语义线索，而不是直接生成 Memory。
+
+这里的“语义线索”有两类边界：
+
+```text
+Memory Graph Signals:
+    Event / ObjectObservation / Relationship
+    由 Stage-2 消费，进入 Attention State / Memory Graph Candidate。
+
+Skill Self-Improve Signals:
+    SkillCoverageGap 等 skill 相关 signal
+    由独立 Skill Improvement / Candidate Skill Miner LLM 消费。
+```
+
+也就是说，本组件可以复用 Stage-1 的扫描、证据、游标和存储模型来发现 skill 相关线索，但不负责消费这些线索，也不负责生成或修改 Skill。
 
 ---
 
@@ -92,6 +107,33 @@ Agent Memory Attention Signal 组件必须支持从 Session History 中发现三
 * Object Observation Signal 关注语义图中的对象节点及其观察。
 * Relationship Signal 关注一次 Session 扫描中出现的对象关系线索，以及线索里的态度、偏好、状态或关联。
 
+这三类是 Memory Graph 的核心 Signal。
+
+为了支持 Skill Self-Improve，Stage-1 还可以发现一类扩展 Signal：
+
+```text
+4. Skill Coverage Gap Signal
+```
+
+它关注：
+
+```text
+Plan 中有明确 TODO
+但没有合适 Skill 覆盖
+Do 阶段通过通用推理 / Global Object 探索完成
+Reporter / Supervisor / User 认可结果
+```
+
+或：
+
+```text
+Plan 分配了 Skill
+但实际 Skill 没有被使用
+最终仍然成功
+```
+
+这类 Signal 只说明“Skill Graph 可能存在 coverage gap”，不等于新 Skill，也不进入 Memory Graph 的 Stage-2 merge 流程。
+
 ---
 
 ### 3.2 第二阶段准备目标
@@ -126,6 +168,9 @@ Stage-1 不负责以下事情：
 5. 不负责长期权重衰减
 6. 不负责判断某事实是否应该永久保存
 7. 不负责 Notebook / Character Event 的最终更新
+8. 不负责生成 Candidate Skill
+9. 不负责更新、拆分、合并、淘汰已有 Skill
+10. 不负责消费 Skill Coverage Gap Signal
 ```
 
 Stage-1 只做：
@@ -135,7 +180,7 @@ Stage-1 只做：
 结构化线索
 保存线索
 标记来源
-等待 Stage-2 消费
+等待下游消费
 ```
 
 ---
@@ -152,14 +197,17 @@ Stage-1 Signal Extractor
 Semantic Tools
     ├── DiscoverEvent
     ├── DiscoverObjectObservation
-    └── DiscoverRelationship
+    ├── DiscoverRelationship
+    └── DiscoverSkillCoverageGap
     ↓
 Attention Signal Store
-    ↓
-Stage-2 Pending Queue
+    ├── Memory Stage-2 Pending Queue
+    └── Skill Signal Pending Queue
 ```
 
-这里的 `Stage-2 Pending Queue` 是逻辑视图，不是本文要定义的完整消费协议。本文只要求 Stage-1 将有效 Signal 写入 Store，并使其能被 Stage-2 按 `agent_scope_id + lifecycle_status = pending_stage2 + created_at` 查询。Stage-2 的 claim / lease / retry / merge / promote 协议由第二阶段文档定义。
+这里的 Pending Queue 是逻辑视图，不是本文要定义的完整消费协议。本文只要求 Stage-1 将有效 Signal 写入 Store，并使下游能按 `agent_scope_id + target_consumer + lifecycle_status = pending_stage2 + created_at` 查询。Memory Stage-2 的 claim / lease / retry / merge / promote 协议由第二阶段文档定义。
+
+对于 Skill Coverage Gap Signal，下游不是 Memory Stage-2，而是独立的 Candidate Skill Miner LLM。Store 可以使用同一套 source / evidence / lifecycle 基础字段，但必须通过 `signal_type` 或 `target_consumer` 明确路由，避免被 Memory Stage-2 当成普通对象或关系信号消费。
 
 ---
 
@@ -257,7 +305,7 @@ Stage-1 的输入只允许来自普通 UI / Work Session 的原始 Session Histo
 
 ## 7. Attention Signal 类型
 
-第一阶段只产生三种核心 Signal。
+第一阶段默认产生三种核心 Memory Graph Signal。
 
 ```text
 AttentionSignal
@@ -265,6 +313,27 @@ AttentionSignal
     ├── ObjectObservationSignal
     └── RelationshipSignal
 ```
+
+此外，为支持 Skill Self-Improve，可以扩展产生：
+
+```text
+AttentionSignal
+    └── SkillCoverageGapSignal
+```
+
+核心约束：
+
+```text
+Event / ObjectObservation / Relationship
+    → Memory Stage-2 消费
+    → Attention State / Memory Graph Candidate
+
+SkillCoverageGap
+    → Candidate Skill Miner LLM 消费
+    → Candidate Skill Case / Skill Draft / Reject
+```
+
+SkillCoverageGap 不应被 Memory Stage-2 提升成 Recallable Memory。
 
 ---
 
@@ -697,6 +766,85 @@ type RelationshipAttitude = {
 
 ---
 
+## 10.7 扩展：Skill Coverage Gap Signal
+
+Skill Coverage Gap Signal 表示：
+
+> 在一次 Session History 扫描中，发现某个明确 TODO 没有被现有 Skill 覆盖，但 Agent 仍然通过通用推理、工具探索或 Global Object 探索完成了任务。
+
+它不是 Memory Graph 的对象、事件或关系，也不是新 Skill。
+
+它只是一条需要交给 Skill Self-Improve 独立流程消费的 attention signal。
+
+典型触发条件：
+
+```text
+1. Plan 有明确 TODO
+2. assigned_skills 为空，或 assigned skill 实际未被使用
+3. Do 阶段成功完成
+4. Reporter / Supervisor / User 对结果给出正向或接受信号
+```
+
+必填字段建议：
+
+```typescript
+type SkillCoverageGapSignal = {
+  signal_type: "skill_coverage_gap";
+
+  todo: {
+    description: string;
+    expected_result?: string;
+  };
+
+  assigned_skills: string[];
+
+  actual_execution: {
+    used_skills: string[];
+    critical_actions: string[];
+    tools_used?: string[];
+    global_objects_used?: string[];
+  };
+
+  result: {
+    status: "success" | "partial" | "failure" | "unknown";
+    report_summary?: string;
+    supervisor_accepted?: boolean;
+    user_feedback?: string;
+  };
+
+  gap_signal: {
+    no_skill_assigned: boolean;
+    assigned_skill_unused: boolean;
+    success_without_skill: boolean;
+    repeated_pattern?: boolean | "unknown";
+  };
+
+  target_consumer: "candidate_skill_miner";
+
+  source: SignalSource;
+
+  evidence: Evidence[];
+
+  confidence: number;
+};
+```
+
+消费边界：
+
+```text
+SkillCoverageGapSignal
+    ↓
+Candidate Skill Miner LLM
+    ↓
+重复性 / 稳定触发条件 / 稳定执行路径判断
+    ↓
+Candidate Skill Case / Skill Draft / Reject
+```
+
+Stage-1 不应该因为发现了 SkillCoverageGapSignal 就直接生成 Skill Draft。
+
+---
+
 # 11. Signal 通用结构
 
 底层统一存储结构建议如下。
@@ -708,7 +856,8 @@ type AttentionSignal = {
   signal_type:
     | "event"
     | "object_observation"
-    | "relationship";
+    | "relationship"
+    | "skill_coverage_gap";
 
   lifecycle_status:
     | "pending_stage2"
@@ -721,7 +870,12 @@ type AttentionSignal = {
   payload:
     | EventSignal
     | ObjectObservationSignal
-    | RelationshipSignal;
+    | RelationshipSignal
+    | SkillCoverageGapSignal;
+
+  target_consumer:
+    | "memory_stage2"
+    | "candidate_skill_miner";
 
   source: SignalSource;
 
@@ -831,9 +985,17 @@ type Evidence = {
 
 ---
 
-# 13. Stage-2 Preparation 字段
+# 13. Stage-2 / Downstream Preparation 字段
 
-Stage-1 必须为 Stage-2 消费准备以下字段。
+Stage-1 必须为下游消费准备以下字段。
+
+对 Memory Graph Signal，下游是 Memory Stage-2。
+
+对 SkillCoverageGapSignal，下游是 Candidate Skill Miner LLM，其中 `suggested_action` 应使用：
+
+```text
+route_to_skill_candidate_miner
+```
 
 ```typescript
 type Stage2Preparation = {
@@ -849,6 +1011,7 @@ type Stage2Preparation = {
     | "consider_event"
     | "consider_object"
     | "consider_relationship"
+    | "route_to_skill_candidate_miner"
     | "consider_alias"
     | "watch"
     | "drop_if_unreinforced"
@@ -946,7 +1109,7 @@ converted       dropped         watching        expired
 Stage-1 新生成的 Signal 默认状态。
 
 ```text
-可被 Stage-2 消费
+可被 target_consumer 指向的下游消费
 不可被 Recall 系统召回
 ```
 
@@ -954,7 +1117,7 @@ Stage-1 新生成的 Signal 默认状态。
 
 ### watching
 
-Stage-2 认为该 Signal 有潜在价值，但当前证据不足。
+下游 consumer 认为该 Signal 有潜在价值，但当前证据不足。
 
 例如：
 
@@ -975,7 +1138,7 @@ Stage-2 认为该 Signal 有潜在价值，但当前证据不足。
 
 ### converted
 
-该 Signal 已被 Stage-2 转化为：
+该 Signal 已被下游 consumer 转化为：
 
 ```text
 Attention State / Memory Graph Candidate
@@ -984,13 +1147,14 @@ Event Update
 Object Update
 Relationship Update
 Alias Update
+Candidate Skill Case
 ```
 
 ---
 
 ### dropped
 
-Stage-2 认为该 Signal 是噪音或价值不足。
+下游 consumer 认为该 Signal 是噪音或价值不足。
 
 ---
 
@@ -1016,7 +1180,7 @@ dropped
 consumed
 ```
 
-这些由 Stage-2 决定。
+这些由 `target_consumer` 指向的下游决定。
 
 ---
 
@@ -1120,7 +1284,7 @@ Stage-1 Extractor Prompt 必须明确告诉 LLM：
 LLM 必须遵守：
 
 ```text
-1. 只提取三类 Signal：Event、ObjectObservation、Relationship。
+1. 默认只提取三类 Memory Signal：Event、ObjectObservation、Relationship。
 2. 不要提取普通常识。
 3. 不要提取没有用户私有价值的公共实体。
 4. Event 必须具有生命周期或阶段。
@@ -1133,6 +1297,8 @@ LLM 必须遵守：
 11. 不要直接生成 Memory。
 12. 不要直接更新用户 Profile。
 13. 不要假设没有证据的信息。
+14. 只有发现明确 Skill coverage gap 时，才提取 SkillCoverageGapSignal。
+15. SkillCoverageGapSignal 必须路由给 Candidate Skill Miner，不要直接生成 Skill。
 ```
 
 ---
@@ -1204,6 +1370,43 @@ Relationship 中的态度应该保留。
 
 ---
 
+## 16.5 Skill Coverage Gap 判断规则
+
+LLM 只有在以下条件同时较强时，才应提取 SkillCoverageGapSignal：
+
+```text
+Plan / TODO 明确
+现有 Skill 未覆盖，或分配了 Skill 但实际未使用
+Do 阶段成功完成或被上级接受
+成功路径主要来自临时探索、通用推理、工具组合或 Global Object 探索
+```
+
+LLM 不应提取：
+
+```text
+普通成功任务
+没有明确 TODO 的聊天
+只是在讨论 Skill 设计的抽象观点
+已有 Skill 正常发挥作用的任务
+失败但没有明确重复错误路径的任务
+```
+
+SkillCoverageGapSignal 的输出目标是：
+
+```text
+Candidate Skill Miner LLM
+```
+
+而不是：
+
+```text
+Memory Stage-2
+Skill Draft Generator
+Skill Update Flow
+```
+
+---
+
 # 17. 扫描流程
 
 ## 17.1 主流程
@@ -1213,11 +1416,11 @@ Relationship 中的态度应该保留。
 2. History Window Reader 查询窗口内未处理 Session History round entries
 3. 对每个 Session 构造 Stage-1 Extraction Input
 4. 调用 LLM Extractor
-5. LLM 使用 DiscoverEvent / DiscoverObjectObservation / DiscoverRelationship
+5. LLM 使用 DiscoverEvent / DiscoverObjectObservation / DiscoverRelationship / DiscoverSkillCoverageGap
 6. Signal Validator 校验结果
 7. Signal Store 写入 Attention Signal
 8. Scan Cursor Manager 推进游标
-9. Signal 进入 pending_stage2 队列
+9. Signal 按 target_consumer 进入 Memory Stage-2 或 Skill Signal pending 队列
 ```
 
 ---
@@ -1497,7 +1700,21 @@ CREATE TABLE extraction_windows (
 
 # 21. Stage-2 消费准备
 
-Stage-1 生成的每条 Signal 必须能被 Stage-2 直接消费。
+Stage-1 生成的每条 Memory Graph Signal 必须能被 Stage-2 直接消费。
+
+这里的 Stage-2 特指：
+
+```text
+Memory Stage-2: Signal Consumption / Attention State Merge
+```
+
+对于 `SkillCoverageGapSignal`，下游是：
+
+```text
+Candidate Skill Miner LLM
+```
+
+它复用 source / evidence / confidence / lifecycle 等通用字段，但不要求回答“是否进入 Memory Graph / Recallable Memory”。
 
 Stage-2 消费时需要能够回答：
 
@@ -1535,16 +1752,33 @@ Recallable Memory:
 进一步突破权重阈值后，可被自动召回系统使用。
 ```
 
+SkillCoverageGapSignal 还有额外边界：
+
+```text
+SkillCoverageGapSignal:
+Skill Self-Improve 的中间线索，默认不可召回。
+
+Candidate Skill Case:
+经过 Candidate Skill Miner LLM 消费后形成的新 Skill 候选 case。
+
+Runtime Skill:
+经过 Skill Draft / Review / Install / Validation 后才进入运行时 Skill 系统。
+```
+
 推荐分层：
 
 ```text
 Session History
     ↓
 Attention Signal
-    ↓
-Attention State / Memory Graph Candidate
-    ↓
-Recallable Memory
+    ├── Memory Stage-2
+    │       ↓
+    │   Attention State / Memory Graph Candidate
+    │       ↓
+    │   Recallable Memory
+    └── Candidate Skill Miner LLM
+            ↓
+        Candidate Skill Case / Skill Draft / Reject
 ```
 
 ---
@@ -1672,6 +1906,8 @@ type AttentionSignalConfig = {
 
   enable_canonicalization_candidates: boolean;
 
+  enable_skill_coverage_gap_signal: boolean;
+
   extractor_model?: string;
 
   prompt_version: string;
@@ -1690,7 +1926,8 @@ type AttentionSignalConfig = {
   "default_watching_ttl_hours": 72,
   "enable_public_entity_filter": true,
   "enable_stage1_light_dedup": true,
-  "enable_canonicalization_candidates": true
+  "enable_canonicalization_candidates": true,
+  "enable_skill_coverage_gap_signal": false
 }
 ```
 
@@ -1706,11 +1943,13 @@ type AttentionSignalConfig = {
 3. 生成了多少 Event Signal
 4. 生成了多少 Object Observation Signal
 5. 生成了多少 Relationship Signal
-6. 被 Validator 拒绝了多少 Signal
-7. 平均 confidence
-8. 每个窗口的 Signal 数量
-9. 重复 Signal 数量
-10. Stage-2 后续消费率
+6. 生成了多少 Skill Coverage Gap Signal
+7. 被 Validator 拒绝了多少 Signal
+8. 平均 confidence
+9. 每个窗口的 Signal 数量
+10. 重复 Signal 数量
+11. Memory Stage-2 后续消费率
+12. Skill Signal 后续消费率
 ```
 
 ---
@@ -1725,10 +1964,12 @@ attention_signal.stage1.signals_created
 attention_signal.stage1.event_signals_created
 attention_signal.stage1.object_signals_created
 attention_signal.stage1.relationship_signals_created
+attention_signal.stage1.skill_gap_signals_created
 attention_signal.stage1.signals_rejected
 attention_signal.stage1.avg_confidence
 attention_signal.stage1.duplicate_signals_skipped
 attention_signal.stage2.pending_count
+attention_signal.skill_candidate_miner.pending_count
 ```
 
 ---
@@ -1879,11 +2120,12 @@ Attention Signal 可能包含非常私有的信息。
 3. 能生成 Event Signal。
 4. 能生成 Object Observation Signal。
 5. 能生成 Relationship Signal。
-6. 每条 Signal 都有 source 和 evidence。
-7. Signal 默认状态为 pending_stage2。
-8. Signal 不进入 Recall Index。
-9. Signal 可被 Stage-2 按状态查询。
-10. 重复扫描不会重复生成相同 Signal。
+6. 启用 skill gap 扩展时，能生成 Skill Coverage Gap Signal。
+7. 每条 Signal 都有 source 和 evidence。
+8. Signal 默认状态为 pending_stage2。
+9. Signal 不进入 Recall Index。
+10. Signal 可按 target_consumer 路由到 Memory Stage-2 或 Skill Signal consumer。
+11. 重复扫描不会重复生成相同 Signal。
 ```
 
 ---
@@ -1900,13 +2142,15 @@ Attention Signal 可能包含非常私有的信息。
 5. 能识别带态度的 Relationship。
 6. 能保留模糊、不确定、推测性信息的 confidence。
 7. 能区分显式事实和上下文推断。
+8. 不把普通成功任务误判为 Skill Coverage Gap。
+9. 不把 Skill Coverage Gap 直接改写为 Candidate Skill。
 ```
 
 ---
 
 ## 30.3 Stage-2 准备验收
 
-每条 Signal 必须能支持 Stage-2 判断：
+每条 Memory Graph Signal 必须能支持 Memory Stage-2 判断：
 
 ```text
 1. 是否要合并到已有对象。
@@ -1919,11 +2163,21 @@ Attention Signal 可能包含非常私有的信息。
 8. 是否影响 Attention Weight。
 ```
 
+每条 SkillCoverageGapSignal 必须能支持 Candidate Skill Miner 判断：
+
+```text
+1. 是否是明确 Skill coverage gap。
+2. 是否只是一次普通成功任务。
+3. 是否需要等待更多重复样本。
+4. 是否进入 Candidate Skill Case。
+5. 是否明确 Reject。
+```
+
 ---
 
 # 31. 后续扩展
 
-本版本只支持三类 Signal。
+本版本的 Memory Graph 核心只支持三类 Signal。
 
 未来可以扩展：
 
@@ -1938,6 +2192,8 @@ Attention Signal 可能包含非常私有的信息。
 ```
 
 但 v0.1 不建议过早扩展。
+
+SkillCoverageGapSignal 是为了支持 Skill Self-Improve 的扩展通道，不属于 Memory Graph 核心类型扩张。它不改变 Event / ObjectObservation / Relationship 这三类核心 Memory Signal 的设计。
 
 当前三类已经覆盖核心图结构：
 
@@ -1954,11 +2210,11 @@ Relationship:
 
 ---
 
-# 32. Stage-1 / Stage-2 生命周期对接协议（v0.1 补充）
+# 32. Stage-1 / 下游 Consumer 生命周期对接协议（v0.1 补充）
 
-> 本节补齐 §14（生命周期）与 §24（72 小时观察期）之间一直悬空的核心决策：**Stage-2 消费一条 Signal 之后，这条 Signal 默认怎么处置。**
+> 本节补齐 §14（生命周期）与 §24（72 小时观察期）之间一直悬空的核心决策：**下游 consumer 消费一条 Signal 之后，这条 Signal 默认怎么处置。**
 >
-> 早期讨论没有结论，导致实现里只落了状态词汇表，没有落状态跃迁——所有 Signal 永久停在 `pending_stage2`，`expires_at` 记录但无人执行。本节给出决策与对接契约。注意：跃迁的 **触发判断（promote / merge / drop / watch 决策本身）属于 Stage-2 协议**，本节只规定 **Stage-1 Store 必须暴露的状态机能力**，使 Stage-2 能够实现下述语义。
+> 早期讨论没有结论，导致实现里只落了状态词汇表，没有落状态跃迁——所有 Signal 永久停在 `pending_stage2`，`expires_at` 记录但无人执行。本节给出决策与对接契约。注意：跃迁的 **触发判断（promote / merge / drop / watch 决策本身）属于下游 consumer 协议**，本节只规定 **Stage-1 Store 必须暴露的状态机能力**，使 Memory Stage-2 或 Candidate Skill Miner 能够实现下述语义。
 
 ---
 
@@ -1966,14 +2222,14 @@ Relationship:
 
 ```text
 模型 A（resolve-by-default，消费即出池）
-  Stage-2 每轮必须把看到的每条 pending 信号 resolve 掉：
+  下游 consumer 每轮必须把看到的每条 pending 信号 resolve 掉：
   强信号 → converted/consumed（离开 pending 池），
   弱信号 → watching（留 72h 等强化），
   噪音   → dropped。
   稳态 pending 池 = 新信号 + 一小撮 watching。
 
 模型 B（keep-all，仅靠 timeout 淘汰）
-  Stage-2 读完不改状态，信号一直留到 72h 过期或手工删除。
+  下游 consumer 读完不改状态，信号一直留到 72h 过期或手工删除。
   pending 池 = 过去 72h 的全部信号，每轮重复处理。
 ```
 
@@ -1990,7 +2246,7 @@ Relationship:
    信号一旦出池物理上无法二次提升；
    模型 B 只能靠每轮拿信号和已有 hint 比对来重新推导，脆弱且会漂移。
 
-2. 成本规模。Stage-2 是 LLM 推理步，成本 ∝ 每轮要看的信号数 × 判断难度。
+2. 成本规模。Memory Stage-2 和 Candidate Skill Miner 都可能是 LLM 推理步，成本 ∝ 每轮要看的信号数 × 判断难度。
    模型 A 每条信号一生只判一次，每轮成本 ∝ 增量（平）；
    模型 B 每轮重看全量、且需把已有 hint 一起喂入去重，
    成本 ∝ 累积信号数 × 已有 hint 数（复利增长）。
@@ -2005,7 +2261,7 @@ Relationship:
 
 ## 32.3 默认行为是"必须 resolve"，不是"必须消费"
 
-每轮 Stage-2 必须把每条 pending 信号 resolve 到一个终态或 watching：
+每轮下游 consumer 必须把每条 pending 信号 resolve 到一个终态或 watching：
 
 ```text
 强证据 / 可直接提升   → converted   （出池，写 hint 回指）
@@ -2030,7 +2286,7 @@ Relationship:
 
 ## 32.4 Store 必须暴露的状态跃迁 API
 
-Stage-1 §14.3 限制"只能创建 pending_stage2"针对的是 **create** 路径；**跃迁是独立的 update 路径**，供 Stage-2 调用。Store 至少须提供：
+Stage-1 §14.3 限制"只能创建 pending_stage2"针对的是 **create** 路径；**跃迁是独立的 update 路径**，供下游 consumer 调用。Store 至少须提供：
 
 ```typescript
 mark_converted(id, hint_ref: string)                 // → converted
@@ -2046,7 +2302,7 @@ mark_dropped(id, reason?: string)                     // → dropped
 2. 合法跃迁仅允许 pending_stage2 → {converted, consumed, dropped, watching}
    以及 watching → {pending_stage2, converted, consumed, dropped, expired}。
    非法跃迁返回 InvalidInput。
-3. converted/consumed 跃迁与 hint 落库的原子性由 Stage-2 保证
+3. converted/consumed 跃迁与下游产物落库的原子性由下游 consumer 保证
    （同事务，或 hint 先持久化再跃迁 + hint 侧幂等键兜底）。
 4. create 用的 validate_signal "只能 pending_stage2" 约束与 update 路径分离，
    不得相互绕过。
@@ -2056,14 +2312,14 @@ mark_dropped(id, reason?: string)                     // → dropped
 
 ## 32.5 hint 回指与去重支持
 
-为缓解 Stage-2"既要判信号重复、又要判生成 hint 重复"的双重压力，Store 须提供两项：
+为缓解下游 consumer "既要判信号重复、又要判生成产物重复"的双重压力，Store 须提供两项：
 
 ```text
 1. 回指字段：converted/consumed 跃迁必须持久化 promoted_to_hint_ref，
    使信号能反查"我已变成哪个 hint / 折叠进哪个 hint"。
 
 2. merge_key 可查：suggested_merge_key 从纯建议字段提升为可查询列 + 索引，
-   让 Stage-2 能 SELECT ... WHERE suggested_merge_key = ? 快速判
+   让下游 consumer 能 SELECT ... WHERE suggested_merge_key = ? 快速判
    "这个语义是否已有 hint"，而非全表 JSON 扫或重新 LLM 决策。
 ```
 
@@ -2126,13 +2382,21 @@ Agent Memory Attention Signal 组件的第一阶段职责是：
 
 它不负责直接记忆，也不负责召回。
 
-核心输出只有三类：
+核心 Memory Graph 输出只有三类：
 
 ```text
 Event Signal
 Object Observation Signal
 Relationship Signal
 ```
+
+为支持 Skill Self-Improve，Stage-1 可以额外输出：
+
+```text
+Skill Coverage Gap Signal
+```
+
+但这类 Signal 的下游是独立 Candidate Skill Miner LLM，不是 Memory Stage-2。
 
 这些 Signal 是短生命周期中间产物。
 
@@ -2144,10 +2408,10 @@ Relationship Signal
 置信度
 时间窗口
 语义结构
-Stage-2 消费提示
+下游消费提示
 ```
 
-第二阶段再负责：
+Memory Stage-2 再负责：
 
 ```text
 消费 Signal
@@ -2166,14 +2430,20 @@ Session History
 Stage-1: Attention Signal Extraction
     ↓
 Pending Attention Signals
-    ↓
-Stage-2: Signal Consumption / Attention State Merge
-    ↓
-Attention State / Memory Graph Candidate
-    ↓
-Recallable Memory
+    ├── Memory Stage-2: Signal Consumption / Attention State Merge
+    │       ↓
+    │   Attention State / Memory Graph Candidate
+    │       ↓
+    │   Recallable Memory
+    └── Candidate Skill Miner LLM
+            ↓
+        Candidate Skill Case / Skill Draft / Reject
 ```
 
 这个组件的关键设计原则是：
 
-> Stage-1 要多发现、轻判断、强结构化；Stage-2 再合并、淘汰、归一化和提升。
+> Stage-1 要多发现、轻判断、强结构化；下游 consumer 再合并、淘汰、归一化、提升或生成候选 case。
+
+对于 SkillCoverageGapSignal，还需要补充一条边界：
+
+> Stage-1 只发现 Skill coverage gap；是否形成新 Skill 候选，由独立 Skill Self-Improve 流程判断。
