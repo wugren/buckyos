@@ -69,6 +69,7 @@ const SELF_IMPROVE_MAX_TARGET_SESSIONS_PER_WAKE: usize = 4;
 const SELF_IMPROVE_MAX_PENDING_ROUNDS_PER_WAKE: u64 = 20;
 const SELF_IMPROVE_STAGE1_SESSION_PREFIX: &str = "self_improve_signals";
 const SELF_IMPROVE_STAGE2_SESSION_PREFIX: &str = "self_improve_set_memory";
+const SELF_IMPROVE_SKILL_STAGE2_SESSION_PREFIX: &str = "try_create_new_skill";
 const SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS: u64 = 72 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -84,6 +85,9 @@ struct SelfImproveSchedulerState {
     next_stage2_session_seq: u64,
     last_stage2_session_id: String,
     last_stage2_triggered_at_ms: u64,
+    next_skill_stage2_session_seq: u64,
+    last_skill_stage2_session_id: String,
+    last_skill_stage2_triggered_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -625,11 +629,15 @@ impl AIAgent {
             return Ok(());
         }
         let mut state = load_self_improve_scheduler_state(&self.config.layout.root).await;
-        if self
+        let woke_memory_stage2 = self
             .clone()
-            .maybe_wake_self_improve_stage2(&class, &mut state)
-            .await?
-        {
+            .maybe_wake_self_improve_memory_stage2(&class, &mut state)
+            .await?;
+        let woke_skill_stage2 = self
+            .clone()
+            .maybe_wake_self_improve_skill_stage2(&class, &mut state)
+            .await?;
+        if woke_memory_stage2 || woke_skill_stage2 {
             return Ok(());
         }
         let targets = self.collect_self_improve_targets().await;
@@ -708,12 +716,12 @@ impl AIAgent {
         Ok(())
     }
 
-    async fn maybe_wake_self_improve_stage2(
+    async fn maybe_wake_self_improve_memory_stage2(
         self: Arc<Self>,
         class: &str,
         state: &mut SelfImproveSchedulerState,
     ) -> Result<bool> {
-        if state.last_stage1_completed_seq == 0 || !self.has_pending_stage2_signals() {
+        if state.last_stage1_completed_seq == 0 || !self.has_pending_stage2_memory_signals() {
             return Ok(false);
         }
         let now_ms = current_unix_ms();
@@ -758,7 +766,7 @@ impl AIAgent {
         Ok(true)
     }
 
-    fn has_pending_stage2_signals(&self) -> bool {
+    fn has_pending_stage2_memory_signals(&self) -> bool {
         let Ok(store) = AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
             self.config.layout.root.join("attention_signals"),
         )) else {
@@ -766,6 +774,69 @@ impl AIAgent {
         };
         store
             .list_pending_stage2_memory_signals(&self.agent_id(), Some(1))
+            .map(|signals| !signals.is_empty())
+            .unwrap_or(false)
+    }
+
+    async fn maybe_wake_self_improve_skill_stage2(
+        self: Arc<Self>,
+        class: &str,
+        state: &mut SelfImproveSchedulerState,
+    ) -> Result<bool> {
+        if state.last_stage1_completed_seq == 0 || !self.has_pending_stage2_skill_signals() {
+            return Ok(false);
+        }
+        let now_ms = current_unix_ms();
+        let stage2_session = choose_self_improve_skill_stage2_session_id(state, now_ms);
+        let session = self
+            .clone()
+            .get_or_create_session(
+                stage2_session.session_id.clone(),
+                "system".to_string(),
+                SessionKind::SelfImprove,
+                class,
+            )
+            .await?;
+        if !self_improve_session_can_start(&session).await {
+            return Ok(false);
+        }
+        let prompt = render_self_improve_skill_stage2_prompt(
+            state,
+            &stage2_session.session_id,
+            stage2_session.rotated,
+        );
+        session
+            .enqueue_behavior_internal_continuation(
+                "try_create_new_skill".to_string(),
+                "self_improve_scheduler:skill_stage2_after_stage1_complete".to_string(),
+                vec![AiMessage::text(AiRole::User, prompt)],
+            )
+            .await?;
+        if stage2_session.rotated {
+            state.next_skill_stage2_session_seq =
+                state.next_skill_stage2_session_seq.saturating_add(1);
+            state.last_skill_stage2_session_id = stage2_session.session_id.clone();
+        }
+        state.last_skill_stage2_triggered_at_ms = now_ms;
+        write_self_improve_scheduler_state(&self.config.layout.root, state).await;
+        info!(
+            "opendan.agent[{}]: self_improve skill stage2 triggered session={} rotated={} from persisted stage1 completion seq={}",
+            self.agent_name,
+            stage2_session.session_id,
+            stage2_session.rotated,
+            state.last_stage1_completed_seq
+        );
+        Ok(true)
+    }
+
+    fn has_pending_stage2_skill_signals(&self) -> bool {
+        let Ok(store) = AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
+            self.config.layout.root.join("attention_signals"),
+        )) else {
+            return false;
+        };
+        store
+            .list_pending_stage2_skill_coverage_gap_signals(&self.agent_id(), Some(1))
             .map(|signals| !signals.is_empty())
             .unwrap_or(false)
     }
@@ -2679,6 +2750,30 @@ fn choose_self_improve_stage2_session_id(
     }
 }
 
+fn choose_self_improve_skill_stage2_session_id(
+    state: &SelfImproveSchedulerState,
+    now_ms: u64,
+) -> SelfImproveStage2SessionChoice {
+    let existing = state.last_skill_stage2_session_id.trim();
+    let reuse_existing = !existing.is_empty()
+        && now_ms.saturating_sub(state.last_skill_stage2_triggered_at_ms)
+            <= SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS;
+    if reuse_existing {
+        return SelfImproveStage2SessionChoice {
+            session_id: existing.to_string(),
+            rotated: false,
+        };
+    }
+    SelfImproveStage2SessionChoice {
+        session_id: format!(
+            "{}-{}",
+            SELF_IMPROVE_SKILL_STAGE2_SESSION_PREFIX,
+            state.next_skill_stage2_session_seq.saturating_add(1)
+        ),
+        rotated: true,
+    }
+}
+
 async fn self_improve_session_can_start(session: &AgentSession) -> bool {
     let meta = session.meta.lock().await;
     meta.internal_continuation.is_none()
@@ -2738,6 +2833,31 @@ First call ListPendingAttentionSignals, then consume applicable non-skill-gap si
         state.last_stage1_completed_seq,
         state.last_stage1_completed_at_ms,
         state.last_stage2_triggered_at_ms
+    )
+}
+
+fn render_self_improve_skill_stage2_prompt(
+    state: &SelfImproveSchedulerState,
+    session_id: &str,
+    rotated: bool,
+) -> String {
+    format!(
+        "Internal Agent State Self Improve Candidate Skill Miner wakeup.\n\
+This wakeup is based on a persisted Stage1 completion state, not external user input.\n\
+skill_stage2_session_id: {}\n\
+skill_stage2_session_rotated: {}\n\
+last_stage1_completed_seq: {}\n\
+last_stage1_completed_at_ms: {}\n\
+last_skill_stage2_triggered_at_ms: {}\n\
+\n\
+Condition satisfied: Stage1 has completed at least once and pending skill_coverage_gap attention signals exist.\n\
+Run Candidate Skill Miner now: Skill Coverage Gap Signals -> New Skill candidate decision.\n\
+First call ListPendingAttentionSignals, process only skill_coverage_gap signals, and mark only processed skill_coverage_gap signals consumed.\n",
+        session_id,
+        rotated,
+        state.last_stage1_completed_seq,
+        state.last_stage1_completed_at_ms,
+        state.last_skill_stage2_triggered_at_ms
     )
 }
 
@@ -2859,6 +2979,27 @@ mod tests {
             10_000 + SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS + 1,
         );
         assert_eq!(choice.session_id, "self_improve_set_memory-2");
+        assert!(choice.rotated);
+    }
+
+    #[test]
+    fn self_improve_skill_stage2_session_id_reuses_within_rotation_window() {
+        let mut state = SelfImproveSchedulerState {
+            next_skill_stage2_session_seq: 1,
+            last_skill_stage2_session_id: "try_create_new_skill-1".to_string(),
+            last_skill_stage2_triggered_at_ms: 10_000,
+            ..SelfImproveSchedulerState::default()
+        };
+        let choice = choose_self_improve_skill_stage2_session_id(&state, 10_000 + 60_000);
+        assert_eq!(choice.session_id, "try_create_new_skill-1");
+        assert!(!choice.rotated);
+
+        state.last_skill_stage2_triggered_at_ms = 10_000;
+        let choice = choose_self_improve_skill_stage2_session_id(
+            &state,
+            10_000 + SELF_IMPROVE_STAGE2_ROTATE_AFTER_MS + 1,
+        );
+        assert_eq!(choice.session_id, "try_create_new_skill-2");
         assert!(choice.rotated);
     }
 

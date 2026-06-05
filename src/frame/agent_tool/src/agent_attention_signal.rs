@@ -1150,6 +1150,36 @@ impl AgentAttentionSignalStore {
         Ok(out)
     }
 
+    pub fn list_pending_stage2_skill_coverage_gap_signals(
+        &self,
+        agent_scope_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<AttentionSignal>> {
+        if agent_scope_id.trim().is_empty() {
+            return Err(AttentionSignalError::InvalidInput(
+                "agent_scope_id is empty".into(),
+            ));
+        }
+        let limit = limit.unwrap_or(100).min(1000);
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT full_json FROM attention_signals
+             WHERE agent_scope_id = ?
+               AND lifecycle_status = 'pending_stage2'
+               AND signal_type = 'skill_coverage_gap'
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![agent_scope_id, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
     pub fn get_signal(&self, id: &str) -> Result<Option<AttentionSignal>> {
         let conn = self.lock_conn()?;
         let value: Option<String> = conn
@@ -2420,6 +2450,13 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+        assert_eq!(
+            store
+                .list_pending_stage2_skill_coverage_gap_signals("scope", None)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }
