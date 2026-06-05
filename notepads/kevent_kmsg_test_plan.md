@@ -1,4 +1,4 @@
-﻿# kevent / kmsg 测试方案
+# kevent / kmsg 测试方案
 
 ## 目录
 
@@ -7,16 +7,16 @@
   - [kevent](#kevent)
   - [kmsg](#kmsg)
   - [kevent 与 kmsg 的协作](#kevent-与-kmsg-的协作)
-  - [最新调用方边界](#最新调用方边界)
+  - [调用方边界](#调用方边界)
 - [3. 测试代码存放目录](#3-测试代码存放目录)
   - [模块级自动化测试](#模块级自动化测试)
   - [真实环境链路测试](#真实环境链路测试)
   - [路由配置测试](#路由配置测试)
   - [测试报告和证据](#测试报告和证据)
-- [4. 已有覆盖与新增补缺](#4-已有覆盖与新增补缺)
+- [4. 已有覆盖与补缺范围](#4-已有覆盖与补缺范围)
   - [kmsg 已有覆盖](#kmsg-已有覆盖)
-  - [kmsg 新增补缺范围](#kmsg-新增补缺范围)
-  - [kevent 已有覆盖与新增重点](#kevent-已有覆盖与新增重点)
+  - [kmsg 补缺范围](#kmsg-补缺范围)
+  - [kevent 已有覆盖与补缺重点](#kevent-已有覆盖与补缺重点)
 - [5. 测试分层](#5-测试分层)
   - [L1：模块级功能约定测试](#l1模块级功能约定测试)
   - [L2：系统配置与路由测试](#l2系统配置与路由测试)
@@ -35,26 +35,13 @@
 - [8. 环境构建](#8-环境构建)
   - [本地模块测试环境](#本地模块测试环境)
   - [真实环境测试环境](#真实环境测试环境)
-- [9. 推进步骤](#9-推进步骤)
-- [10. 最终测试报告格式](#10-最终测试报告格式)
-- [10.1 测试进度追踪规则](#101-测试进度追踪规则)
-  - [文件职责](#文件职责)
-  - [每轮测试后的更新规则](#每轮测试后的更新规则)
-  - [状态字段规则](#状态字段规则)
-  - [查看当前进度](#查看当前进度)
-  - [验证报告是否完整](#验证报告是否完整)
-- [11. 风险和取舍](#11-风险和取舍)
-- [12. 测试视角：以设计和生产语义为准](#12-测试视角以设计和生产语义为准)
+- [9. 测试复现指南](#9-测试复现指南)
+- [10. 推进步骤](#10-推进步骤)
+- [11. 报告和进度规则](#11-报告和进度规则)
+- [12. 风险和取舍](#12-风险和取舍)
+- [13. 测试视角：以设计和生产语义为准](#13-测试视角以设计和生产语义为准)
   - [当前已发现的设计 / 实现偏差](#当前已发现的设计--实现偏差)
-- [13. 编写 test plan 的提示词总结](#13-编写-test-plan-的提示词总结)
-  - [13.1 基础输入和范围](#131-基础输入和范围)
-  - [13.2 测试设计原则](#132-测试设计原则)
-  - [13.3 测试视角](#133-测试视角)
-  - [13.4 kmsg 测试落点和边界](#134-kmsg-测试落点和边界)
-  - [13.5 kevent / kmsg 真实环境测试要求](#135-kevent--kmsg-真实环境测试要求)
-  - [13.6 运行环境和隔离要求](#136-运行环境和隔离要求)
-  - [13.7 调用方覆盖要求](#137-调用方覆盖要求)
-  - [13.8 报告和推进方式](#138-报告和推进方式)
+- [14. 附录：测试方案维护原则](#14-附录测试方案维护原则)
 
 ## 1. 任务确认
 
@@ -81,7 +68,7 @@
 - `src/frame/opendan/src/msg_center_pump.rs`
 - `src/frame/opendan/src/session_event_pump.rs`
 
-目标是设计一套可落地、可重复执行、不过度设计的测试体系，覆盖 kevent 和 kmsg 作为生产基础通信能力必须满足的功能、可靠性、性能和真实链路行为。本轮只输出测试方案；确认后再按方案实现测试代码、执行测试并输出报告。
+目标是提供一套可落地、可重复执行、不过度设计的测试体系，覆盖 kevent 和 kmsg 作为生产基础通信能力必须满足的功能、可靠性、性能和真实链路行为。仓库内只维护测试计划、测试入口和当前测试结论；当前结论记录在 `notepads/kevent_kmsg_test_report.md`，每轮详细执行日志和原始输出可在本地归档到 `test/kevent_kmsg/reports/`，该目录不纳入版本控制。
 
 ## 2. 当前实现边界
 
@@ -131,22 +118,22 @@
 
 因此必须测试两者的组合语义，而不是只分别测各自 API。
 
-### 最新调用方边界
+### 调用方边界
 
-合入 `beta2.2` 后，`doc/arch/kevent.md` 和 `doc/arch/kmsg.md` 本身没有变化，但相关文档和调用方代码补充了更多生产使用约束，测试计划需要覆盖这些调用方契约：
+除 kevent/kmsg 模块本身外，测试还需要覆盖当前代码中已经形成的调用方契约：
 
 - `msg_center` 在消息 box 变化时发布 `/msg_center/{owner}/box/{box}/changed` 事件，payload 包含 `operation`、`owner`、`box_kind`、`box_name`、`record_id`、`msg_id`、`state`、`updated_at_ms`。
 - `control_panel` 的 chat stream 订阅 `/msg_center/{owner}/box/in/**` 和 `/msg_center/{owner}/box/out/**`，收到事件后必须重新读取 `MsgCenterClient.get_record(...)`，事件只作为加速信号。
 - `OpenDAN msg_center_pump` 订阅 `/msg_center/{owner}/box/{in,group_in,request}/**`，同时兼容旧路径 `/msg_center/{owner}/{box}/**`；无法识别的 `/msg_center/` 事件应防御性 sweep 全部 inbox 类 box。
 - `OpenDAN session_event_pump` 聚合各 session 的 kevent 订阅 pattern，动态重建 reader，并把匹配事件路由成目标 session 的 `Inbound::Event`。
 - `TaskManagerClient::wait_for_task_end_kevent` 明确把 kevent 当作加速层：订阅后立即回读 `get_task`，event 或 timeout 后都回读真相源，订阅失败时退化为轮询。
-- `agent_tool` 文档新增 `subscribe_event` / `unsubscribe_event`，说明 Agent Session 可以订阅 KEvent pattern；这依赖 `session_event_pump` 的 pattern 聚合、路由和 reader 重建行为。
+- `agent_tool` 文档提供 `subscribe_event` / `unsubscribe_event`，说明 Agent Session 可以订阅 KEvent pattern；这依赖 `session_event_pump` 的 pattern 聚合、路由和 reader 重建行为。
 
 ## 3. 测试代码存放目录
 
 ### 模块级自动化测试
 
-新增测试不放入模块源码文件，不扩展现有 `src/*.rs` 内部 `mod tests`。测试落点如下：
+测试代码不放入模块源码文件，不扩展现有 `src/*.rs` 内部 `mod tests`。
 
 - `src/kernel/kevent/tests/`
   - `client_contract.rs`
@@ -159,37 +146,40 @@
   - `sled_contract.rs`
   - `rpc_contract.rs`
 
-`kevent` 是 library crate，可直接新增模块级集成测试。
-
-`kmsg` 当前是 binary crate，没有 `src/lib.rs` library target。为了不修改生产源码，只允许 `src/kernel/kmsg/tests/sled_contract.rs` 在测试文件里临时引入实现文件：
+`kmsg` 当前是 binary crate，没有 `src/lib.rs`。只允许 `sled_contract.rs` 用一次 `#[path]` 引入底层实现，用于验证持久化、cursor、retention、权限、错误行为、并发和性能参考数据；不得写面向私有分支覆盖率的白盒测试。
 
 ```rust
 #[path = "../src/sled_msg_queue.rs"]
 mod sled_msg_queue;
 ```
 
-这种方式只用于验证对外承诺的行为，例如重启后数据仍在、消费位置正确、保留策略、权限、并发、错误行为和性能参考数据；不得写为了覆盖私有分支而存在的白盒测试。`sled_contract.rs` 是唯一允许 `#[path]` 引入实现文件的测试，避免多处重复引入。注意：被引入文件里的 `#[cfg(test)]` 内容可能会在该测试中再次参与编译或运行；如果实际造成重复或冲突，应改为拆出 `lib.rs` 或调整测试结构，需单独确认。
-
-`src/kernel/kmsg/tests/rpc_contract.rs` 不引入 sled 实现文件，只验证公开 RPC/handler 的接口行为。该测试使用测试内最小 fake `MsgQueueHandler`，挂到 `MsgQueueServerHandler` 上，专门验证方法名、参数解析、未知方法、缺字段、错类型和错误映射；不测试 sled 存储行为。真实 HTTP `/kapi/kmsg` 行为放到真实环境链路测试。
+注意：被引入文件里的 `#[cfg(test)]` 内容可能会在该测试中再次参与编译或运行；如果造成重复或冲突，应改为拆出 `lib.rs` 或调整测试结构。`rpc_contract.rs` 不引入 sled，只用测试内 fake `MsgQueueHandler` 验证 RPC/handler 接口行为。真实 HTTP `/kapi/kmsg` 行为放到 DV 测试。
 
 ### 真实环境链路测试
 
-新增根目录测试模块：
+统一目录为 `test/kevent_kmsg/`：
 
-- `test/kevent_kmsg_test/`
-  - `package.json`
-  - `kevent_kmsg_dv.ts`
-  - `README.md`
+| 目录 | 目的 | 环境要求 |
+| --- | --- | --- |
+| `dv/` | gateway 入口下的 kevent/kmsg 最小闭环、POST/GET 行为记录、event 唤醒后回读 kmsg。 | 标准 devtest 环境；Deno、pnpm、bash。 |
+| `restart/` | BuckyOS 服务重启后 kmsg 消息可读、kevent stream 可恢复，subscription 丢失作为偏差记录。 | 独立 Linux 测试机或可重建 devtest 环境。 |
+| `peer_container/` | Docker 网络命名空间下 native framed 单向 peer 投递。 | Linux 测试机、Docker。 |
+| `peer_vm/` | QEMU/KVM VM 隔离下 native framed 单向 peer 投递。 | Linux 测试机、`/dev/kvm`、`qemu-system-x86_64`、`qemu-img`、`genisoimage`。 |
+| `reports/` | 本地每轮详细测试数据和当轮结论，git 忽略，不作为仓库交付内容。 | 无。 |
 
-该目录由现有 `test/run.py` 自动发现，通过 `uv run test/run.py -p kevent_kmsg_test` 执行。这类测试只验证真实 BuckyOS 环境中的关键链路，不替代模块级测试。
+执行入口：
 
-`test/run.py` 的发现条件必须满足：
+```bash
+uv run test/run.py -p kevent_kmsg
+uv run test/run.py -p kevent_kmsg/dv
+uv run test/run.py -p kevent_kmsg/restart
+uv run test/run.py -p kevent_kmsg/peer_container
+uv run test/run.py -p kevent_kmsg/peer_vm
+```
 
-- `test/kevent_kmsg_test/package.json` 存在。
-- `package.json` 中必须包含 `scripts.test`。
-- runner 会在该目录执行 `bash -lc "pnpm install && pnpm test"`。
+`test/run.py --list` 通过 `test/kevent_kmsg/main.py` 发现分组入口。分组入口默认只打印子项说明，不直接运行重启、Docker 或 VM 测试。`dv/` 和 `restart/` 的 `package.json` 必须包含 `scripts.test`，runner 会在对应目录执行 `bash -lc "pnpm install && pnpm test"`。
 
-建议的最小 `package.json`：
+真实环境测试使用 Deno runner，并固定 WebSDK 依赖：
 
 ```json
 {
@@ -205,36 +195,28 @@ mod sled_msg_queue;
 }
 ```
 
-真实环境测试脚本使用 Deno 风格，和现有 `test/aicc_test` / `test/workflow_test` 保持一致，便于复用 `test/test_helpers/buckyos_client.ts`。如果引入除现有测试已使用依赖之外的新依赖，需要先确认。Windows devtest 下依赖 `test/run.py` 仍通过 `bash -lc` 调用 `pnpm`，因此执行前需确认当前环境可用 `bash`、`pnpm`、`deno`；若不可用，应先修 runner 或环境，而不是在测试脚本里绕过 `test/run.py`。
-
 ### 路由配置测试
 
-复用并必要时补充：
-
-- `src/test/test_boot_gatweay/`
-
-该目录已有 `/kapi/kevent/*` 早转发和 `/kapi/kmsg/*` service 路由相关用例。后续只补足缺口，不另建重复路由测试。
+路由测试复用并必要时补充 `src/test/test_boot_gatweay/`。该目录覆盖 `/kapi/kevent/*` 早转发和 `/kapi/kmsg/*` service 路由，不另建重复路由测试。
 
 ### 测试报告和证据
 
-测试输出统一保存到：
+每轮详细证据可在执行者本地保存到 `test/kevent_kmsg/reports/<yyyyMMdd-HHmmss>/`，该目录被 git 忽略。建议至少包含：
 
-- `target/test-reports/kevent-kmsg/<yyyyMMdd-HHmmss>/`
-  - `commands.log`
-  - `cargo-kevent.log`
-  - `cargo-kmsg.log`
-  - `boot-gateway.log`
-  - `dv.log`
-  - `performance.json`
-  - `report.md`
+- `commands.log`
+- `cargo-kevent.log`
+- `cargo-kmsg.log`
+- `boot-gateway.log`
+- `dv.log`
+- `performance.json`
+- `report.md`
 
-`target/` 是构建产物目录，适合存放测试证据，不污染源码。
-
-## 4. 已有覆盖与新增补缺
+仓库内的当前结论和进度索引只写入 `notepads/kevent_kmsg_test_report.md`。
+## 4. 已有覆盖与补缺范围
 
 ### kmsg 已有覆盖
 
-当前 `src/kernel/kmsg/src/sled_msg_queue.rs` 已有较完整的内部测试，后续实现时应复用这些测试，不重复搬到新测试文件里：
+`src/kernel/kmsg/src/sled_msg_queue.rs` 已有较完整的内部测试，实施本计划时应复用这些测试，不重复搬到新测试文件里：
 
 - `test_msg_queue_end_to_end`：覆盖 create/update/post/stats/subscribe/fetch/commit_ack/read/seek/delete/unsubscribe/delete_queue 的主流程。
 - `test_multiple_subscribers_and_messages`：覆盖多订阅者、不同起始位置、独立 cursor、追加消息和裁剪后的读取。
@@ -242,9 +224,9 @@ mod sled_msg_queue;
 
 `src/kernel/buckyos-api/src/msg_queue.rs` 也已有 mock client 层测试，覆盖 `MsgQueueClient` 的 in-process 行为、`read_message` 无副作用、`commit_ack`、`seek` 和路径 QueueUrn。
 
-### kmsg 新增补缺范围
+### kmsg 补缺范围
 
-新增测试不再重复 KM-01 到 KM-10 的 happy path。默认补缺范围收敛为：
+补缺测试不重复 KM-01 到 KM-10 的 happy path。默认补缺范围收敛为：
 
 - 持久化 reopen：确认 drop/reopen 后 queue、message、subscription cursor 仍符合预期。
 - config 生效：`max_messages`、`retention_seconds`、权限字段目前疑似未实现，需要用测试确认并输出偏差。
@@ -252,11 +234,11 @@ mod sled_msg_queue;
 - 并发和性能：验证 index 唯一、stats 正确，记录性能参考数据。
 - 真实服务链路：通过 gateway 的最小验证确认生产入口可用。
 
-新增 kmsg 测试放在 `src/kernel/kmsg/tests/*` 或 DV 目录。现有内部 `#[cfg(test)]` 测试继续保留并运行，但不作为新增测试的默认落点。
+kmsg 补缺测试放在 `src/kernel/kmsg/tests/*` 或 DV 目录。现有内部 `#[cfg(test)]` 测试继续保留并运行，但不作为补缺测试的默认落点。
 
-### kevent 已有覆盖与新增重点
+### kevent 已有覆盖与补缺重点
 
-`kevent` 和 `buckyos-api` 当前已有较多内部单元测试，覆盖 local pub/sub、pattern、timer、light mode、shared ring、HTTP wrapper、native transport 等。新增 `src/kernel/kevent/tests/*` 的重点不是重复内部断言，而是把公开契约和设计偏差固化为独立 integration tests，尤其是：
+`kevent` 和 `buckyos-api` 已有较多内部单元测试，覆盖 local pub/sub、pattern、timer、light mode、shared ring、HTTP wrapper、native transport 等。`src/kernel/kevent/tests/*` 的重点不是重复内部断言，而是把公开契约和设计偏差固化为独立 integration tests，尤其是：
 
 - HTTP/native 对外协议。
 - shared ring 数据大小和 overflow 边界。
@@ -285,8 +267,8 @@ cargo test -p kmsg
 
 说明：
 
-- `cargo test -p kevent` 包含现有单元测试和计划新增的 kevent integration tests。
-- `cargo test -p kmsg` 运行现有 kmsg 内部测试，以及计划新增的 `src/kernel/kmsg/tests/*` 测试。
+- `cargo test -p kevent` 包含现有单元测试和 kevent integration tests。
+- `cargo test -p kmsg` 运行现有 kmsg 内部测试，以及 `src/kernel/kmsg/tests/*` 测试。
 
 ### L2：系统配置与路由测试
 
@@ -320,7 +302,7 @@ uv run src/check.py
 命令：
 
 ```bash
-uv run test/run.py -p kevent_kmsg_test
+uv run test/run.py -p kevent_kmsg/dv
 ```
 
 真实环境测试必须通过 gateway 暴露入口访问 `/kapi/kevent` 和 `/kapi/kmsg`，不直接绕过 gateway 调服务进程端口。若调试阶段需要直连端口，只能作为临时定位手段，不计入最终通过证据。
@@ -339,9 +321,9 @@ cargo test -p kevent --test performance -- --ignored --nocapture
 cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 ```
 
-`kmsg` 性能参考数据放在 `src/kernel/kmsg/tests/sled_contract.rs` 的 ignored case 中，用唯一一次 `#[path]` 引入方式验证底层写读性能；公开 RPC 和真实环境性能参考数据仍放在 `test/kevent_kmsg_test`。
+`kmsg` 性能参考数据放在 `src/kernel/kmsg/tests/sled_contract.rs` 的 ignored case 中，用唯一一次 `#[path]` 引入方式验证底层写读性能；公开 RPC 和真实环境性能参考数据仍放在 `test/kevent_kmsg/dv`。
 
-性能测试不直接写死产品 SLO。首轮只做正确性检查和性能参考记录：测试失败条件主要是数据错误、panic、死锁、明显卡死或资源耗尽；吞吐和延迟只写入 `performance.json` 作为基线。后续产品定义明确 SLO 后，再把基线升级为硬门槛。
+性能测试不直接写死产品 SLO。默认只做正确性检查和性能参考记录：测试失败条件主要是数据错误、panic、死锁、明显卡死或资源耗尽；吞吐和延迟写入 `performance.json` 作为基线。产品定义明确 SLO 后，再把基线升级为硬门槛。
 
 ## 6. 详细测试项
 
@@ -363,14 +345,14 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 | `D-*` | 设计/实现偏差 | 已发现或待验证的设计与当前实现不一致之处。 |
 | `B-*` | 阻塞项 | 测试推进中遇到的环境或依赖问题。 |
 
-后续沟通中不使用笼统的“好了”作为测试结论。统一按下面口径判断：
+测试结论不使用笼统的“好了”。统一按下面口径判断：
 
 - `方案可推进`：测试项已经对应到设计要求、公开 API 或真实使用方式，测试放在哪里、怎么跑、需要什么环境、怎么留证据、怎么更新报告都已经明确，且没有已知结构性阻塞。
-- `测试已完成`：`notepads/kevent_kmsg_test_report.md` 第 9 章中对应测试项状态为 `已完成`，并且有可复现命令、测试文件、关键输出或运行态探针证据支撑。
+- `测试已完成`：`notepads/kevent_kmsg_test_report.md` 中对应测试项状态为 `已完成`，并且有可复现命令、测试文件、关键输出或运行态探针证据支撑。
 - `部分完成`：已有核心正确性证据，但还缺计划要求的真实环境、规模、路径或故障注入验证。
 - `未执行` / `阻塞`：没有执行证据，或当前环境问题会导致执行结果只反映环境失败。
 
-因此，当前如果说“这部分可以继续推进”，只表示计划结构和执行路径已经收敛；不表示所有 `KM-*`、`UF-*`、`DV-*` 项都已经通过。实际进度以测试报告第 9 章为准。
+`方案可推进` 不等于 `测试已完成`。实际进度以 `notepads/kevent_kmsg_test_report.md` 中的当前状态为准。
 
 ### A. kevent 模块功能测试
 
@@ -401,7 +383,7 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 | KM-EXIST-03 | 现有路径 QueueUrn 流程 | 复用已有路径型 queue name 测试。 | 高 | 保留并运行 `test_path_queue_name_roundtrip`。 | 同上 | 绝对路径 QueueUrn 可 create/post/subscribe/fetch。 |
 | KM-GAP-01 | persistence reopen | 补足现有测试未覆盖的重启恢复场景。 | 高 | 在 `src/kernel/kmsg/tests/sled_contract.rs` 用唯一一次 `#[path]` 引入方式和临时目录调用 `SledMsgQueue::new_in_dir`，创建 queue/post/sub/fetch/ack 后关闭并重新打开。 | `cd src && cargo test -p kmsg --test sled_contract` | 重新打开后 stats、read/fetch、subscription cursor 保持一致。 |
 | KM-GAP-02 | config 生效 | 验证 `max_messages`、`retention_seconds` 是否实现。 | 高 | 在 `sled_contract.rs` 创建带限制的 queue，写入超过限制并等待过期窗口，验证 stats/read/fetch。 | 同上 | 若未生效，报告标注为“实现与设计不符”。 |
-| KM-GAP-03 | 权限配置 | 验证 `other_app_can_*`、`other_user_can_*` 和 `RPCContext` 是否生效。 | 高 | 分两层：`sled_contract.rs` 构造不同 `RPCContext` 验证 handler 是否使用权限字段；该测试目标是暴露是否忽略 `RPCContext`，不能为了适配当前实现而把权限忽略当作通过。多身份真实环境测试仅在 devtest 能稳定构造多 session 时执行。 | `cd src && cargo test -p kmsg --test sled_contract`；真实环境条件具备时再跑 `uv run test/run.py -p kevent_kmsg_test` | 模块级测试若确认全部忽略权限字段，标注偏差；多身份真实环境测试不可用时记录为未验证风险，不作为默认自动门槛。 |
+| KM-GAP-03 | 权限配置 | 验证 `other_app_can_*`、`other_user_can_*` 和 `RPCContext` 是否生效。 | 高 | 分两层：`sled_contract.rs` 构造不同 `RPCContext` 验证 handler 是否使用权限字段；该测试目标是暴露是否忽略 `RPCContext`，不能为了适配当前实现而把权限忽略当作通过。多身份真实环境测试仅在 devtest 能稳定构造多 session 时执行。 | `cd src && cargo test -p kmsg --test sled_contract`；真实环境条件具备时再跑 `uv run test/run.py -p kevent_kmsg/dv` | 模块级测试若确认全部忽略权限字段，标注偏差；多身份真实环境测试不可用时记录为未验证风险，不作为默认自动门槛。 |
 | KM-GAP-04 | RPC 接口行为 | 验证公开 RPC/handler 行为，不引入 sled 私有实现。 | 高 | `rpc_contract.rs` 使用测试内最小 fake `MsgQueueHandler`，挂到 `MsgQueueServerHandler` 上，专门验证方法名、参数解析、未知方法、缺字段、错类型和错误映射；不启动完整 HTTP 服务，也不 include `sled_msg_queue.rs`。真实 `/kapi/kmsg` HTTP POST/GET 行为放到真实环境测试。 | `cd src && cargo test -p kmsg --test rpc_contract` | 正常方法返回可解析结果；异常返回明确错误，不 panic。 |
 | KM-GAP-05 | 并发 post | 补充并发生产者下 index 唯一性。 | 高 | `sled_contract.rs` 并发 post 1000 条；真实环境测试可补公开 RPC 并发小样本。 | `cd src && cargo test -p kmsg --test sled_contract` | index 唯一、连续，stats count 正确。 |
 | KM-GAP-06 | sync_write cursor 可靠性 | 验证 `sync_write` 是否覆盖 cursor 更新。 | 中高 | `sled_contract.rs` 中 sync_write=true 队列 fetch/ack/seek 后 drop/reopen。 | `cd src && cargo test -p kmsg --test sled_contract` | cursor 不回退；若回退，标注生产风险。 |
@@ -410,13 +392,13 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 
 | 编号 | 测试项 | 测试目的 | 重要性 | 测试方法 | 命令 | 验证和证据 |
 | --- | --- | --- | --- | --- | --- | --- |
-| KK-01 | event 驱动拉取 kmsg | 验证推荐生产模式。 | 高 | 创建 queue 和 subscription；post kmsg 后发布 kevent `{ queue_urn, index }`；consumer 收到 event 后 fetch kmsg。 | `uv run test/run.py -p kevent_kmsg_test`；若新增 Rust 独立测试，则命名为 `kevent_kmsg_contract` | 收到的 kmsg payload 与 event index 对应。 |
+| KK-01 | event 驱动拉取 kmsg | 验证推荐生产模式。 | 高 | 创建 queue 和 subscription；post kmsg 后发布 kevent `{ queue_urn, index }`；consumer 收到 event 后 fetch kmsg。 | `uv run test/run.py -p kevent_kmsg/dv`；若需要 Rust 独立测试，则命名为 `kevent_kmsg_contract` | 收到的 kmsg payload 与 event index 对应。 |
 | KK-02 | kevent 丢失时 kmsg 轮询兜底 | 验证尽力通知通道丢事件时，可靠数据层仍能保证业务可恢复。 | 高 | 只 post kmsg，不发布 kevent；consumer `pull_event(timeout)` 返回 None 后按 cursor fetch kmsg。 | 同上 | 即使无 event，消息仍能被 fetch 到。 |
 | KK-03 | 重复 kevent 不导致重复处理已 ack 消息 | kevent 可重复/无序场景下业务消费应靠 kmsg cursor 收敛。 | 中高 | 对同一 kmsg index 发布两次 event；第一次 fetch+ack，第二次 event 后 fetch 为空。 | 同上 | kmsg cursor 保证不重复处理。 |
 
 ### D. 使用场景归纳后的功能测试
 
-该层不按每个业务使用场景无限新增测试项，而是从现有调用方中提炼共性能力，再针对这些能力做稳定的功能测试。当前使用方包括 `TaskManagerClient::wait_for_task_end_kevent`、`msg_center` box changed event、`control_panel` chat stream、`OpenDAN msg_center_pump`、`OpenDAN session_event_pump`、`agent_tool subscribe_event` 和 AgentRuntime / workflow task 事件处理。它们共同使用的不是某个业务流程，而是以下 kevent/kmsg 能力：
+该层不按每个业务使用场景无限增加测试项，而是从现有调用方中提炼共性能力，再针对这些能力做稳定的功能测试。当前使用方包括 `TaskManagerClient::wait_for_task_end_kevent`、`msg_center` box changed event、`control_panel` chat stream、`OpenDAN msg_center_pump`、`OpenDAN session_event_pump`、`agent_tool subscribe_event` 和 AgentRuntime / workflow task 事件处理。它们共同使用的不是某个业务流程，而是以下 kevent/kmsg 能力：
 
 - kevent 作为尽力通知信号，业务必须回读真相源。
 - event path / pattern 是事件生产方和消费方的共同约定。
@@ -438,13 +420,13 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 | --- | --- | --- | --- | --- | --- | --- |
 | DV-01 | boot gateway kevent route | 确认 `/kapi/kevent/*` 走预期早转发。 | 高 | 复用或补充 `req_kevent_direct_ok.json`。 | `uv run src/test/test_boot_gatweay/run_debug_tests.py` | debug 输出 PASS，保存 `boot-gateway.log`。 |
 | DV-02 | boot gateway kmsg route | 确认 `/kapi/kmsg/*` 可路由到 service。 | 高 | 复用或补充 `req_service_kmsg_via_routes_ok.json`。 | 同上 | debug 输出 PASS。 |
-| DV-03 | kmsg gateway 最小闭环 | 验证真实 BuckyOS 环境中 `/kapi/kmsg` 可完成最小队列闭环。 | 高 | TS 测试通过 gateway 调 create/post/subscribe/fetch/ack/delete。 | `uv run test/run.py -p kevent_kmsg_test` | 所有 RPC 返回成功；测试数据清理；保存 `dv.log`。 |
+| DV-03 | kmsg gateway 最小闭环 | 验证真实 BuckyOS 环境中 `/kapi/kmsg` 可完成最小队列闭环。 | 高 | TS 测试通过 gateway 调 create/post/subscribe/fetch/ack/delete。 | `uv run test/run.py -p kevent_kmsg/dv` | 所有 RPC 返回成功；测试数据清理；保存 `dv.log`。 |
 | DV-03B | kmsg HTTP 当前行为记录 | 记录真实 `/kapi/kmsg` 当前只接受 kRPC over HTTP POST，GET 拉模型与文档不一致。 | 中 | TS 测试对 `/kapi/kmsg` 执行一个 POST 最小验证，再执行 GET 探测并记录 status。 | 同上 | POST 可用；GET 当前若不可用，不作为失败项，报告标为文档/实现偏差。 |
 | DV-04 | kevent gateway stream 最小验证 | 验证浏览器推荐消费路径在真实环境可用。 | 高 | TS 测试建 `/kapi/kevent/stream`，另一路 publish，读取 ack/event/keepalive。 | 同上 | NDJSON frame 正确；断开后进程无异常日志。 |
 | DV-05 | kevent + kmsg gateway 协作 | 验证生产链路：kmsg 持久化 + kevent 通知。 | 高 | TS 测试 create queue、subscribe、post message、publish event、stream 收 event 后 fetch。 | 同上 | event 加速路径可用；轮询兜底路径也可用。 |
-| DV-06 | kmsg 持久化自动验证 | 验证真实服务入口下消息在测试进程重连后仍可读。 | 高 | TS 测试创建 queue/post/read，关闭 client 并重新创建 client，再 read/fetch。该项不重启服务，只验证公开入口和持久数据可重复读取。 | `uv run test/run.py -p kevent_kmsg_test` | 重新连接后消息仍可读；记录 queue_urn/index。 |
-| DV-MANUAL-01 | 服务重启后 kmsg 持久化 | 验证完整 BuckyOS 服务重启后不丢数据。 | 高 | 可选手工验证：先运行真实环境测试创建并记录 queue_urn/index；执行 `uv run src/start.py` 覆盖启动；`uv run src/check.py` 通过后运行只读验证脚本。 | 不计入自动验收；命令和输出写入报告 | 重启后消息仍可读；失败时保留 start/check/read 三段日志。 |
-| DV-MANUAL-02 | kevent daemon restart 退化行为 | 验证尽力通知通道的故障语义：不会卡死，功能靠 kmsg 恢复。 | 中高 | 可选手工验证：建 stream 后重启服务，期间 post kmsg；允许 stream 断开或漏 event，但恢复后必须可 fetch kmsg。 | 不计入自动验收；命令和输出写入报告 | kevent 断开/重连行为可解释；kmsg 消息不丢。 |
+| DV-06 | kmsg 持久化自动验证 | 验证真实服务入口下消息在测试进程重连后仍可读。 | 高 | TS 测试创建 queue/post/read，关闭 client 并重新创建 client，再 read/fetch。该项不重启服务，只验证公开入口和持久数据可重复读取。 | `uv run test/run.py -p kevent_kmsg/dv` | 重新连接后消息仍可读；记录 queue_urn/index。 |
+| DV-MANUAL-01 | 服务重启后 kmsg 持久化 | 验证完整 BuckyOS 服务重启后不丢数据。 | 高 | `kevent_kmsg/restart` 创建 queue/post/read/sub/ack，执行 `uv run src/start.py --skip-update` 重启服务，`uv run src/check.py` 恢复后通过 gateway 重新 read 重启前消息。 | `uv run test/run.py -p kevent_kmsg/restart` | 重启后消息仍可读；subscription 若丢失，记录为 D-09 相关偏差，不作为该项消息持久化失败。 |
+| DV-MANUAL-02 | kevent daemon restart 退化行为 | 验证尽力通知通道的故障语义：不会卡死，功能靠 kmsg 恢复。 | 中高 | `kevent_kmsg/restart` 在重启前建立 stream，重启期间观察旧 stream 有界关闭或超时；恢复后重建 stream，post kmsg 并 publish kevent。 | `uv run test/run.py -p kevent_kmsg/restart` | 旧 stream 行为可解释；恢复后 kmsg fetch 和 kevent stream 均可用。 |
 
 ## 7. 性能测试设计
 
@@ -468,7 +450,7 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 | MP-02 | fetch throughput | 验证批量消费路径具备生产可用的基础吞吐。 | 高 | 预置 10k 条，fetch batch=100，auto_commit=true。 | 全部读完；无重复、无缺失。 | batch latency。 |
 | MP-03 | at-least-once overhead | 验证可靠消费路径在显式 ack 下不破坏 cursor。 | 高 | fetch auto_commit=false + commit_ack。 | 全部读完；无 cursor 错乱。 | ops/s。 |
 | MP-04 | concurrent producers | 验证多生产者并发写入时 index 唯一且连续。 | 高 | 10 个 task 并发 post，总 10k 条。 | index 唯一连续，stats 正确。 | index 校验摘要。 |
-| MP-05 | sync_write 性能成本 | 记录可靠写入开关的性能成本，作为后续退化对比基线。 | 中 | sync_write=false 和 true 各 post 1k 条。 | 两者都成功；记录差异，不以差异作为失败条件。 | sync_write 对比数据。 |
+| MP-05 | sync_write 性能成本 | 记录可靠写入开关的性能成本，作为退化排查基线。 | 中 | sync_write=false 和 true 各 post 1k 条。 | 两者都成功；记录差异，不以差异作为失败条件。 | sync_write 对比数据。 |
 
 ## 8. 环境构建
 
@@ -496,7 +478,7 @@ uv run src/check.py
 通过标准后再运行：
 
 ```bash
-uv run test/run.py -p kevent_kmsg_test
+uv run test/run.py -p kevent_kmsg/dv
 ```
 
 真实环境测试中的 URL 和凭证通过环境变量配置，默认使用 devtest 本地环境：
@@ -507,12 +489,41 @@ uv run test/run.py -p kevent_kmsg_test
 
 如果需要登录态，优先复用现有 `test/aicc_test` 和 `test/test_helpers` 的登录方式。测试包只增加测试依赖，不引入模块生产依赖。
 
-## 9. 推进步骤
+## 9. 测试复现指南
+
+执行者按本节准备环境和运行命令，再用 `notepads/kevent_kmsg_test_report.md` 核对当前状态。每轮详细证据可保存到本地 `test/kevent_kmsg/reports/`，但不提交到仓库。
+
+| 分类 | 命令 | 环境 | 覆盖 | 通过判断 |
+| --- | --- | --- | --- | --- |
+| 模块级功能 | `cd src && cargo test -p kevent && cargo test -p kmsg` | Rust workspace 可解析；Linux 如需 native 依赖设置 `LIBCLANG_PATH`。 | `KE-01`~`KE-15`、`KM-EXIST-*`、`KM-GAP-*`、`D-01/D-04/D-05/D-06/D-07/D-09` | 退出码 0；config/权限等当前偏差必须记录为偏差，不伪装成设计通过。 |
+| 使用功能契约 | `cd src && cargo test -p kevent --test usage_contract` | 不需要完整 BuckyOS。 | `UF-01`~`UF-05`、`D-11` | event id 与 consumer pattern 匹配；payload 只用于定位；timeout/重复 event 不破坏真相源收敛。 |
+| 真实环境 DV | `uv run src/start.py --all && uv run src/check.py && uv run test/run.py -p kevent_kmsg/dv` | 仓库根目录；标准 devtest；Deno、pnpm、bash 可用。 | `KK-01`~`KK-03`、`DV-03`~`DV-06`、`DV-03B`、`D-08` | kmsg POST/kRPC 闭环通过；kevent stream 可 ack/receive；GET `/kapi/kmsg` 当前行为只记录。 |
+| 服务重启恢复 | `uv run test/run.py -p kevent_kmsg/restart` | 可重建 devtest；测试会执行 `uv run src/start.py --skip-update`。 | `DV-MANUAL-01`、`DV-MANUAL-02`、`D-09` | 重启前消息重启后可读；旧 stream 有界关闭或超时；恢复后新 stream/kmsg 可用；subscription 丢失记录为 D-09 偏差。 |
+| peer container | `uv run test/run.py -p kevent_kmsg/peer_container` | Linux 测试机；Docker 可运行 `ubuntu:24.04`。 | `D-02`、`D-03` | 外部 client 发布到 `node_a` 后，`node_b` 能收到同一 event。 |
+| peer VM | `uv run test/run.py -p kevent_kmsg/peer_vm` | Linux 测试机；KVM、`qemu-system-x86_64`、`qemu-img`、`genisoimage` 可用。 | `D-02`、`D-03` | 与 container 同；只证明手工配置 peer 后 native framed 单向投递可达。 |
+| 性能基线 | `cd src && cargo test -p kevent --test performance -- --ignored --nocapture --test-threads=1 && cargo test -p kmsg --test sled_contract -- --ignored --nocapture` | Rust workspace；性能测试默认 ignored。 | `KP-01`~`KP-05`、`MP-01`~`MP-05` | 退出码 0；输出 baseline JSON；数值作为基线，不作为产品 SLO。 |
+| 路由 debug | `uv run src/test/test_boot_gatweay/run_debug_tests.py` | `cyfs_gateway debug` 能加载当前 `boot_gateway.yaml`。 | `DV-01`、`DV-02` | route case 输出 PASS；若 debug binary 不支持当前 `--backup-map` 语法，记录为工具链阻塞，不代表 runtime gateway DV 失败。 |
+
+单独复现 kevent slow reader baseline：
+
+```bash
+cd src
+cargo test -p kevent --test performance slow_reader_overflow_10k_baseline -- --ignored --nocapture
+```
+
+每轮执行后：
+
+- `test/kevent_kmsg/reports/` 可在本地保存该轮实际命令、环境、退出码、关键输出、日志路径和当轮结论；该目录不提交。
+- `notepads/kevent_kmsg_test_report.md` 更新当前状态表、复现索引、关键证据、阻塞项和剩余风险。
+- 实现与设计不符时，在当前报告的偏差和修补建议中记录依据、实际行为和建议处理方式。
+
+## 10. 推进步骤
 
 1. 确认本测试方案。
-2. 新增 `src/kernel/kevent/tests/*` integration tests。
-3. 新增 `src/kernel/kmsg/tests/sled_contract.rs` 和 `src/kernel/kmsg/tests/rpc_contract.rs`。其中 `sled_contract.rs` 是唯一使用 `#[path = "../src/sled_msg_queue.rs"]` 引入实现文件的测试，验证持久化、config、权限、cursor、并发、性能等对外行为；`rpc_contract.rs` 使用 fake `MsgQueueHandler` 验证 RPC/handler 接口行为。
-4. 运行 L1：
+2. 实现 `src/kernel/kevent/tests/*` integration tests。
+3. 实现 `src/kernel/kmsg/tests/sled_contract.rs` 和 `src/kernel/kmsg/tests/rpc_contract.rs`。其中 `sled_contract.rs` 是唯一使用 `#[path = "../src/sled_msg_queue.rs"]` 引入实现文件的测试，验证持久化、config、权限、cursor、并发、性能等对外行为；`rpc_contract.rs` 使用 fake `MsgQueueHandler` 验证 RPC/handler 接口行为。
+4. 实现 `test/kevent_kmsg/dv`、`restart`、`peer_container`、`peer_vm` 测试。
+5. 运行模块级测试：
 
 ```bash
 cd src
@@ -520,8 +531,7 @@ cargo test -p kevent
 cargo test -p kmsg
 ```
 
-5. 修正测试或实现中暴露的问题。若需改协议、字段、存储结构，同时检查前后端和文档联动。
-6. 新增 `test/kevent_kmsg_test` DV 测试。
+6. 修正测试或实现中暴露的问题。若需改协议、字段、存储结构，同时检查前后端和文档联动。
 7. 运行路由测试：
 
 ```bash
@@ -533,73 +543,46 @@ uv run src/test/test_boot_gatweay/run_debug_tests.py
 ```bash
 uv run src/start.py --all
 uv run src/check.py
-uv run test/run.py -p kevent_kmsg_test
+uv run test/run.py -p kevent_kmsg/dv
 ```
 
-9. 运行 ignored 性能测试和真实环境性能参考测试：
+9. 在合适环境运行 restart、peer container、peer VM 测试：
+
+```bash
+uv run test/run.py -p kevent_kmsg/restart
+uv run test/run.py -p kevent_kmsg/peer_container
+uv run test/run.py -p kevent_kmsg/peer_vm
+```
+
+10. 运行 ignored 性能测试和真实环境性能参考测试：
 
 ```bash
 cd src
 cargo test -p kevent --test performance -- --ignored --nocapture
 cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 cd ..
-uv run test/run.py -p kevent_kmsg_test
+uv run test/run.py -p kevent_kmsg/dv
 ```
 
-10. 汇总 `target/test-reports/kevent-kmsg/<timestamp>/report.md`。
+11. 可在本地汇总 `test/kevent_kmsg/reports/<timestamp>/report.md`，并更新仓库内的 `notepads/kevent_kmsg_test_report.md`。
 
-## 10. 最终测试报告格式
+## 11. 报告和进度规则
 
-测试完成后输出报告到：
-
-```text
-target/test-reports/kevent-kmsg/<timestamp>/report.md
-```
-
-报告至少包含：
-
-- 测试时间、commit、操作系统、Rust 版本。
-- 本轮修改的测试文件列表。
-- 已有测试复用清单和新增补缺清单。
-- 执行命令和退出码。
-- kevent 功能测试结果。
-- kmsg 功能测试结果。
-- 使用功能最小验证结果。
-- 路由和真实环境测试结果。
-- 性能测试摘要。
-- 失败用例、日志路径、复现命令。
-- 未验证项和剩余风险。
-
-报告结论必须能回答：
-
-- 改了什么测试。
-- 为什么这些测试覆盖了生产关键风险。
-- 跑了什么验证。
-- 还有什么风险或未验证项。
-
-## 10.1 测试进度追踪规则
-
-测试推进状态统一记录在 `notepads/kevent_kmsg_test_report.md` 中。
-
-### 文件职责
+报告分两层维护：
 
 | 文件 | 职责 |
 | --- | --- |
-| `notepads/kevent_kmsg_test_plan.md` | 人读测试方案，描述测试范围、目的、方法和推进步骤。 |
-| `notepads/kevent_kmsg_test_report.md` | 唯一测试进度台账和测试报告，记录每轮执行结果、证据、阻塞项和测试计划推进状态。 |
+| `notepads/kevent_kmsg_test_report.md` | 当前测试报告和进度索引，记录每个计划项的状态、结论、证据索引和剩余风险。 |
+| `test/kevent_kmsg/reports/<timestamp>/` 或 `test/kevent_kmsg/reports/<date>-<name>.md` | 执行者本地每一轮测试的详细记录，包含命令、环境、原始输出、日志路径、性能数据和当轮结论；该目录 git 忽略，不提交。 |
 
-### 每轮测试后的更新规则
+每执行一轮测试后：
 
-每执行一轮测试后，必须更新 `notepads/kevent_kmsg_test_report.md`：
+1. 可将该轮命令、环境、退出码、关键输出、日志路径和当轮结论归档到本地 `test/kevent_kmsg/reports/`。
+2. 更新 `notepads/kevent_kmsg_test_report.md` 中的当前结论、统计口径、测试项状态、阻塞项和证据索引。
+3. 如增加测试项、拆分测试项或调整测试目录，同时更新本测试计划和当前报告。
+4. 不在 notepad 当前报告里长期保留多轮历史数据；历史明细由执行者本地 `test/kevent_kmsg/reports/` 保留。
 
-1. 在执行结果章节记录本轮实际运行的命令、环境、退出码、关键输出和结论。
-2. 在阻塞或诊断章节记录未执行原因、环境问题和下一步。
-3. 更新 `## 9. 测试计划推进状态`，确保每个相关测试项的状态、测试结果、证据和剩余工作同步变化。
-4. 如果新增测试项或拆分测试项，同时更新 `notepads/kevent_kmsg_test_plan.md` 和报告第 9 章。
-
-### 状态字段规则
-
-第 9 章中的每个测试项必须使用以下状态之一：
+当前报告中的每个测试项必须使用以下状态之一：
 
 | 状态 | 含义 |
 | --- | --- |
@@ -608,48 +591,24 @@ target/test-reports/kevent-kmsg/<timestamp>/report.md
 | `未执行` | 计划项尚无执行证据。 |
 | `阻塞` | 受环境或依赖问题阻塞，当前执行只会得到环境失败。 |
 
-每个测试项至少要维护：
+每个测试项至少维护：`当前状态`、`测试结果`、`通过证据 / 当前证据`、`剩余工作`。
 
-| 字段 | 填写要求 |
-| --- | --- |
-| `当前状态` | 使用固定状态枚举。 |
-| `测试结果` | 写明 `通过`、`未验证`、`失败`、`当前行为已确认`、`实现与设计不符` 等。 |
-| `通过证据 / 当前证据` | 写明命令、测试文件、关键输出、日志路径或探针结果。 |
-| `剩余工作` | 写明未完成内容、阻塞原因、下一步或修复后需要调整的预期。 |
+报告完整性检查：
 
-### 查看当前进度
-
-直接查看：
-
-```text
-notepads/kevent_kmsg_test_report.md
-```
-
-其中：
-
-- 第 1-8 章记录本轮执行过程、构建和诊断证据。
-- 第 9 章是测试计划推进状态总览。
-
-### 验证报告是否完整
-
-人工 review 报告时至少检查：
-
-- 第 9 章是否覆盖 test plan 中所有测试项。
-- 每个测试项是否有明确状态。
-- `已完成` 项是否有可复现命令或明确探针证据。
-- `阻塞` 项是否写明阻塞原因、影响范围和下一步。
-- 第 1-8 章的执行证据是否能支撑第 9 章中的状态变化。
-
-## 11. 风险和取舍
+- 当前报告覆盖 test plan 中所有测试项。
+- `已完成` 项有可复现命令或明确探针证据。
+- `阻塞` 项写明阻塞原因、影响范围和下一步。
+- 当前报告中的状态变化要有可复现命令和关键证据；本地 `test/kevent_kmsg/reports/` 可作为执行者自留的详细证据。
+## 12. 风险和取舍
 
 - 不把所有行为都放到真实环境测试里。大多数语义用模块级测试快速覆盖，真实环境测试只验证关键链路，避免测试慢且不稳定。
-- kevent 新增测试优先放在 integration test 或根目录 test 模块，避免侵入模块源码。
+- kevent 补充测试优先放在 integration test 或根目录 test 模块，避免侵入模块源码。
 - kmsg 当前是 binary crate，仅 `src/kernel/kmsg/tests/sled_contract.rs` 通过 `#[path]` 引入实现文件，不改生产源码。该方式只能验证设计要求和对外行为，不能写面向私有分支覆盖率的白盒测试。公开链路测试仍放在真实环境/RPC/HTTP 层。
 - kevent 是尽力通知通道，测试不会要求事件永不丢；只要求错误可解释、不会卡死、丢事件时 kmsg 兜底有效。
 - kmsg 是可靠层，测试会严格要求持久化、index 单调、cursor 正确、重启后数据仍可读。
 - 性能阈值先作为防明显退化的 guardrail，首轮报告记录基线；没有产品 SLO 前不做过度性能门槛。
 
-## 12. 测试视角：以设计和生产语义为准
+## 13. 测试视角：以设计和生产语义为准
 
 本测试方案不能面向源码实现细节来设计，也不能把“当前代码怎么写的”直接当成正确行为。测试的判断基准按优先级排列如下：
 
@@ -658,7 +617,7 @@ notepads/kevent_kmsg_test_report.md
 3. 模块公开 API、服务入口、调用方使用方式所体现的契约。
 4. 当前源码实现。
 
-因此后续实现测试时，需要把测试分成两类：
+实施测试时，需要把测试分成两类：
 
 - **功能约定测试**：验证当前实现是否满足设计文档和公开接口语义。例如 kmsg 的 index 单调、cursor 正确、重启后数据仍可读；kevent 的 local/global 边界、pattern 匹配、尽力通知下的丢旧保新、HTTP stream frame 语义。
 - **实现审视测试**：通过测试暴露当前实现中不合理、过度耦合、与设计不符或生产风险较高的地方。例如文档要求的能力未实现、错误码与文档不一致、HTTP facade 与 native 协议不一致、kmsg 配置字段没有生效、kevent 事件大小限制与 shared ring slot 限制冲突、异常路径返回 500 或 panic。
@@ -688,13 +647,13 @@ notepads/kevent_kmsg_test_report.md
 
 ### 当前已发现的设计 / 实现偏差
 
-以下是基于当前文档和代码静态阅读已经能确认或需要重点验证的偏差。后续测试实现时应把这些作为优先验证目标；如果测试证明偏差存在，需要在测试报告中明确标注“实现与设计不符”或“文档需要补充”。
+以下是基于当前文档和代码静态阅读已经能确认或需要重点验证的偏差。实施测试时应把这些作为优先验证目标；如果测试证明偏差存在，需要在测试报告中明确标注“实现与设计不符”或“文档需要补充”。
 
-| 编号 | 模块 | 偏差说明 | 依据 | 状态 | 初步判断 | 后续验证方式 |
+| 编号 | 模块 | 偏差说明 | 依据 | 状态 | 初步判断 | 验证方式 / 剩余验证 |
 | --- | --- | --- | --- | --- | --- | --- |
 | D-01 | kevent | 文档建议 `data` 字段大小上限可为 64KB，`KEventClient` 也按 64KB 校验；但 shared ringbuffer 单 slot 只有 2048 bytes，且写入的是序列化后的完整 `Event`，因此 2KB 左右以上的 global event 在 shared-ring 路径可能失败。 | `doc/arch/kevent.md` 提到 64KB；`kevent_client.rs` 有 `MAX_EVENT_DATA_SIZE_BYTES = 64 * 1024`；`kevent_ringbuffer.rs` 有 `SLOT_DATA_SIZE = 2048`。 | 已静态确认 | 明确的设计/实现冲突。需要决定是降低文档/API 上限，还是调整 shared ring 传输策略。 | 增加 1KB、2KB、4KB、64KB event 的 local/service/shared ring/HTTP publish 测试，记录各路径行为。 |
-| D-02 | kevent | 文档描述 Node Daemon 通过全 mesh TCP 长连接向所有 peer 广播 global event；当前代码只有 `KEventPeerPublisher` 抽象和 in-process 测试，`node_daemon/src/kevent_server.rs` 未看到 peer 连接建立、维护和配置加载。 | `doc/arch/kevent.md` 的 peer daemon 协议和 `remote_peers` 设计；当前 node_daemon kevent server 只启动 HTTP、native TCP 和 shared-ring importer。 | 疑似未实现 | 生产跨节点 kevent 能力疑似未落地。 | 增加双 daemon / 双节点 DV 测试；若当前环境无法搭建，报告中标为未实现或未验证。 |
-| D-03 | kevent | 文档说外部 Light SDK 连接任意 daemon 发布事件后应广播到所有 peer；若 D-02 未实现，则 Light SDK 的跨节点语义也无法满足。 | `doc/arch/kevent.md` 说明 Light SDK 只需连接任意 Daemon；当前只有本地 service/HTTP/native publish 路径。 | 疑似未实现 | 依赖 D-02，疑似设计未落地。 | Light client 发布到 Node A，Node B reader 订阅验证是否收到。 |
+| D-02 | kevent | 文档描述 Node Daemon 通过全 mesh TCP 长连接向所有 peer 广播 global event；当前代码有 `KEventPeerPublisher` 抽象、in-process 测试、container 级和 QEMU/KVM VM 级 native framed 单向投递测试，但 `node_daemon/src/kevent_server.rs` 未看到 peer 连接建立、维护和配置加载。 | `doc/arch/kevent.md` 的 peer daemon 协议和 `remote_peers` 设计；当前 node_daemon kevent server 只启动 HTTP、native TCP 和 shared-ring importer。`test/kevent_kmsg/peer_container` 与 `test/kevent_kmsg/peer_vm` 可验证手工配置 peer 后的单向 framed 投递。 | 部分验证，仍疑似未完整实现 | 生产跨节点自动 peer mesh 能力疑似未落地。 | 已有 container 和 QEMU/KVM VM harness 验证单向 framed peer 投递；剩余验证是完整 `ood1 + node1` BuckyOS DV，确认 node-daemon 是否自动建立和维护 peer 连接。 |
+| D-03 | kevent | 文档说外部 Light SDK 连接任意 daemon 发布事件后应广播到所有 peer；container 和 QEMU/KVM VM harness 已验证“外部 client -> node_a -> node_b”单向可达，但完整任意 daemon / 全 mesh 语义仍依赖 D-02。 | `doc/arch/kevent.md` 说明 Light SDK 只需连接任意 Daemon；当前只有本地 service/HTTP/native publish 路径。harness 显示 framed `PublishGlobal` 到接收端后 `ingress_node` 会变成接收端。 | 部分验证，仍疑似设计语义未完整落地 | 依赖 D-02；当前 framed 协议还不能清晰表达 peer 转发语义。 | 使用 `uv run test/run.py -p kevent_kmsg/peer_container` 和 `uv run test/run.py -p kevent_kmsg/peer_vm` 作为单向可达证据；剩余验证是 peer publish 协议确认和完整双节点 BuckyOS DV。 |
 | D-04 | kevent | 文档的错误码列表只有 `INVALID_EVENTID`、`INVALID_PATTERN`、`DAEMON_UNAVAILABLE`、`TIMER_INVALID_TARGET`、`TIMER_NOT_FOUND`；当前实现额外有 `NOT_SUPPORTED`、`READER_CLOSED`，且 `pull_event` 对不存在 reader 返回 `Ok(None)`，`update_reader` 对不存在 reader 返回 `READER_CLOSED`，生命周期错误语义不一致。 | `doc/arch/kevent.md` 错误码章节；`kevent_client.rs` 的 `KEventError`；`service.rs` 的 `pull_event` / `update_reader`。 | 已静态确认 | 文档与实现不一致，且 API 行为需要统一。 | 模块测试固定关闭/不存在 reader 的 pull/update/remove 行为；报告中建议统一错误语义或补文档。 |
 | D-05 | kevent | 文档强调 EventBus 是尽力通知、无匹配 reader 时静默丢弃；当前 service 在 mirror 到 shared ring 失败时可能让 HTTP publish / external publish 返回错误。这对超大事件是好事还是违反尽力通知语义，需要设计确认。 | `doc/arch/kevent.md` 的尽力通知和静默丢弃语义；`service.rs` 的 `mirror_to_shared_ring` 返回错误链路。 | 待测试验证 | 设计语义不够精确，尤其是“非法/过大事件”是否应失败。 | 构造过大事件，分别验证 publish 返回、reader 接收、日志。 |
 | D-06 | kmsg | 文档和 API 都定义了 `max_messages`、`retention_seconds`，但当前 sled 实现仅保存 config，未在 post/fetch/read 或后台维护中执行最大条数和过期清理。 | `doc/arch/kmsg.md` 的 `QueueConfig`；`msg_queue.rs` 的字段；`sled_msg_queue.rs` 只读取 `sync_write`，未使用 `max_messages` / `retention_seconds`。 | 已静态确认 | 明确的设计/实现冲突。 | 创建 `max_messages=3` / `retention_seconds=1` 的队列，写入和等待后验证 stats/read 是否裁剪。 |
@@ -704,83 +663,14 @@ notepads/kevent_kmsg_test_report.md
 | D-10 | kmsg | `doc/arch/kmsg.md` 描述的是基础 trait，没有包含当前公开 API 中的 `read_message`、权限 bool、绝对路径 QueueUrn 透传规则等扩展。 | `doc/arch/kmsg.md` 与 `msg_queue.rs` 差异。 | 文档需补充 | 文档落后于实现，不一定是代码错误，但测试计划和报告要明确当前契约来源。 | 在测试报告里列出“文档未覆盖但当前 API 暴露”的能力，建议补文档。 |
 | D-11 | kevent 调用方 | `msg_center` 当前发布 `/msg_center/{owner}/box/{box}/changed`，OpenDAN 同时订阅新旧两类 path，control_panel 只订阅 `/box/in/**` 和 `/box/out/**`。如果未来 msg_center path 或 box name 变化，两个消费方容易静默失效。 | `msg_center.rs` 的 `build_box_changed_event_id`；`message_hub.rs` 的 chat stream patterns；`msg_center_pump.rs` 的 `build_msg_center_event_patterns`。 | 已静态确认风险 | 不是当前实现 bug，但属于调用方约定脆弱点，应固化测试。 | 增加事件生产方和消费方 pattern 兼容性最小验证，验证所有消费方 pattern 能匹配 msg_center 当前发布路径。 |
 
-## 13. 编写 test plan 的提示词总结
+## 14. 附录：测试方案维护原则
 
-本节总结本轮编写和修订 `kevent_kmsg_test_plan.md` 时使用的约束、原则和 review 反馈，后续编写类似测试方案时应优先遵循。
-
-### 13.1 基础输入和范围
-
-- 只依据当前工作区实际存在的 kevent / kmsg 相关文档、模块源码和调用方源码设计测试。
-- 重点参考 `doc/arch/kevent.md`、`doc/arch/kmsg.md`、模块本身代码，以及实际使用 kevent / kmsg 的调用方代码。
-- 工作区没有的、已删除的、无法从当前仓库确认的资料不要作为测试依据。
-- 方案文档输出到 `notepads/` 下。
-
-### 13.2 测试设计原则
-
-- 测试覆盖要全面，但不要冗余。
-- 测试代码不要侵入模块源码。
-- 明确测试代码存放目录，目录选择要合理并符合工程规范。
-- 所有测试方案必须可落地、可执行、可验证。
-- 每项测试需要说明测试目的、重要性、测试方法、测试命令、环境要求、环境构建方式、验证方式和必要证据。
-- `重要性` 必须作为单独一列或单独字段，不要和 `测试目的` 混在一起。
-- 需要按步骤推进测试完成；如果需要复杂测试环境，必须说明如何搭建。
-- 测试完成后必须输出测试报告。
-- 测试报告应包含测试计划推进情况：每个测试项当前是已完成、未完成、部分完成还是阻塞；测试结果是否通过；通过证据是什么。
-
-### 13.3 测试视角
-
-- 不要只面向源码实现写测试，不能把“当前代码怎么写”直接当成正确行为。
-- 测试应以设计文档、公开 API、生产语义和调用方契约为判断基准。
-- 要主动审视当前实现中不合理、过度耦合、与设计不符或生产风险高的地方。
-- 在 test plan 中增加专门主题说明“测试视角：以设计和生产语义为准”。
-- 对已经发现的实现 / 设计冲突，需要在方案中列出偏差表，说明偏差依据、状态、初步判断和后续验证方式。
-- 偏差项要区分“已静态确认”和“待测试验证”，避免把疑似问题写成已证实问题。
-
-### 13.4 kmsg 测试落点和边界
-
-- 允许在 `src/kernel/kmsg/tests/*.rs` 下新增测试文件。
-- 新增测试不要再建议通过修改模块源码增加内部 `#[cfg(test)]`。
-- `kmsg` 是 binary crate，没有 `src/lib.rs` 时，底层 sled 行为测试可以在测试文件中用 `#[path = "../src/sled_msg_queue.rs"] mod sled_msg_queue;` 引入实现文件，不改生产源码。
-- `#[path]` 引入方式只能用于验证持久化、cursor、retention、权限、错误行为、并发和性能参考数据等设计要求，不写为了覆盖私有分支而存在的白盒测试。
-- `#[path]` include 不要分散到多个 kmsg test 文件；集中到 `src/kernel/kmsg/tests/sled_contract.rs` 一个文件中。
-- 注意 integration test crate 中 `cfg(test)` 也是开启的，被 include 文件里的内部 `#[cfg(test)]` 内容可能会再次参与编译或运行；若造成重复或冲突，应改为拆出 `lib.rs` 或调整测试结构，需单独确认。
-- `rpc_contract.rs` 不 include sled 实现；使用测试内最小 fake `MsgQueueHandler` 挂到 `MsgQueueServerHandler` 上，只验证方法名、参数解析、未知方法、缺字段、错类型和错误映射，不测试 sled 存储行为。
-- `performance.rs` 不要再单独 `#[path]` include sled；底层性能 ignored case 放入 `sled_contract.rs`。
-
-### 13.5 kevent / kmsg 真实环境测试要求
-
-- 真实环境测试目录使用 `test/kevent_kmsg_test/`。
-- `test/run.py` 只有在 `package.json` 含 `scripts.test` 时才会纳入，并会执行 `bash -lc "pnpm install && pnpm test"`，方案需要写清楚这一点。
-- 真实环境测试要与现有测试风格一致，使用 Deno runner，而不是 Node `--experimental-strip-types`。
-- `package.json` 中 `test` 脚本使用 `deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors kevent_kmsg_dv.ts`。
-- 依赖版本固定为现有测试使用的 `github:buckyos/buckyos-websdk#beta2.2`。
-- 真实 HTTP `/kapi/kmsg` 行为放到真实环境测试验证；模块级的 `rpc_contract.rs` 不启动完整 HTTP 服务。
-- 如果 devtest 当前无法稳定构造多身份 session，权限真实环境测试只记录为未验证风险，不作为默认自动测试通过条件。
-
-### 13.6 运行环境和隔离要求
-
-- shared ring 测试必须使用唯一临时 `BUCKYOS_KEVENT_RINGBUFFER_PATH`。
-- 因为 `BUCKYOS_KEVENT_RINGBUFFER_PATH` 是进程级环境变量，shared ring integration tests 需要通过全局锁或 `--test-threads=1` 串行隔离，避免偶发失败。
-- 性能测试默认标记为 ignored，避免拖慢普通开发循环。
-- 没有产品 SLO 前，性能测试先做正确性检查和性能参考记录；阈值只用于防止明显卡死、panic、死锁或资源耗尽，不作为严格产品门槛。
-- 对需要完整 BuckyOS 环境的测试，必须说明如何启动、检查和恢复环境。
-
-### 13.7 调用方覆盖要求
-
-- 测试不能只覆盖模块 API、路由和组合语义，还要把实际调用方纳入验收范围。
-- 但不要为每个新增业务使用场景都创建一条独立测试项；应先归纳这些场景共同使用了哪些 kevent/kmsg 功能，再针对共性功能建立稳定测试项。
-- 当前调用方共同能力包括：event 唤醒后回读真相源、producer path 与 consumer pattern 兼容、event payload 轻量定位、reader 动态订阅和重建、kevent 失败退化到 poll/sweep/fetch。
-- 具体调用方如 TaskManager、msg_center、control_panel、OpenDAN、agent-tool、workflow 主要作为功能测试的样本来源和证据来源。
-- 如果某个业务场景引入了新的 kevent/kmsg 使用模式，先判断是否能归入已有 `UF-*` 功能契约；只有出现新的共同能力时才新增测试项。
-
-### 13.8 报告和推进方式
-
-- 测试报告必须能回答：改了什么测试、为什么覆盖生产关键风险、跑了什么验证、还有什么风险或未验证项。
-- 报告应包含每个计划项的推进状态、测试结果、通过证据或当前证据、剩余工作或阻塞原因。
-- 如果报告已经包含推进进度，就不再维护独立 progress 文档，避免重复来源。
-- 为避免多套状态来源，当前方案以 `notepads/kevent_kmsg_test_report.md` 作为唯一进度台账；每轮测试后由执行者更新报告。
-- 进度追踪规则必须写清楚：第 9 章覆盖所有测试项，每项包含状态、测试结果、证据和剩余工作。
-- 验证进度完整性时，应检查第 9 章是否覆盖 test plan 中所有测试项，以及前文执行证据是否支撑状态变化。
-- test plan 最前面必须维护目录；每次新增、删除、重命名章节时，需要同步更新目录。
-- 对阻塞项要写明阻塞原因、影响范围、当前证据和下一步。
-- 如果发现实现与设计不符，不应为了让测试通过而改写测试目标；应在报告中明确标注偏差，并保留命令、输入、实际返回和日志证据。
+- 只依据当前工作区实际存在的 kevent/kmsg 文档、模块代码和调用方代码设计测试。
+- 测试以设计文档、公开 API、生产语义和调用方契约为判断基准，不能把当前私有实现当作正确性来源。
+- 测试覆盖要全面但不冗余；调用方测试先归纳共性功能，只有出现新的共同能力时才增加测试项。
+- 测试代码不侵入模块源码；kevent 使用 integration tests，kmsg 底层契约只允许 `sled_contract.rs` 一处 `#[path]` harness。
+- 每项测试必须写清目的、重要性、方法、命令、环境要求、验证方式和证据。
+- 真实性能阈值只用于防明显卡死、panic、死锁或资源耗尽；没有产品 SLO 前只记录 baseline。
+- 如果实现与设计不符，不改写测试目标来适配实现；在报告中标注偏差并保留命令、输入、实际返回和日志证据。
+- 当前结论统一看 `notepads/kevent_kmsg_test_report.md`；每轮具体数据和当轮结论可在本地归档到 `test/kevent_kmsg/reports/`，不提交到仓库。
+- 维护本文件时必须同步更新目录。

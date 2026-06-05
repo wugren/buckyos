@@ -93,6 +93,53 @@ async fn service_publish_pull_baseline() {
 
 #[tokio::test]
 #[ignore]
+async fn slow_reader_overflow_10k_baseline() {
+    let capacity = 1024usize;
+    let service = KEventService::new_with_capacity("node_a", capacity);
+    service
+        .register_reader("slow", vec!["/perf/overflow/**".to_string()])
+        .await
+        .unwrap();
+
+    let start = Instant::now();
+    for seq in 0..10_000 {
+        service
+            .publish_local_global("/perf/overflow/event", json!({ "seq": seq }))
+            .await
+            .unwrap();
+    }
+    let publish_elapsed = start.elapsed();
+
+    let start = Instant::now();
+    let mut consumed = 0usize;
+    let mut first_seq = None;
+    let mut last_seq = None;
+    while let Some(event) = service.pull_event("slow", Some(0)).await.unwrap() {
+        let seq = event.data["seq"].as_u64().unwrap();
+        if first_seq.is_none() {
+            first_seq = Some(seq);
+        }
+        last_seq = Some(seq);
+        consumed += 1;
+    }
+    let drain_elapsed = start.elapsed();
+
+    assert_eq!(consumed, capacity);
+    assert_eq!(first_seq, Some((10_000 - capacity) as u64));
+    assert_eq!(last_seq, Some(9_999));
+
+    eprintln!(
+        "{{\"kevent_slow_reader_publish_10k_ms\":{},\"kevent_slow_reader_drain_ms\":{},\"kevent_slow_reader_retained\":{},\"kevent_slow_reader_first_seq\":{},\"kevent_slow_reader_last_seq\":{}}}",
+        publish_elapsed.as_millis(),
+        drain_elapsed.as_millis(),
+        consumed,
+        first_seq.unwrap(),
+        last_seq.unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn shared_ring_full_client_latency_baseline() {
     let _guard = RING_ENV_LOCK.lock().unwrap();
     let path = set_unique_ring_path("shared_ring_latency");

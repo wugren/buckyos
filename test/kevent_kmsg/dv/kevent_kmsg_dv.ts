@@ -1,4 +1,4 @@
-import { initTestRuntime } from "../test_helpers/buckyos_client.ts";
+import { initTestRuntime } from "../../test_helpers/buckyos_client.ts";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -46,6 +46,46 @@ function getEnv(name: string, fallback?: string): string | undefined {
     return value.trim();
   }
   return fallback;
+}
+
+async function prepareAppClientConfig(): Promise<void> {
+  const sourceDir = getEnv(
+    "BUCKYOS_TEST_APP_CLIENT_DIR",
+    "/opt/buckyos/etc/.buckycli",
+  )!;
+  const tempDir = await Deno.makeTempDir({ prefix: "buckyos-appclient-" });
+
+  await Deno.copyFile(
+    `${sourceDir}/user_private_key.pem`,
+    `${tempDir}/user_private_key.pem`,
+  );
+
+  const userConfigPath = `${sourceDir}/user_config.json`;
+  const userConfig = JSON.parse(
+    await Deno.readTextFile(userConfigPath),
+  ) as JsonObject;
+  if (Array.isArray(userConfig["@context"])) {
+    const contexts = userConfig["@context"].filter((item) =>
+      typeof item === "string"
+    );
+    userConfig["@context"] = contexts.at(-1) ??
+      "https://buckyos.org/ns/owner/v1";
+  }
+  await Deno.writeTextFile(
+    `${tempDir}/user_config.json`,
+    `${JSON.stringify(userConfig, null, 2)}\n`,
+  );
+
+  try {
+    await Deno.copyFile(
+      `${sourceDir}/zone_config.json`,
+      `${tempDir}/zone_config.json`,
+    );
+  } catch {
+    // zone_config.json is not required by the WebSDK private key loader.
+  }
+
+  Deno.env.set("BUCKYOS_TEST_APP_CLIENT_DIR", tempDir);
 }
 
 function nowTag(): string {
@@ -109,7 +149,10 @@ async function createQueue(
   });
 }
 
-async function cleanupQueue(rpc: RpcClient, queueUrn: string | null): Promise<void> {
+async function cleanupQueue(
+  rpc: RpcClient,
+  queueUrn: string | null,
+): Promise<void> {
   if (!queueUrn) return;
   try {
     await rpc.call("delete_queue", { queue_urn: queueUrn });
@@ -159,7 +202,10 @@ async function openKeventStream(
       const readPromise = reader.read();
       const timeoutPromise = new Promise<ReadableStreamReadResult<Uint8Array>>(
         (_resolve, reject) =>
-          setTimeout(() => reject(new Error("kevent stream read timeout")), remaining),
+          setTimeout(
+            () => reject(new Error("kevent stream read timeout")),
+            remaining,
+          ),
       );
       const chunk = await Promise.race([readPromise, timeoutPromise]);
       if (chunk.done) throw new Error("kevent stream closed");
@@ -189,14 +235,18 @@ async function publishKevent(
   });
   const body = await response.text();
   if (!response.ok) {
-    throw new Error(`kevent publish failed: status=${response.status}, body=${body}`);
+    throw new Error(
+      `kevent publish failed: status=${response.status}, body=${body}`,
+    );
   }
   const parsed = JSON.parse(body);
   assert.equal(parsed.status, "ok", "kevent publish response should be ok");
 }
 
 async function probeKmsgGet(gatewayBaseUrl: string): Promise<void> {
-  const response = await fetch(`${gatewayBaseUrl}/kapi/kmsg`, { method: "GET" });
+  const response = await fetch(`${gatewayBaseUrl}/kapi/kmsg`, {
+    method: "GET",
+  });
   console.log(
     JSON.stringify({
       case: "DV-03B",
@@ -207,16 +257,25 @@ async function probeKmsgGet(gatewayBaseUrl: string): Promise<void> {
 }
 
 async function run(): Promise<void> {
+  await prepareAppClientConfig();
   const { buckyos, userId, ownerUserId, zoneHost } = await initTestRuntime();
   const appId = getEnv("BUCKYOS_TEST_APP_ID", "buckycli")!;
-  const gatewayBaseUrl = getEnv("BUCKYOS_GATEWAY_BASE_URL", `https://${zoneHost}`)!;
+  const gatewayBaseUrl = getEnv(
+    "BUCKYOS_GATEWAY_BASE_URL",
+    `https://${zoneHost}`,
+  )!;
   const tag = nowTag();
   const kmsg = buckyos.getServiceRpcClient("kmsg") as RpcClient;
 
   let queueUrn: string | null = null;
   let stream: StreamReader | null = null;
   try {
-    queueUrn = await createQueue(kmsg, `kevent-kmsg-dv-${tag}`, appId, ownerUserId);
+    queueUrn = await createQueue(
+      kmsg,
+      `kevent-kmsg-dv-${tag}`,
+      appId,
+      ownerUserId,
+    );
     const firstPayload = { case: "DV-03", tag, value: "durable-message" };
     const firstIndex = await rpcCall<number>(kmsg, "post_message", {
       queue_urn: queueUrn,
@@ -236,12 +295,18 @@ async function run(): Promise<void> {
       sub_id: `kevent-kmsg-dv-sub-${tag}`,
       position: "Earliest",
     });
-    const fetched = asMessages(await kmsg.call("fetch_messages", {
-      sub_id: subId,
-      length: 10,
-      auto_commit: false,
-    }));
-    assert.equal(fetched.length, 1, "kmsg fetch should return the first message");
+    const fetched = asMessages(
+      await kmsg.call("fetch_messages", {
+        sub_id: subId,
+        length: 10,
+        auto_commit: false,
+      }),
+    );
+    assert.equal(
+      fetched.length,
+      1,
+      "kmsg fetch should return the first message",
+    );
     assert.equal(fetched[0].index, firstIndex);
     assert.equal(
       (decodePayload(fetched[0]) as JsonObject).value,
@@ -252,16 +317,26 @@ async function run(): Promise<void> {
     const stats = await rpcCall<QueueStats>(kmsg, "get_queue_stats", {
       queue_urn: queueUrn,
     });
-    assert.equal(stats.message_count, 1, "queue stats should count first message");
+    assert.equal(
+      stats.message_count,
+      1,
+      "queue stats should count first message",
+    );
 
-    const reread = asMessages(await kmsg.call("read_message", {
-      queue_urn: queueUrn,
-      cursor: firstIndex,
-      length: 1,
-    }));
-    assert.equal(reread.length, 1, "reconnect/read smoke should see durable data");
+    const reread = asMessages(
+      await kmsg.call("read_message", {
+        queue_urn: queueUrn,
+        cursor: firstIndex,
+        length: 1,
+      }),
+    );
+    assert.equal(
+      reread.length,
+      1,
+      "reconnect/read smoke should see durable data",
+    );
 
-    const eventid = `/kevent_kmsg_test/${tag}`;
+    const eventid = `/kevent_kmsg/dv/${tag}`;
     stream = await openKeventStream(gatewayBaseUrl, eventid);
     const ack = await stream.readFrame(5000);
     assert.equal(ack.type, "ack", "kevent stream should ack");
@@ -297,15 +372,64 @@ async function run(): Promise<void> {
     assert.equal(eventData.queue_urn, queueUrn);
     assert.equal(eventData.index, signalIndex);
 
-    const readSignal = asMessages(await kmsg.call("read_message", {
-      queue_urn: queueUrn,
-      cursor: signalIndex,
-      length: 1,
-    }));
-    assert.equal(readSignal.length, 1, "kmsg durable payload should be readable after event");
+    const readSignal = asMessages(
+      await kmsg.call("read_message", {
+        queue_urn: queueUrn,
+        cursor: signalIndex,
+        length: 1,
+      }),
+    );
+    assert.equal(
+      readSignal.length,
+      1,
+      "kmsg durable payload should be readable after event",
+    );
     assert.equal(
       (decodePayload(readSignal[0]) as JsonObject).value,
       "event-driven-message",
+    );
+
+    const signalFetched = asMessages(
+      await kmsg.call("fetch_messages", {
+        sub_id: subId,
+        length: 10,
+        auto_commit: false,
+      }),
+    );
+    assert.equal(
+      signalFetched.length,
+      1,
+      "signal message should be fetched once",
+    );
+    assert.equal(signalFetched[0].index, signalIndex);
+    await kmsg.call("commit_ack", { sub_id: subId, index: signalIndex });
+
+    await publishKevent(gatewayBaseUrl, eventid, {
+      queue_urn: queueUrn,
+      index: signalIndex,
+      tag,
+      duplicate: true,
+    });
+    let duplicateFrame: JsonObject | null = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const frame = await stream.readFrame(5000);
+      if (frame.type === "event") {
+        duplicateFrame = frame;
+        break;
+      }
+    }
+    assert.ok(duplicateFrame, "duplicate kevent should still be delivered");
+    const afterDuplicate = asMessages(
+      await kmsg.call("fetch_messages", {
+        sub_id: subId,
+        length: 10,
+        auto_commit: false,
+      }),
+    );
+    assert.equal(
+      afterDuplicate.length,
+      0,
+      "duplicate kevent must not reprocess an acked kmsg message",
     );
 
     const fallbackPayload = { case: "DV-05", tag, value: "polling-fallback" };
@@ -318,12 +442,18 @@ async function run(): Promise<void> {
         headers: { test_case: "DV-05-fallback" },
       },
     });
-    const fallbackRead = asMessages(await kmsg.call("read_message", {
-      queue_urn: queueUrn,
-      cursor: fallbackIndex,
-      length: 1,
-    }));
-    assert.equal(fallbackRead.length, 1, "polling fallback should read without event");
+    const fallbackRead = asMessages(
+      await kmsg.call("read_message", {
+        queue_urn: queueUrn,
+        cursor: fallbackIndex,
+        length: 1,
+      }),
+    );
+    assert.equal(
+      fallbackRead.length,
+      1,
+      "polling fallback should read without event",
+    );
     assert.equal(
       (decodePayload(fallbackRead[0]) as JsonObject).value,
       "polling-fallback",

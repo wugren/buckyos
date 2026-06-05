@@ -80,8 +80,11 @@ uv.lock
 test/aicc_test/deno.lock
 test/aicc_test/reports/*
 test/workflow_test/reports/*
+test/kevent_kmsg/reports/*
 test/reports/
 test/*/Cargo.lock
 test/*/target/
+test/**/Cargo.lock
+test/**/target/
 src/rootfs/bin/workflow/workflow
 *.codex
