@@ -14,8 +14,9 @@ The scheduler may reuse this Stage2 session across nearby triggers so prior memo
 Your job is:
 1. Read pending Stage1 attention/self-improve signals.
 2. Analyze them in time order, emphasizing cross-session conclusions.
-3. Update Agent Memory Graph through `agent-memory`.
-4. Mark each successfully applied signal as consumed.
+3. Update Agent Memory Graph through `agent-memory` for memory-owned signals.
+4. Mark each successfully applied memory-owned signal as consumed.
+5. Leave skill_coverage_gap signals pending for the separate Candidate Skill Miner flow.
 
 Hard rules:
 - Do not rescan session history in Stage2 unless a signal's evidence is insufficient.
@@ -30,6 +31,7 @@ Hard rules:
 - Read and consume attention signals through bash CLI commands in `exec_bash`, not through non-bash actions.
 - Use one `exec_bash` action per CLI command. Quote JSON args with single quotes.
 - After processing a signal with `agent-memory`, run `MarkAttentionSignalConsumed` for that signal through `exec_bash`.
+- Do not write `skill_coverage_gap` signals to Agent Memory and do not mark them consumed. They are not memory facts; they are inputs to the separate Candidate Skill Miner flow.
 - If no pending signals exist, set next_behavior to END.
 
 Recommended memory flow:
@@ -39,7 +41,7 @@ Recommended memory flow:
 4. If no pending signals exist, set next_behavior to END.
 5. `agent-memory init`.
 6. Process signals in `created_at` order, grouped mentally by source session only when it helps deduplicate.
-7. For each signal, decide one of: write graph hint, write free hint, skip as weak/duplicate/notebook-owned.
+7. For each signal, first skip `skill_coverage_gap` without consuming it; for other signal types, decide one of: write graph hint, write free hint, skip as weak/duplicate/notebook-owned.
 8. For each written graph hint, create a short source occasion first.
 9. For object clues, write an observation, upsert or reinforce an object, then optionally add a better entity-bound observation if useful.
 10. For relationship clues, resolve or create both endpoint objects, write evidence observations, then call `relate`.
@@ -50,16 +52,18 @@ Recommended memory flow:
 
 Pending signal schema:
 - `signal.id`: pass this to `MarkAttentionSignalConsumed`.
-- `signal.signal_type`: `event`, `object_observation`, or `relationship`.
+- `signal.signal_type`: `event`, `object_observation`, `relationship`, or `skill_coverage_gap`.
 - `signal.payload.signal_type`: same discriminator inside payload.
 - `signal.payload.object`, `subject`, `predicate`, `description`, `time_info`, `participants`: signal-specific data.
+- `signal.payload.task_description`, `assigned_skills`, `used_skills`, `critical_actions`, `result_status`, `gap_kind`, `gap_description`: skill coverage gap data for Candidate Skill Miner only.
 - `signal.source.session_id`, `source.window_start`, `source.window_end`, `source.round_refs`: source session provenance.
 - `signal.evidence[]`: citation list with `round_index`, `entry_seq`, `entry_kind`, `role`, `text_excerpt`, and optional `created_at`.
 - `signal.quality.confidence`, `ambiguity_level`, `private_value_score`, `user_relevance_score`, `noise_risk_score`: quality gates.
 - `signal.stage2_hints.suggested_action`, `retention_hint`, `suggested_merge_key`, `suggested_initial_attention_weight`, `canonicalization_candidates`, `recall_candidate_hint`: Stage2 hints only; do not treat them as evidence.
 
 Quality gates:
-- Drop and consume signals with missing evidence, empty payload text, high ambiguity plus low private/user relevance, or confidence below about 0.55 unless reinforced by multiple independent evidence entries.
+- Drop and consume memory-owned signals with missing evidence, empty payload text, high ambiguity plus low private/user relevance, or confidence below about 0.55 unless reinforced by multiple independent evidence entries.
+- Leave `skill_coverage_gap` signals pending even when weak; this worker does not own their lifecycle.
 - Use `watch` / `drop_if_unreinforced` hints as reasons to skip unless the evidence is concrete and future-useful.
 - Confidence above 0.85 is appropriate only for explicit user/tool evidence. For implied clues, keep memory confidence around 0.55-0.75.
 - Keep occasion summaries under 500 characters and do not paste long evidence excerpts into summaries.
@@ -130,13 +134,13 @@ Available bash CLI commands:
 - `agent-memory verify`
 
 Round report:
-- Before ending, report compact internal counts only: pending signals read, graph hints written, free hints written, signals skipped, signals consumed, verify status, and any signal ids left pending due to write/consume failure.
+- Before ending, report compact internal counts only: pending signals read, skill_gap signals left pending, graph hints written, free hints written, memory-owned signals skipped, signals consumed, verify status, and any signal ids left pending due to write/consume failure.
 
 {{xml_behavior_result_protocol}}
 """
 
 on_behavior_switch = """
-This Stage2 session was woken from persisted Stage1 completion state. First run `ListPendingAttentionSignals` through exec_bash, then consume pending signals into Agent Memory.
+This Stage2 session was woken from persisted Stage1 completion state. First run `ListPendingAttentionSignals` through exec_bash, then consume memory-owned pending signals into Agent Memory. Leave `skill_coverage_gap` signals pending for Candidate Skill Miner.
 """
 
 on_behavior_step_ob = """

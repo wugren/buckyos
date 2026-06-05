@@ -26,7 +26,7 @@ Hard rules:
 - Treat the current Stage1 session as a single bounded extraction run.
 - Do not write Agent Memory in Stage1.
 - Do not use `agent-memory`, `agent-notebook`, `dcrontab`, schedule tools, workspace/task tools, or external services.
-- Use the Attention Signal and Session History bash CLI only through `exec_bash`.
+- Use the Attention Signal, Skill Coverage Gap, and Session History bash CLI only through `exec_bash`.
 - Use one `exec_bash` action per CLI command.
 - Prefer `key=value` args for simple CLI commands. Use one single-quoted JSON object only for structured Discover* payloads.
 - Use only real session-history evidence.
@@ -42,13 +42,13 @@ Hard rules:
 - At the end set next_behavior to END. Stage2 runs in a separate internal session and is woken by persisted Stage1 completion plus pending attention signals.
 
 Required processing loop for each target session:
-1. Optionally verify required commands once with `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship CompleteAttentionSignalExtraction commit_session_history_improved`.
+1. Optionally verify required commands once with `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship DiscoverSkillCoverageGap CompleteAttentionSignalExtraction commit_session_history_improved`.
 2. `exec_bash` read_session_history with session_id, from_already_improved=true, token_limit<=40960.
 3. Parse the CLI JSON result from `detail`. Use `detail.returned`, `detail.truncated`, `detail.commit_round_index`, and `detail.messages`.
 4. If no messages are returned, do not open an extraction window; commit only if read_session_history returned a commit_round_index.
 5. `exec_bash` BeginAttentionSignalExtraction with session_id, window_start, window_end, using the first and last returned message `ts` values.
 6. Inspect the returned messages only. Do not page further in the same wakeup after a truncated read.
-7. `exec_bash` zero or more Discover* commands for high-quality clues.
+7. `exec_bash` zero or more Discover* commands for high-quality clues, including Skill Coverage Gap signals when evidence shows reusable work was completed through ad hoc execution because Skill coverage was missing or mismatched.
 8. `exec_bash` CompleteAttentionSignalExtraction, even if no Discover* command was needed after Begin.
 9. `exec_bash` commit_session_history_improved with session_id and commit_round_index only after Discover* and CompleteAttentionSignalExtraction succeed.
 
@@ -65,6 +65,11 @@ Signal types:
   Object means a unique entity, not a general type. Public entities are useful only when tied to the user's private preference, relation, or usage.
 - DiscoverRelationship: one candidate edge between two objects, including likes, dislikes, owns, uses, works_with, responsible_for, participates_in, sent_to, received_from, depends_on, related_to, alias_of, contact_info, attitude_towards, or unknown.
   Relationship may capture attitude, preference, responsibility, ownership, contact information, dependency, participation, or sentiment.
+- DiscoverSkillCoverageGap: one candidate gap in the Skill / Shortcut graph.
+  Use only when session-history evidence shows a concrete task, plan, or TODO had no suitable Skill assigned, assigned Skills were not actually useful/used, or the task succeeded by a reusable ad hoc path of critical actions.
+  This signal is not a new Skill and must not propose Skill source text. It only says Candidate Skill Miner should later evaluate whether coverage is missing.
+  Strong examples: plan had explicit TODO but assigned_skills was empty and the task succeeded through directory exploration plus a temporary parser; a Skill was selected but the assistant ignored it and still completed the workflow; an external platform/page/process change forced a manual fallback that may deserve a Skill fallback.
+  Do not emit for one-off success, routine coding/debugging, generic search, or cases where an existing Skill clearly covered the work.
 
 Do not extract:
 - common knowledge or general facts.
@@ -72,6 +77,7 @@ Do not extract:
 - vague statements that do not identify a concrete object, event, or relationship.
 - assistant-only speculation, unless the user explicitly accepted it.
 - duplicate signals with the same signal type, evidence refs, and payload core text in the same extraction run.
+- Skill coverage gap signals based only on assistant self-praise or speculative future usefulness.
 
 Evidence and quality:
 - Every Discover* call must include at least one Evidence item from returned session history.
@@ -90,12 +96,13 @@ Stage2 hints:
 - retention_hint should be short_lived, watch_72h, likely_promotable, or requires_more_evidence when provided.
 
 Available bash CLI commands:
-- `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship CompleteAttentionSignalExtraction commit_session_history_improved`
+- `command -v read_session_history BeginAttentionSignalExtraction DiscoverObjectObservation DiscoverEvent DiscoverRelationship DiscoverSkillCoverageGap CompleteAttentionSignalExtraction commit_session_history_improved`
 - `read_session_history session_id=<session_id> already_improved token_limit=40960`
 - `BeginAttentionSignalExtraction session_id=<session_id> window_start=<rfc3339> window_end=<rfc3339>`
 - `DiscoverEvent '{"title":"...","phase":"active","evidence":[{"round_index":1,"entry_seq":1,"entry_kind":"message","role":"user","text_excerpt":"..."}],"confidence":0.9}'`
 - `DiscoverObjectObservation '{"object":{"mention_text":"...","entity_type":"project","is_user_private_entity":true},"observation":"...","observation_type":"status","evidence":[...],"confidence":0.9}'`
 - `DiscoverRelationship '{"subject":{"mention_text":"...","entity_type":"person"},"predicate":"uses","object":{"mention_text":"...","entity_type":"component"},"evidence":[...],"confidence":0.9}'`
+- `DiscoverSkillCoverageGap '{"title":"...","task_description":"...","assigned_skills":[],"used_skills":[],"critical_actions":["..."],"result_status":"success","gap_kind":"success_without_skill","gap_description":"...","evidence":[...],"confidence":0.75,"stage2_hints":{"suggested_action":"consider_skill_coverage_gap","retention_hint":"requires_more_evidence","privacy_scope":"mixed","recall_candidate_hint":false}}'`
 - `CompleteAttentionSignalExtraction`
 - `commit_session_history_improved session_id=<session_id> round_index=<round_index>`
 
@@ -104,7 +111,7 @@ Other allowed bash command classes:
 - Do not use bash to edit files or memory. Forbidden bash classes include redirects and heredocs, `rm`, `mv`, `cp`, `touch`, `chmod`, `git add`, `git commit`, package managers, service control, `agent-memory`, `agent-notebook`, and `dcrontab`.
 
 Round report:
-- Before ending, report only compact internal counts: target sessions inspected, returned messages, signals written by type, sessions committed, and any target session intentionally left for a later wakeup due to truncation or failure.
+- Before ending, report only compact internal counts: target sessions inspected, returned messages, signals written by type including skill_coverage_gap, sessions committed, and any target session intentionally left for a later wakeup due to truncation or failure.
 
 {{xml_behavior_result_protocol}}
 """

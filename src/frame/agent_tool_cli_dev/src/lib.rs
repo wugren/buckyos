@@ -19,7 +19,7 @@ use tokio::process::Command;
 
 use agent_tool::agent_attention_signal::{
     CreateExtractionWindowInput, DiscoverEventArgs, DiscoverObjectObservationArgs,
-    DiscoverRelationshipArgs, SignalLifecycleStatus,
+    DiscoverRelationshipArgs, DiscoverSkillCoverageGapArgs, SignalLifecycleStatus,
 };
 use agent_tool::agent_memory::{
     AddObservationOp, AgentMemory, AgentMemoryConfig, AgentMemoryError, FlatSetOp, LoadOptions,
@@ -49,9 +49,10 @@ use agent_tool::{
     AgentToolError, AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus,
     AttentionSignalStoreConfig, AttentionSignalToolRuntime, BindWorkspaceTool, CliRunOutput,
     CreateWorkspaceTool, DcrontabTool, DiscoverEventTool, DiscoverObjectObservationTool,
-    DiscoverRelationshipTool, EditFileTool, FileToolConfig, GetSessionTool, GlobTool, GrepTool,
-    NoopFileWriteAudit, ReadFileTool, RuntimeContext, SessionRuntimeContext, SessionViewBackend,
-    TodoTool, TodoToolConfig, ToolCtx, TypedTool, WorkspaceToolBackend, WriteFileTool,
+    DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, EditFileTool, FileToolConfig,
+    GetSessionTool, GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext,
+    SessionRuntimeContext, SessionViewBackend, TodoTool, TodoToolConfig, ToolCtx, TypedTool,
+    WorkspaceToolBackend, WriteFileTool,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
 use chrono::{DateTime, Duration, Utc};
@@ -84,7 +85,7 @@ const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtrac
 const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
 const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
 const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
-const TOOL_NAMES: [&str; 28] = [
+const TOOL_NAMES: [&str; 29] = [
     "Glob",
     "Grep",
     "dcrontab",
@@ -111,6 +112,7 @@ const TOOL_NAMES: [&str; 28] = [
     agent_tool::TOOL_DISCOVER_EVENT,
     agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION,
     agent_tool::TOOL_DISCOVER_RELATIONSHIP,
+    agent_tool::TOOL_DISCOVER_SKILL_COVERAGE_GAP,
     TOOL_LIST_PENDING_ATTENTION_SIGNALS,
     TOOL_MARK_ATTENTION_SIGNAL_CONSUMED,
 ];
@@ -4771,6 +4773,12 @@ struct CliDiscoverRelationshipTool {
     current_session_id: String,
 }
 
+struct CliDiscoverSkillCoverageGapTool {
+    store: Arc<AgentAttentionSignalStore>,
+    agent_root: PathBuf,
+    current_session_id: String,
+}
+
 #[async_trait]
 impl TypedTool for CliReadSessionHistoryTool {
     type Args = ReadSessionHistoryArgs;
@@ -5225,6 +5233,35 @@ impl TypedTool for CliDiscoverRelationshipTool {
     ) -> Result<Self::Output, AgentToolError> {
         let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
         DiscoverRelationshipTool::new(self.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypedTool for CliDiscoverSkillCoverageGapTool {
+    type Args = DiscoverSkillCoverageGapArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_SKILL_COVERAGE_GAP
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage1 skill coverage gap attention signal for the current extraction scope."
+    }
+
+    fn usage(&self) -> Option<String> {
+        Some("DiscoverSkillCoverageGap '{\"title\":\"...\",\"task_description\":\"...\",\"result_status\":\"success\",\"evidence\":[...],\"confidence\":0.8}'".to_string())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
+        DiscoverSkillCoverageGapTool::new(self.store.clone(), runtime)
             .execute(ctx, args)
             .await
     }
@@ -5782,6 +5819,11 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
         current_session_id: env.call_ctx.session_id.clone(),
     })?;
     mgr.register_typed_tool(CliDiscoverRelationshipTool {
+        store: attention_store.clone(),
+        agent_root: env.agent_env_root.clone(),
+        current_session_id: env.call_ctx.session_id.clone(),
+    })?;
+    mgr.register_typed_tool(CliDiscoverSkillCoverageGapTool {
         store: attention_store.clone(),
         agent_root: env.agent_env_root.clone(),
         current_session_id: env.call_ctx.session_id.clone(),

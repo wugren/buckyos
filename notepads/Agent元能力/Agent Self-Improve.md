@@ -532,7 +532,7 @@ High Attention Object / Event
         ↓
 发现 Shortcut
         ↓
-形成 Skill Candidate
+形成 Skill Coverage Gap / Candidate Signal
         ↓
 真实使用与验证
         ↓
@@ -544,6 +544,57 @@ High Attention Object / Event
 > 热点对象周围的捷径才值得优先发现和维护。
 
 例如，只有当“2026 暑假出游”升温后，探索国家公园官网、预约页面和开放状态查询捷径才变得重要。
+
+---
+
+### 6.1.1 Skill Signal 不等于 Skill 改写
+
+这里需要区分两件事情：
+
+```text
+Self Improve Stage 1
+    从 Session History 中发现 attention signals。
+
+Skill Improvement LLM
+    消费 skill 相关 signals，生成 Skill Update / New Skill / Anti-pattern proposal。
+```
+
+Self Improve 的标准流程更像是在维护 Attention Graph：
+
+- 哪些事件变热；
+- 哪些对象被反复提及；
+- 哪些观察值得写入；
+- 哪些对象需要主动探索。
+
+Skill 相关信号可以进入这个 Stage 1，但不应该由标准 Self Improve LLM 直接完成 Skill 改写。
+
+原因是 Skill 改进需要一套不同的判断标准：
+
+```text
+这个 Skill 是否被 list / select / load / use？
+它是否真的参与了成功路径？
+它失败是因为 Skill 错，还是选择错？
+是否应该改描述、改 category、拆分、合并、降级或 Block？
+是否需要回放历史 case 做 regression test？
+```
+
+这些问题和普通 Attention 更新不同。因此，Self Improve Stage 1 更适合作为信号抽取层：
+
+```text
+Session History
+    ↓
+Attention / Skill Signal Extraction
+    ↓
+Attention Graph Update
+    ↓
+Skill Signals Queue
+    ↓
+独立 Skill Improvement LLM
+```
+
+也就是说：
+
+> Skill signal 可以由 Self Improve Stage 1 发现，但 Skill signal 的消费应当交给独立 LLM 流程。
 
 ---
 
@@ -804,7 +855,7 @@ Skill Group: YouTube Video Download
 
 Work Session 会加载 Skill、使用 Skill，并形成 Session History。
 
-Self Improve 再通过这些历史评价 Skill。
+Self Improve 会从这些历史中抽取 skill 相关 signal，但不应该把“发现 signal”和“修改 Skill”合并成同一次 LLM 调用。
 
 ```text
 Work Session
@@ -821,8 +872,119 @@ Session History
     ↓
 Self Improve
     ↓
-Update Skill Score / Rank / Status
+Extract Skill Signals
+    ↓
+Skill Improvement LLM
+    ↓
+Update Skill Score / Rank / Status / Proposal
 ```
+
+这里有两类需要分开的 LLM 激活流程。
+
+### 8.1 已有 Skill 改进是独立激活流程
+
+对已有 Skill 的改进，不应依赖标准 Self Improve 的常规触发条件。
+
+标准 Self Improve 的触发信号通常是：
+
+```text
+新的 Session History 未处理
+某些 Event / Object attention 上升
+需要合并、强化或遗忘 Memory
+```
+
+已有 Skill 改进的触发信号则是另一组：
+
+```text
+Skill 经常被 list 但不被 select
+Skill 经常被 select / load 但没有实际使用
+Skill 被使用但不在成功关键路径上
+Skill 被使用后任务失败率高
+Skill 触发 fallback / redo / supervisor rejection
+Reporter 明确说 Skill 不适用
+同类 Skill 之间出现重复或冲突
+外部平台、协议、页面或流程变化导致 Skill 过期
+```
+
+因此它应该是一个独立的 LLM activation flow：
+
+```text
+SkillUsageTrace
+    ↓
+SkillEffectiveness / Misuse / Expiration Signals
+    ↓
+Skill Improvement LLM
+    ↓
+Skill Evaluation Case
+Skill Update Proposal
+Skill Deprecation Proposal
+Skill Regression Test Plan
+```
+
+这个流程的目标不是泛化地更新 Memory，而是围绕已有 Skill 做诊断：
+
+- 是否修改 Skill 内容；
+- 是否调整 Skill 描述或触发条件；
+- 是否调整 category / ranking；
+- 是否拆分、合并或淘汰；
+- 是否加入 BlockList；
+- 是否需要人工 review。
+
+---
+
+### 8.2 新 Skill 发现是 Attention Signal，但消费流程独立
+
+新 Skill 发现没有现成 Skill 对象，因此它不应从“所有成功任务”中盲目提取。
+
+更可靠的入口是把它作为一种新的 attention signal：
+
+```text
+Skill Coverage Gap Signal
+```
+
+它在 Self Improve Stage 1 中被抽取，和 Event / Object / Observation signal 一起进入 attention 处理，但它的语义不同：
+
+```text
+Plan 中有明确 TODO
+但没有合适 Skill 覆盖
+Do 阶段通过通用推理 / Global Object 探索完成
+Reporter / Supervisor / User 认可结果
+```
+
+或：
+
+```text
+Plan 分配了 Skill
+但实际 Skill 没有被使用
+最终仍然成功
+```
+
+这类信号说明：
+
+> 当前 Skill Graph 对某类任务的 coverage 可能不足，Agent 临时摸索出了一条可复用路径。
+
+但是否真的要生成新 Skill，应该由独立流程判断：
+
+```text
+Skill Coverage Gap Signal
+    ↓
+Candidate Skill Miner LLM
+    ↓
+是否重复出现？
+是否有稳定触发条件？
+是否有稳定执行路径？
+是否能写成可验证 Skill？
+是否比现有 Skill 更好？
+    ↓
+Candidate Skill Case / Skill Draft / Reject
+```
+
+这避免两个误判：
+
+- 把一次偶然成功沉淀成 Skill；
+- 把普通任务总结误认为能力增长。
+
+---
 
 Skill 的元数据至少应包括：
 
@@ -865,7 +1027,7 @@ Expired
 
 ---
 
-### 8.1 不同类型 Skill 的评价方式不同
+### 8.3 不同类型 Skill 的评价方式不同
 
 #### 数据获取类 Skill
 
@@ -1050,7 +1212,7 @@ BlockList 有两种来源。
    被实际用于观察、思考或行动。
 
 6. Evaluated
-   通过 Session Report 和 Self Improve 获得评分。
+   通过 Session Report 和独立 Skill Improvement Flow 获得评分。
 
 7. Ranked
    在同类 Skill 中被提升或降低排名。
@@ -1263,6 +1425,30 @@ Yosemite 预约页面
 
 ---
 
+### 13.8 Skill Signal 的生产和消费分离
+
+Self Improve 可以生产 skill signal，但不直接消费 skill signal。
+
+更准确的职责划分是：
+
+```text
+Self Improve Stage 1:
+    从 Session History 中抽取 Event / Object / Observation / Skill signals。
+
+Attention Graph Updater:
+    消费普通 attention signals，更新事件、对象、观察和权重。
+
+Skill Improvement LLM:
+    消费已有 Skill 的使用效果 signals，生成更新、降级、合并、拆分或淘汰建议。
+
+Candidate Skill Miner LLM:
+    消费 Skill Coverage Gap signals，判断是否形成新 Skill 候选。
+```
+
+这样 Skill 系统仍然依赖 Attention，但不会让通用 Self Improve LLM 同时承担过多职责。
+
+---
+
 ## 14. 一个可能的数据结构草案
 
 下面不是最终 schema，只是为了表达结构。
@@ -1363,6 +1549,86 @@ conflicts_with:
 adoption_status: not_adopted
 ```
 
+### 14.7 SkillUsageTrace
+
+```yaml
+trace_id: skill_trace_001
+task_context:
+  user_request: 帮我整理这份 PDF 里的流程
+  todo: 抽取流程步骤并生成 Markdown
+skill_listing:
+  listed_skills:
+    - pdf
+    - documents
+skill_selection:
+  selected_skills:
+    - pdf
+skill_loading:
+  loaded_skills:
+    - pdf
+execution:
+  actually_used_skills:
+    - pdf
+  fallback_used: false
+  tool_errors: []
+report:
+  status: success
+  summary: 成功渲染 PDF 并抽取文本。
+supervisor_review:
+  accepted: true
+```
+
+这是已有 Skill 改进流程的主要输入。
+
+### 14.8 SkillCoverageGapSignal
+
+```yaml
+signal_id: skill_gap_001
+source_session: session_123
+todo:
+  description: 分析一组未知格式日志并定位失败原因
+assigned_skills: []
+actual_execution:
+  used_skills: []
+  critical_actions:
+    - 探索目录结构
+    - 识别日志格式
+    - 编写临时解析脚本
+    - 归纳失败模式
+result:
+  status: success
+  supervisor_accepted: true
+gap_signal:
+  no_skill_assigned: true
+  success_without_skill: true
+  repeated_pattern: unknown
+consumer:
+  target_llm_flow: candidate_skill_miner
+```
+
+这是 Stage 1 发现的新 attention signal。它只说明“这里可能有 Skill coverage gap”，不直接等同于新 Skill。
+
+### 14.9 SkillImprovementCase
+
+```yaml
+case_id: skill_case_001
+case_type: existing_skill_update
+input_signals:
+  - skill_trace_001
+affected_skills:
+  - pdf
+finding: Skill 经常被加载并成功使用，但缺少图片型 PDF 的 OCR fallback。
+proposal:
+  action: update_skill
+  change: 增加图片型 PDF 的预处理路径和失败判断。
+validation:
+  replay_cases:
+    - session_123
+status: needs_review
+```
+
+这是独立 Skill Improvement LLM 的输出，而不是 Self Improve Stage 1 的直接输出。
+
 ---
 
 ## 15. 一个可能的系统目录结构
@@ -1375,6 +1641,10 @@ self_improve/
     observations/
     edges/
     attention_rank/
+    signals/
+      event_signals/
+      object_signals/
+      skill_gap_signals/
 
   skills/
     sources/
@@ -1394,10 +1664,17 @@ self_improve/
 
     evaluation/
       usage_logs/
+      traces/
       scorecards/
       conflicts/
       deprecated/
       blocklist/
+      cases/
+
+    improvement_flows/
+      existing_skill_update/
+      candidate_skill_mining/
+      anti_pattern_mining/
 
   principles/
     external/
@@ -1420,7 +1697,26 @@ self_improve/
 
 当前可以先不实现完整 Level 0，而从更明确的 Skill 管理开始。
 
-### Phase 1：Skill Source 与 Runtime Skill 分离
+### Phase 1：Self Improve Stage 1 抽取 Skill Signals
+
+实现：
+
+- 从 Session History 中抽取已有 Skill 使用链路；
+- 从 Plan / Do / Report / Review 中抽取 Skill Coverage Gap；
+- 将 Skill Gap 作为新的 attention signal 写入 signal queue；
+- 只生成 signals 和 traces，不直接改 Skill。
+
+这个阶段的输出包括：
+
+```text
+SkillUsageTrace
+SkillCoverageGapSignal
+AntiPatternSignal
+```
+
+其中，新 Skill 发现只在这里产生 signal，不在这里生成 Skill。
+
+### Phase 2：Skill Source 与 Runtime Skill 分离
 
 实现：
 
@@ -1430,7 +1726,7 @@ self_improve/
 - 生成 Runtime Skill；
 - 按 Skill Group 归档。
 
-### Phase 2：Work Session 记录 Skill 使用
+### Phase 3：Work Session 记录 Skill 使用
 
 实现：
 
@@ -1440,17 +1736,29 @@ self_improve/
 - 记录失败原因；
 - 生成 Session Report。
 
-### Phase 3：Self Improve 更新 Skill Rank
+### Phase 4：独立 Existing Skill Improvement Flow
 
 实现：
 
-- 根据 Work Session History 给 Skill 打分；
+- 消费 `SkillUsageTrace`；
+- 根据 Work Session History 给已有 Skill 打分；
 - 同组 Skill 排名；
 - 标记失效 Skill；
 - 发现冲突 Skill；
-- 自动降级或 Block。
+- 生成 Skill Update / Deprecation / Block proposal；
+- 必要时生成 regression test plan。
 
-### Phase 4：最小 Attention Graph
+这个 Flow 的激活信号不同于标准 Self Improve：
+
+```text
+高失败率
+高 unused rate
+fallback / redo / supervisor rejection
+Reporter 负反馈
+过期或冲突迹象
+```
+
+### Phase 5：最小 Attention Graph
 
 实现：
 
@@ -1459,15 +1767,27 @@ self_improve/
 - 维护 Top-N Attention Objects；
 - 通过衰减机制遗忘冷对象。
 
-### Phase 5：主动探索 Subtask
+### Phase 6：独立 Candidate Skill Miner Flow
+
+实现：
+
+- 消费 `SkillCoverageGapSignal`；
+- 聚合同类 gap；
+- 判断是否重复出现；
+- 判断是否有稳定触发条件和执行路径；
+- 生成 Candidate Skill Case 或明确 Reject。
+
+这个 Flow 不应把一次成功直接变成 Skill。它只在 coverage gap 重复、路径稳定、触发条件清晰时推动后续 Skill Draft。
+
+### Phase 7：主动探索 Subtask
 
 实现：
 
 - 对 Top Attention Event / Object 创建 Research Task；
 - 将研究结果作为 Observation 写回；
-- 如果发现稳定捷径，生成 Skill Candidate。
+- 如果发现稳定捷径，生成 Skill Coverage Gap / Candidate Skill signal。
 
-### Phase 6：Principle 与 BlockList
+### Phase 8：Principle 与 BlockList
 
 实现：
 
@@ -1522,12 +1842,12 @@ Self-Thinking / Value Graph
 - 用户可以安装 Skill；
 - LLM 可以编译 Skill；
 - Work Session 可以使用 Skill；
-- Session History 可以评价 Skill；
-- Self Improve 可以排名、升级和淘汰 Skill。
+- Self Improve Stage 1 可以从 Session History 中抽取 Skill signals；
+- 独立 Skill Improvement LLM 可以推动排名、升级和淘汰 Skill；
+- 独立 Candidate Skill Miner LLM 可以把 coverage gap 转化为候选 Skill case。
 
 这使得 Agent 不再只是依赖模型内置能力，而是逐步拥有一套可增长、可竞争、可遗忘、可验证的经验生态系统。
 
 最终，Self Improve 想实现的是：
 
 > Agent 通过自己的历史经验，持续理解自己正在参与什么世界，持续发现更好的交互捷径，并逐渐形成关于自身能力和改进方向的长期判断。
-

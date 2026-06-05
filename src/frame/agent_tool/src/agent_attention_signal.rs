@@ -22,6 +22,7 @@ pub const DEFAULT_PROMPT_VERSION: &str = "attention_signal_stage1_v0.1";
 pub const TOOL_DISCOVER_EVENT: &str = "DiscoverEvent";
 pub const TOOL_DISCOVER_OBJECT_OBSERVATION: &str = "DiscoverObjectObservation";
 pub const TOOL_DISCOVER_RELATIONSHIP: &str = "DiscoverRelationship";
+pub const TOOL_DISCOVER_SKILL_COVERAGE_GAP: &str = "DiscoverSkillCoverageGap";
 
 pub type Result<T> = std::result::Result<T, AttentionSignalError>;
 
@@ -108,6 +109,7 @@ pub enum SignalType {
     Event,
     ObjectObservation,
     Relationship,
+    SkillCoverageGap,
 }
 
 impl SignalType {
@@ -116,6 +118,7 @@ impl SignalType {
             Self::Event => "event",
             Self::ObjectObservation => "object_observation",
             Self::Relationship => "relationship",
+            Self::SkillCoverageGap => "skill_coverage_gap",
         }
     }
 }
@@ -269,9 +272,31 @@ pub enum SuggestedAction {
     ConsiderEvent,
     ConsiderObject,
     ConsiderRelationship,
+    ConsiderSkillCoverageGap,
     ConsiderAlias,
     Watch,
     DropIfUnreinforced,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillCoverageGapKind {
+    NoSkillAssigned,
+    SuccessWithoutSkill,
+    AssignedSkillUnused,
+    MissingFallback,
+    RepeatedManualPath,
+    ExistingSkillMismatch,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillTaskResultStatus {
+    Success,
+    PartialSuccess,
+    Failure,
     Unknown,
 }
 
@@ -481,6 +506,27 @@ pub struct RelationshipSignalPayload {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SkillCoverageGapSignalPayload {
+    pub title: String,
+    pub task_description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_objects: Vec<EntityMention>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub used_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_actions: Vec<String>,
+    pub result_status: SkillTaskResultStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_kind: Option<SkillCoverageGapKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_context: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "signal_type")]
 pub enum AttentionSignalPayload {
     #[serde(rename = "event")]
@@ -489,6 +535,8 @@ pub enum AttentionSignalPayload {
     ObjectObservation(ObjectObservationSignalPayload),
     #[serde(rename = "relationship")]
     Relationship(RelationshipSignalPayload),
+    #[serde(rename = "skill_coverage_gap")]
+    SkillCoverageGap(SkillCoverageGapSignalPayload),
 }
 
 impl AttentionSignalPayload {
@@ -497,6 +545,7 @@ impl AttentionSignalPayload {
             Self::Event(_) => SignalType::Event,
             Self::ObjectObservation(_) => SignalType::ObjectObservation,
             Self::Relationship(_) => SignalType::Relationship,
+            Self::SkillCoverageGap(_) => SignalType::SkillCoverageGap,
         }
     }
 }
@@ -638,6 +687,7 @@ pub struct AttentionSignalStage1RunReport {
     pub event_signals_created: usize,
     pub object_signals_created: usize,
     pub relationship_signals_created: usize,
+    pub skill_coverage_gap_signals_created: usize,
     pub signals_rejected: usize,
     pub duplicate_signals_skipped: usize,
     pub avg_confidence: f64,
@@ -696,6 +746,7 @@ impl AgentAttentionSignalStage1Runner {
             event_signals_created: 0,
             object_signals_created: 0,
             relationship_signals_created: 0,
+            skill_coverage_gap_signals_created: 0,
             signals_rejected: 0,
             duplicate_signals_skipped: 0,
             avg_confidence: 0.0,
@@ -751,6 +802,9 @@ impl AgentAttentionSignalStage1Runner {
                                 report.object_signals_created += 1;
                             }
                             SignalType::Relationship => report.relationship_signals_created += 1,
+                            SignalType::SkillCoverageGap => {
+                                report.skill_coverage_gap_signals_created += 1;
+                            }
                         }
                     }
                     Err(AttentionSignalError::InvalidInput(message)) => {
@@ -851,6 +905,34 @@ pub struct DiscoverRelationshipArgs {
     pub attitude: Option<RelationshipAttitude>,
     #[serde(default)]
     pub temporal_context: Option<TemporalContext>,
+    pub evidence: Vec<Evidence>,
+    pub confidence: f64,
+    #[serde(default)]
+    pub quality: Option<PartialSignalQuality>,
+    #[serde(default)]
+    pub stage2_hints: Option<Stage2Preparation>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverSkillCoverageGapArgs {
+    pub title: String,
+    pub task_description: String,
+    #[serde(default)]
+    pub related_objects: Vec<EntityMention>,
+    #[serde(default)]
+    pub assigned_skills: Vec<String>,
+    #[serde(default)]
+    pub used_skills: Vec<String>,
+    #[serde(default)]
+    pub critical_actions: Vec<String>,
+    pub result_status: SkillTaskResultStatus,
+    #[serde(default)]
+    pub gap_kind: Option<SkillCoverageGapKind>,
+    #[serde(default)]
+    pub gap_description: Option<String>,
+    #[serde(default)]
+    pub trigger_context: Option<String>,
     pub evidence: Vec<Evidence>,
     pub confidence: f64,
     #[serde(default)]
@@ -1025,6 +1107,36 @@ impl AgentAttentionSignalStore {
         let mut stmt = conn.prepare(
             "SELECT full_json FROM attention_signals
              WHERE agent_scope_id = ? AND lifecycle_status = 'pending_stage2'
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![agent_scope_id, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_pending_stage2_memory_signals(
+        &self,
+        agent_scope_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<AttentionSignal>> {
+        if agent_scope_id.trim().is_empty() {
+            return Err(AttentionSignalError::InvalidInput(
+                "agent_scope_id is empty".into(),
+            ));
+        }
+        let limit = limit.unwrap_or(100).min(1000);
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT full_json FROM attention_signals
+             WHERE agent_scope_id = ?
+               AND lifecycle_status = 'pending_stage2'
+               AND signal_type <> 'skill_coverage_gap'
              ORDER BY created_at ASC, id ASC
              LIMIT ?",
         )?;
@@ -1437,6 +1549,68 @@ impl TypedTool for DiscoverRelationshipTool {
     }
 }
 
+#[derive(Clone)]
+pub struct DiscoverSkillCoverageGapTool {
+    store: Arc<AgentAttentionSignalStore>,
+    runtime: AttentionSignalToolRuntime,
+}
+
+impl DiscoverSkillCoverageGapTool {
+    pub fn new(store: Arc<AgentAttentionSignalStore>, runtime: AttentionSignalToolRuntime) -> Self {
+        Self { store, runtime }
+    }
+}
+
+#[async_trait]
+impl TypedTool for DiscoverSkillCoverageGapTool {
+    type Args = DiscoverSkillCoverageGapArgs;
+    type Output = AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        TOOL_DISCOVER_SKILL_COVERAGE_GAP
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage-1 skill coverage gap signal from real session-history evidence. Use when a task succeeded or progressed through ad hoc actions because no suitable Skill covered it."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    fn build_summary(&self, output: &Self::Output) -> String {
+        format_signal_summary(output)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> std::result::Result<Self::Output, AgentToolError> {
+        let signal = self.store.build_signal(
+            AttentionSignalPayload::SkillCoverageGap(SkillCoverageGapSignalPayload {
+                title: args.title,
+                task_description: args.task_description,
+                related_objects: args.related_objects,
+                assigned_skills: args.assigned_skills,
+                used_skills: args.used_skills,
+                critical_actions: args.critical_actions,
+                result_status: args.result_status,
+                gap_kind: args.gap_kind,
+                gap_description: empty_to_none(args.gap_description),
+                trigger_context: empty_to_none(args.trigger_context),
+            }),
+            build_source(&self.runtime, &args.evidence)?,
+            args.evidence,
+            build_extraction(&self.runtime),
+            build_quality(args.confidence, args.quality)?,
+            args.stage2_hints
+                .unwrap_or_else(|| default_stage2_hints(SignalType::SkillCoverageGap)),
+        )?;
+        Ok(self.store.insert_signal(signal)?)
+    }
+}
+
 fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS attention_signals (
@@ -1543,6 +1717,9 @@ fn validate_signal(signal: &AttentionSignal) -> Result<()> {
         AttentionSignalPayload::Event(payload) => validate_event_payload(payload),
         AttentionSignalPayload::ObjectObservation(payload) => validate_object_payload(payload),
         AttentionSignalPayload::Relationship(payload) => validate_relationship_payload(payload),
+        AttentionSignalPayload::SkillCoverageGap(payload) => {
+            validate_skill_coverage_gap_payload(payload)
+        }
     }
 }
 
@@ -1585,6 +1762,50 @@ fn validate_relationship_payload(payload: &RelationshipSignalPayload) -> Result<
     {
         return Err(AttentionSignalError::InvalidInput(
             "subject and object cannot be the same mention".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_skill_coverage_gap_payload(payload: &SkillCoverageGapSignalPayload) -> Result<()> {
+    require_non_empty(&payload.title, "title")?;
+    require_non_empty(&payload.task_description, "task_description")?;
+    for object in &payload.related_objects {
+        validate_entity(object, "related_objects")?;
+    }
+    for skill in &payload.assigned_skills {
+        require_non_empty(skill, "assigned_skills")?;
+    }
+    for skill in &payload.used_skills {
+        require_non_empty(skill, "used_skills")?;
+    }
+    for action in &payload.critical_actions {
+        require_non_empty(action, "critical_actions")?;
+    }
+    if payload.assigned_skills.is_empty()
+        && payload.used_skills.is_empty()
+        && payload.critical_actions.is_empty()
+        && payload
+            .gap_description
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        && !matches!(
+            payload.gap_kind,
+            Some(
+                SkillCoverageGapKind::NoSkillAssigned
+                    | SkillCoverageGapKind::SuccessWithoutSkill
+                    | SkillCoverageGapKind::AssignedSkillUnused
+                    | SkillCoverageGapKind::MissingFallback
+                    | SkillCoverageGapKind::RepeatedManualPath
+                    | SkillCoverageGapKind::ExistingSkillMismatch
+            )
+        )
+    {
+        return Err(AttentionSignalError::InvalidInput(
+            "skill coverage gap needs explicit missing coverage or ad hoc execution evidence"
+                .into(),
         ));
     }
     Ok(())
@@ -1784,6 +2005,7 @@ fn default_stage2_hints(signal_type: SignalType) -> Stage2Preparation {
         SignalType::Event => SuggestedAction::ConsiderEvent,
         SignalType::ObjectObservation => SuggestedAction::ConsiderObject,
         SignalType::Relationship => SuggestedAction::ConsiderRelationship,
+        SignalType::SkillCoverageGap => SuggestedAction::ConsiderSkillCoverageGap,
     };
     Stage2Preparation {
         suggested_merge_key: None,
@@ -1815,6 +2037,13 @@ fn build_idempotency_key(signal: &AttentionSignal) -> Result<String> {
             payload.subject.mention_text.trim(),
             payload.predicate.trim(),
             payload.object.mention_text.trim()
+        )),
+        AttentionSignalPayload::SkillCoverageGap(payload) => Json::String(format!(
+            "{}\n{}\n{}\n{}",
+            payload.title.trim(),
+            payload.task_description.trim(),
+            payload.gap_description.as_deref().unwrap_or("").trim(),
+            payload.critical_actions.join("\n")
         )),
     };
     let mut evidence_refs: Vec<_> = signal
@@ -2135,6 +2364,62 @@ mod tests {
         assert_eq!(
             result.details["signal"]["lifecycle_status"],
             "pending_stage2"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_skill_coverage_gap_tool_stores_signal_but_memory_query_excludes_it() {
+        let (_tmp, store) = open_tmp();
+        let tool = TypedToolHandle::with_null_host(DiscoverSkillCoverageGapTool::new(
+            store.clone(),
+            runtime(),
+        ));
+        let ctx = SessionRuntimeContext {
+            trace_id: "trace".into(),
+            agent_name: "agent".into(),
+            behavior: "test".into(),
+            step_idx: 0,
+            wakeup_id: String::new(),
+            session_id: "session".into(),
+        };
+        let args = json!({
+            "title": "Log parser coverage gap",
+            "task_description": "Analyze unknown-format logs and identify the failure pattern.",
+            "assigned_skills": [],
+            "used_skills": [],
+            "critical_actions": [
+                "Explored log directory structure",
+                "Wrote a temporary parser",
+                "Grouped failures by signature"
+            ],
+            "result_status": "success",
+            "gap_kind": "success_without_skill",
+            "gap_description": "The task succeeded through a repeatable ad hoc log-analysis path without Skill coverage.",
+            "evidence": [{
+                "round_index": 1,
+                "entry_seq": 1,
+                "entry_kind": "message",
+                "role": "assistant",
+                "text_excerpt": "I wrote a temporary parser and grouped the failures by signature."
+            }],
+            "confidence": 0.78
+        });
+        let result = tool.call(&ctx, args).await.unwrap();
+        assert_eq!(
+            result.tool.as_deref(),
+            Some(TOOL_DISCOVER_SKILL_COVERAGE_GAP)
+        );
+        assert_eq!(
+            result.details["signal"]["signal_type"],
+            "skill_coverage_gap"
+        );
+        assert_eq!(store.list_pending_stage2("scope", None).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_pending_stage2_memory_signals("scope", None)
+                .unwrap()
+                .len(),
+            0
         );
     }
 }

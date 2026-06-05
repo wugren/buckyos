@@ -5,7 +5,8 @@ use agent_tool::{
     agent_attention_signal::{
         CreateExtractionWindowInput, DiscoverEventArgs, DiscoverEventTool,
         DiscoverObjectObservationArgs, DiscoverObjectObservationTool, DiscoverRelationshipArgs,
-        DiscoverRelationshipTool, SignalLifecycleStatus,
+        DiscoverRelationshipTool, DiscoverSkillCoverageGapArgs, DiscoverSkillCoverageGapTool,
+        SignalLifecycleStatus,
     },
     AgentAttentionSignalStore, AgentToolError, AgentToolManager, AttentionSignal,
     AttentionSignalStoreConfig, AttentionSignalToolRuntime, CallingConventions, ExtractionWindow,
@@ -191,6 +192,10 @@ pub struct ScopedDiscoverRelationshipTool {
     state: AttentionSignalToolState,
 }
 
+pub struct ScopedDiscoverSkillCoverageGapTool {
+    state: AttentionSignalToolState,
+}
+
 pub struct ReadSessionHistoryTool {
     agent: Weak<AIAgent>,
 }
@@ -248,6 +253,12 @@ impl ScopedDiscoverObjectObservationTool {
 }
 
 impl ScopedDiscoverRelationshipTool {
+    fn new(state: AttentionSignalToolState) -> Self {
+        Self { state }
+    }
+}
+
+impl ScopedDiscoverSkillCoverageGapTool {
     fn new(state: AttentionSignalToolState) -> Self {
         Self { state }
     }
@@ -753,6 +764,35 @@ impl TypedTool for ScopedDiscoverRelationshipTool {
     }
 }
 
+#[async_trait]
+impl TypedTool for ScopedDiscoverSkillCoverageGapTool {
+    type Args = DiscoverSkillCoverageGapArgs;
+    type Output = agent_tool::AttentionSignalWriteResult;
+
+    fn name(&self) -> &str {
+        agent_tool::TOOL_DISCOVER_SKILL_COVERAGE_GAP
+    }
+
+    fn description(&self) -> &str {
+        "Store a Stage-1 skill coverage gap attention signal for the current extraction scope."
+    }
+
+    fn calling(&self) -> CallingConventions {
+        CallingConventions::LLM | CallingConventions::ACTION
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: Self::Args,
+    ) -> Result<Self::Output, AgentToolError> {
+        let runtime = current_attention_runtime(&self.state).await?;
+        DiscoverSkillCoverageGapTool::new(self.state.store.clone(), runtime)
+            .execute(ctx, args)
+            .await
+    }
+}
+
 fn validate_session_id_arg(session_id: &str) -> Result<(), AgentToolError> {
     if session_id.is_empty() {
         return Err(AgentToolError::InvalidArgs(
@@ -1250,5 +1290,6 @@ pub fn register_attention_signal_tools(
     let _ = manager.register_typed_tool(MarkAttentionSignalConsumedTool::new(state.clone()));
     let _ = manager.register_typed_tool(ScopedDiscoverEventTool::new(state.clone()));
     let _ = manager.register_typed_tool(ScopedDiscoverObjectObservationTool::new(state.clone()));
-    let _ = manager.register_typed_tool(ScopedDiscoverRelationshipTool::new(state));
+    let _ = manager.register_typed_tool(ScopedDiscoverRelationshipTool::new(state.clone()));
+    let _ = manager.register_typed_tool(ScopedDiscoverSkillCoverageGapTool::new(state));
 }

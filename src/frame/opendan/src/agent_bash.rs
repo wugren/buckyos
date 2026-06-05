@@ -84,6 +84,7 @@ const BUILTIN_AGENT_TOOL_BINS: &[&str] = &[
     "DiscoverEvent",
     "DiscoverObjectObservation",
     "DiscoverRelationship",
+    "DiscoverSkillCoverageGap",
     "ListPendingAttentionSignals",
     "MarkAttentionSignalConsumed",
 ];
@@ -1056,6 +1057,7 @@ mod tests {
             "DiscoverEvent",
             "DiscoverObjectObservation",
             "DiscoverRelationship",
+            "DiscoverSkillCoverageGap",
             "ListPendingAttentionSignals",
             "MarkAttentionSignalConsumed",
         ] {

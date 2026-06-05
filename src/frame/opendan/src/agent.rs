@@ -765,7 +765,7 @@ impl AIAgent {
             return false;
         };
         store
-            .list_pending_stage2(&self.agent_id(), Some(1))
+            .list_pending_stage2_memory_signals(&self.agent_id(), Some(1))
             .map(|signals| !signals.is_empty())
             .unwrap_or(false)
     }
@@ -2730,9 +2730,9 @@ last_stage1_completed_seq: {}\n\
 last_stage1_completed_at_ms: {}\n\
 last_stage2_triggered_at_ms: {}\n\
 \n\
-Condition satisfied: Stage1 has completed at least once and pending attention signals exist.\n\
+Condition satisfied: Stage1 has completed at least once and pending memory attention signals exist.\n\
 Run Stage2 now: Attention Signals -> Agent Memory Graph.\n\
-First call ListPendingAttentionSignals, then consume applicable signals into Agent Memory and mark processed signals consumed.\n",
+First call ListPendingAttentionSignals, then consume applicable non-skill-gap signals into Agent Memory and mark processed signals consumed.\n",
         session_id,
         rotated,
         state.last_stage1_completed_seq,

@@ -54,8 +54,9 @@ pub use agent_attention_signal::{
     AttentionSignalPayload, AttentionSignalSessionWindow, AttentionSignalStage1RunReport,
     AttentionSignalStoreConfig, AttentionSignalTimeWindow, AttentionSignalToolRuntime,
     AttentionSignalWriteResult, DiscoverEventTool, DiscoverObjectObservationTool,
-    DiscoverRelationshipTool, ExtractionWindow, MarkScannedInput, ScanCheckpoint,
-    TOOL_DISCOVER_EVENT, TOOL_DISCOVER_OBJECT_OBSERVATION, TOOL_DISCOVER_RELATIONSHIP,
+    DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, ExtractionWindow, MarkScannedInput,
+    ScanCheckpoint, TOOL_DISCOVER_EVENT, TOOL_DISCOVER_OBJECT_OBSERVATION,
+    TOOL_DISCOVER_RELATIONSHIP, TOOL_DISCOVER_SKILL_COVERAGE_GAP,
 };
 pub use agent_memory::{
     AgentMemory, AgentMemoryConfig, AgentMemoryError, Envelope as AgentMemoryEnvelope, LoadItem,
