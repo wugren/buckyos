@@ -7,7 +7,7 @@ Run from the repository root:
 
 ```bash
 uv run src/check.py
-uv run test/run.py -p kevent_kmsg_test
+uv run test/run.py -p kevent_kmsg/dv
 ```
 
 Optional environment variables:
