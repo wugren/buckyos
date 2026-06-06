@@ -807,6 +807,28 @@ def _run_checked(cmd: list[str], *, cwd: Path | None = None, dry_run: bool = Fal
         raise RuntimeError(f"command failed with exit code {rc}: {' '.join(cmd)}")
 
 
+def _timings_subdir(timings_dir: str | None, target: TargetScript, project_key: str) -> Path | None:
+    if not timings_dir:
+        return None
+    return Path(timings_dir).expanduser() / target.platform_key / target.architecture / project_key
+
+
+def _buckyos_build_command(
+    *,
+    app_keys: list[str],
+    rust_target: str | None,
+    timings_dir: Path | None,
+) -> list[str]:
+    cmd = ["buckyos-build"]
+    for app_key in app_keys:
+        cmd.append(f"--app={app_key}")
+    if rust_target:
+        cmd.append(f"--target={rust_target}")
+    if timings_dir is not None:
+        cmd.append(f"--timings-dir={timings_dir}")
+    return cmd
+
+
 def _remove_tree(path: Path, *, dry_run: bool) -> None:
     if not path.exists():
         return
@@ -1000,6 +1022,7 @@ def _prepare_publish_dependencies(
     dry_run: bool,
     skip_cargo_update: bool,
     rust_target: str | None,
+    timings_dir: str | None = None,
 ) -> None:
     project_file = project_path.expanduser().resolve()
     data = _load_project_config(project_file)
@@ -1029,9 +1052,11 @@ def _prepare_publish_dependencies(
                 target_rootfs.mkdir(parents=True, exist_ok=True)
             if not skip_cargo_update:
                 _run_checked(["cargo", "update"], cwd=dep.source_dir, dry_run=dry_run)
-            dep_build_cmd = ["buckyos-build"]
-            if rust_target:
-                dep_build_cmd.append(f"--target={rust_target}")
+            dep_build_cmd = _buckyos_build_command(
+                app_keys=[dep.key],
+                rust_target=rust_target,
+                timings_dir=_timings_subdir(timings_dir, target, dep.key),
+            )
             _run_checked(dep_build_cmd, cwd=dep.source_dir, dry_run=dry_run)
             _run_checked(
                 ["buckyos-install", "--all", f"--target-rootfs={target_rootfs}", f"--app={dep.key}"],
@@ -1049,6 +1074,7 @@ def _prepare_common_build_root(
     desktop_app: str | None,
     skip_desktop_app_build: bool,
     rust_target: str | None = None,
+    timings_dir: str | None = None,
 ) -> None:
     python_exe = _python_executable()
     buckyos_root = target.build_root / "buckyos"
@@ -1067,13 +1093,16 @@ def _prepare_common_build_root(
         dry_run=dry_run,
         skip_cargo_update=skip_cargo_update,
         rust_target=rust_target,
+        timings_dir=timings_dir,
     )
 
     if not skip_cargo_update:
         _run_checked(["cargo", "update"], cwd=SRC_DIR, dry_run=dry_run)
-    buckyos_build_cmd = ["buckyos-build"]
-    if rust_target:
-        buckyos_build_cmd.append(f"--target={rust_target}")
+    buckyos_build_cmd = _buckyos_build_command(
+        app_keys=["buckycli", "buckyos"],
+        rust_target=rust_target,
+        timings_dir=_timings_subdir(timings_dir, target, "buckyos"),
+    )
     _run_checked(buckyos_build_cmd, cwd=SRC_DIR, dry_run=dry_run)
     _run_checked(
         ["buckyos-install", "--all", f"--target-rootfs={buckycli_root}", "--app=buckycli"],
@@ -1110,6 +1139,11 @@ def prepare_root(argv: list[str]) -> int:
     )
     parser.add_argument("--skip-cargo-update", action="store_true", help="Skip cargo update in shared build steps")
     parser.add_argument("--rust-target", default=None, help="Pass explicit --target to internal buckyos-build commands")
+    parser.add_argument(
+        "--timings-dir",
+        default=None,
+        help="Collect devkit cargo timing reports under this directory",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
     args = parser.parse_args(argv)
 
@@ -1123,6 +1157,7 @@ def prepare_root(argv: list[str]) -> int:
         desktop_app=args.desktop_app,
         skip_desktop_app_build=bool(args.skip_desktop_app_build),
         rust_target=args.rust_target,
+        timings_dir=args.timings_dir,
     )
     return 0
 
@@ -1145,6 +1180,11 @@ def build_pkg(argv: list[str]) -> int:
     parser.add_argument("--skip-prepare", action="store_true", help="Assume BUCKYOS_BUILD_ROOT is already staged")
     parser.add_argument("--skip-cargo-update", action="store_true", help="Skip cargo update in shared build steps")
     parser.add_argument("--rust-target", default=None, help="Pass explicit --target to internal buckyos-build commands")
+    parser.add_argument(
+        "--timings-dir",
+        default=None,
+        help="Collect devkit cargo timing reports under this directory",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args, forwarded = parser.parse_known_args(argv)
 
@@ -1160,6 +1200,7 @@ def build_pkg(argv: list[str]) -> int:
             desktop_app=args.desktop_app,
             skip_desktop_app_build=bool(args.skip_desktop_app_build),
             rust_target=args.rust_target,
+            timings_dir=args.timings_dir,
         )
     else:
         print("[prepare] skipped by --skip-prepare")
