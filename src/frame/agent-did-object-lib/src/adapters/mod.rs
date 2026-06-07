@@ -151,6 +151,25 @@ pub enum AdapterCallStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdapterEventSubscription {
     pub subscription: EventBridgeSubscription,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<AdapterEventTransport>,
+    #[serde(default = "default_adapter_unsubscribe")]
+    pub unsubscribe_via_adapter: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AdapterEventTransport {
+    WebSocket {
+        endpoint: String,
+        subscribe: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsubscribe: Option<Value>,
+    },
+}
+
+fn default_adapter_unsubscribe() -> bool {
+    true
 }
 
 #[derive(Clone, Default)]

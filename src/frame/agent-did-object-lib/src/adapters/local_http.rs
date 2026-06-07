@@ -319,7 +319,11 @@ impl AgentObjectAdapter for LocalHttpAdapter {
             cursor: response.cursor,
             route: req.route_trace,
         };
-        Ok(AdapterEventSubscription { subscription })
+        Ok(AdapterEventSubscription {
+            subscription,
+            transport: None,
+            unsubscribe_via_adapter: true,
+        })
     }
 
     async fn unsubscribe_event(

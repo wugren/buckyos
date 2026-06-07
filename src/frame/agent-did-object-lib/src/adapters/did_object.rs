@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use name_client::DIDObjectClient;
-use name_lib::ActionResponse;
+use name_lib::{ActionResponse, EventSubscribeRequest};
 use serde_json::{json, Value};
 
 use super::{
-    unsupported_event_subscription, unsupported_event_unsubscription, AdapterCallStatus,
-    AdapterEventSubscription, AdapterReadRequest, AdapterReadResponse,
-    AdapterSubscribeEventRequest, AdapterUnsubscribeEventRequest, AdapterXCallRequest,
-    AdapterXCallResponse, AgentObjectAdapter,
+    AdapterCallStatus, AdapterEventSubscription, AdapterEventTransport, AdapterReadRequest,
+    AdapterReadResponse, AdapterSubscribeEventRequest, AdapterUnsubscribeEventRequest,
+    AdapterXCallRequest, AdapterXCallResponse, AgentObjectAdapter,
 };
 use crate::error::AgentDIDObjectError;
 use crate::types::{
@@ -178,14 +177,62 @@ impl AgentObjectAdapter for DidObjectProtocolAdapter {
         &self,
         req: AdapterSubscribeEventRequest,
     ) -> Result<AdapterEventSubscription, AgentDIDObjectError> {
-        unsupported_event_subscription(&self.id, &req)
+        let resolved = self
+            .client
+            .resolve(&req.object_ref.normalized)
+            .await
+            .map_err(|err| AgentDIDObjectError::ResolveError(err.to_string()))?;
+        if !DIDObjectClient::has_event(&resolved.object_profile, &req.input.event) {
+            return Err(AgentDIDObjectError::DeclaredCapabilityNotFound(format!(
+                "event {} is not declared by {}",
+                req.input.event, resolved.object_url
+            )));
+        }
+        let endpoint = DIDObjectClient::event_endpoint(
+            &resolved.object_card,
+            &resolved.object_profile,
+            &req.input.event,
+        )
+        .map_err(|err| AgentDIDObjectError::ProtocolError(err.to_string()))?;
+        let subscribe = EventSubscribeRequest {
+            op: "subscribe".to_string(),
+            object: resolved.object_url.clone(),
+            object_did: Some(resolved.object_card.id.clone()),
+            event: req.input.event.clone(),
+            filter: req.input.filter.clone(),
+            ttl_ms: req.input.ttl_ms,
+            cursor: req.input.cursor.clone(),
+            trace_id: req.input.trace_id.clone(),
+        };
+        Ok(AdapterEventSubscription {
+            subscription: crate::types::EventBridgeSubscription {
+                subscription_id: "pending_remote_subscription".to_string(),
+                object: resolved.object_url.clone(),
+                object_did: Some(did_to_string(&resolved.object_card.id)),
+                event: req.input.event.clone(),
+                kevent_pattern: crate::event_bridge::encode_object_event_id(
+                    &resolved.object_url,
+                    &req.input.event,
+                ),
+                expires_at: None,
+                cursor: req.input.cursor.clone(),
+                route: req.route_trace,
+            },
+            transport: Some(AdapterEventTransport::WebSocket {
+                endpoint,
+                subscribe: serde_json::to_value(subscribe)
+                    .map_err(|err| AgentDIDObjectError::ProtocolError(err.to_string()))?,
+                unsubscribe: None,
+            }),
+            unsubscribe_via_adapter: false,
+        })
     }
 
     async fn unsubscribe_event(
         &self,
         _req: AdapterUnsubscribeEventRequest,
     ) -> Result<(), AgentDIDObjectError> {
-        unsupported_event_unsubscription(&self.id)
+        Ok(())
     }
 }
 

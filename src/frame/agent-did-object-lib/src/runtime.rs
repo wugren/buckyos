@@ -6,10 +6,11 @@ use serde_json::{json, Value};
 
 use crate::adapters::{
     AdapterCallStatus, AdapterReadRequest, AdapterReadResponse, AdapterRegistry,
-    AdapterSubscribeEventRequest, AdapterUnsubscribeEventRequest, AdapterXCallRequest,
+    AdapterSubscribeEventRequest, AdapterXCallRequest,
 };
 use crate::config::ObjectRouteConfig;
 use crate::error::AgentDIDObjectError;
+use crate::event_bridge::EventBridgeManager;
 use crate::router::{ObjectRouter, RouteMethod};
 use crate::types::{
     apply_line_range, cmd_args_value, limit_chars, EventBridgeSubscription, ObjectRef, ReadInput,
@@ -20,6 +21,7 @@ pub struct AgentDIDObjectRuntime {
     router: ObjectRouter,
     registry: AdapterRegistry,
     kevent_client: Option<Arc<KEventClient>>,
+    event_bridge: EventBridgeManager,
 }
 
 impl AgentDIDObjectRuntime {
@@ -29,6 +31,7 @@ impl AgentDIDObjectRuntime {
             router: ObjectRouter::new(config),
             registry,
             kevent_client: None,
+            event_bridge: EventBridgeManager::new(None),
         })
     }
 
@@ -41,11 +44,14 @@ impl AgentDIDObjectRuntime {
             router: ObjectRouter::new(config),
             registry,
             kevent_client: None,
+            event_bridge: EventBridgeManager::new(None),
         })
     }
 
     pub fn with_kevent_client(mut self, client: KEventClient) -> Self {
-        self.kevent_client = Some(Arc::new(client));
+        let client = Arc::new(client);
+        self.kevent_client = Some(client.clone());
+        self.event_bridge = EventBridgeManager::new(Some(client));
         self
     }
 
@@ -167,38 +173,25 @@ impl AgentDIDObjectRuntime {
             .ok_or_else(|| {
                 AgentDIDObjectError::AdapterNotFound(route_match.route.adapter.clone())
             })?;
-        let response = adapter
-            .subscribe_event(AdapterSubscribeEventRequest {
-                object_ref,
-                input,
-                route: route_match.route,
-                route_trace: route_match.trace,
-                adapter_config,
-            })
-            .await?;
-        Ok(response.subscription)
+        self.event_bridge
+            .subscribe(
+                adapter,
+                AdapterSubscribeEventRequest {
+                    object_ref,
+                    input,
+                    route: route_match.route,
+                    route_trace: route_match.trace,
+                    adapter_config,
+                },
+            )
+            .await
     }
 
     pub async fn unsubscribe_event(
         &self,
         input: UnsubscribeEventInput,
     ) -> Result<(), AgentDIDObjectError> {
-        for adapter_id in self
-            .router
-            .config()
-            .adapters
-            .iter()
-            .map(|adapter| &adapter.id)
-        {
-            if let Some(adapter) = self.registry.get(adapter_id) {
-                let _ = adapter
-                    .unsubscribe_event(AdapterUnsubscribeEventRequest {
-                        input: input.clone(),
-                    })
-                    .await;
-            }
-        }
-        Ok(())
+        self.event_bridge.unsubscribe(&self.registry, input).await
     }
 }
 
@@ -405,9 +398,22 @@ mod tests {
 
         async fn subscribe_event(
             &self,
-            _req: AdapterSubscribeEventRequest,
+            req: AdapterSubscribeEventRequest,
         ) -> Result<AdapterEventSubscription, AgentDIDObjectError> {
-            unreachable!()
+            Ok(AdapterEventSubscription {
+                subscription: EventBridgeSubscription {
+                    subscription_id: "remote-sub".to_string(),
+                    object: req.object_ref.normalized,
+                    object_did: None,
+                    event: req.input.event,
+                    kevent_pattern: "remote-pattern".to_string(),
+                    expires_at: Some("2026-06-07T13:00:00Z".to_string()),
+                    cursor: None,
+                    route: req.route_trace,
+                },
+                transport: None,
+                unsubscribe_via_adapter: true,
+            })
         }
 
         async fn unsubscribe_event(
@@ -481,5 +487,51 @@ mod tests {
             .unwrap();
         assert_eq!(result.details["ok"], true);
         assert_eq!(result.cmd_name.as_deref(), Some("x_call"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_event_uses_bridge_manager_and_local_pattern() {
+        let runtime = runtime();
+        let first = runtime
+            .subscribe_event(SubscribeEventInput {
+                object: "obj://example/1".to_string(),
+                event: "changed".to_string(),
+                filter: json!({}),
+                session_id: None,
+                ttl_ms: None,
+                cursor: None,
+                trace_id: None,
+            })
+            .await
+            .unwrap();
+        let second = runtime
+            .subscribe_event(SubscribeEventInput {
+                object: "obj://example/1".to_string(),
+                event: "changed".to_string(),
+                filter: json!({}),
+                session_id: None,
+                ttl_ms: None,
+                cursor: None,
+                trace_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first.subscription_id, second.subscription_id);
+        assert_eq!(first.kevent_pattern, "/obj/example/1/changed");
+        assert_ne!(first.kevent_pattern, "remote-pattern");
+
+        runtime
+            .unsubscribe_event(UnsubscribeEventInput {
+                subscription_id: first.subscription_id.clone(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .unsubscribe_event(UnsubscribeEventInput {
+                subscription_id: first.subscription_id,
+            })
+            .await
+            .unwrap();
     }
 }

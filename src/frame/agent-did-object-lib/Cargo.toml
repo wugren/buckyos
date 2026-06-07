@@ -8,6 +8,7 @@ authors = ["BuckyOS DAO", "codex"]
 agent_tool = { path = "../agent_tool" }
 async-trait = { workspace = true }
 buckyos-api = { path = "../../kernel/buckyos-api" }
+futures-util = { workspace = true }
 name-client = { workspace = true }
 name-lib = { workspace = true }
 reqwest = { workspace = true }
@@ -16,6 +17,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
