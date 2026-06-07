@@ -429,9 +429,9 @@ mod tests {
                 options: json!({}),
             }],
             routes: vec![ObjectRoute {
-                id: "alias".to_string(),
+                id: "obj".to_string(),
                 priority: 0,
-                match_type: RouteMatchType::AliasPrefix,
+                match_type: RouteMatchType::Scheme,
                 pattern: "obj".to_string(),
                 adapter: "fake".to_string(),
                 methods: vec![],
@@ -447,7 +447,7 @@ mod tests {
     async fn read_uses_router_and_returns_agent_tool_result() {
         let result = runtime()
             .read(ReadInput {
-                object: "obj1".to_string(),
+                object: "obj://example/1".to_string(),
                 purpose: None,
                 session_id: None,
                 content_only: false,
@@ -469,7 +469,7 @@ mod tests {
     async fn x_call_maps_adapter_response() {
         let result = runtime()
             .x_call(XCallInput {
-                object: "obj1".to_string(),
+                object: "obj://example/1".to_string(),
                 action: "do".to_string(),
                 params: json!({"x": 1}),
                 session_id: None,

@@ -8,16 +8,6 @@ use crate::error::AgentDIDObjectError;
 pub struct ObjectRef {
     pub raw: String,
     pub normalized: String,
-    pub kind: ObjectRefKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ObjectRefKind {
-    Url,
-    Did,
-    ObjUrl,
-    Alias,
 }
 
 impl ObjectRef {
@@ -29,45 +19,32 @@ impl ObjectRef {
             ));
         }
 
-        if raw.starts_with("did:") {
-            return Ok(Self {
-                raw: raw.clone(),
-                normalized: raw,
-                kind: ObjectRefKind::Did,
-            });
+        let url = Url::parse(&raw).map_err(|err| {
+            AgentDIDObjectError::UnsupportedObjectRef(format!(
+                "object must be a canonical URL after gateway resolution: {raw}: {err}"
+            ))
+        })?;
+        if url.cannot_be_a_base() {
+            return Err(AgentDIDObjectError::UnsupportedObjectRef(format!(
+                "object must be a hierarchical URL after gateway resolution: {raw}"
+            )));
         }
 
-        if let Ok(url) = Url::parse(&raw) {
-            let kind = if url.scheme() == "obj" {
-                ObjectRefKind::ObjUrl
-            } else {
-                ObjectRefKind::Url
-            };
-            return Ok(Self {
-                raw,
-                normalized: url.to_string(),
-                kind,
-            });
-        }
-
+        let normalized = url.to_string();
         Ok(Self {
-            raw: raw.clone(),
-            normalized: raw,
-            kind: ObjectRefKind::Alias,
+            raw: normalized.clone(),
+            normalized,
         })
     }
 
     pub fn scheme(&self) -> Option<String> {
-        if self.kind == ObjectRefKind::Did {
-            return Some("did".to_string());
-        }
         Url::parse(&self.normalized)
             .ok()
             .map(|url| url.scheme().to_string())
     }
 
     pub fn is_url(&self) -> bool {
-        matches!(self.kind, ObjectRefKind::Url | ObjectRefKind::ObjUrl)
+        true
     }
 }
 

@@ -3,7 +3,7 @@ use url::Url;
 
 use crate::config::{ObjectRoute, ObjectRouteConfig};
 use crate::error::AgentDIDObjectError;
-use crate::types::{ObjectRef, ObjectRefKind};
+use crate::types::ObjectRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,10 +18,7 @@ pub enum RouteMethod {
 pub enum RouteMatchType {
     Exact,
     UrlPrefix,
-    PathPrefix,
     Scheme,
-    DidPrefix,
-    AliasPrefix,
     Glob,
 }
 
@@ -93,24 +90,9 @@ fn route_matches(route: &ObjectRoute, object_ref: &ObjectRef) -> bool {
         RouteMatchType::UrlPrefix => {
             object_ref.is_url() && object_ref.normalized.starts_with(&route.pattern)
         }
-        RouteMatchType::PathPrefix => {
-            object_ref.raw.starts_with(&route.pattern)
-                || object_ref.normalized.starts_with(&route.pattern)
-        }
-        RouteMatchType::Scheme => match object_ref.kind {
-            ObjectRefKind::Did => route.pattern == "did",
-            _ => Url::parse(&object_ref.normalized)
-                .map(|url| url.scheme() == route.pattern)
-                .unwrap_or(false),
-        },
-        RouteMatchType::DidPrefix => {
-            object_ref.kind == ObjectRefKind::Did
-                && object_ref.normalized.starts_with(&route.pattern)
-        }
-        RouteMatchType::AliasPrefix => {
-            object_ref.kind == ObjectRefKind::Alias
-                && object_ref.normalized.starts_with(&route.pattern)
-        }
+        RouteMatchType::Scheme => Url::parse(&object_ref.normalized)
+            .map(|url| url.scheme() == route.pattern)
+            .unwrap_or(false),
         RouteMatchType::Glob => {
             if let Some(prefix) = route.pattern.strip_suffix('*') {
                 object_ref.normalized.starts_with(prefix)
@@ -233,22 +215,16 @@ mod tests {
     }
 
     #[test]
-    fn object_ref_normalizes_supported_forms() {
+    fn object_ref_accepts_only_hierarchical_urls() {
         assert_eq!(
-            ObjectRef::parse("https://example.com/a").unwrap().kind,
-            ObjectRefKind::Url
+            ObjectRef::parse("https://example.com/a").unwrap().scheme(),
+            Some("https".to_string())
         );
         assert_eq!(
-            ObjectRef::parse("did:web:example.com").unwrap().kind,
-            ObjectRefKind::Did
+            ObjectRef::parse("obj://a/b").unwrap().scheme(),
+            Some("obj".to_string())
         );
-        assert_eq!(
-            ObjectRef::parse("obj://a/b").unwrap().kind,
-            ObjectRefKind::ObjUrl
-        );
-        assert_eq!(
-            ObjectRef::parse("camera.home").unwrap().kind,
-            ObjectRefKind::Alias
-        );
+        assert!(ObjectRef::parse("did:web:example.com").is_err());
+        assert!(ObjectRef::parse("camera.home").is_err());
     }
 }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -35,7 +35,7 @@ impl AgentObjectAdapter for FilesystemAdapter {
         &self,
         req: AdapterReadRequest,
     ) -> Result<AdapterReadResponse, AgentDIDObjectError> {
-        let path = resolve_path(&req.object_ref.raw)?;
+        let path = resolve_path(&req.object_ref.normalized)?;
         let metadata = fs::metadata(&path).await?;
         if !metadata.is_file() {
             return Err(AgentDIDObjectError::UnsupportedObjectRef(format!(
@@ -144,16 +144,17 @@ impl AgentObjectAdapter for FilesystemAdapter {
 }
 
 fn resolve_path(input: &str) -> Result<PathBuf, AgentDIDObjectError> {
-    if input.starts_with("file://") {
-        let url = Url::parse(input).map_err(|err| {
-            AgentDIDObjectError::UnsupportedObjectRef(format!("invalid file URL {input}: {err}"))
-        })?;
-        return url.to_file_path().map_err(|_| {
-            AgentDIDObjectError::UnsupportedObjectRef(format!("invalid file path URL {input}"))
-        });
+    let url = Url::parse(input).map_err(|err| {
+        AgentDIDObjectError::UnsupportedObjectRef(format!("invalid file URL {input}: {err}"))
+    })?;
+    if url.scheme() != "file" {
+        return Err(AgentDIDObjectError::UnsupportedObjectRef(format!(
+            "filesystem adapter requires file URL: {input}"
+        )));
     }
-    let path = Path::new(input);
-    Ok(path.to_path_buf())
+    url.to_file_path().map_err(|_| {
+        AgentDIDObjectError::UnsupportedObjectRef(format!("invalid file path URL {input}"))
+    })
 }
 
 #[cfg(test)]
@@ -165,11 +166,11 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn req(path: String) -> AdapterReadRequest {
+    fn req(object_url: String) -> AdapterReadRequest {
         AdapterReadRequest {
-            object_ref: ObjectRef::parse(&path).unwrap(),
+            object_ref: ObjectRef::parse(&object_url).unwrap(),
             input: ReadInput {
-                object: path,
+                object: object_url,
                 purpose: None,
                 session_id: None,
                 content_only: false,
@@ -180,8 +181,8 @@ mod tests {
             route: ObjectRoute {
                 id: "r".to_string(),
                 priority: 0,
-                match_type: RouteMatchType::PathPrefix,
-                pattern: "/".to_string(),
+                match_type: RouteMatchType::Scheme,
+                pattern: "file".to_string(),
                 adapter: "filesystem".to_string(),
                 methods: vec![RouteMethod::Read],
                 options: json!({}),
@@ -206,8 +207,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.txt");
         fs::write(&path, "abcdef").await.unwrap();
+        let object_url = Url::from_file_path(&path).unwrap().to_string();
         let adapter = FilesystemAdapter::new("filesystem".to_string());
-        let res = adapter.read(req(path.display().to_string())).await.unwrap();
+        let res = adapter.read(req(object_url)).await.unwrap();
         assert_eq!(res.content.unwrap(), "abcd\n[truncated]");
         assert_eq!(res.adapt_meta["truncated"], true);
     }
@@ -217,8 +219,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.bin");
         fs::write(&path, [0, 159, 146, 150]).await.unwrap();
+        let object_url = Url::from_file_path(&path).unwrap().to_string();
         let adapter = FilesystemAdapter::new("filesystem".to_string());
-        let res = adapter.read(req(path.display().to_string())).await.unwrap();
+        let res = adapter.read(req(object_url)).await.unwrap();
         assert_eq!(
             res.meta.content_type.as_deref(),
             Some("application/octet-stream")
