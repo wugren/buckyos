@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -154,7 +155,7 @@ fn validate_local_http_endpoint(
         )));
     }
     let host = url.host_str().unwrap_or_default();
-    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+    if matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
         return Ok(());
     }
     let allowed = options
@@ -170,20 +171,23 @@ fn validate_local_http_endpoint(
 }
 
 fn is_private_host(host: &str) -> bool {
-    host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("172.16.")
-        || host.starts_with("172.17.")
-        || host.starts_with("172.18.")
-        || host.starts_with("172.19.")
-        || host.starts_with("172.2")
-        || host.starts_with("172.30.")
-        || host.starts_with("172.31.")
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => is_private_ipv4(addr),
+        Ok(IpAddr::V6(_)) | Err(_) => false,
+    }
+}
+
+fn is_private_ipv4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const CONFIG: &str = r#"
 version = 1
@@ -273,6 +277,36 @@ endpoint = "http://example.com:8080"
 "#,
         )
         .unwrap_err();
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn local_http_endpoint_validation_allows_only_loopback_by_default() {
+        validate_local_http_endpoint("http://127.0.0.1:8787", &json!({})).unwrap();
+        validate_local_http_endpoint("http://localhost:8787", &json!({})).unwrap();
+        validate_local_http_endpoint("http://[::1]:8787", &json!({})).unwrap();
+
+        let err = validate_local_http_endpoint("https://127.0.0.1:8787", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("must use http"));
+
+        let err = validate_local_http_endpoint("http://0.0.0.0:8787", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("loopback"));
+
+        let err = validate_local_http_endpoint("http://192.168.1.20:8787", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn local_http_endpoint_can_explicitly_allow_private_ipv4() {
+        let options = json!({"allow_private_host": true});
+        validate_local_http_endpoint("http://10.0.0.2:8787", &options).unwrap();
+        validate_local_http_endpoint("http://172.16.0.2:8787", &options).unwrap();
+        validate_local_http_endpoint("http://172.31.0.2:8787", &options).unwrap();
+        validate_local_http_endpoint("http://192.168.1.20:8787", &options).unwrap();
+
+        let err = validate_local_http_endpoint("http://172.32.0.2:8787", &options).unwrap_err();
+        assert!(err.to_string().contains("loopback"));
+        let err = validate_local_http_endpoint("http://172.200.0.2:8787", &options).unwrap_err();
         assert!(err.to_string().contains("loopback"));
     }
 }

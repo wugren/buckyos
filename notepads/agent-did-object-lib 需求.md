@@ -56,6 +56,8 @@ unsubscribe_event(subscription)   -> stop / release local bridge subscription
 
 本库不把 Object Event 持久化为真相源。KEvent 是本地 fanout / wakeup 通道，不是远端 event 的 durable delivery 存储。
 
+本库不要求 Event 具备 MQ 语义。第一版所有 object event 都按 best-effort accelerator 处理，用于唤醒 session、提示 cache invalidation 和触发后续 `read()` 刷新；不要求 adapter 实现 ack、backlog、重投、顺序一致性或跨重启补齐。若未来需要可靠事件，应作为单独的 durable event / MQ 能力设计，而不是当前 Event Bridge 的默认语义。
+
 本库第一版不实现新的 Agent Tool CLI。它必须提供可被 `x-call` / `agent_tool` / `opendan` 以及其他独立工具进程调用的 Rust API 和配置加载能力。
 
 ---
@@ -925,16 +927,33 @@ POST /adapter/events/unsubscribe
 
 本地 HTTP Adapter 的 event subscription 有两种模式：
 
-1. 返回已经桥接到 KEvent 的 `kevent_pattern`，由用户 adapter 自己负责发布 KEvent。
-2. 返回 WebSocket event endpoint 信息，由本库 `ObjectEventBridge` 负责连接和发布 KEvent。
+1. 返回已经桥接到 KEvent 的 `kevent_pattern`，由用户 adapter 自己负责 best-effort 发布 KEvent。
+2. 返回 WebSocket event endpoint 信息，由本库 `ObjectEventBridge` 负责创建真实 subscription、维持连接并 best-effort 发布 KEvent。
 
 第一版必须至少支持模式 1；模式 2 可复用 DID Object event bridge。
+
+这两种模式都不要求本地 HTTP adapter 提供 MQ 语义。adapter 不需要维护可靠队列、ack 状态、补投 backlog 或跨进程重放；事件只用于加速 Runtime / Agent Session 重新读取对象状态。
 
 ---
 
 ## 11. Event 到 KEvent 的桥接
 
 DID Object Protocol 的 event wire binding 是 WebSocket；BuckyOS 内部 Agent Session 使用 KEvent 作为 wakeup / fanout。`agent-did-object-lib` 需要桥接二者。
+
+Event Bridge 的核心目标是在 Runtime 内创建和管理真实 subscription，并把收到的 EventFrame 发布为本地 KEvent。KEvent 只承担本地 wakeup / fanout，不是 MQ；EventFrame 丢失时，恢复路径是根据 `refresh_hints` / `invalidated_objects` 重新 `read()` 对象状态，而不是 replay 事件流。
+
+### 11.0 Delivery 语义
+
+第一版 Event Bridge 只要求 best-effort delivery：
+
+- 不保证每个事件都送达。
+- 不保证事件严格有序。
+- 不要求 adapter 保存 backlog。
+- 不要求 ack / retry-until-delivered。
+- 不要求跨 Runtime 重启恢复未送达事件。
+- cursor 只作为断线后尽力恢复和丢失检测 hint，不能被上层当作 MQ offset。
+
+因此 adapter 只需要实现事件源或订阅入口，降低实现负担。可靠事件、持久订阅和 MQ-style delivery 如果需要，应作为后续独立能力建模。
 
 ### 11.1 启动条件
 
@@ -989,8 +1008,8 @@ pub enum BridgeState {
 
 - connect / subscribe 失败：返回 subscribe error，不创建本地 subscription。
 - active 后断线：进入重连，指数退避，上限 30s。
-- cursor 可用时带 cursor resume。
-- cursor 失效时发布一次 KEvent，payload 标记 `cursor_expired` 并附带 `refresh_hints`。
+- cursor 可用时可以带 cursor 尽力 resume，但不承诺补齐所有断线期间事件。
+- cursor 失效或检测到可能丢失事件时发布一次 KEvent，payload 标记 `cursor_expired` 并附带 `refresh_hints`，提示上层重新 `read()`。
 - unsubscribe 失败不阻塞本地取消，但必须记录到 error / log。
 
 ### 11.4 KEvent event id
@@ -1036,9 +1055,9 @@ payload 必须包含原始 frame：
 
 ### 11.5 与 OpenDAN Session Event Pump 的关系
 
-本库只发布 KEvent 并返回 `kevent_pattern`。OpenDAN 的 session event pump 负责订阅 pattern、fanout 到 session、持久化 session subscription。
+本库只发布 KEvent 并返回 `kevent_pattern`。OpenDAN 的 session event pump 负责订阅 pattern、fanout 到 session、持久化 session subscription intent。
 
-本库不直接写 OpenDAN session meta。
+本库不直接写 OpenDAN session meta。即使 OpenDAN 持久化了 session subscription，也只表示 session 重启后可以重新订阅事件源；不表示事件消息被持久化或会被补投。
 
 ---
 
@@ -1226,4 +1245,4 @@ cargo test
 2. DID 输入的完整 resolver route 依赖 `NameClient` / provider 细节，第一版可以先把 DID route 留给 adapter 或返回明确错误。
 3. `read()` 的 Agent-facing 文本输出未来可能需要根据 LLM context compression 再调整；第一版先保持段落结构稳定且可测试。
 4. 本地 HTTP adapter 的安全策略第一版只允许 loopback；如果未来允许远端 adapter，需要单独设计 auth / permission。
-5. Event bridge 不做 durable delivery。若需要跨重启恢复 subscription，应由 OpenDAN session meta 或后续 durable schema 任务处理。
+5. Event bridge 不做 durable delivery。若需要跨重启恢复 subscription intent，应由 OpenDAN session meta 处理；若需要可靠事件或 MQ-style replay，应另起 durable event / MQ schema 任务。

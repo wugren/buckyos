@@ -681,13 +681,15 @@ EventFrame：
 
 Subscription MUST 有 `expires_at`。Runtime SHOULD 在过期前 renew。Provider MAY 拒绝过长 TTL。订阅过期后 Provider SHOULD 停止发送事件并释放资源。
 
-v1 Runtime MUST 支持 `best_effort`。Provider MAY 支持 `at_least_once` 或 `durable`。支持 cursor resume 时，Provider SHOULD 允许 subscribe 携带 `cursor`；cursor 失效时返回 `cursor_expired` error 和 `refresh_hints`。
+v1 Event delivery 只要求 `best_effort`。Event 是对象状态刷新和 session wakeup 的 accelerator，不是 MQ；协议不要求 Provider 或 Adapter 维护 backlog、ack 状态、重投队列、严格顺序或跨重启补齐。支持 cursor resume 时，Provider MAY 允许 subscribe 携带 `cursor`，但 cursor 只表示尽力恢复和丢失检测 hint，不能被上层当作 MQ offset。cursor 失效或检测到可能丢失事件时，Provider SHOULD 返回 `cursor_expired` error 和 `refresh_hints`，提示 Runtime 重新读取对象状态。
+
+`at_least_once`、`durable` 或 MQ-style replay 不属于 v1 Event Bridge 的默认语义。如果后续需要可靠事件，应作为独立 durable event / MQ 能力设计，而不是要求普通 DID Object Adapter 默认实现。
 
 当前 `ObjectProfile::event_endpoint()` 已能把 event form 的 `href` 或默认 `events` endpoint 解析为 `ws://` / `wss://` URL，但还没有 event subscribe client。
 
 ### 10.1 KEvent bridge
 
-远端 Provider 不直接控制本地 KEvent。本地 Object Event Runtime 接收远端 EventFrame 后，MAY 发布到本地 KEvent 用于 fanout / wakeup。
+远端 Provider 不直接控制本地 KEvent。本地 Object Event Runtime 接收远端 EventFrame 后，MAY 发布到本地 KEvent 用于 fanout / wakeup。KEvent bridge 不提供 durable delivery；EventFrame 丢失后的恢复路径是根据 `refresh_hints` / `invalidated_objects` 重新读取对象状态，而不是 replay 事件流。
 
 不要把 Object URL 原样塞入 KEvent event id。Runtime 应编码成合法 path：
 
