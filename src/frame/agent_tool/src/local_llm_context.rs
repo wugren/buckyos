@@ -1247,6 +1247,7 @@ impl LocalDirToolManager {
             step_idx: 0,
             wakeup_id: String::new(),
             session_id: run_id,
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
         };
         Ok(Self {
             workspace,

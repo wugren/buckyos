@@ -287,6 +287,7 @@ pub async fn run_fork_sub_context(input: ForkSubContextInput<'_>) -> Result<Cont
         step_idx: parent_snap.state.steps.len() as u32,
         wakeup_id: String::new(),
         session_id: session_id.to_string(),
+        read_token_limit: agent_tool::DEFAULT_READ_TOKEN_LIMIT,
     };
     let deps = build_session_deps(
         runtime,

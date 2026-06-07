@@ -863,6 +863,7 @@ mod tests {
             step_idx: 0,
             wakeup_id: "wakeup-1".to_string(),
             session_id: session_id.to_string(),
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
         }
     }
 

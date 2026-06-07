@@ -8,12 +8,11 @@
 //! `event://`, `http://`, `mcp://...`) get added by extending the dispatch
 //! table in [`ReadTool::call`].
 //!
-//! Compared with the legacy CLI-oriented `read_file`, this tool is
-//! byte-oriented and intentionally does *not* truncate within the requested
-//! window — its existence reason is "bypass the `exec_bash` `max_output_bytes`
-//! clipping when the model genuinely needs to read a large file in chunks."
+//! Compared with the legacy CLI-oriented `read_file`, this tool reads text
+//! content with line-based pagination so the model can page through structured
+//! data deterministically.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
@@ -31,15 +30,6 @@ use crate::{
 
 pub const TOOL_READ: &str = "read";
 
-/// Default `limit` when caller omits it. Picked to be slightly larger than
-/// the typical exec_bash output clip (256 KiB) so the tool is useful as a
-/// "give me the next chunk" loop, but bounded so a single call can't blow
-/// the context.
-const DEFAULT_LIMIT_BYTES: u64 = 64 * 1024;
-
-/// Hard cap on a single read regardless of `limit`. 4 MiB is enough for any
-/// realistic single-shot file slice; anything bigger should paginate.
-const MAX_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const READ_UNCHANGED_MESSAGE: &str = "和上一次read相比没有变化";
 
 #[derive(Clone, Debug)]
@@ -58,23 +48,23 @@ impl AgentTool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_READ.to_string(),
-            description: "Read everything by uri.".to_string(),
+            description: "Read structured data by uri and return LLM-readable text.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
                     "uri": {
                         "type": "string",
-                        "description": "Target to read. Bare paths default to file reads; "
+                        "description": "Structured data target to read. Bare paths default to file reads."
                     },
                     "offset": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Byte offset to start reading at; defaults to 0."
+                        "description": "Line offset to start reading at; defaults to 0."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Max bytes to read. Capped at 4 MiB; default 64 KiB."
+                        "description": "Max lines to read."
                     }
                 },
                 "required": ["uri"]
@@ -87,14 +77,17 @@ impl AgentTool for ReadTool {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
                     "offset": {"type": "integer"},
-                    "bytes_read": {"type": "integer"},
-                    "total_bytes": {"type": "integer"},
+                    "limit": {"type": ["integer", "null"]},
+                    "lines_read": {"type": "integer"},
+                    "total_lines": {"type": "integer"},
                     "eof": {"type": "boolean"},
-                    "unchanged": {"type": "boolean"}
+                    "unchanged": {"type": "boolean"},
+                    "token_limit": {"type": "integer"},
+                    "token_truncated": {"type": "boolean"}
                 }
             }),
             usage: Some(format!(
-                "{TOOL_READ} uri=\"<path-or-uri>\" [offset=<bytes>] [limit=<bytes>]"
+                "{TOOL_READ} uri=\"<path-or-uri>\" [offset=<line>] [limit=<lines>]"
             )),
         }
     }
@@ -127,9 +120,7 @@ impl AgentTool for ReadTool {
             .to_string();
 
         let offset = parse_u64_arg(map.get("offset"), "offset")?.unwrap_or(0);
-        let limit = parse_u64_arg(map.get("limit"), "limit")?
-            .unwrap_or(DEFAULT_LIMIT_BYTES)
-            .clamp(1, MAX_LIMIT_BYTES);
+        let limit = parse_u64_arg(map.get("limit"), "limit")?;
 
         let target = parse_read_target(&uri)?;
         match target.scheme.as_str() {
@@ -176,7 +167,7 @@ impl ReadTool {
         uri: &str,
         path_str: &str,
         offset: u64,
-        limit: u64,
+        limit: Option<u64>,
     ) -> Result<AgentToolResult, AgentToolError> {
         let resolved = self.resolve_file_read_path(path_str)?;
         if !resolved.exists() {
@@ -193,107 +184,120 @@ impl ReadTool {
                 resolved.display()
             )));
         }
-        let total = metadata.len();
-        let read_start = offset.min(total);
-        let want = limit.min(total.saturating_sub(read_start));
         let content_hash = hash_file_content(&resolved)?;
+        let content = std::fs::read_to_string(&resolved).map_err(|e| {
+            AgentToolError::InvalidArgs(format!(
+                "read target must be UTF-8 text for LLM consumption: {} ({e})",
+                resolved.display()
+            ))
+        })?;
+        let line_window = build_line_window(&content, offset, limit);
         let read_key = ReadStateKey {
             path: resolved.to_string_lossy().to_string(),
-            offset: read_start,
+            offset: line_window.offset,
             limit,
         };
-        let unchanged =
-            detect_and_update_read_state(ctx.session_id.as_str(), &read_key, total, &content_hash)
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "read_tool.state_update_failed: session_id={} path={} err={}",
-                        ctx.session_id,
-                        resolved.display(),
-                        err
-                    );
-                    false
-                });
+        let unchanged = detect_and_update_read_state(
+            ctx.session_id.as_str(),
+            &read_key,
+            line_window.total_lines,
+            &content_hash,
+        )
+        .unwrap_or_else(|err| {
+            warn!(
+                "read_tool.state_update_failed: session_id={} path={} err={}",
+                ctx.session_id,
+                resolved.display(),
+                err
+            );
+            false
+        });
+        let token_limit = ctx.effective_read_token_limit();
         if unchanged {
-            let eof = read_start >= total || read_start.saturating_add(want) >= total;
             let cmd_line = build_read_cmd_line(uri, offset, limit);
             let details = json!({
                 "uri": uri,
                 "scheme": "file",
                 "path": resolved.to_string_lossy().to_string(),
                 "content": READ_UNCHANGED_MESSAGE,
-                "offset": read_start,
-                "bytes_read": 0u64,
-                "total_bytes": total,
-                "eof": eof,
+                "offset": line_window.offset,
+                "limit": limit,
+                "lines_read": 0u64,
+                "total_lines": line_window.total_lines,
+                "eof": line_window.eof,
                 "unchanged": true,
+                "token_limit": token_limit,
+                "token_truncated": false,
             });
             return Ok(
                 build_builtin_tool_result(details, cmd_line, READ_UNCHANGED_MESSAGE)
                     .with_tool(TOOL_READ)
                     .with_status(AgentToolStatus::Success)
                     .with_title(format!(
-                        "read {uri} => read 0 bytes{}",
-                        if eof { " (EOF)" } else { "" }
+                        "read {uri} => read 0 lines{}",
+                        if line_window.eof { " (EOF)" } else { "" }
                     ))
                     .with_output(READ_UNCHANGED_MESSAGE),
             );
         }
-        let bytes_to_read = usize::try_from(want).map_err(|_| {
-            AgentToolError::InvalidArgs(format!(
-                "requested read size exceeds usize on this platform: {want} bytes"
-            ))
-        })?;
-
-        let mut buf = vec![0u8; bytes_to_read];
-        if bytes_to_read > 0 {
-            let mut file = std::fs::File::open(&resolved)
-                .map_err(|e| AgentToolError::ExecFailed(format!("open failed: {e}")))?;
-            file.seek(SeekFrom::Start(read_start))
-                .map_err(|e| AgentToolError::ExecFailed(format!("seek failed: {e}")))?;
-            file.read_exact(&mut buf)
-                .map_err(|e| AgentToolError::ExecFailed(format!("read failed: {e}")))?;
-        }
-        let content = String::from_utf8_lossy(&buf).into_owned();
-        let actual_bytes = buf.len() as u64;
-        let eof = read_start + actual_bytes >= total;
+        let limited = apply_token_limit(&line_window.content, token_limit);
 
         let cmd_line = build_read_cmd_line(uri, offset, limit);
         let summary = format!(
-            "read {actual_bytes} bytes at offset {read_start} of {total}{}",
-            if eof { " (EOF)" } else { "" }
+            "read {} lines at offset {} of {}{}{}",
+            line_window.lines_read,
+            line_window.offset,
+            line_window.total_lines,
+            if line_window.eof { " (EOF)" } else { "" },
+            if limited.truncated {
+                " (token truncated)"
+            } else {
+                ""
+            }
         );
         let title = format!(
-            "read {uri} => read {actual_bytes} bytes{}",
-            if eof { " (EOF)" } else { "" }
+            "read {uri} => read {} lines{}{}",
+            line_window.lines_read,
+            if line_window.eof { " (EOF)" } else { "" },
+            if limited.truncated {
+                " (token truncated)"
+            } else {
+                ""
+            }
         );
         let details = json!({
             "uri": uri,
             "scheme": "file",
             "path": resolved.to_string_lossy().to_string(),
-            "content": content,
-            "offset": read_start,
-            "bytes_read": actual_bytes,
-            "total_bytes": total,
-            "eof": eof,
+            "content": limited.content,
+            "offset": line_window.offset,
+            "limit": limit,
+            "lines_read": line_window.lines_read,
+            "total_lines": line_window.total_lines,
+            "eof": line_window.eof,
             "unchanged": false,
+            "token_limit": token_limit,
+            "token_truncated": limited.truncated,
         });
 
         let mut result = build_builtin_tool_result(details, cmd_line, summary)
             .with_tool(TOOL_READ)
             .with_status(AgentToolStatus::Success)
             .with_title(title);
-        if !content.is_empty() {
-            result = result.with_output(content);
+        if !limited.content.is_empty() {
+            result = result.with_output(limited.content);
         }
         Ok(result)
     }
 }
 
-fn build_read_cmd_line(uri: &str, offset: u64, limit: u64) -> String {
-    if offset == 0 && limit == DEFAULT_LIMIT_BYTES {
+fn build_read_cmd_line(uri: &str, offset: u64, limit: Option<u64>) -> String {
+    if offset == 0 && limit.is_none() {
         format!("read {uri}")
-    } else {
+    } else if let Some(limit) = limit {
         format!("read {uri} offset={offset} limit={limit}")
+    } else {
+        format!("read {uri} offset={offset}")
     }
 }
 
@@ -301,15 +305,15 @@ fn build_read_cmd_line(uri: &str, offset: u64, limit: u64) -> String {
 struct ReadStateKey {
     path: String,
     offset: u64,
-    limit: u64,
+    limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ReadStateRecord {
     path: String,
     offset: u64,
-    limit: u64,
-    total_bytes: u64,
+    limit: Option<u64>,
+    total_lines: u64,
     content_hash: String,
 }
 
@@ -333,7 +337,7 @@ fn hash_file_content(path: &Path) -> Result<String, AgentToolError> {
 fn detect_and_update_read_state(
     session_id: &str,
     key: &ReadStateKey,
-    total_bytes: u64,
+    total_lines: u64,
     content_hash: &str,
 ) -> Result<bool, AgentToolError> {
     let session_id = session_id.trim();
@@ -348,14 +352,14 @@ fn detect_and_update_read_state(
         record.path == key.path
             && record.offset == key.offset
             && record.limit == key.limit
-            && record.total_bytes == total_bytes
+            && record.total_lines == total_lines
             && record.content_hash == content_hash
     });
     let record = ReadStateRecord {
         path: key.path.clone(),
         offset: key.offset,
         limit: key.limit,
-        total_bytes,
+        total_lines,
         content_hash: content_hash.to_string(),
     };
     if let Some(parent) = state_path.parent() {
@@ -375,7 +379,7 @@ fn detect_and_update_read_state(
 
 fn read_state_path(session_id: &str, key: &ReadStateKey) -> PathBuf {
     let session_hash = blake3::hash(session_id.as_bytes()).to_hex().to_string();
-    let key_hash = blake3::hash(format!("{}:{}:{}", key.path, key.offset, key.limit).as_bytes())
+    let key_hash = blake3::hash(format!("{}:{}:{:?}", key.path, key.offset, key.limit).as_bytes())
         .to_hex()
         .to_string();
     std::env::temp_dir()
@@ -383,6 +387,69 @@ fn read_state_path(session_id: &str, key: &ReadStateKey) -> PathBuf {
         .join("read_state")
         .join(session_hash)
         .join(format!("{key_hash}.json"))
+}
+
+struct LineWindow {
+    content: String,
+    offset: u64,
+    lines_read: u64,
+    total_lines: u64,
+    eof: bool,
+}
+
+fn build_line_window(content: &str, offset: u64, limit: Option<u64>) -> LineWindow {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total_lines = lines.len() as u64;
+    let start = offset.min(total_lines);
+    let remaining = total_lines.saturating_sub(start);
+    let lines_read = limit.unwrap_or(remaining).min(remaining);
+    let end = start.saturating_add(lines_read);
+    let mut window = String::new();
+    for line in &lines[start as usize..end as usize] {
+        window.push_str(line);
+    }
+    LineWindow {
+        content: window,
+        offset: start,
+        lines_read,
+        total_lines,
+        eof: end >= total_lines,
+    }
+}
+
+struct TokenLimitedText {
+    content: String,
+    truncated: bool,
+}
+
+fn apply_token_limit(content: &str, token_limit: u32) -> TokenLimitedText {
+    let token_limit = token_limit.max(1);
+    let mut used = 0u32;
+    let mut out = String::new();
+    let mut truncated = false;
+
+    for line in content.split_inclusive('\n') {
+        let line_tokens = estimate_text_tokens(line);
+        if used.saturating_add(line_tokens) > token_limit {
+            truncated = true;
+            if out.is_empty() {
+                let max_chars = token_limit.saturating_mul(4) as usize;
+                out = line.chars().take(max_chars).collect();
+            }
+            break;
+        }
+        used = used.saturating_add(line_tokens);
+        out.push_str(line);
+    }
+
+    TokenLimitedText {
+        content: out,
+        truncated,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
+    ((text.chars().count() as u32).saturating_add(3) / 4).max(1)
 }
 
 /// Pull a non-negative integer out of args. Accepts either a JSON number or
@@ -488,6 +555,14 @@ mod tests {
             step_idx: 0,
             wakeup_id: "w".into(),
             session_id: session_id.into(),
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
+        }
+    }
+
+    fn ctx_with_read_token_limit(read_token_limit: u32) -> SessionRuntimeContext {
+        SessionRuntimeContext {
+            read_token_limit,
+            ..ctx_with_session("token-limited-read-session")
         }
     }
 
@@ -512,7 +587,8 @@ mod tests {
             .expect("call");
         assert_eq!(res.status, AgentToolStatus::Success);
         assert_eq!(res.details["content"], "hello world\n");
-        assert_eq!(res.details["bytes_read"], 12);
+        assert_eq!(res.details["lines_read"], 1);
+        assert_eq!(res.details["total_lines"], 1);
         assert_eq!(res.details["eof"], true);
     }
 
@@ -563,10 +639,10 @@ mod tests {
 
     #[tokio::test]
     async fn offset_and_limit_paginate() {
-        let (_dir, ws) = ws_with_file("big.txt", b"abcdefghijklmnop");
+        let (_dir, ws) = ws_with_file("big.txt", b"a\nb\nc\nd\ne\nf\ng\nh\n");
         let tool = ReadTool::new(FileToolConfig::new(ws.clone()));
 
-        // First chunk: bytes 0..4
+        // First chunk: lines 0..4
         let res = tool
             .call(
                 &ctx(),
@@ -578,10 +654,11 @@ mod tests {
             )
             .await
             .expect("call");
-        assert_eq!(res.details["content"], "abcd");
+        assert_eq!(res.details["content"], "a\nb\nc\nd\n");
+        assert_eq!(res.details["lines_read"], 4);
         assert_eq!(res.details["eof"], false);
 
-        // Second chunk: bytes 4..8
+        // Second chunk: lines 4..8
         let res = tool
             .call(
                 &ctx(),
@@ -593,7 +670,7 @@ mod tests {
             )
             .await
             .expect("call");
-        assert_eq!(res.details["content"], "efgh");
+        assert_eq!(res.details["content"], "e\nf\ng\nh\n");
 
         // Past-EOF read returns empty content (not error).
         let res = tool
@@ -608,14 +685,14 @@ mod tests {
             .await
             .expect("call");
         assert_eq!(res.details["content"], "");
-        assert_eq!(res.details["bytes_read"], 0);
+        assert_eq!(res.details["lines_read"], 0);
         assert_eq!(res.details["eof"], true);
     }
 
     #[tokio::test]
     async fn string_offset_limit_from_xml_attrs_works() {
         // The v2 XML parser supplies attribute values as JSON strings.
-        let (_dir, ws) = ws_with_file("s.txt", b"abcdef");
+        let (_dir, ws) = ws_with_file("s.txt", b"a\nb\nc\nd\ne\n");
         let tool = ReadTool::new(FileToolConfig::new(ws.clone()));
         let res = tool
             .call(
@@ -628,7 +705,25 @@ mod tests {
             )
             .await
             .expect("call");
-        assert_eq!(res.details["content"], "bcd");
+        assert_eq!(res.details["content"], "b\nc\nd\n");
+    }
+
+    #[tokio::test]
+    async fn session_read_token_limit_truncates_text_output() {
+        let (_dir, ws) = ws_with_file("s.txt", b"abcdefgh\nijklmnop\nqrstuvwx\n");
+        let tool = ReadTool::new(FileToolConfig::new(ws.clone()));
+        let res = tool
+            .call(
+                &ctx_with_read_token_limit(3),
+                json!({
+                    "uri": format!("file://{}/s.txt", ws.to_string_lossy()),
+                }),
+            )
+            .await
+            .expect("call");
+        assert_eq!(res.details["content"], "abcdefgh\n");
+        assert_eq!(res.details["token_limit"], 3);
+        assert_eq!(res.details["token_truncated"], true);
     }
 
     #[tokio::test]

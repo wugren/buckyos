@@ -52,7 +52,7 @@ use agent_tool::{
     DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, EditFileTool, FileToolConfig,
     GetSessionTool, GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext,
     SessionRuntimeContext, SessionViewBackend, TodoTool, TodoToolConfig, ToolCtx, TypedTool,
-    WorkspaceToolBackend, WriteFileTool,
+    WorkspaceToolBackend, WriteFileTool, DEFAULT_READ_TOKEN_LIMIT,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
 use chrono::{DateTime, Duration, Utc};
@@ -174,6 +174,7 @@ impl CliRuntimeEnv {
                 step_idx: 0,
                 wakeup_id: DEFAULT_WAKEUP_ID.to_string(),
                 session_id,
+                read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
             },
         })
     }
@@ -6614,6 +6615,7 @@ mod tests {
                 step_idx: 0,
                 wakeup_id: "wakeup-test".to_string(),
                 session_id: "session-test".to_string(),
+                read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
             },
         }
     }
@@ -6641,6 +6643,7 @@ mod tests {
                 step_idx: 0,
                 wakeup_id: "wakeup-test".to_string(),
                 session_id: "session-test".to_string(),
+                read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
             },
         }
     }

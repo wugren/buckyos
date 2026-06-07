@@ -187,7 +187,9 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 - 读取文件
 - 支持 `file://` 显式文件 URI
 - 支持无协议头路径，默认按文件路径处理
-- 支持 byte offset / limit 分页
+- 读取结构化数据并返回 LLM 可处理的文本
+- 支持 line offset / limit 分页
+- token limit 是 session 属性，默认 20K，不是本函数参数
 
 输入：
 
@@ -202,7 +204,7 @@ legacy CLI `read_file` 在 CLI 下存在一个特例：
 action 形式：
 
 ```xml
-<read uri="src/foo.rs" offset="0" limit="4096"/>
+<read uri="src/foo.rs" offset="0" limit="200"/>
 ```
 
 detail 关键字段：
@@ -210,10 +212,13 @@ detail 关键字段：
 
 - `content`
 - `offset`
-- `bytes_read`
-- `total_bytes`
+- `limit`
+- `lines_read`
+- `total_lines`
 - `eof`
 - `unchanged`
+- `token_limit`
+- `token_truncated`
 
 同一个 `session_id` 中，对同一个文件、同一 `offset/limit` 窗口重复 `read` 时，如果文件内容和上一次相比没有变化，`detail.content` 和顶层 `output` 返回 `和上一次read相比没有变化`，`detail.unchanged` 为 `true`。状态文件保存在系统临时目录下。
 
@@ -222,7 +227,7 @@ detail 关键字段：
 
 - 顶层固定字段至少包含 `agent_tool_protocol / status / cmd_name / cmd_args / title / summary`
 - `cmd_name` 应为 `read`
-- `cmd_args` 应渲染成 bash 风格参数文本，例如 `src/foo.rs offset=0 limit=4096`
+- `cmd_args` 应渲染成 bash 风格参数文本，例如 `src/foo.rs offset=0 limit=200`
 - 读取结果放 `detail.content`
 - `summary` 提供读取字节数、offset、total 和 EOF 状态
 

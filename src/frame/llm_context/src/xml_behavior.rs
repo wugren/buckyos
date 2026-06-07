@@ -91,7 +91,7 @@ ifconfig
       <old_string><![CDATA[println!("hello");]]></old_string>
       <new_string><![CDATA[println!("hi");]]></new_string>
     </edit_file>
-    <read uri="src/foo.rs" offset="0" limit="4096"/>
+    <read uri="src/foo.rs" offset="0" limit="200"/>
     <sendmsg><![CDATA[
 Message to the user; optional; SHOULD only be provided when there is important progress or user input is required.
     ]]></sendmsg>

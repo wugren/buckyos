@@ -132,6 +132,24 @@ pub struct SessionRuntimeContext {
     pub step_idx: u32,
     pub wakeup_id: String,
     pub session_id: String,
+    #[serde(default = "default_read_token_limit")]
+    pub read_token_limit: u32,
+}
+
+pub const DEFAULT_READ_TOKEN_LIMIT: u32 = 20 * 1024;
+
+fn default_read_token_limit() -> u32 {
+    DEFAULT_READ_TOKEN_LIMIT
+}
+
+impl SessionRuntimeContext {
+    pub fn effective_read_token_limit(&self) -> u32 {
+        if self.read_token_limit == 0 {
+            DEFAULT_READ_TOKEN_LIMIT
+        } else {
+            self.read_token_limit
+        }
+    }
 }
 
 pub const TOOL_GET_SESSION: &str = "get_session";
@@ -2649,6 +2667,7 @@ mod tests {
             step_idx: 3,
             wakeup_id: "wake-1".to_string(),
             session_id: "session-1".to_string(),
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
         }
     }
 

@@ -192,26 +192,26 @@ JSON 调度形态：
 
 ## 2. `read`
 
-v2 Behavior 协议的 `<read uri="..."/>` 规范读取工具。仅实现 `file://` scheme，bare path 等价于 `file://`，其他 scheme 返回 `InvalidArgs`。
+v2 Behavior 协议的 `<read uri="..."/>` 规范读取工具。读取目标必定是结构化数据，返回内容必定是 LLM 可处理的文本。当前仅实现 `file://` scheme，bare path 等价于 `file://`，其他 scheme 返回 `InvalidArgs`。
 
 ### Prompt
 
-- `description`: `Read everything by uri.`
+- `description`: `Read structured data by uri and return LLM-readable text.`
 - `args_schema`:
   ```json
   {
     "type": "object",
     "properties": {
-      "uri":    { "type": "string",  "description": "Target to read. Bare paths default to file reads;" },
-      "offset": { "type": "integer", "minimum": 0, "description": "Byte offset to start reading at; defaults to 0." },
-      "limit":  { "type": "integer", "minimum": 1, "description": "Max bytes to read. Capped at 4 MiB; default 64 KiB." }
+      "uri":    { "type": "string",  "description": "Structured data target to read. Bare paths default to file reads." },
+      "offset": { "type": "integer", "minimum": 0, "description": "Line offset to start reading at; defaults to 0." },
+      "limit":  { "type": "integer", "minimum": 1, "description": "Max lines to read." }
     },
     "required": ["uri"]
   }
   ```
-- `usage`: `read uri="<path-or-uri>" [offset=<bytes>] [limit=<bytes>]`
+- `usage`: `read uri="<path-or-uri>" [offset=<line>] [limit=<lines>]`
 
-byte-oriented，单次最多 4 MiB，不在窗口内做截断。同 session + 同窗口的重复 read，命中"未变化"短路时 `detail.unchanged = true` 且 `content` 替换为 `和上一次read相比没有变化`，状态文件落在系统临时目录。
+`offset` 是 0-based 行位置，`limit` 是行数。原 token limit 不再是本函数参数，而是 session 属性 `read_token_limit`，默认 20K；返回内容超过该预算时会设置 `detail.token_truncated = true`。同 session + 同窗口的重复 read，命中"未变化"短路时 `detail.unchanged = true` 且 `content` 替换为 `和上一次read相比没有变化`，状态文件落在系统临时目录。
 
 ### Bash 支持
 
@@ -226,17 +226,17 @@ read src/foo.rs
 # 显式 URI
 read uri=file:///workspace/demo.txt
 
-# 分段读：先头 4 KB
-read src/big.log offset=0 limit=4096
+# 分段读：先头 200 行
+read src/big.log offset=0 limit=200
 
 # 翻下一页
-read src/big.log offset=4096 limit=4096
+read src/big.log offset=200 limit=200
 ```
 
 XML action 形态：
 
 ```xml
-<read uri="src/foo.rs" offset="0" limit="4096"/>
+<read uri="src/foo.rs" offset="0" limit="200"/>
 ```
 
 ### 输出示例
@@ -246,19 +246,22 @@ XML action 形态：
   "agent_tool_protocol": "1",
   "status": "success",
   "cmd_name": "read",
-  "cmd_args": "file:///workspace/demo.txt offset=0 limit=4096",
-  "title": "read file:///workspace/demo.txt => read 1234 bytes (EOF)",
-  "summary": "read 1234 bytes at offset 0 of 1234 (EOF)",
+  "cmd_args": "file:///workspace/demo.txt offset=0 limit=200",
+  "title": "read file:///workspace/demo.txt => read 50 lines (EOF)",
+  "summary": "read 50 lines at offset 0 of 50 (EOF)",
   "detail": {
     "uri": "file:///workspace/demo.txt",
     "scheme": "file",
     "path": "/workspace/demo.txt",
     "content": "...",
     "offset": 0,
-    "bytes_read": 1234,
-    "total_bytes": 1234,
+    "limit": 200,
+    "lines_read": 50,
+    "total_lines": 50,
     "eof": true,
-    "unchanged": false
+    "unchanged": false,
+    "token_limit": 20480,
+    "token_truncated": false
   }
 }
 ```
@@ -270,9 +273,9 @@ XML action 形态：
   "agent_tool_protocol": "1",
   "status": "success",
   "cmd_name": "read",
-  "title": "read src/foo.rs => read 0 bytes",
+  "title": "read src/foo.rs => read 0 lines",
   "output": "和上一次read相比没有变化",
-  "detail": { "content": "和上一次read相比没有变化", "bytes_read": 0, "unchanged": true, "eof": false, "offset": 0, "total_bytes": 1234 }
+  "detail": { "content": "和上一次read相比没有变化", "lines_read": 0, "unchanged": true, "eof": false, "offset": 0, "limit": 200, "total_lines": 50 }
 }
 ```
 

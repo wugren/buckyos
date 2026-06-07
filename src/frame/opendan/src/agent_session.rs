@@ -19,7 +19,9 @@ use tokio::time::{timeout, Duration};
 
 use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput};
 use agent_tool::todo_tools::read_todo_records;
-use agent_tool::{llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord};
+use agent_tool::{
+    llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord, DEFAULT_READ_TOKEN_LIMIT,
+};
 use agent_tool::{AgentMemory, AgentMemoryConfig, LoadOptions};
 use llm_context::{
     behavior_loop::{
@@ -2172,6 +2174,7 @@ impl AgentSession {
             step_idx: snapshot.state.steps.len() as u32,
             wakeup_id: String::new(),
             session_id: self.session_id.clone(),
+            read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
         };
         let from_user_did = self.current_from_user_did().await;
         let mut deps = build_session_deps(
@@ -2416,6 +2419,7 @@ impl AgentSession {
             step_idx: snap_winddown.state.steps.len() as u32,
             wakeup_id: String::new(),
             session_id: self.session_id.clone(),
+            read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
         };
         let from_user_did = self.current_from_user_did().await;
         let mut deps = build_session_deps(
@@ -3469,6 +3473,7 @@ impl AgentSession {
                     step_idx: snapshot.state.steps.len() as u32,
                     wakeup_id: String::new(),
                     session_id: self.session_id.clone(),
+                    read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
                 },
                 snapshot_path: self.state_snap_path.clone(),
                 approval_required: behavior.capabilities.approval_required.clone(),
@@ -3728,6 +3733,7 @@ impl AgentSession {
             step_idx: 0,
             wakeup_id: String::new(),
             session_id: self.session_id.clone(),
+            read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
         };
         let parser_renderer = behavior.build_parser_and_renderer(self.session_class_loop_mode());
         let preserve_behavior_state = parser_renderer.is_some();

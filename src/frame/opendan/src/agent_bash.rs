@@ -995,6 +995,7 @@ mod tests {
             step_idx: 0,
             wakeup_id: "w".into(),
             session_id: sid.to_string(),
+            read_token_limit: agent_tool::DEFAULT_READ_TOKEN_LIMIT,
         }
     }
 
@@ -1214,6 +1215,7 @@ mod tests {
             step_idx: 7,
             wakeup_id: "wake-1".into(),
             session_id: "session-real".into(),
+            read_token_limit: agent_tool::DEFAULT_READ_TOKEN_LIMIT,
         };
         let env = runtime_exec_env(
             &[

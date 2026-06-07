@@ -69,13 +69,46 @@ Agent Notebook有2个核心目的
 > TODO 建立下面标准抽象：
 
 ```text
-read(object_id)
+read(object_id,params)
 read(indexer_id, filter) //用read代替？
-call(object_id, method, params)// 工具化？
+xcall(object_id, method, params)// 工具化？
 subscribe(object_id, event_name, options)
 unsubscribe(object_id, event_name)
-read(alias_or_did_or_url) //用read代替？
+read(url) //用read代替？
 ```
+file:// (默认) : read
+http:// or cyfs:// : read
+
+原创：obj:// : read / call / subscribe，理解容器 + /@/ ,
+原创：index:// : read only
+
+
+### 为LLM定制的 read
+
+>read 是开放世界解释器；xcall/event 是封闭世界执行器。
+
+- agent的read 路由配置 （系统+agent+session overlay)
+- **定义read adapat**
+- 没有任何adapt 的情况下的read行为
+    - 读取本地文件
+    - 读取http/https
+- read 对 cyfs:// 直接支持(更多的当数据），但要做一些翻译，核心就是对known object-type(schema) 进行定制化的翻译
+- read 对 did-> Object（更多的当实体），核心是对known did-document schema 进行定制化的翻译
+
+翻译的核心是简化
+
+- 为LLM阅读简化语义（固定的json->text)
+- 支持分级压缩
+- session级别的可变检查（返回not changed)
+
+read返回的多段式结构
+- content， 注意Range（文本文件自带行号），裁剪和压缩
+- Meta
+- 提示词指导：Session级别的”逐步披露“和”未修改引导“，面向信用系统的可信性支持
+  - 逐步披露是指相关工具的使用方法，进一步信息的获取的方法，Object Meta可以认为是一种通用的逐步披露协议
+  - 未修改引导是指在一次session中，不重复返回已经返回的信息（包括逐步披露的内容）
+  - 信用是说明数据的来源和可信度
+- 错误引导： 如果读取错误，要把错误信息转换成LLM易于理解的类型
 
 ### 索引支持
 
@@ -88,6 +121,14 @@ Read(obj_did)
 Sub(objid,event_name) / Unsub(objid,event_name) ： /objid/event_name
 Call(objid,function_name,params)
 
+
+TODO: 定义xcall协议 （本地或raw http)
+    1）确定object的类型（本地特殊 / 标准 remote）
+    2) 执行调用 ：本地trait 或 标准的json rpc (注意session对rpc client的初始化影响)
+
+TODO: 定义event协议。（本地或raw http)
+    1） 确定object的类型（本地特殊 / 标准 remote）
+    2） 订阅事件， remotes
 
 ### 数据(cyfs://)支持
 
@@ -158,57 +199,11 @@ Stage3:
 
 
 > TODO: 增加一个专门的组件来管理 Attention Signals OK 
-> TODO: 补齐 Attention Signal / Session History 管理操作的 bash CLI 支持
->
-> 背景：Agent 行为层原则上不继续扩展 action surface，复杂管理操作应通过 Agent Tool bash CLI 暴露给 `exec_bash` 使用。当前 `self_improve_signals` Stage1 需要通过 CLI 完成 session-history 读取、extraction window 管理、Discover* 写入、progress commit；Stage2 也需要通过 CLI list/mark attention signals。现状里这些工具多为 `LLM | ACTION` 或只注册在 live OpenDAN tool manager 中，不能保证 `exec_bash` 命令可用。
->
-> 目标：Code Agent 实现完整 CLI/BASH 支持，并回改 Jarvis self-improve 行为配置，使 Stage1/Stage2 主要使用 bash CLI，而不是新增 action。
->
-> 需要支持的 CLI 命令：
-> - `read_session_history`
-> - `commit_session_history_improved`
-> - `BeginAttentionSignalExtraction`
-> - `CompleteAttentionSignalExtraction`
-> - `DiscoverEvent`
-> - `DiscoverObjectObservation`
-> - `DiscoverRelationship`
-> - `ListPendingAttentionSignals`
-> - `MarkAttentionSignalConsumed`
->
-> 实现要求：
-> - 优先复用现有类型和 store：`src/frame/agent_tool/src/agent_attention_signal.rs`、`src/frame/opendan/src/buildin_tool.rs`、`src/frame/opendan/src/round_history.rs`。
-> - CLI 可以接受一整个 JSON object 参数，例如 `DiscoverEvent '{"title":"...","phase":"active","evidence":[...],"confidence":0.9}'`；简单命令可以同时支持 `key=value`。
-> - 不能只改 prompt。必须让 `exec_bash` 在实际 session PATH 中能找到这些命令并成功 dispatch。
-> - 如需给 `agent_tool` CLI registry 增加实现，必须从 `OPENDAN_AGENT_ROOT` / `OPENDAN_SESSION_ID` 推导 root、session、attention_signals store；不能依赖 live `AIAgent` 指针。
-> - `read_session_history` 必须能读取 `<agent_root>/sessions/<session_id>/round_history`，并保持 round completeness、`from_already_improved`、`commit_round_index` 语义。
-> - `commit_session_history_improved` 必须更新目标 session `.meta/session.json` 中的 already_improved 状态。
-> - `BeginAttentionSignalExtraction` / `Discover*` / `CompleteAttentionSignalExtraction` 在 CLI 形态下必须能维护同一次 Stage1 run 的 extraction runtime 状态。可用 session-local runtime 文件保存当前 window，不要依赖进程内全局状态。
-> - `ListPendingAttentionSignals` / `MarkAttentionSignalConsumed` 必须对 `<agent_root>/attention_signals` 的 store 生效。
-> - 把上述命令加入 session bin 自动链接列表或等价机制，确保 Jarvis 的 `exec_bash` 可以直接调用。
-> - 回改 `src/rootfs/bin/buckyos_jarvis/behaviors/self_improve_signals.toml`：`action_whitelist` 只保留 `exec_bash`，prompt 中列出 CLI 命令和 JSON 用法。
-> - 同步检查 `src/rootfs/bin/buckyos_jarvis/behaviors/self_improve_set_memory.toml`，如果 Stage2 仍依赖 `ListPendingAttentionSignals` / `MarkAttentionSignalConsumed` action，也改为 CLI。
->
-> 验收标准：
-> - 在一个 Agent session 的 `exec_bash` 中，所有上述命令都能 `command -v` 找到。
-> - 能用 CLI 完成最小 Stage1 流程：read history -> begin extraction -> DiscoverObjectObservation -> complete extraction -> commit progress。
-> - 能用 CLI 完成最小 Stage2 管理流程：list pending signals -> mark one consumed。
-> - `self_improve_signals.toml` 不再暴露 attention/session-history action。
-> - 必须补充或更新 Rust 单元测试，至少覆盖 CLI 参数解析、store 写入、pending list、consumed mark、session history progress commit。
-> - 验证命令至少包括：
->   - `cargo test -p agent_tool agent_attention_signal`
->   - `cargo test -p agent_tool_cli_dev`
->   - `cargo test -p opendan behavior_cfg --lib`
->   - 如改动 OpenDAN runtime wiring，再跑相关 `opendan` 单测。
->
-> 风险点：
-> - 不要把 CLI 支持做成只在 provider tool/action 里可用。
-> - 不要让 CLI Discover* 丢失 source/evidence/extraction_window_id。
-> - 不要扫描 self_improve session 自己的 history。
-> - 不要在 Stage1 直接写 Agent Memory。
-> TODO: 如何重点观察skill的两种信号？
+> TODO: 补齐 Attention Signal / Session History 管理操作的 bash CLI 支持 OK 
+> TODO: 如何重点观察skill的两种信号？ : 待实现，根本上是需要让session/session report与skill建立强结构关系
     1）使用了skill的session -> 看report
     2) 使用了skills mgr的selector,但没有选中任何skill
-> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统 对象观察
+> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统： 对象观察
 
 
 ## Skills 
@@ -249,11 +244,11 @@ plan模式进行选择） + report汇报效果
 
 ### skills的安装 (llm_install_skill)
 
-> TODO 需要实现
+> TODO 需要实现 首先应该实现，这根本上是给一个结构后，让llm帮着完成“强化“的过程
 
 ### skills的结晶和整理 (improve-skill)
 
-> TODO 需要实现
+> TODO 这个版本暂不实现（与价值观绑定太大）
 
 ## Agent的价值观
 
@@ -264,8 +259,9 @@ plan模式进行选择） + report汇报效果
 
 根据理论，似乎是Plan阶段对Do阶段的权限管理？
 
-- 通过硬边界限制能力 （目前）
+- 通过硬边界（沙盒）限制能力 （目前）
 - 建立信用架构：如何定义？
+- 根本矛盾是 LLM 自主决定的自由度 与 权限控制硬边界的矛盾 （这也许是产品问题？ 也许是一个核心问题）
 
 identity
 owner

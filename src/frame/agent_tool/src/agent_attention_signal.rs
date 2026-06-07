@@ -2374,6 +2374,7 @@ mod tests {
             step_idx: 0,
             wakeup_id: String::new(),
             session_id: "session".into(),
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
         };
         let args = json!({
             "title": "Self Improve 第一阶段设计讨论",
@@ -2411,6 +2412,7 @@ mod tests {
             step_idx: 0,
             wakeup_id: String::new(),
             session_id: "session".into(),
+            read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,
         };
         let args = json!({
             "title": "Log parser coverage gap",
