@@ -4,6 +4,7 @@ pub mod error;
 pub mod event_bridge;
 pub mod router;
 pub mod runtime;
+pub mod tool;
 pub mod types;
 
 pub use adapters::{
@@ -20,6 +21,7 @@ pub use event_bridge::{
     EventTransport, EventTransportHandle, EventTransportStarted, NoopEventTransport,
     WebSocketEventTransport,
 };
-pub use router::{ObjectRouter, RouteMatch, RouteTrace};
+pub use router::{ObjectRouter, RouteMatch, RouteMatchType, RouteMethod, RouteTrace};
 pub use runtime::AgentDIDObjectRuntime;
+pub use tool::{AgentDIDObjectReadTool, TOOL_READ};
 pub use types::*;

@@ -66,7 +66,7 @@ Agent Notebook有2个核心目的
 需要定义观察/探索/互动/订阅的标准动作
 这里的核心是read （返回的必然是一个引导文本（提示词）），要考虑风险
 
-> TODO 建立下面标准抽象：
+> TODO 建立下面标准抽象： OK 
 
 ```text
 read(object_id,params)
@@ -122,17 +122,19 @@ Sub(objid,event_name) / Unsub(objid,event_name) ： /objid/event_name
 Call(objid,function_name,params)
 
 
-TODO: 定义xcall协议 （本地或raw http)
+> TODO: 定义xcall协议 （本地或raw http) OK
     1）确定object的类型（本地特殊 / 标准 remote）
     2) 执行调用 ：本地trait 或 标准的json rpc (注意session对rpc client的初始化影响)
 
-TODO: 定义event协议。（本地或raw http)
+> TODO: 定义event协议。（本地或raw http) OK
     1） 确定object的类型（本地特殊 / 标准 remote）
     2） 订阅事件， remotes
 
 ### 数据(cyfs://)支持
 
 Read(objid) -> 最简单，读取一个对象(如果是容器会返回分页访问的方法） objid是hash
+
+> TODO 需要统一
 
 ### 工具支持(Agent Tool体系)
 

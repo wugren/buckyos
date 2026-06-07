@@ -65,7 +65,7 @@ pub struct ReadInput {
     pub content_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<ReadLineRange>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub options: Value,

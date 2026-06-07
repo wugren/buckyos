@@ -17,6 +17,10 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
 
+use agent_did_object_lib::{
+    AgentDIDObjectRuntime, ObjectRouteConfig, ReadInput as ObjectReadInput, ReadLineRange,
+    XCallInput as ObjectXCallInput,
+};
 use agent_tool::agent_attention_signal::{
     CreateExtractionWindowInput, DiscoverEventArgs, DiscoverObjectObservationArgs,
     DiscoverRelationshipArgs, DiscoverSkillCoverageGapArgs, SignalLifecycleStatus,
@@ -73,6 +77,9 @@ use opendan::session_model::{AlreadyImprovedState, SessionKind, SessionMeta};
 const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
 const TOOL_FINISH_TASK: &str = "finish_task";
+const TOOL_READ_OBJECT: &str = "read";
+const TOOL_X_CALL: &str = "x-call";
+const TOOL_X_CALL_SNAKE: &str = "x_call";
 const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
@@ -85,10 +92,13 @@ const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtrac
 const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
 const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
 const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
-const TOOL_NAMES: [&str; 29] = [
+const TOOL_NAMES: [&str; 32] = [
     "Glob",
     "Grep",
     "dcrontab",
+    TOOL_READ_OBJECT,
+    TOOL_X_CALL,
+    TOOL_X_CALL_SNAKE,
     "read_file",
     "write_file",
     "edit_file",
@@ -136,6 +146,66 @@ const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 40 * 1024;
 const DEFAULT_HISTORY_WINDOW_MS: i64 = 10 * 60 * 1000;
 const ATTENTION_EXTRACTION_RUNTIME_REL_PATH: &str =
     ".runtime/attention_signal_extraction/current.json";
+const OBJECT_ROUTE_CONFIG_ENV: &str = "AGENT_DID_OBJECT_ROUTE_CONFIG";
+const OPENDAN_OBJECT_ROUTE_CONFIG_ENV: &str = "OPENDAN_AGENT_OBJECT_ROUTE_CONFIG";
+const DEFAULT_OBJECT_ROUTE_CONFIG: &str = r#"
+version = 1
+
+[[adapters]]
+id = "filesystem"
+type = "filesystem"
+
+[[adapters]]
+id = "web"
+type = "web"
+
+[[adapters]]
+id = "agent-runtime"
+type = "agent_runtime"
+
+[[adapters]]
+id = "did-object"
+type = "did_object"
+
+[[routes]]
+id = "file-read"
+priority = 100
+match_type = "scheme"
+pattern = "file"
+adapter = "filesystem"
+methods = ["read"]
+
+[[routes]]
+id = "http-web-read"
+priority = 10
+match_type = "scheme"
+pattern = "http"
+adapter = "web"
+methods = ["read"]
+
+[[routes]]
+id = "https-web-read"
+priority = 10
+match_type = "scheme"
+pattern = "https"
+adapter = "web"
+methods = ["read"]
+
+[[routes]]
+id = "https-did-object-call"
+priority = 10
+match_type = "scheme"
+pattern = "https"
+adapter = "did-object"
+methods = ["x_call", "subscribe_event"]
+
+[[routes]]
+id = "agent-runtime"
+priority = 10
+match_type = "scheme"
+pattern = "agent"
+adapter = "agent-runtime"
+"#;
 
 #[derive(Clone, Debug)]
 struct CliRuntimeEnv {
@@ -223,6 +293,15 @@ enum ParsedCommand {
     Tool {
         tool_name: String,
         raw_tokens: Vec<String>,
+    },
+    ObjectRead {
+        route_config_path: Option<PathBuf>,
+        input: ObjectReadInput,
+    },
+    ObjectXCall {
+        tool_name: String,
+        route_config_path: Option<PathBuf>,
+        input: ObjectXCallInput,
     },
     CheckTask {
         tool_name: String,
@@ -557,6 +636,15 @@ async fn execute(
                 EXIT_SUCCESS,
             ))
         }
+        ParsedCommand::ObjectRead {
+            route_config_path,
+            input,
+        } => dispatch_object_read(&env, route_config_path, input).await,
+        ParsedCommand::ObjectXCall {
+            tool_name,
+            route_config_path,
+            input,
+        } => dispatch_object_x_call(&env, &tool_name, route_config_path, input).await,
         ParsedCommand::CheckTask { tool_name, task_id } => {
             let task_mgr = build_task_manager_client(&env).await?;
             let task = task_mgr.get_task(task_id).await.map_err(|err| {
@@ -673,6 +761,93 @@ async fn dispatch_tool(
     }
 }
 
+async fn dispatch_object_read(
+    env: &CliRuntimeEnv,
+    route_config_path: Option<PathBuf>,
+    mut input: ObjectReadInput,
+) -> Result<CliRunOutput, AgentToolError> {
+    if input.session_id.is_none() {
+        input.session_id = Some(env.call_ctx.session_id.clone());
+    }
+    if input.max_tokens.is_none() {
+        input.max_tokens = Some(env.call_ctx.read_token_limit as usize);
+    }
+    let runtime = build_object_runtime(env, route_config_path).await?;
+    match runtime.read(input).await {
+        Ok(result) => Ok(render_cli_output(
+            &success_result(TOOL_READ_OBJECT, result),
+            EXIT_SUCCESS,
+        )),
+        Err(err) => Ok(render_object_error_output(Some(TOOL_READ_OBJECT), err)),
+    }
+}
+
+async fn dispatch_object_x_call(
+    env: &CliRuntimeEnv,
+    tool_name: &str,
+    route_config_path: Option<PathBuf>,
+    mut input: ObjectXCallInput,
+) -> Result<CliRunOutput, AgentToolError> {
+    if input.session_id.is_none() {
+        input.session_id = Some(env.call_ctx.session_id.clone());
+    }
+    if input.trace_id.is_none() {
+        input.trace_id = Some(env.call_ctx.trace_id.clone());
+    }
+    let runtime = build_object_runtime(env, route_config_path).await?;
+    match runtime.x_call(input).await {
+        Ok(result) => {
+            let exit_code = result.return_code.unwrap_or_else(|| {
+                if result.status == AgentToolStatus::Error {
+                    agent_tool::CLI_EXIT_ERROR
+                } else {
+                    EXIT_SUCCESS
+                }
+            });
+            Ok(render_cli_output(
+                &success_result(tool_name, result),
+                exit_code,
+            ))
+        }
+        Err(err) => Ok(render_object_error_output(Some(tool_name), err)),
+    }
+}
+
+async fn build_object_runtime(
+    env: &CliRuntimeEnv,
+    route_config_path: Option<PathBuf>,
+) -> Result<AgentDIDObjectRuntime, AgentToolError> {
+    let config = load_object_route_config(env, route_config_path).await?;
+    AgentDIDObjectRuntime::new(config).map_err(object_error_to_agent_tool_error)
+}
+
+async fn load_object_route_config(
+    env: &CliRuntimeEnv,
+    route_config_path: Option<PathBuf>,
+) -> Result<ObjectRouteConfig, AgentToolError> {
+    if let Some(path) = route_config_path.or_else(|| {
+        first_path_env(
+            &[OBJECT_ROUTE_CONFIG_ENV, OPENDAN_OBJECT_ROUTE_CONFIG_ENV],
+            &env.current_dir,
+        )
+    }) {
+        return ObjectRouteConfig::from_toml_file(&path)
+            .await
+            .map_err(object_error_to_agent_tool_error);
+    }
+    ObjectRouteConfig::from_toml_str(DEFAULT_OBJECT_ROUTE_CONFIG)
+        .map_err(object_error_to_agent_tool_error)
+}
+
+fn render_object_error_output(
+    tool_name: Option<&str>,
+    err: agent_did_object_lib::AgentDIDObjectError,
+) -> CliRunOutput {
+    let agent_err = object_error_to_agent_tool_error(err);
+    let exit_code = cli_exit_code_for_error(&agent_err);
+    render_cli_output(&cli_error_result(tool_name, &agent_err), exit_code)
+}
+
 async fn resolve_content_input(
     input: agent_tool::ContentInput,
     stdin_override: Option<String>,
@@ -754,6 +929,10 @@ fn parse_tool_command(
     }
 
     match tool_name.as_str() {
+        TOOL_READ_OBJECT => parse_object_read_cli_command(tokens, current_dir),
+        TOOL_X_CALL | TOOL_X_CALL_SNAKE => {
+            parse_object_x_call_cli_command(tool_name, tokens, current_dir)
+        }
         TOOL_CHECK_TASK => parse_check_task_cli_command(tool_name, tokens),
         TOOL_CANCEL_TASK => parse_cancel_task_cli_command(tool_name, tokens),
         TOOL_FINISH_TASK => parse_finish_task_cli_command(tool_name, tokens),
@@ -777,6 +956,308 @@ fn parse_tool_command(
             })
         }
     }
+}
+
+fn parse_object_read_cli_command(
+    tokens: &[String],
+    current_dir: &Path,
+) -> Result<ParsedCommand, AgentToolError> {
+    let mut route_config_path = None;
+    let mut object = None;
+    let mut purpose = None;
+    let mut session_id = None;
+    let mut content_only = false;
+    let mut offset = None;
+    let mut limit = None;
+    let mut options = json!({});
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        match token.as_str() {
+            "--config" | "--route-config" => {
+                idx += 1;
+                let Some(path) = tokens.get(idx) else {
+                    return Err(with_tool_usage(
+                        "missing route config path",
+                        TOOL_READ_OBJECT,
+                    ));
+                };
+                route_config_path = Some(resolve_cli_path(path, current_dir));
+            }
+            "--purpose" => {
+                idx += 1;
+                purpose = Some(required_token(tokens, idx, "--purpose", TOOL_READ_OBJECT)?);
+            }
+            "--session-id" => {
+                idx += 1;
+                session_id = Some(required_token(
+                    tokens,
+                    idx,
+                    "--session-id",
+                    TOOL_READ_OBJECT,
+                )?);
+            }
+            "--content-only" => content_only = true,
+            "--offset" => {
+                idx += 1;
+                offset = Some(parse_object_usize(
+                    &required_token(tokens, idx, "--offset", TOOL_READ_OBJECT)?,
+                    "offset",
+                    TOOL_READ_OBJECT,
+                )?);
+            }
+            "--limit" => {
+                idx += 1;
+                limit = Some(parse_object_usize(
+                    &required_token(tokens, idx, "--limit", TOOL_READ_OBJECT)?,
+                    "limit",
+                    TOOL_READ_OBJECT,
+                )?);
+            }
+            "--options" => {
+                idx += 1;
+                options = parse_json_arg(
+                    &required_token(tokens, idx, "--options", TOOL_READ_OBJECT)?,
+                    "--options",
+                    TOOL_READ_OBJECT,
+                )?;
+            }
+            _ if token.starts_with("--") => {
+                return Err(with_tool_usage(
+                    format!("unsupported flag `{token}`"),
+                    TOOL_READ_OBJECT,
+                ));
+            }
+            _ => {
+                if let Some((key, value)) = token.split_once('=') {
+                    match key {
+                        "object" | "uri" => object = Some(value.to_string()),
+                        "purpose" => purpose = Some(value.to_string()),
+                        "session_id" | "session-id" => session_id = Some(value.to_string()),
+                        "content_only" | "content-only" => {
+                            content_only = parse_object_bool(value, key, TOOL_READ_OBJECT)?
+                        }
+                        "offset" => {
+                            offset = Some(parse_object_usize(value, "offset", TOOL_READ_OBJECT)?)
+                        }
+                        "limit" => {
+                            limit = Some(parse_object_usize(value, "limit", TOOL_READ_OBJECT)?)
+                        }
+                        "options" => options = parse_json_arg(value, "options", TOOL_READ_OBJECT)?,
+                        _ => {
+                            return Err(with_tool_usage(
+                                format!("unsupported key `{key}`"),
+                                TOOL_READ_OBJECT,
+                            ));
+                        }
+                    }
+                } else if object.is_none() {
+                    object = Some(token.clone());
+                } else {
+                    return Err(with_tool_usage(
+                        format!("unexpected positional argument `{token}`"),
+                        TOOL_READ_OBJECT,
+                    ));
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    let object = object
+        .map(|value| canonical_object_url_for_cli(&value, current_dir))
+        .transpose()?
+        .ok_or_else(|| with_tool_usage("missing object/uri", TOOL_READ_OBJECT))?;
+
+    Ok(ParsedCommand::ObjectRead {
+        route_config_path,
+        input: ObjectReadInput {
+            object,
+            purpose,
+            session_id,
+            content_only,
+            range: (offset.is_some() || limit.is_some()).then_some(ReadLineRange {
+                offset: offset.unwrap_or(1),
+                limit,
+            }),
+            max_tokens: None,
+            options,
+        },
+    })
+}
+
+fn parse_object_x_call_cli_command(
+    tool_name: String,
+    tokens: &[String],
+    current_dir: &Path,
+) -> Result<ParsedCommand, AgentToolError> {
+    let mut route_config_path = None;
+    let mut object = None;
+    let mut action = None;
+    let mut params = json!({});
+    let mut session_id = None;
+    let mut idempotency_key = None;
+    let mut confirm_token = None;
+    let mut trace_id = None;
+    let mut positionals = Vec::new();
+    let mut param_pairs = serde_json::Map::new();
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        match token.as_str() {
+            "--config" | "--route-config" => {
+                idx += 1;
+                let Some(path) = tokens.get(idx) else {
+                    return Err(with_tool_usage("missing route config path", &tool_name));
+                };
+                route_config_path = Some(resolve_cli_path(path, current_dir));
+            }
+            "--params" => {
+                idx += 1;
+                params = parse_json_arg(
+                    &required_token(tokens, idx, "--params", &tool_name)?,
+                    "--params",
+                    &tool_name,
+                )?;
+            }
+            "--session-id" => {
+                idx += 1;
+                session_id = Some(required_token(tokens, idx, "--session-id", &tool_name)?);
+            }
+            "--idempotency-key" => {
+                idx += 1;
+                idempotency_key = Some(required_token(
+                    tokens,
+                    idx,
+                    "--idempotency-key",
+                    &tool_name,
+                )?);
+            }
+            "--confirm-token" => {
+                idx += 1;
+                confirm_token = Some(required_token(tokens, idx, "--confirm-token", &tool_name)?);
+            }
+            "--trace-id" => {
+                idx += 1;
+                trace_id = Some(required_token(tokens, idx, "--trace-id", &tool_name)?);
+            }
+            _ if token.starts_with("--") => {
+                if let Some((key, value)) =
+                    token.strip_prefix("--").and_then(|arg| arg.split_once('='))
+                {
+                    match key {
+                        "config" | "route-config" => {
+                            route_config_path = Some(resolve_cli_path(value, current_dir));
+                        }
+                        "params" => {
+                            params = parse_json_arg(value, "--params", &tool_name)?;
+                        }
+                        "session_id" | "session-id" => session_id = Some(value.to_string()),
+                        "idempotency_key" | "idempotency-key" => {
+                            idempotency_key = Some(value.to_string())
+                        }
+                        "confirm_token" | "confirm-token" => {
+                            confirm_token = Some(value.to_string())
+                        }
+                        "trace_id" | "trace-id" => trace_id = Some(value.to_string()),
+                        key if !key.trim().is_empty() && !key.starts_with('-') => {
+                            param_pairs.insert(key.to_string(), parse_scalar_json_value(value));
+                        }
+                        _ => {
+                            return Err(with_tool_usage(
+                                format!("unsupported flag `{token}`"),
+                                &tool_name,
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(with_tool_usage(
+                        format!("unsupported flag `{token}`"),
+                        &tool_name,
+                    ));
+                }
+            }
+            _ => {
+                if let Some((key, value)) = token.split_once('=') {
+                    match key {
+                        "object" => object = Some(value.to_string()),
+                        "action" => action = Some(value.to_string()),
+                        "params" => params = parse_json_arg(value, "params", &tool_name)?,
+                        "session_id" | "session-id" => session_id = Some(value.to_string()),
+                        "idempotency_key" | "idempotency-key" => {
+                            idempotency_key = Some(value.to_string())
+                        }
+                        "confirm_token" | "confirm-token" => {
+                            confirm_token = Some(value.to_string())
+                        }
+                        "trace_id" | "trace-id" => trace_id = Some(value.to_string()),
+                        key => {
+                            param_pairs.insert(key.to_string(), parse_scalar_json_value(value));
+                        }
+                    }
+                } else {
+                    positionals.push(token.clone());
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    if object.is_none() {
+        object = positionals.first().cloned();
+    }
+    if action.is_none() {
+        action = positionals.get(1).cloned();
+    }
+    if let Some(raw_params) = positionals.get(2) {
+        params = parse_json_arg(raw_params, "params", &tool_name)?;
+    }
+    if positionals.len() > 3 {
+        return Err(with_tool_usage(
+            format!(
+                "unexpected positional argument `{}`",
+                positionals.get(3).unwrap()
+            ),
+            &tool_name,
+        ));
+    }
+    if !param_pairs.is_empty() {
+        if params.as_object().is_some_and(|map| map.is_empty()) {
+            params = Json::Object(param_pairs);
+        } else if let Some(map) = params.as_object_mut() {
+            map.extend(param_pairs);
+        } else {
+            return Err(with_tool_usage(
+                "key=value params require object params",
+                &tool_name,
+            ));
+        }
+    }
+
+    let object = object
+        .map(|value| canonical_object_url_for_cli(&value, current_dir))
+        .transpose()?
+        .ok_or_else(|| with_tool_usage("missing object", &tool_name))?;
+    let action = action
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| with_tool_usage("missing action", &tool_name))?;
+
+    Ok(ParsedCommand::ObjectXCall {
+        tool_name,
+        route_config_path,
+        input: ObjectXCallInput {
+            object,
+            action,
+            params,
+            session_id,
+            idempotency_key,
+            confirm_token,
+            trace_id,
+        },
+    })
 }
 
 fn parse_check_task_cli_command(
@@ -5918,6 +6399,12 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
 
 fn with_tool_usage(message: impl Into<String>, tool_name: &str) -> AgentToolError {
     let usage = match tool_name {
+        TOOL_READ_OBJECT => {
+            "read <object-or-path> [--content-only] [--offset <1-based-line>] [--limit <lines>] [--config <route.toml>]"
+        }
+        TOOL_X_CALL | TOOL_X_CALL_SNAKE => {
+            "x-call <object> <action> [--params <json>] [key=value ...] [--key=value ...] [--config <route.toml>]"
+        }
         TOOL_CHECK_TASK => "check_task <task_id>",
         TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]",
         TOOL_FINISH_TASK => "finish_task <task_id> [failed] [--message <text>]",
@@ -5925,6 +6412,111 @@ fn with_tool_usage(message: impl Into<String>, tool_name: &str) -> AgentToolErro
         _ => "agent_tool <tool> ...",
     };
     AgentToolError::InvalidArgs(format!("{}\nUsage: {usage}", message.into()))
+}
+
+fn required_token(
+    tokens: &[String],
+    idx: usize,
+    flag: &str,
+    tool_name: &str,
+) -> Result<String, AgentToolError> {
+    tokens
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| with_tool_usage(format!("missing value for `{flag}`"), tool_name))
+}
+
+fn parse_object_usize(raw: &str, name: &str, tool_name: &str) -> Result<usize, AgentToolError> {
+    raw.trim().parse::<usize>().map_err(|_| {
+        with_tool_usage(
+            format!("invalid `{name}` value `{raw}`, expected non-negative integer"),
+            tool_name,
+        )
+    })
+}
+
+fn parse_object_bool(raw: &str, name: &str, tool_name: &str) -> Result<bool, AgentToolError> {
+    match raw.trim() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(with_tool_usage(
+            format!("invalid `{name}` value `{raw}`, expected bool"),
+            tool_name,
+        )),
+    }
+}
+
+fn parse_json_arg(raw: &str, name: &str, tool_name: &str) -> Result<Json, AgentToolError> {
+    serde_json::from_str(raw).map_err(|err| {
+        with_tool_usage(
+            format!("invalid `{name}` JSON value `{raw}`: {err}"),
+            tool_name,
+        )
+    })
+}
+
+fn parse_scalar_json_value(raw: &str) -> Json {
+    let value = raw.trim();
+    match value {
+        "true" => Json::Bool(true),
+        "false" => Json::Bool(false),
+        "null" => Json::Null,
+        _ => value
+            .parse::<i64>()
+            .map(|n| json!(n))
+            .or_else(|_| value.parse::<f64>().map(|n| json!(n)))
+            .unwrap_or_else(|_| Json::String(raw.to_string())),
+    }
+}
+
+fn canonical_object_url_for_cli(raw: &str, current_dir: &Path) -> Result<String, AgentToolError> {
+    let raw = raw.trim();
+    if raw.contains("://") {
+        return Ok(raw.to_string());
+    }
+    let path = resolve_cli_path(raw, current_dir);
+    Ok(format!("file://{}", percent_encode_file_path(&path)))
+}
+
+fn resolve_cli_path(raw: &str, current_dir: &Path) -> PathBuf {
+    let path = PathBuf::from(raw);
+    canonicalize_or_normalize(path, Some(current_dir))
+}
+
+fn percent_encode_file_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut out = String::new();
+    for byte in raw.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn object_error_to_agent_tool_error(
+    err: agent_did_object_lib::AgentDIDObjectError,
+) -> AgentToolError {
+    use agent_did_object_lib::AgentDIDObjectError as ObjErr;
+    match err {
+        ObjErr::InvalidConfig(message)
+        | ObjErr::RouteNotFound(message)
+        | ObjErr::UnsupportedObjectRef(message)
+        | ObjErr::UnsupportedMethod(message)
+        | ObjErr::DeclaredCapabilityNotFound(message)
+        | ObjErr::SchemaError(message) => AgentToolError::InvalidArgs(message),
+        ObjErr::AdapterNotFound(message)
+        | ObjErr::AdapterUnavailable(message)
+        | ObjErr::ResolveError(message)
+        | ObjErr::HttpError(message)
+        | ObjErr::ProtocolError(message)
+        | ObjErr::KEventError(message)
+        | ObjErr::EventBridgeError(message)
+        | ObjErr::AdapterError(message) => AgentToolError::ExecFailed(message),
+    }
 }
 
 fn generic_usage() -> String {
@@ -6579,6 +7171,8 @@ mod tests {
     use opendan::round_history::{ContextMode, RoundStatus, RoundTrigger, SessionHistoryWriter};
     use tempfile::tempdir;
     use tokio::fs;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
 
     /// Env-mutating tests must hold this lock so they don't race with each
     /// other or with notebook tests that rely on `AGENT_NOTEBOOK_ROOT` /
@@ -6761,6 +7355,207 @@ mod tests {
         let cmd_args = payload["cmd_args"].as_str().expect("cmd_args string");
         assert!(cmd_args.ends_with("/demo.txt range=1-1"));
         assert_eq!(payload["detail"]["content"], "line-1\n");
+    }
+
+    #[tokio::test]
+    async fn object_read_cli_uses_agent_did_runtime_for_bare_path() {
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+        fs::write(cwd.join("demo.txt"), "line-1\nline-2\n")
+            .await
+            .expect("write demo file");
+
+        let output = execute(
+            vec![
+                OsString::from("/tmp/agent_tool"),
+                OsString::from("read"),
+                OsString::from("demo.txt"),
+                OsString::from("--content-only"),
+                OsString::from("--offset"),
+                OsString::from("2"),
+                OsString::from("--limit"),
+                OsString::from("1"),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("run object read");
+
+        assert_eq!(output.exit_code, EXIT_SUCCESS);
+        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["tool"], "read");
+        assert_eq!(payload["cmd_name"], "read");
+        assert_eq!(payload["output"], "line-2");
+    }
+
+    #[tokio::test]
+    async fn object_read_cli_returns_unchanged_for_same_session_id_env() {
+        let _lock = nb_lock();
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+        fs::write(cwd.join("demo.txt"), "line-1\nline-2\n")
+            .await
+            .expect("write demo file");
+        seed_agent_identity(&root, "alice", "did:example:agent");
+
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, previous }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(previous) = self.previous.as_ref() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+
+        struct CwdGuard(std::path::PathBuf);
+        impl CwdGuard {
+            fn set(path: &Path) -> Self {
+                let previous = std::env::current_dir().expect("read current dir");
+                std::env::set_current_dir(path).expect("set current dir");
+                Self(previous)
+            }
+        }
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let session_id = format!("unchanged-session-{}", now_ms());
+        let _g1 = EnvGuard::set(agent_tool::OPENDAN_AGENT_ROOT_ENV, &root);
+        let _g2 = EnvGuard::set(agent_tool::OPENDAN_SESSION_ID_ENV, &session_id);
+        let _g3 = EnvGuard::set(agent_tool::OPENDAN_TRACE_ID_ENV, "trace-unchanged");
+        let _cwd = CwdGuard::set(&cwd);
+
+        let args = vec![
+            OsString::from("/tmp/agent_tool"),
+            OsString::from("read"),
+            OsString::from("demo.txt"),
+            OsString::from("--content-only"),
+        ];
+        let first = execute(args.clone(), CliRuntimeEnv::from_process().unwrap(), None)
+            .await
+            .expect("first read");
+        assert_eq!(first.exit_code, EXIT_SUCCESS);
+        let first_payload: Json = serde_json::from_str(&first.stdout).expect("parse first json");
+        assert_eq!(first_payload["detail"]["unchanged"], false);
+        assert_eq!(first_payload["output"], "line-1\nline-2\n");
+
+        let second = execute(args, CliRuntimeEnv::from_process().unwrap(), None)
+            .await
+            .expect("second read");
+        assert_eq!(second.exit_code, EXIT_SUCCESS);
+        let second_payload: Json = serde_json::from_str(&second.stdout).expect("parse second json");
+        assert_eq!(second_payload["detail"]["unchanged"], true);
+        assert_eq!(second_payload["output"], "和上一次read相比没有变化");
+    }
+
+    #[tokio::test]
+    async fn object_x_call_cli_uses_route_config_and_local_http_adapter() {
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().join("agent");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd)
+            .await
+            .expect("create workspace dir");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local adapter");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /adapter/x-call "));
+            assert!(request.contains("\"object\":\"obj://demo/item\""));
+            assert!(request.contains("\"action\":\"reserve\""));
+            assert!(request.contains("\"qty\":2"));
+            assert!(request.contains("\"dry_run\":true"));
+            let body = r#"{"agent_tool_protocol":"1","status":"success","detail":{"reserved":true},"output":"ok"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let config_path = temp.path().join("routes.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+version = 1
+
+[[adapters]]
+id = "local"
+type = "local_http"
+endpoint = "{endpoint}"
+
+[[routes]]
+id = "obj-local"
+match_type = "scheme"
+pattern = "obj"
+adapter = "local"
+methods = ["x_call"]
+"#
+            ),
+        )
+        .await
+        .expect("write route config");
+
+        let output = execute(
+            vec![
+                OsString::from("/tmp/agent_tool"),
+                OsString::from("x-call"),
+                OsString::from("--config"),
+                OsString::from(config_path),
+                OsString::from("obj://demo/item"),
+                OsString::from("reserve"),
+                OsString::from("--qty=2"),
+                OsString::from("--dry_run=true"),
+            ],
+            test_env(root, cwd),
+            None,
+        )
+        .await
+        .expect("run object x-call");
+        server.await.expect("server task");
+
+        assert_eq!(output.exit_code, EXIT_SUCCESS);
+        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["tool"], "x-call");
+        assert_eq!(payload["cmd_name"], "x_call");
+        assert_eq!(payload["detail"]["reserved"], true);
+        assert_eq!(payload["output"], "ok");
     }
 
     #[tokio::test]

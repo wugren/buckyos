@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -36,6 +36,7 @@ impl AgentObjectAdapter for FilesystemAdapter {
         req: AdapterReadRequest,
     ) -> Result<AdapterReadResponse, AgentDIDObjectError> {
         let path = resolve_path(&req.object_ref.normalized)?;
+        ensure_allowed_path(&path, &req.adapter_config.options)?;
         let metadata = fs::metadata(&path).await?;
         if !metadata.is_file() {
             return Err(AgentDIDObjectError::UnsupportedObjectRef(format!(
@@ -143,6 +144,58 @@ impl AgentObjectAdapter for FilesystemAdapter {
     }
 }
 
+fn ensure_allowed_path(
+    path: &Path,
+    options: &serde_json::Value,
+) -> Result<(), AgentDIDObjectError> {
+    let roots = options
+        .get("allowed_read_roots")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    let normalized_path = normalize_abs_path(path);
+    if roots
+        .iter()
+        .map(|root| normalize_abs_path(root))
+        .any(|root| normalized_path.starts_with(root))
+    {
+        return Ok(());
+    }
+
+    Err(AgentDIDObjectError::UnsupportedObjectRef(format!(
+        "read path not allowed by policy: {}",
+        path.display()
+    )))
+}
+
+fn normalize_abs_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(seg) => normalized.push(seg),
+        }
+    }
+    normalized
+}
+
 fn resolve_path(input: &str) -> Result<PathBuf, AgentDIDObjectError> {
     let url = Url::parse(input).map_err(|err| {
         AgentDIDObjectError::UnsupportedObjectRef(format!("invalid file URL {input}: {err}"))
@@ -227,5 +280,24 @@ mod tests {
             Some("application/octet-stream")
         );
         assert!(res.content.unwrap().contains("Binary file"));
+    }
+
+    #[tokio::test]
+    async fn rejects_file_outside_allowed_roots() {
+        let dir = tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let denied = dir.path().join("denied");
+        fs::create_dir_all(&allowed).await.unwrap();
+        fs::create_dir_all(&denied).await.unwrap();
+        let path = denied.join("a.txt");
+        fs::write(&path, "secret").await.unwrap();
+
+        let mut req = req(Url::from_file_path(&path).unwrap().to_string());
+        req.adapter_config.options = json!({
+            "allowed_read_roots": [allowed.display().to_string()]
+        });
+        let adapter = FilesystemAdapter::new("filesystem".to_string());
+        let err = adapter.read(req).await.unwrap_err();
+        assert!(err.to_string().contains("read path not allowed"));
     }
 }

@@ -28,11 +28,16 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
+use agent_did_object_lib::{
+    AdapterConfig, AdapterType, AgentDIDObjectReadTool, AgentDIDObjectRuntime, ObjectRoute,
+    ObjectRouteConfig, RouteMatchType, RouteMethod,
+};
 use agent_tool::{
     AgentToolError, AgentToolManager, BashRunOutput, BashRunRequest, BashRunner, BashTarget,
     BinOverlayConfig, EditFileTool, ExecBashTool, FileToolConfig, LlmBashConfig,
-    LlmUnderstandMediaTool, NoopFileWriteAudit, ReadTool, SessionRuntimeContext, WriteFileTool,
+    LlmUnderstandMediaTool, NoopFileWriteAudit, SessionRuntimeContext, WriteFileTool,
 };
+use serde_json::json;
 
 use crate::agent_config::FilesystemPolicy;
 use crate::paths;
@@ -186,6 +191,70 @@ impl FsRoots {
             }
         }
         cfg
+    }
+
+    fn to_object_route_config(&self) -> ObjectRouteConfig {
+        let allowed_read_roots = match self.filesystem_policy {
+            FilesystemPolicy::Workspace => {
+                let mut roots = Vec::with_capacity(1 + self.extra_read_roots.len());
+                roots.push(self.workspace_root.display().to_string());
+                roots.extend(
+                    self.extra_read_roots
+                        .iter()
+                        .map(|root| root.display().to_string()),
+                );
+                json!(roots)
+            }
+            FilesystemPolicy::Unrestricted => json!([]),
+        };
+        ObjectRouteConfig {
+            version: 1,
+            adapters: vec![
+                AdapterConfig {
+                    id: "filesystem".to_string(),
+                    adapter_type: AdapterType::Filesystem,
+                    endpoint: None,
+                    auth_token_env: None,
+                    options: json!({ "allowed_read_roots": allowed_read_roots }),
+                },
+                AdapterConfig {
+                    id: "web".to_string(),
+                    adapter_type: AdapterType::Web,
+                    endpoint: None,
+                    auth_token_env: None,
+                    options: json!({}),
+                },
+            ],
+            routes: vec![
+                ObjectRoute {
+                    id: "file-read".to_string(),
+                    priority: 100,
+                    match_type: RouteMatchType::Scheme,
+                    pattern: "file".to_string(),
+                    adapter: "filesystem".to_string(),
+                    methods: vec![RouteMethod::Read],
+                    options: json!({}),
+                },
+                ObjectRoute {
+                    id: "http-web-read".to_string(),
+                    priority: 10,
+                    match_type: RouteMatchType::Scheme,
+                    pattern: "http".to_string(),
+                    adapter: "web".to_string(),
+                    methods: vec![RouteMethod::Read],
+                    options: json!({}),
+                },
+                ObjectRoute {
+                    id: "https-web-read".to_string(),
+                    priority: 10,
+                    match_type: RouteMatchType::Scheme,
+                    pattern: "https".to_string(),
+                    adapter: "web".to_string(),
+                    methods: vec![RouteMethod::Read],
+                    options: json!({}),
+                },
+            ],
+        }
     }
 }
 
@@ -403,7 +472,11 @@ pub fn build_default_tool_manager(
     // - `Glob` / `Grep` / `read_file` are links in Session Exec Bin,
     //   not XML actions.
     // - `write_file` / `edit_file` unchanged
-    let _ = manager.register_tool(ReadTool::new(file_cfg.clone()));
+    let runtime = AgentDIDObjectRuntime::new(fs_roots.to_object_route_config())
+        .expect("static agent DID object read route config must be valid");
+    let _ = manager.register_tool(
+        AgentDIDObjectReadTool::new(runtime).with_file_base_dir(fs_roots.workspace_root.clone()),
+    );
     let _ = manager.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()));
     let _ = manager.register_typed_tool(EditFileTool::new(file_cfg, audit));
     let _ = manager.register_tool(LlmUnderstandMediaTool::new());

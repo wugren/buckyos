@@ -13,6 +13,7 @@ serde_yaml = "0.9"
 toml = { workspace = true }
 thiserror = {workspace = true}
 agent_tool = { path = "../agent_tool" }
+agent-did-object-lib = { path = "../agent-did-object-lib" }
 llm_context = { path = "../llm_context" }
 buckyos-api = { path = "../../kernel/buckyos-api" }
 kRPC = { workspace = true }

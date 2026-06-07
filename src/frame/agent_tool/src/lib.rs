@@ -34,7 +34,6 @@ pub mod llm_tool_carft;
 pub mod llm_understand_media;
 pub mod local_llm_context;
 pub mod path_utils;
-pub mod read_tool;
 pub mod run_local_llm;
 pub mod runtime_context;
 pub mod skills_mgr;
@@ -84,7 +83,6 @@ pub use path_utils::{
     rewrite_path_with_shell_cwd, sanitize_session_id_for_path, session_record_path, to_abs_path,
     MAX_SESSION_ID_LEN,
 };
-pub use read_tool::{ReadTool, TOOL_READ};
 pub use runtime_context::{
     AgentIdentity, RuntimeContext, RuntimeContextSource, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV,
     OPENDAN_AGENT_ROOT_ENV, OPENDAN_SESSION_ID_ENV, OPENDAN_TRACE_ID_ENV,
@@ -153,6 +151,7 @@ impl SessionRuntimeContext {
 }
 
 pub const TOOL_GET_SESSION: &str = "get_session";
+pub const TOOL_READ: &str = "read";
 pub const TOOL_LIST_SESSION: &str = "list_session";
 pub const TOOL_LIST_EXTERNAL_WORKSPACES: &str = "list_external_workspaces";
 pub const TOOL_BIND_EXTERNAL_WORKSPACE: &str = "bind_external_workspace";

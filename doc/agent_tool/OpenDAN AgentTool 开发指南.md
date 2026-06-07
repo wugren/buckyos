@@ -80,15 +80,22 @@ stdout 输出 AgentToolResult JSON，exec 再按协议解析或作为普通 bash
 当前 CLI `TOOL_NAMES` 包含：
 
 ```text
+Glob
+Grep
+dcrontab
+read
+x-call
+x_call
 read_file
 write_file
 edit_file
-get_session
-set_memory
-remove_memory
 todo
+get_session
 create_workspace
 bind_workspace
+agent-memory
+agent-notebook
+agent-skills
 check_task
 cancel_task
 finish_task
@@ -96,7 +103,8 @@ finish_task
 
 注意：
 
-- `check_task` / `cancel_task` / `finish_task` 是 CLI pseudo-tool，不在 `AgentToolManager` 注册表中。
+- `read` / `x-call` / `x_call` / `check_task` / `cancel_task` / `finish_task` 是 CLI pseudo-tool，不在 `AgentToolManager` 注册表中。
+- `read` / `x-call` 通过 `agent-did-object-lib` 加载 `ObjectRouteConfig` 并调用 `AgentDIDObjectRuntime`，用于替代旧 `agent_tool::read_tool` 的 CLI 接入路径。
 - `load_memory` 当前是 Runtime 注册的 LLM/bash-capable tool，但没有加入 `agent_tool_cli_dev::TOOL_NAMES`，也没有默认 session 软链接。
 - `worklog_manage` 的 `TypedTool` 仍在 `agent_tool` crate 中，但当前 OpenDAN workshop 不再把它暴露成 Runtime tool，只保留 `tools.json` 参数解析给写审计复用。
 
@@ -492,7 +500,29 @@ read_file ./demo.txt | wc -l
 - exit code 语义不变
 - 在 [builtin_agent_tools.md](builtin_agent_tools.md) 写清 JSON 模式与纯文本模式的切换条件
 
-### 5.5 stdout / stderr 分工
+### 5.5 DID Object 访问 CLI
+
+`read` 和 `x-call` 是 `agent-did-object-lib` 的 CLI 接入准备层。二者加载同一份 `ObjectRouteConfig`，构造 `AgentDIDObjectRuntime` 后直接返回库生成的 `AgentToolResult`，CLI 不再二次拼接 read / x-call 结果。
+
+配置加载顺序：
+
+1. 命令行 `--config <route.toml>` 或 `--route-config <route.toml>`。
+2. 环境变量 `AGENT_DID_OBJECT_ROUTE_CONFIG`。
+3. 环境变量 `OPENDAN_AGENT_OBJECT_ROUTE_CONFIG`。
+4. 内置 dev 默认配置：`file://` read 走 filesystem，`http://` / `https://` read 走 web，`https://` x-call 走 did_object，`agent://` 走 agent_runtime。
+
+示例：
+
+```bash
+agent_tool read ./demo.txt --content-only --offset 1 --limit 20
+agent_tool read uri=file:///tmp/demo.txt content_only=true
+agent_tool x-call --config ./object-routes.toml obj://demo/item reserve qty=2
+agent_tool x-call https://device.example.com/cam01 restart --params '{"delay_ms":1000}'
+```
+
+CLI 层只做 Gateway 第一层的本地便利转换：没有 `://` 的 `read` / `x-call` object 会按当前工作目录解析成 canonical `file://` URL。进入 `agent-did-object-lib` 后仍只接受 URL，不接受 DID URI、alias 或裸路径。
+
+### 5.6 stdout / stderr 分工
 
 - stdout 只写最终协议 JSON，或纯文本模式下的主内容。
 - stderr 写进度、警告、调试日志。

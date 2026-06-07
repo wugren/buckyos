@@ -142,8 +142,8 @@ use llm_context::LLMContext;
 use crate::llm_compress::LlmSummarizeCompressor;
 use crate::{
     AgentToolManager, AgentToolResult, AgentToolStatus, BinOverlayConfig, EditFileTool,
-    ExecBashTool, FileToolConfig, LlmBashConfig, NoopFileWriteAudit, ReadTool,
-    SessionRuntimeContext, WriteFileTool,
+    ExecBashTool, FileToolConfig, LlmBashConfig, NoopFileWriteAudit, SessionRuntimeContext,
+    WriteFileTool,
 };
 
 // =========================================================================
@@ -1202,7 +1202,7 @@ const EXEC_BASH_MAX_TIMEOUT_MS: u64 = 120_000;
 const EXEC_BASH_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 impl LocalDirToolManager {
-    /// 构造:在 `<dir>/workspace` 上注册 Read / WriteFile / EditFile /
+    /// 构造:在 `<dir>/workspace` 上注册 WriteFile / EditFile /
     /// ExecBash。`dir` 是 OneShot 根目录(由 `ensure_dir_layout`
     /// 保证 `workspace` 和 `bin` 子目录存在)。`run_id` 进
     /// `SessionRuntimeContext.trace_id` / `session_id`,让 agent_tool 的日志
@@ -1213,13 +1213,9 @@ impl LocalDirToolManager {
         let inner = AgentToolManager::new();
         let cfg = FileToolConfig::new(workspace.clone());
         let write_audit = Arc::new(NoopFileWriteAudit);
-        // v2 Action set (see doc/opendan/Agent Actions.md §1):
-        // - `read` replaces v1 `read_file`
-        // - `glob` / `grep` removed (LLM uses find/grep/rg via exec_bash)
-        // - `write_file` / `edit_file` unchanged
-        inner
-            .register_tool(ReadTool::new(cfg.clone()))
-            .map_err(|e| LocalLLMContextError::ToolWiringFailed(e.to_string()))?;
+        // `read` is owned by agent-did-object-lib at the runtime/CLI layer.
+        // Local one-shot context keeps file inspection available through
+        // exec_bash.
         inner
             .register_typed_tool(WriteFileTool::new(cfg.clone(), write_audit.clone()))
             .map_err(|e| LocalLLMContextError::ToolWiringFailed(e.to_string()))?;

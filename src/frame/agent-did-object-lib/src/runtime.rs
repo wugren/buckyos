@@ -1,8 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_tool::{AgentToolResult, AgentToolStatus, AGENT_TOOL_PROTOCOL_VERSION};
 use buckyos_api::KEventClient;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::adapters::{
     AdapterCallStatus, AdapterReadRequest, AdapterReadResponse, AdapterRegistry,
@@ -16,6 +19,8 @@ use crate::types::{
     apply_line_range, cmd_args_value, limit_chars, EventBridgeSubscription, ObjectRef, ReadInput,
     SubscribeEventInput, UnsubscribeEventInput, XCallInput,
 };
+
+const READ_UNCHANGED_MESSAGE: &str = "和上一次read相比没有变化";
 
 pub struct AgentDIDObjectRuntime {
     router: ObjectRouter,
@@ -199,6 +204,40 @@ fn read_response_to_tool_result(
     input: &ReadInput,
     response: AdapterReadResponse,
 ) -> AgentToolResult {
+    let content_hash = hash_text(response.content.as_deref().unwrap_or_default());
+    let unchanged = detect_and_update_read_state(input, &response, &content_hash).unwrap_or(false);
+    if unchanged {
+        return AgentToolResult {
+            agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+            tool: None,
+            cmd_name: Some("read".to_string()),
+            status: AgentToolStatus::Success,
+            task_id: None,
+            pending_reason: None,
+            check_after: None,
+            estimated_wait: None,
+            title: response
+                .meta
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Read {}", input.object)),
+            summary: READ_UNCHANGED_MESSAGE.to_string(),
+            details: read_details(input, &response, true, &content_hash),
+            cmd_args: Some(format!(
+                "{}{}",
+                input.object,
+                if input.content_only {
+                    " --content-only"
+                } else {
+                    ""
+                }
+            )),
+            return_code: Some(0),
+            partial_output: None,
+            output: Some(READ_UNCHANGED_MESSAGE.to_string()),
+        };
+    }
+
     let mut content = response.content.clone().unwrap_or_default();
     if let Some(range) = &input.range {
         content = apply_line_range(&content, range);
@@ -233,7 +272,7 @@ fn read_response_to_tool_result(
             .clone()
             .unwrap_or_else(|| format!("Read {}", input.object)),
         summary: render_read_summary(&response),
-        details: json!({}),
+        details: read_details(input, &response, false, &content_hash),
         cmd_args: Some(format!(
             "{}{}",
             input.object,
@@ -247,6 +286,122 @@ fn read_response_to_tool_result(
         partial_output: None,
         output: Some(output),
     }
+}
+
+#[derive(Debug)]
+struct ReadStateKey {
+    object: String,
+    cache_key: Option<String>,
+    range: Option<crate::types::ReadLineRange>,
+    content_only: bool,
+    max_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReadStateRecord {
+    object: String,
+    cache_key: Option<String>,
+    version: Option<String>,
+    range: Option<crate::types::ReadLineRange>,
+    content_only: bool,
+    max_tokens: Option<usize>,
+    content_hash: String,
+}
+
+fn detect_and_update_read_state(
+    input: &ReadInput,
+    response: &AdapterReadResponse,
+    content_hash: &str,
+) -> Result<bool, AgentDIDObjectError> {
+    let Some(session_id) = input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let key = ReadStateKey {
+        object: input.object.clone(),
+        cache_key: response.cache_key.clone(),
+        range: input.range.clone(),
+        content_only: input.content_only,
+        max_tokens: input.max_tokens,
+    };
+    let state_path = read_state_path(session_id, &key);
+    let previous = std::fs::read(&state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ReadStateRecord>(&bytes).ok());
+    let unchanged = previous.as_ref().is_some_and(|record| {
+        record.object == key.object
+            && record.cache_key == key.cache_key
+            && record.version == response.version
+            && record.range == key.range
+            && record.content_only == key.content_only
+            && record.max_tokens == key.max_tokens
+            && record.content_hash == content_hash
+    });
+
+    let record = ReadStateRecord {
+        object: key.object.clone(),
+        cache_key: key.cache_key.clone(),
+        version: response.version.clone(),
+        range: key.range.clone(),
+        content_only: key.content_only,
+        max_tokens: key.max_tokens,
+        content_hash: content_hash.to_string(),
+    };
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(&record)
+        .map_err(|err| AgentDIDObjectError::ProtocolError(err.to_string()))?;
+    let tmp_path = state_path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)?;
+    std::fs::rename(&tmp_path, &state_path)?;
+    Ok(unchanged)
+}
+
+fn read_state_path(session_id: &str, key: &ReadStateKey) -> PathBuf {
+    let key_text = serde_json::to_string(&json!({
+        "object": key.object,
+        "cache_key": key.cache_key,
+        "range": key.range,
+        "content_only": key.content_only,
+    }))
+    .unwrap_or_default();
+    std::env::temp_dir()
+        .join("buckyos_agent_did_object")
+        .join("read_state")
+        .join(hash_text(session_id))
+        .join(format!("{}.json", hash_text(&key_text)))
+}
+
+fn read_details(
+    input: &ReadInput,
+    response: &AdapterReadResponse,
+    unchanged: bool,
+    content_hash: &str,
+) -> Value {
+    json!({
+        "object": input.object,
+        "content_only": input.content_only,
+        "range": input.range,
+        "unchanged": unchanged,
+        "cache_key": response.cache_key,
+        "version": response.version,
+        "content_hash": content_hash,
+        "route": response.route,
+        "meta": response.meta,
+    })
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn render_read_sections(content: &str, response: &AdapterReadResponse) -> String {
