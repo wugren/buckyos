@@ -45,6 +45,7 @@ export function FileBrowserView() {
 
   const [tabs, setTabs] = useState<BrowserTab[]>(defaultTabs)
   const [activeTabId, setActiveTabId] = useState(defaultTabs[0].id)
+  const [closedTabs, setClosedTabs] = useState<BrowserTab[]>([])
   const [history, setHistory] = useState<Record<string, HistoryState>>({
     [defaultTabs[0].id]: { back: [], forward: [] },
     [defaultTabs[1].id]: { back: [], forward: [] },
@@ -143,13 +144,35 @@ export function FileBrowserView() {
   }
 
   const handleCloseTab = (id: string) => {
+    const closingTab = tabs.find((tab) => tab.id === id)
+    if (!closingTab || tabs.length <= 1) return
+
+    setClosedTabs((prev) => [closingTab, ...prev].slice(0, 10))
+    setHistory((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
     setTabs((prev) => {
+      const closingIndex = prev.findIndex((tab) => tab.id === id)
       const next = prev.filter((tab) => tab.id !== id)
       if (id === activeTabId && next.length) {
-        setActiveTabId(next[0].id)
+        setActiveTabId(next[Math.min(closingIndex, next.length - 1)].id)
       }
       return next
     })
+  }
+
+  const handleRestoreClosedTab = (tab: BrowserTab) => {
+    const id = `tab-${Date.now()}`
+    const restoredTab: BrowserTab = { ...tab, id }
+    setClosedTabs((prev) => prev.filter((item) => item.id !== tab.id))
+    setTabs((prev) => [...prev, restoredTab])
+    setHistory((prev) => ({ ...prev, [id]: { back: [], forward: [] } }))
+    setActiveTabId(id)
+    setSelectedId(null)
+    setActiveTopicId(null)
+    setSearchQuery('')
   }
 
   const showToast = (message: string) => {
@@ -524,6 +547,8 @@ export function FileBrowserView() {
         onSelectTab={setActiveTabId}
         onCloseTab={handleCloseTab}
         onNewTab={handleNewTab}
+        closedTabs={closedTabs}
+        onRestoreClosedTab={handleRestoreClosedTab}
         currentPath={currentPath}
         onNavigate={navigate}
         onBack={back}

@@ -1,9 +1,10 @@
 import clsx from 'clsx'
-import { IconButton, TextField, Tooltip } from '@mui/material'
+import { Divider, IconButton, ListItemText, Menu, MenuItem, TextField, Tooltip } from '@mui/material'
 import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  ChevronDown,
   ChevronRight,
   Copy,
   LayoutGrid,
@@ -23,6 +24,8 @@ interface TopBarProps {
   onSelectTab: (id: string) => void
   onCloseTab: (id: string) => void
   onNewTab: () => void
+  closedTabs: BrowserTab[]
+  onRestoreClosedTab: (tab: BrowserTab) => void
   currentPath: string
   onNavigate: (path: string) => void
   onBack: () => void
@@ -74,6 +77,8 @@ export function TopBar({
   onSelectTab,
   onCloseTab,
   onNewTab,
+  closedTabs,
+  onRestoreClosedTab,
   currentPath,
   onNavigate,
   onBack,
@@ -90,19 +95,26 @@ export function TopBar({
 }: TopBarProps) {
   const { t } = useI18n()
   const [searchOpen, setSearchOpen] = useState(false)
+  const [tabMenuAnchor, setTabMenuAnchor] = useState<HTMLElement | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const searchVisible = searchOpen || !!searchQuery
 
   useEffect(() => {
-    if (searchQuery) setSearchOpen(true)
-  }, [searchQuery])
-
-  useEffect(() => {
-    if (searchOpen) searchInputRef.current?.focus()
-  }, [searchOpen])
+    if (searchVisible) searchInputRef.current?.focus()
+  }, [searchVisible])
 
   const closeSearch = () => {
     onSearchChange('')
     setSearchOpen(false)
+  }
+
+  const closeTabMenu = () => {
+    setTabMenuAnchor(null)
+  }
+
+  const handleNewTab = () => {
+    closeTabMenu()
+    onNewTab()
   }
 
   return (
@@ -142,10 +154,63 @@ export function TopBar({
           )
         })}
         <Tooltip title={t('filebrowser.topbar.newTab', 'New tab')}>
-          <IconButton size="small" onClick={onNewTab}>
+          <button
+            type="button"
+            onClick={onNewTab}
+            className="flex h-7 shrink-0 items-center gap-0.5 rounded-md px-1.5 text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--cp-accent)]"
+            aria-label={t('filebrowser.topbar.newTab', 'New tab')}
+          >
             <Plus size={14} />
-          </IconButton>
+          </button>
         </Tooltip>
+        <Tooltip title={t('filebrowser.topbar.closedTabs', 'Recently closed tabs')}>
+          <button
+            type="button"
+            onClick={(event) => setTabMenuAnchor(event.currentTarget)}
+            className={clsx(
+              'flex h-7 shrink-0 items-center rounded-md px-1 text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--cp-accent)]',
+              tabMenuAnchor && 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] text-[color:var(--cp-text)]',
+            )}
+            aria-label={t('filebrowser.topbar.closedTabs', 'Recently closed tabs')}
+            aria-haspopup="menu"
+            aria-expanded={Boolean(tabMenuAnchor)}
+          >
+            <ChevronDown size={14} />
+          </button>
+        </Tooltip>
+        <Menu
+          anchorEl={tabMenuAnchor}
+          open={Boolean(tabMenuAnchor)}
+          onClose={closeTabMenu}
+          slotProps={{ paper: { sx: { minWidth: 220, maxWidth: 320 } } }}
+        >
+          <MenuItem onClick={handleNewTab}>
+            <ListItemText primary={t('filebrowser.topbar.newTab', 'New tab')} />
+          </MenuItem>
+          <Divider />
+          {closedTabs.length > 0 ? (
+            closedTabs.map((tab) => (
+              <MenuItem
+                key={tab.id}
+                onClick={() => {
+                  closeTabMenu()
+                  onRestoreClosedTab(tab)
+                }}
+              >
+                <ListItemText
+                  primary={tab.title}
+                  secondary={tab.path}
+                  primaryTypographyProps={{ noWrap: true, fontSize: 13 }}
+                  secondaryTypographyProps={{ noWrap: true, fontSize: 12 }}
+                />
+              </MenuItem>
+            ))
+          ) : (
+            <MenuItem disabled>
+              <ListItemText primary={t('filebrowser.topbar.noClosedTabs', 'No recently closed tabs')} />
+            </MenuItem>
+          )}
+        </Menu>
       </div>
 
       {/* Nav row */}
@@ -164,7 +229,7 @@ export function TopBar({
         </IconButton>
 
         <div className="relative ml-1 flex min-w-0 flex-1 items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_88%,transparent)] px-2 py-1">
-          {searchOpen ? (
+          {searchVisible ? (
             <>
               <Search size={14} className="ml-1 shrink-0 text-[color:var(--cp-muted)]" />
               <TextField
@@ -237,7 +302,7 @@ export function TopBar({
             size="small"
             onClick={() => setSearchOpen((v) => !v)}
             className={clsx(
-              searchOpen &&
+              searchVisible &&
                 '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
             )}
             aria-label={t('filebrowser.topbar.search', 'Search')}
