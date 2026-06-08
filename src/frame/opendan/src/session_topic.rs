@@ -7,18 +7,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use crate::hint_recall::{
+    DefaultRecallService, HintRecallEngine, LlmRecallService, MemoryRecallProvider,
+    NotebookRecallProvider, RecallHintType, RecallInput, RecallItem, RecallPayload, RecallProvider,
+    RecallResult, RecallService, RecallSourceSystem, RecallTarget, SessionTopicRecallProvider,
+};
 
 const META_DIR: &str = ".meta";
 const TOPIC_FILE: &str = "topic.md";
 const TOPIC_LOG_FILE: &str = "topic_log.jsonl";
 const TAG_SET_FILE: &str = "tag_set.json";
 const SUBSCRIPTIONS_FILE: &str = "subscriptions.json";
-const DEFAULT_RECALL_LIMIT: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum SessionTopicError {
@@ -77,24 +81,6 @@ pub enum RecallStatus {
     Mechanical { ms: u32 },
     Llm { ms: u32 },
     Failed { reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct RecallPayload {
-    pub items: Vec<RecallItem>,
-    #[serde(default)]
-    pub subscriptions: Vec<Subscription>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct RecallItem {
-    pub session_id: String,
-    pub session_dir: String,
-    pub topic: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub score: f32,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -186,51 +172,25 @@ pub enum RecallDecision {
     Llm,
 }
 
-#[derive(Debug, Clone)]
-pub struct RecallInput<'a> {
-    pub session_id: &'a str,
-    pub session_dir: &'a Path,
-    pub topic: &'a str,
-    pub tags: &'a TagSet,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RecallResult {
-    NotTriggered,
-    Recalled {
-        items: Vec<RecallItem>,
-        subscriptions: Vec<Subscription>,
-    },
-    Failed {
-        reason: String,
-    },
-}
-
-#[async_trait]
-pub trait RetrievalService: Send + Sync {
-    async fn recall(
-        &self,
-        input: RecallInput<'_>,
-        mode: RecallMode,
-        policy: &RecallPolicy,
-    ) -> RecallResult;
-}
-
 pub struct SessionTopicUpdater {
-    retrieval_service: Arc<dyn RetrievalService>,
+    recall_service: Arc<dyn RecallService>,
     policy: RecallPolicy,
 }
 
 impl SessionTopicUpdater {
-    pub fn new(retrieval_service: Arc<dyn RetrievalService>, policy: RecallPolicy) -> Self {
+    pub fn new(recall_service: Arc<dyn RecallService>, policy: RecallPolicy) -> Self {
         Self {
-            retrieval_service,
+            recall_service,
             policy,
         }
     }
 
+    pub fn with_default_recall(policy: RecallPolicy) -> Self {
+        Self::new(Arc::new(DefaultRecallService::default()), policy)
+    }
+
     pub fn with_default_retrieval(policy: RecallPolicy) -> Self {
-        Self::new(Arc::new(DefaultRetrievalService::default()), policy)
+        Self::with_default_recall(policy)
     }
 
     pub async fn update(
@@ -310,7 +270,7 @@ impl SessionTopicUpdater {
                 let result = if matches!(mode, RecallMode::Llm) {
                     match tokio::time::timeout(
                         Duration::from_millis(self.policy.llm_timeout_ms),
-                        self.retrieval_service.recall(
+                        self.recall_service.recall(
                             RecallInput {
                                 session_id: &input.session_id,
                                 session_dir: &input.session_dir,
@@ -326,13 +286,13 @@ impl SessionTopicUpdater {
                         Ok(result) => result,
                         Err(_) => RecallResult::Failed {
                             reason: format!(
-                                "LLM retrieval timed out after {}ms",
+                                "LLM recall timed out after {}ms",
                                 self.policy.llm_timeout_ms
                             ),
                         },
                     }
                 } else {
-                    self.retrieval_service
+                    self.recall_service
                         .recall(
                             RecallInput {
                                 session_id: &input.session_id,
@@ -397,136 +357,7 @@ impl SessionTopicUpdater {
 
 impl Default for SessionTopicUpdater {
     fn default() -> Self {
-        Self::with_default_retrieval(RecallPolicy::default())
-    }
-}
-
-#[derive(Default)]
-pub struct DefaultRetrievalService {
-    mechanical: MechanicalRetrievalService,
-    llm: LlmRetrievalService,
-}
-
-#[async_trait]
-impl RetrievalService for DefaultRetrievalService {
-    async fn recall(
-        &self,
-        input: RecallInput<'_>,
-        mode: RecallMode,
-        policy: &RecallPolicy,
-    ) -> RecallResult {
-        match mode {
-            RecallMode::Mechanical => self.mechanical.recall(input, mode, policy).await,
-            RecallMode::Llm => self.llm.recall(input, mode, policy).await,
-            RecallMode::Auto => RecallResult::NotTriggered,
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct MechanicalRetrievalService;
-
-#[async_trait]
-impl RetrievalService for MechanicalRetrievalService {
-    async fn recall(
-        &self,
-        input: RecallInput<'_>,
-        _mode: RecallMode,
-        _policy: &RecallPolicy,
-    ) -> RecallResult {
-        let Some(sessions_root) = input.session_dir.parent() else {
-            return RecallResult::Recalled {
-                items: Vec::new(),
-                subscriptions: Vec::new(),
-            };
-        };
-        let query_tags: HashSet<String> = input.tags.tags.iter().map(|t| t.name.clone()).collect();
-        if query_tags.is_empty() {
-            return RecallResult::Recalled {
-                items: Vec::new(),
-                subscriptions: Vec::new(),
-            };
-        }
-
-        let mut items = Vec::new();
-        let Ok(entries) = fs::read_dir(sessions_root) else {
-            return RecallResult::Recalled {
-                items: Vec::new(),
-                subscriptions: Vec::new(),
-            };
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == input.session_dir || !path.is_dir() {
-                continue;
-            }
-            let topic_path = path.join(META_DIR).join(TOPIC_FILE);
-            let Ok(doc) = read_topic_doc(&topic_path) else {
-                continue;
-            };
-            if doc.session_id == input.session_id {
-                continue;
-            }
-            let item_tags: HashSet<String> = doc.tags.iter().cloned().collect();
-            let matched: Vec<String> = query_tags.intersection(&item_tags).cloned().collect();
-            let mut score = (matched.len() as f32) * 2.0;
-            let topic_lc = doc.topic.to_lowercase();
-            for tag in &query_tags {
-                if topic_lc.contains(tag) {
-                    score += 1.0;
-                }
-            }
-            if score <= 0.0 {
-                continue;
-            }
-            items.push(RecallItem {
-                session_id: if doc.session_id.is_empty() {
-                    path.file_name()
-                        .and_then(|v| v.to_str())
-                        .unwrap_or_default()
-                        .to_string()
-                } else {
-                    doc.session_id
-                },
-                session_dir: path.display().to_string(),
-                topic: doc.topic,
-                tags: doc.tags,
-                score,
-                reason: if matched.is_empty() {
-                    "topic text matched current tags".to_string()
-                } else {
-                    format!("matched tags: {}", matched.join(", "))
-                },
-            });
-        }
-        items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.session_id.cmp(&a.session_id))
-        });
-        items.truncate(DEFAULT_RECALL_LIMIT);
-        RecallResult::Recalled {
-            items,
-            subscriptions: Vec::new(),
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct LlmRetrievalService;
-
-#[async_trait]
-impl RetrievalService for LlmRetrievalService {
-    async fn recall(
-        &self,
-        _input: RecallInput<'_>,
-        _mode: RecallMode,
-        _policy: &RecallPolicy,
-    ) -> RecallResult {
-        RecallResult::Failed {
-            reason: "LLM retrieval backend is not configured".to_string(),
-        }
+        Self::with_default_recall(RecallPolicy::default())
     }
 }
 
@@ -666,7 +497,7 @@ fn write_topic_doc(
     Ok(())
 }
 
-fn read_topic_doc(path: &Path) -> Result<TopicDoc, SessionTopicError> {
+pub(crate) fn read_topic_doc(path: &Path) -> Result<TopicDoc, SessionTopicError> {
     let text = fs::read_to_string(path)?;
     parse_topic_doc(&text)
 }
@@ -727,11 +558,11 @@ fn append_topic_log(
 }
 
 #[derive(Debug, Clone)]
-struct TopicDoc {
-    session_id: String,
-    tags: Vec<String>,
-    tag_reasons: BTreeMap<String, String>,
-    topic: String,
+pub(crate) struct TopicDoc {
+    pub(crate) session_id: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) tag_reasons: BTreeMap<String, String>,
+    pub(crate) topic: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -886,15 +717,16 @@ fn default_tag_capacity() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct MockRetrievalService {
+    struct MockRecallService {
         result: Mutex<Option<RecallResult>>,
     }
 
     #[async_trait]
-    impl RetrievalService for MockRetrievalService {
+    impl RecallService for MockRecallService {
         async fn recall(
             &self,
             _input: RecallInput<'_>,
@@ -989,15 +821,23 @@ mod tests {
     #[tokio::test]
     async fn updater_writes_topic_tag_set_and_recall_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(MockRetrievalService {
+        let service = Arc::new(MockRecallService {
             result: Mutex::new(Some(RecallResult::Recalled {
                 items: vec![RecallItem {
-                    session_id: "s-old".to_string(),
-                    session_dir: "/tmp/s-old".to_string(),
-                    topic: "old topic".to_string(),
-                    tags: vec!["design".to_string()],
-                    score: 2.0,
+                    source_system: RecallSourceSystem::SessionRaw,
+                    hint_type: RecallHintType::SessionRaw,
+                    target: RecallTarget {
+                        kind: "session".to_string(),
+                        id: "s-old".to_string(),
+                        uri: Some("/tmp/s-old".to_string()),
+                    },
+                    title: Some("old topic".to_string()),
+                    hint: "Related previous session topic: old topic".to_string(),
                     reason: "matched tags: design".to_string(),
+                    matched_tags: vec!["design".to_string()],
+                    score: 2.0,
+                    suggested_action: "open_session_history_if_needed".to_string(),
+                    debug: BTreeMap::new(),
                 }],
                 subscriptions: vec![Subscription {
                     id: "sub-1".to_string(),
@@ -1020,7 +860,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out.recall_status, RecallStatus::Llm { .. }));
-        assert_eq!(out.recall.unwrap().items[0].session_id, "s-old");
+        let recall_item = &out.recall.unwrap().items[0];
+        assert_eq!(recall_item.source_system, RecallSourceSystem::SessionRaw);
+        assert_eq!(recall_item.hint_type, RecallHintType::SessionRaw);
+        assert_eq!(recall_item.target.id, "s-old");
+        assert_eq!(recall_item.matched_tags, vec!["design"]);
         assert!(dir
             .path()
             .join("s1/.meta/topic.md")
@@ -1044,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn updater_keeps_success_when_recall_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(MockRetrievalService {
+        let service = Arc::new(MockRecallService {
             result: Mutex::new(Some(RecallResult::Failed {
                 reason: "boom".to_string(),
             })),
@@ -1073,7 +917,7 @@ mod tests {
     async fn repeated_same_topic_keeps_topic_doc_content_stable() {
         let dir = tempfile::tempdir().unwrap();
         let updater = SessionTopicUpdater::new(
-            Arc::new(MockRetrievalService::default()),
+            Arc::new(MockRecallService::default()),
             RecallPolicy {
                 change_threshold: 2.0,
                 distance_threshold_turns: u32::MAX,
@@ -1099,7 +943,7 @@ mod tests {
     async fn updater_appends_topic_timeline_and_keeps_latest_projection() {
         let dir = tempfile::tempdir().unwrap();
         let updater = SessionTopicUpdater::new(
-            Arc::new(MockRetrievalService::default()),
+            Arc::new(MockRecallService::default()),
             RecallPolicy {
                 change_threshold: 2.0,
                 distance_threshold_turns: u32::MAX,

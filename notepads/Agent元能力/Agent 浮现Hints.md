@@ -179,7 +179,7 @@ NFL
 这些 Tags 的作用是帮助系统判断：
 
 - 当前 Session 正在围绕什么话题展开；
-- 哪些 Memory / Notebook / 历史 Session / DID-Object 可能相关；
+- 哪些 Memory / Notebook / DID-Object 可能相关；
 - 是否需要触发 Hints 召回；
 - 是否需要对某些环境状态进行半订阅。
 
@@ -204,7 +204,7 @@ Hint 是“线索”，不是完整上下文。
 
 Hint 的目标不是把所有事实都塞进上下文，而是告诉 Agent：
 
-> 有一个可能相关的对象、事实、记忆、笔记或历史 Session 存在。
+> 有一个可能相关的对象、事实、记忆、笔记或 Memory 中沉淀出的历史 Session 线索存在。
 
 一个好的 Hint 应该包含：
 
@@ -215,6 +215,46 @@ Hint 的目标不是把所有事实都塞进上下文，而是告诉 Agent：
 - 如有必要，是否可以订阅其状态变化。
 
 Hint 不应该默认携带大段原始文本。
+
+#### 4.4.1 Agent Memory Hint Type
+
+Agent Memory Hint Type 描述 Agent Memory 内部的 Hint 语义类型和召回层级，和全局 `Source` 不完全等价。
+
+`Source` 表示 Hint 来自哪个系统，当前大的来源只有 Agent Memory、Notebook、DID-Object；`Agent Memory Hint Type` 表示 Agent Memory Recall 在当前 Topic 下应该用哪一类观察方式生成和淘汰 Hint。
+
+Agent Memory 当前至少应区分五类 Hint：
+
+1. **Session 原文类 Hint**
+
+   Agent Memory 通过 Topic Tag 发现另一个相关 Session 时产生。它指向的是历史 Session 中的原文、topic、history 或 artifact，而不是对事实的再加工总结。
+
+   这类 Hint 的价值是告诉 Agent：“之前有一段原始工作上下文可能相关，可以按需打开。”
+
+2. **Event Hint**
+
+   表示现在正在发生、最近发生、或 Agent 曾经关注过的事件。它属于 Agent Memory 的事件类信息。
+
+   如果一个事件和当前 task 相关，Recall 应该把它作为 Hint 浮现出来，让 Agent 知道当前任务可能受某个进行中事件影响。
+
+3. **Entity Observation Hint**
+
+   当 Topic Tags 命中实体名称、别名、人名、对象名或其它可识别实体时产生。
+
+   这类 Hint 表示系统应该对该实体做“对象观察”：它是谁、当前状态是什么、最近有什么变化、是否存在可读对象或可订阅状态。
+
+4. **Entity Relation Hint**
+
+   只有在当前 Topic 中识别出多个实体时才产生。
+
+   如果系统知道这些实体之间存在关系，就应召回关系类线索，尤其是关系状态、态度、协作、冲突、依赖、所属、引用等信息。通常至少有一个实体是 Agent 自己或 Owner。
+
+5. **Free Hint**
+
+   不属于以上四类、但仍可能帮助 Agent 发现相关信息的自由线索。
+
+   它可能来自弱关联记忆、模糊语义命中或其它 Agent Memory 内部启发式来源。
+
+Agent Memory Hint Type 的作用是让 Memory Recall 能按类别分层查询、类内排序和类内淘汰，而不是让所有 Memory Hint 直接进入一个全局排序池。这样可以避免某一类高产候选挤掉其它类别中更关键但数量较少的线索。
 
 ### 4.5 DID-Object
 
@@ -236,7 +276,7 @@ hostname / object_id / path
 - `object_id` 表示具体对象；
 - `path` 表示对象中的某个状态、属性或字段。
 
-Memory、Notebook、历史 Session、文件目录、项目状态、用户位置、日程、设备状态、外部服务状态，都可以被抽象为 DID-Object。
+Memory、Notebook、文件目录、项目状态、用户位置、日程、设备状态、外部服务状态，都可以被抽象为 DID-Object。历史 Session 经过 Self Improve 后进入 Agent Memory，不作为独立的大来源参与 Recall。
 
 ---
 
@@ -274,6 +314,22 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 }
 ```
 
+工程接口上，`update_session_topic` 至少应表达以下语义：
+
+```rust
+update_session_topic(
+    title: String,
+    tags: Vec<TopicTagInput>,
+    recall_policy_override: Option<RecallPolicyOverride>,
+) -> UpdateSessionTopicResult
+```
+
+其中：
+
+- `title` 是当前 Session Topic Title，一行自然语言，单行、≤ 120 字符、人类可读、对未来的“我”友好。旧草案里的 `topic` 参数在本文统一命名为 `title`，语义不变；
+- `tags` 是当前 Topic Tags。每个 Tag 至少包含 `name`，可以包含 `reason` 供调试和后续解释使用；
+- `recall_policy_override` 是可选策略覆盖项，只能调整本次召回策略，不应改变 Topic / Tag 的存储语义。
+
 典型输出可以包括：
 
 - 更新后的 Topic Title；
@@ -284,6 +340,32 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 - LLM 旁路是否触发；
 - 新创建的半订阅；
 - 下一次上下文编织时需要关注的 Background Information。
+
+工具返回值应保留一个最小可验证结构，方便 Agent、测试和日志统一理解：
+
+```rust
+struct UpdateSessionTopicResult {
+    tag_set_diff: TagSetDiff,
+    recall: Option<RecallPayload>,
+    recall_status: RecallStatus,
+}
+
+struct TagSetDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    reinforced: Vec<String>,
+    current: Vec<TagEntry>,
+}
+
+enum RecallStatus {
+    NotTriggered,
+    Mechanical { ms: u32 },
+    LLM { ms: u32 },
+    Failed { reason: String },
+}
+```
+
+`tag_set_diff` 是工具的保底结果，机械更新成功后必然存在；`recall` 可能为空；`recall_status` 即使在召回失败时也必须明确返回，避免 Agent 把“未触发”和“触发失败”混为一谈。
 
 但需要强调：
 
@@ -314,6 +396,7 @@ Agent 在发现当前任务主题发生变化、收敛或深化时，调用 upda
 - **历史可追溯但不必暴露给 LLM**：底层把每次更新落到 `round_history` 的 `session_topic_updated` 事件，并同步保留 `topic_log.jsonl` 作为运维 / 审计用时间线；工具对外仍承诺“当前 topic = 最后一次写入”；
 - **隔离边界**：不允许跨 Session 写他人的 topic（边界 = session_id）；
 - **单行 ≤ 120 字符校验**：topic title 单行、人类可读、对未来的“我”友好。
+- **缺失态可表达**：从未调用过该工具的 Session 不应生成空 `topic.md`；浮现层必须能容忍没有 topic 的 Session。
 
 ### 5.4 文件布局
 
@@ -361,6 +444,19 @@ tags: [llm-context, design]
 ```
 
 全局索引由浮现层另行维护，本工具不负责索引，只承诺：写完 `topic.md` 后浮现层最终能看到。
+
+### 5.5 工具边界
+
+`update_session_topic` 是 Notebook 语义的写入工具，不是一个新的 Memory 查询 API。
+
+实现时应遵守以下边界：
+
+- `session_dir` 路径由 AgentSession 决定，工具从当前 Session 上下文读取，不自行发明路径；
+- 工具只允许写当前 Session 的 `.meta/topic.md`、`.meta/tag_set.json`、`.meta/topic_log.jsonl`、必要时写 `.meta/subscriptions.json`；
+- 不允许跨 Session 写入其它 Session 的 Topic 或 Tag；
+- 不引入新的 RPC、数据库或专用 Memory API；当前状态只通过文件系统投影表达；
+- 不额外暴露 `read_topic` / `list_topics` 之类专用读接口。读取 Topic、枚举 Session、深度展开 history / artifacts 应走已有文件系统或 Session 资产读取能力；
+- 工具本身始终可见，因为它负责维护当前 Session 题眼；Memory / Hint 相关工具是否可见由浮现层策略决定。
 
 ---
 
@@ -450,9 +546,10 @@ Tag 被淘汰不代表信息丢失。
 
 - Memory；
 - Notebook；
-- 历史 Session；
 - DID-Object；
 - 归档系统。
+
+历史 Session 如果仍然有长期价值，应通过 Self Improve 沉淀到 Memory；Session 原文可以作为 Memory Hint 指向的读取目标存在。
 
 Session Topic 只负责表达当前 Session 的短期注意力。
 
@@ -496,10 +593,9 @@ Hints 可以来自多个系统：
 
 - Memory：用户偏好、长期事实、稳定背景；
 - Notebook：用户或 Agent 记录的结构化笔记；
-- 历史 Session：过去曾经讨论过的相关任务；
-- 文件系统：项目目录、文档、代码、配置；
-- DID-Object：日程、位置、设备、应用状态、远程服务状态；
-- Search Index：全文索引、向量索引、图索引等。
+- DID-Object：日程、位置、设备、应用状态、远程服务状态、文件系统对象等。
+
+历史 Session 不作为独立大来源。它会通过 Self Improve 进入 Agent Memory，并在 Memory Recall 中作为 **Session 原文类 Hint** 浮现。
 
 例如当前 Topic 出现 `NFL`，系统可能召回：
 
@@ -513,13 +609,42 @@ Reason: 当前 Session Topic 包含 NFL。
 
 ```text
 Hint: 之前有一个 Session 讨论过今年超级碗门票搜索。
-Source: Historical Session
+Source: Memory
+MemoryHintType: SessionRaw
 Reason: 当前 Topic 包含 NFL / ticket / event planning。
 ```
 
 注意，这些 Hint 不一定包含完整门票搜索结果。它们只需要让 Agent 知道：“这件事存在，可能值得查”。
 
-### 7.2 Attention Graph 与 Memory Hint Recall
+### 7.2 Agent Memory 按 Hint Type 分层召回
+
+Agent Memory Recall 应该先按 Hint Type 分层查询候选 Hint，再分别做淘汰和保留。
+
+推荐流程是：
+
+```text
+Session Topic Tags
+  -> Session 原文类候选
+  -> Event 候选
+  -> Entity Observation 候选
+  -> Entity Relation 候选
+  -> Free Hint 候选
+  -> 各类型内排序、去重、截断
+  -> 跨类型合并、解释、最终预算截断
+  -> Hints
+```
+
+各层的基本职责：
+
+- **Session 原文类**：用 Tags 匹配 Agent Memory 中的历史 Session topic、title、artifact 摘要或 session index，返回可定位到原文上下文的 Hint；
+- **Event**：从 Agent Memory 的事件索引里查询当前正在发生、最近发生、或曾经被 Agent 关注过的事件；
+- **Entity Observation**：从 Tags 和已识别 aliases 中抽取实体，查询实体对象、状态、最近变化和可订阅字段；
+- **Entity Relation**：在识别出多个实体后，查询实体之间的关系、态度、协作、冲突、依赖等关系类信息；
+- **Free Hint**：在剩余预算内查询不属于上述类别的弱关联线索。
+
+每一类都应有独立候选预算和保留预算。类内先按自身规则排序、去重、合并，再进入 Memory Hint 合并阶段。Memory Hint 合并阶段仍可以按解释性、相关性和紧迫性做二次排序，但不应完全抹掉类型预算，否则 Free Hint 或高频 Session 命中容易挤占 Event / Entity Relation 这类低频但关键的线索。
+
+### 7.3 Attention Graph 与 Memory Hint Recall
 
 基于 Tag 的 Memory Hint Recall 不应被理解成简单的全文检索。
 
@@ -579,7 +704,7 @@ Reason: matched tags "agent memory", "architecture"; linked object "Agent Memory
 Handle: item_001
 ```
 
-Agent 拿到 Hint 后，可以选择忽略、读取完整 Memory item、追溯 evidence / source occasion，或者基于这个 Hint 主动询问用户。系统不应在第一阶段直接把大段 Memory / Notebook / Session 正文塞入上下文。
+Agent 拿到 Hint 后，可以选择忽略、读取完整 Memory item、追溯 evidence / source occasion，或者基于这个 Hint 主动询问用户。系统不应在第一阶段直接把大段 Memory / Notebook / DID-Object 正文塞入上下文；历史 Session 原文也只应通过 Memory 的 Session 原文类 Hint 按需展开。
 
 需要特别注意 Memory 与 Notebook 的 tag 语义差异：
 
@@ -606,7 +731,7 @@ Agent 拿到 Hint 后，可以选择忽略、读取完整 Memory item、追溯 e
 - 全文检索；
 - Memory Attention Graph 一跳 / 二跳展开；
 - Notebook 标题匹配；
-- 历史 Session Title 匹配；
+- Agent Memory 中的 Session 原文类匹配；
 - 简单向量相似度搜索。
 
 机械召回可以直接返回一组短 Hints。
@@ -615,7 +740,7 @@ Agent 拿到 Hint 后，可以选择忽略、读取完整 Memory item、追溯 e
 
 - 明确命中的长期记忆；
 - 明确命中的 Notebook；
-- 历史 Session 的标题级召回；
+- Memory 中 Session 原文类 Hint 的标题级召回；
 - 与当前 Tags 直接相关的对象列表；
 - 与当前高关注对象 / 事件直接相关的 Memory Hints。
 
@@ -631,7 +756,7 @@ LLM 旁路召回用于更复杂的语义判断。
 
 LLM 旁路可能判断：
 
-- 哪些 Memory / Notebook / Session 真正值得提示；
+- 哪些 Memory / Notebook / DID-Object 真正值得提示；
 - 当前 Topic 是否意味着一个新的任务阶段；
 - 是否应该恢复某个历史 Work Session；
 - 是否应该关注某些动态环境状态；
@@ -757,7 +882,7 @@ update_session_topic
   -> 机械式更新 Tag 权重
   -> 执行 Tag 淘汰
   -> 调用 RecallService
-  -> 机械召回 Memory / Notebook / Session / Object Hints
+  -> 机械召回 Memory / Notebook / DID-Object Hints
   -> 返回 Hints
 ```
 
@@ -765,7 +890,7 @@ update_session_topic
 
 - Memory 中的一句话事实；
 - Notebook 中的标题级线索；
-- 历史 Session 的摘要级线索；
+- Memory 中 Session 原文类的摘要级线索；
 - 明确命中的对象引用。
 
 ### 10.2 延迟召回 / 半订阅召回
@@ -1093,9 +1218,10 @@ flowchart TD
 
 - Memory Hints；
 - Notebook Hints；
-- Historical Session Hints；
 - DID-Object Hints；
 - 去重后的短线索集合。
+
+Agent Memory 产出的 `RecallItem` 必须同时携带 `memory_hint_type` 和 `source_system`。前者用于 Memory 内部策略分层、类内淘汰和上下文呈现；后者用于说明该 Hint 由 Agent Memory 产出。若 Hint 指向 Session 原文、实体对象或事件，还应额外携带目标 handle，供后续读取真实数据。
 
 Memory Hints 的机械召回应通过独立的 MemoryRecallProvider 完成。HintRecallEngine 只负责编排，不直接实现 Memory 图展开。
 
@@ -1105,6 +1231,8 @@ MemoryRecallProvider 的职责：
 - 使用 objects / aliases 做 entity、pair、relation 的机械展开；
 - 结合 Attention Graph 的 object attention、event attention 和 graph distance 排序；
 - 过滤 inactive、forgotten、salience 等不可召回项；
+- 按 Session 原文类、Event、Entity Observation、Entity Relation、Free Hint 五类分别设置候选预算和保留预算；
+- 对每类候选分别排序、去重、截断，再合并为最终 Memory Hints；
 - 返回短 Hint、reason、matched tags、source handle 和必要的 debug metadata。
 
 MemoryRecallProvider 不负责：
@@ -1264,6 +1392,8 @@ Hints 应该少而精。
 推荐原则：
 
 - 一次不要返回太多；
+- 总预算之外，Agent Memory 还应按 Memory Hint Type 设置独立候选预算和保留预算；
+- Memory Hint 每类先独立淘汰，再进入 Memory 内部合并；
 - 优先返回解释性强的；
 - 优先返回“存在性线索”；
 - 避免直接插入大段内容；
@@ -1292,6 +1422,9 @@ Hints 应该少而精。
 | 剧烈度阀门 | (add+remove)/total 比例 | 0.5 |
 | 召回路径选择 | mechanical / llm / auto | auto |
 | 召回入口 | `update_session_topic` | 仅此一个（接口开放） |
+| Hint 总保留预算 | 整数 | 由 `RecallPolicy` 配置 |
+| Agent Memory Hint Type 候选预算 | per-type 整数 | 由 `RecallPolicy` 配置 |
+| Agent Memory Hint Type 保留预算 | per-type 整数 | 由 `RecallPolicy` 配置 |
 | 呈现通道 | tool result / bg inject / sub trigger | 三通道并存 |
 | LLM 召回超时 | 时长 | 10s |
 | topic title 长度 | 字符上限 | 120 |
@@ -1339,7 +1472,7 @@ update_session_topic(
 2. 如果 Tags 已满，机械淘汰低权重旧 Tag；
 3. 机械召回 Memory；
 4. 命中用户偏好 49ers；
-5. 命中历史 Session：之前搜索过超级碗门票。
+5. 命中 Memory 中的 Session 原文类线索：之前搜索过超级碗门票。
 
 返回 Hints：
 
@@ -1351,7 +1484,8 @@ Reason: 当前 Topic 包含 NFL。
 
 Hint 2:
 曾有历史 Session 讨论今年超级碗门票搜索。
-Source: Historical Session
+Source: Memory
+MemoryHintType: SessionRaw
 Reason: 当前 Topic 包含 NFL / tickets / event。
 ```
 
@@ -1535,7 +1669,67 @@ Tag 淘汰、权重衰减、基础召回应尽量机械、可预测。
 
 ---
 
-## 23. 最终架构定位
+## 23. 实现验收清单
+
+本节给实现者使用，避免把架构原则误读成可选建议。
+
+### 23.1 工具基础语义
+
+- [ ] 工具名为 `update_session_topic`，参数至少包含 Topic Title 和 Topic Tags；
+- [ ] 写入路径固定为 `{session_dir}/.meta/topic.md`，内容为 frontmatter + body 结构；
+- [ ] `topic.md` 表达当前态，覆盖写；`round_history` / `topic_log.jsonl` 表达调用历史，append-only；
+- [ ] 相同 Title 重复调用时，`topic.md` 不应无意义重写，但 Tags 仍要参与权重增强、淘汰和可能召回；
+- [ ] Title 必须是单行、≤ 120 字符；
+- [ ] 从未写入 Topic 的 Session 不生成空 `topic.md`，浮现层应容忍缺失；
+- [ ] 工具描述必须明确：只在主题首次明确、显著漂移或进入长尾时调用；写给未来的 Agent；不是 Session Summary；
+- [ ] 不引入新的 RPC / DB；不暴露专用 read / list API。
+
+### 23.2 Tag 集合维护
+
+- [ ] `tag_set.json` 可读取、更新和持久化；
+- [ ] 同名 Tag 权重增强并更新 `last_touched`；
+- [ ] 新 Tag 默认 `weight=1.0`，`tier=Transient`；
+- [ ] 容量超限时按 `weight * exp(-(now - last_touched) / TAU)` 淘汰最低分 transient Tag；
+- [ ] v0.2 保留 `tier` 字段，但全部按 Transient 处理；
+- [ ] Tag 容量和 TAU 通过配置注入，不硬编码。
+
+### 23.3 召回触发与交付
+
+- [ ] 阀门判定使用距离阀门和剧烈度阀门；
+- [ ] `change_ratio >= change_threshold` 映射为 LLM 召回；
+- [ ] `turns_since_last_recall >= distance_threshold` 映射为 Mechanical 召回；
+- [ ] 阀门未突破时返回 `NotTriggered`；
+- [ ] 召回策略通过 `RecallPolicy` 注入，不硬编码；
+- [ ] `update_session_topic` 只调用 `RecallService`，不得内嵌具体召回逻辑；
+- [ ] 机械召回与 LLM 召回互斥二选一；
+- [ ] 工具同步等待召回完成，永不返回 `pending`；
+- [ ] LLM 召回默认 10s 超时，超时归入 `Failed`；
+- [ ] 召回失败不影响 Tag 更新成功，工具仍返回 `success` + `recall_status=Failed`；
+- [ ] `UpdateSessionTopicResult` 至少包含 `tag_set_diff`、`recall`、`recall_status`。
+
+### 23.4 RecallService 与订阅
+
+- [ ] 定义 `RecallService` trait，并通过 trait 注入到 `update_session_topic`；
+- [ ] 提供机械召回实现，用于基于 Tag 的 Memory / Notebook / DID-Object 短 Hint 召回；
+- [ ] 提供 LLM 旁路召回实现，用于语义筛选、动态环境判断和半订阅创建；
+- [ ] 提供 mock RecallService 用于单元测试和工具集成测试；
+- [ ] LLM 召回产出的订阅写入 `{session_dir}/.meta/subscriptions.json`；
+- [ ] 订阅记录显式携带 `bound_tags`，Tag 淘汰时可级联清理；
+- [ ] 同类订阅可去重合并，Session 结束时清理。
+
+### 23.5 测试要点
+
+- [ ] Tag 淘汰算法单元测试：容量满、同名累加、时间衰减、tier 预留字段；
+- [ ] 阀门判定单元测试：距离阀门、剧烈度阀门、NotTriggered / Mechanical / LLM 三态；
+- [ ] 工具调用集成测试：mock RecallService 返回 NotTriggered、Recalled、Failed；
+- [ ] 幂等性测试：相同 Title 重复调用不重复写当前态，但仍处理 Tags；
+- [ ] 召回失败 / 超时测试：工具返回 `success`，`recall_status=Failed`；
+- [ ] 订阅写入和 Tag 级联清理测试；
+- [ ] 缺失 `topic.md` 测试：浮现层枚举时能跳过无 Topic 的 Session。
+
+---
+
+## 24. 最终架构定位
 
 OpenDAN 的观察世界机制可以概括为：
 

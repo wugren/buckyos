@@ -76,6 +76,7 @@ pub mod contact;
 pub mod task_dispatch;
 
 // Session-topic storage / recall primitives used by the non-CLI tool entry.
+pub mod hint_recall;
 pub mod session_topic;
 // §8 — non-CLI session tools (worksession control + update_session_topic).
 pub mod worksession_tools;
