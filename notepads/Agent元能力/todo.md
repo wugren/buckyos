@@ -134,7 +134,9 @@ Call(objid,function_name,params)
 
 Read(objid) -> 最简单，读取一个对象(如果是容器会返回分页访问的方法） objid是hash
 
-> TODO 需要统一
+objref: cyfs://$objid
+
+> TODO 需要增加支持
 
 ### 工具支持(Agent Tool体系)
 
@@ -153,8 +155,7 @@ tmux session + 意图引擎
 Hint = 时间 + 一句话 + 对象ID
 
 固定下现在支持的hint架构，并打通从hint->事实的路径
-- AgentSession
-- Global Object
+
 	
 确认基于tag的机械召回路径
 - 有tag的对象的匹配
@@ -162,6 +163,9 @@ Hint = 时间 + 一句话 + 对象ID
 	
 	
 确认基于LLM的半订阅调用（目前缺失的一环），触发边界在哪？订阅太多触发？能否机械的判断当前session topic应该订阅哪些global object?
+
+> TODO: 正确实现新的Hint
+
 
 ### Agent State Self Improve
 
@@ -202,10 +206,10 @@ Stage3:
 
 > TODO: 增加一个专门的组件来管理 Attention Signals OK 
 > TODO: 补齐 Attention Signal / Session History 管理操作的 bash CLI 支持 OK 
-> TODO: 如何重点观察skill的两种信号？ : 待实现，根本上是需要让session/session report与skill建立强结构关系
+> TODO: 如何重点观察skill的两种信号？ : 待实现，根本上是需要让session/session report与skill建立强结构关系 later
     1）使用了skill的session -> 看report
     2) 使用了skills mgr的selector,但没有选中任何skill
-> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统： 对象观察
+> TODO: 需要Agent视角的，对Object进行备注和状态管理的系统： 对象观察类memory OK 
 
 
 ## Skills 
@@ -235,7 +239,7 @@ skill的分类
 - lifecycle_state
 - verification_status
 
-> TODO 需要重新定义skill的格式
+> TODO 需要重新定义skill的格式 OK
 
 ### skills的使用 
 
@@ -246,7 +250,7 @@ plan模式进行选择） + report汇报效果
 
 ### skills的安装 (llm_install_skill)
 
-> TODO 需要实现 首先应该实现，这根本上是给一个结构后，让llm帮着完成“强化“的过程
+> TODO 需要实现 首先应该实现，这根本上是给一个结构后，让llm帮着完成“强化“的过程，
 
 ### skills的结晶和整理 (improve-skill)
 
@@ -262,7 +266,7 @@ plan模式进行选择） + report汇报效果
 根据理论，似乎是Plan阶段对Do阶段的权限管理？
 
 - 通过硬边界（沙盒）限制能力 （目前）
-- 建立信用架构：如何定义？
+- 建立信用架构：如何定义？ Read里已经有相关的信用提示词了
 - 根本矛盾是 LLM 自主决定的自由度 与 权限控制硬边界的矛盾 （这也许是产品问题？ 也许是一个核心问题）
 
 identity

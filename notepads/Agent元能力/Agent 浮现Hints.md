@@ -63,7 +63,7 @@
 - RPC 接口；
 - MCP 工具；
 - 向量库或全文索引查询工具；
-- Global Object 读取接口。
+- DID-Object 读取接口。
 
 这样 Agent 可以带着意图去查。如果不查询，工具只占用少量工具定义上下文。
 
@@ -179,7 +179,7 @@ NFL
 这些 Tags 的作用是帮助系统判断：
 
 - 当前 Session 正在围绕什么话题展开；
-- 哪些 Memory / Notebook / 历史 Session / Global Object 可能相关；
+- 哪些 Memory / Notebook / 历史 Session / DID-Object 可能相关；
 - 是否需要触发 Hints 召回；
 - 是否需要对某些环境状态进行半订阅。
 
@@ -216,9 +216,9 @@ Hint 的目标不是把所有事实都塞进上下文，而是告诉 Agent：
 
 Hint 不应该默认携带大段原始文本。
 
-### 4.5 Global Object
+### 4.5 DID-Object
 
-Global Object 是 OpenDAN 中对现实世界数字化状态的一种抽象。
+DID-Object 是 OpenDAN 中对现实世界数字化状态的一种抽象。
 
 从心智模型上看，可以认为：
 
@@ -236,7 +236,7 @@ hostname / object_id / path
 - `object_id` 表示具体对象；
 - `path` 表示对象中的某个状态、属性或字段。
 
-Memory、Notebook、历史 Session、文件目录、项目状态、用户位置、日程、设备状态、外部服务状态，都可以被抽象为 Global Object。
+Memory、Notebook、历史 Session、文件目录、项目状态、用户位置、日程、设备状态、外部服务状态，都可以被抽象为 DID-Object。
 
 ---
 
@@ -451,7 +451,7 @@ Tag 被淘汰不代表信息丢失。
 - Memory；
 - Notebook；
 - 历史 Session；
-- Global Object；
+- DID-Object；
 - 归档系统。
 
 Session Topic 只负责表达当前 Session 的短期注意力。
@@ -498,7 +498,7 @@ Hints 可以来自多个系统：
 - Notebook：用户或 Agent 记录的结构化笔记；
 - 历史 Session：过去曾经讨论过的相关任务；
 - 文件系统：项目目录、文档、代码、配置；
-- Global Object：日程、位置、设备、应用状态、远程服务状态；
+- DID-Object：日程、位置、设备、应用状态、远程服务状态；
 - Search Index：全文索引、向量索引、图索引等。
 
 例如当前 Topic 出现 `NFL`，系统可能召回：
@@ -519,6 +519,74 @@ Reason: 当前 Topic 包含 NFL / ticket / event planning。
 
 注意，这些 Hint 不一定包含完整门票搜索结果。它们只需要让 Agent 知道：“这件事存在，可能值得查”。
 
+### 7.2 Attention Graph 与 Memory Hint Recall
+
+基于 Tag 的 Memory Hint Recall 不应被理解成简单的全文检索。
+
+Session Topic Tags 是当前工作焦点的压缩入口。Memory 召回要用这组 Tags 进入 Attention Graph，在受预算限制的一跳 / 二跳范围内找到可能相关的对象、事件、观察和关系，再返回短 Hint。
+
+也就是说，召回链路更准确地说是：
+
+```text
+Session Topic Tags
+  -> tag / phrase 候选
+  -> Attention Graph 中的 Object / Event 命中
+  -> 一跳关系展开
+  -> 受预算限制的二跳展开
+  -> 排序、去重、截断
+  -> Memory Hints
+```
+
+这里的 Attention Graph 是 Owner-Centric 的：它不试图描述世界上最重要的对象，而是描述在 Agent 看来，哪些对象和事件正在与用户、当前 Session 和历史任务发生关系。
+
+Memory Hint Recall 至少应区分四类信号：
+
+- **Tag Match**：当前 Topic Tags 与 Memory item / observation / free hint 的 tag 或文本命中；
+- **Object Attention**：命中的 item 是否关联高关注对象；
+- **Event Attention**：命中的 item 是否属于高关注事件或事件子图；
+- **Graph Distance**：命中结果距离当前 Topic / Object 是一跳还是二跳。
+
+排序时，Attention Graph 不替代 tag，而是和 tag 一起参与评分：
+
+```text
+score =
+  structural_match_boost
+  + tag_position_boost
+  + object_attention_boost
+  + event_attention_boost
+  + item.weight
+  + item.confidence
+  - recency_decay(noticed_at)
+  - graph_distance_penalty
+```
+
+其中：
+
+- `tag_position_boost` 只适用于 Memory 的 ordered tags；越靠前的 tag 命中权重越高；
+- `object_attention_boost` 来自对象在 Attention Graph 中的当前权重；
+- `event_attention_boost` 来自事件本身及其局部子图的热度；
+- `graph_distance_penalty` 用来限制二跳扩散噪声；
+- `noticed_at` 是遗忘与召回衰减的主要时间来源。
+
+Memory 返回的仍然是 Hint，而不是事实正文：
+
+```text
+Hint:
+User may prefer inspectable local memory systems over opaque embedding-only memory.
+
+Source: Memory
+Reason: matched tags "agent memory", "architecture"; linked object "Agent Memory".
+Handle: item_001
+```
+
+Agent 拿到 Hint 后，可以选择忽略、读取完整 Memory item、追溯 evidence / source occasion，或者基于这个 Hint 主动询问用户。系统不应在第一阶段直接把大段 Memory / Notebook / Session 正文塞入上下文。
+
+需要特别注意 Memory 与 Notebook 的 tag 语义差异：
+
+- Memory 使用 ordered tags；tag 顺序表达当前 Topic 的优先级，可参与排序；
+- Notebook 的 tags 只做过滤，tag 顺序不影响结果排序；
+- 两者共享 tag 规范化规则，但召回排序策略不能混用。
+
 ---
 
 ## 8. 机械召回与 LLM 旁路召回
@@ -536,8 +604,8 @@ Reason: 当前 Topic 包含 NFL / ticket / event planning。
 
 - Tag 匹配；
 - 全文检索；
+- Memory Attention Graph 一跳 / 二跳展开；
 - Notebook 标题匹配；
-- Memory 关键词匹配；
 - 历史 Session Title 匹配；
 - 简单向量相似度搜索。
 
@@ -548,7 +616,8 @@ Reason: 当前 Topic 包含 NFL / ticket / event planning。
 - 明确命中的长期记忆；
 - 明确命中的 Notebook；
 - 历史 Session 的标题级召回；
-- 与当前 Tags 直接相关的对象列表。
+- 与当前 Tags 直接相关的对象列表；
+- 与当前高关注对象 / 事件直接相关的 Memory Hints。
 
 机械召回的原则是：
 
@@ -664,7 +733,7 @@ else:
 LLM 旁路可能只产生：
 
 - 一组更精确的 Hints；
-- 一组待关注 Global Objects；
+- 一组待关注 DID-Objects；
 - 一组半订阅；
 - 一个“暂不召回”的决策；
 - 一个对当前 Topic 的重写或合并建议。
@@ -687,6 +756,7 @@ LLM 旁路可能只产生：
 update_session_topic
   -> 机械式更新 Tag 权重
   -> 执行 Tag 淘汰
+  -> 调用 RecallService
   -> 机械召回 Memory / Notebook / Session / Object Hints
   -> 返回 Hints
 ```
@@ -761,7 +831,7 @@ User Message 到达
 
 它的基本思想是：
 
-1. Topic 浮现后，系统识别出一组相关 Global Objects；
+1. Topic 浮现后，系统识别出一组相关 DID-Objects；
 2. Agent 或 LLM 旁路判断这些对象值得关注；
 3. 系统订阅这些对象的某些状态变化；
 4. 当变化发生时，以 Background Hint 的方式注入上下文；
@@ -954,7 +1024,7 @@ flowchart TD
     I -- not triggered --> H
     I -- triggered --> J[LLM Side-channel Recall]
     J --> K[Better Hints]
-    J --> L[Global Object Candidates]
+    J --> L[DID-Object Candidates]
     J --> M[Semi-subscriptions]
 
     G --> N[Agent May Query Details]
@@ -1013,6 +1083,8 @@ flowchart TD
 - Topic Title；
 - 当前 Tags；
 - Tag 权重；
+- 当前 Session 已识别出的 Objects / Aliases；
+- Attention Graph Snapshot（对象权重、事件权重、关系距离）；
 - Session ID；
 - User / Agent profile；
 - 检索预算。
@@ -1022,8 +1094,26 @@ flowchart TD
 - Memory Hints；
 - Notebook Hints；
 - Historical Session Hints；
-- Global Object Hints；
+- DID-Object Hints；
 - 去重后的短线索集合。
+
+Memory Hints 的机械召回应通过独立的 MemoryRecallProvider 完成。HintRecallEngine 只负责编排，不直接实现 Memory 图展开。
+
+MemoryRecallProvider 的职责：
+
+- 使用 ordered tags 做 tag / phrase 候选召回；
+- 使用 objects / aliases 做 entity、pair、relation 的机械展开；
+- 结合 Attention Graph 的 object attention、event attention 和 graph distance 排序；
+- 过滤 inactive、forgotten、salience 等不可召回项；
+- 返回短 Hint、reason、matched tags、source handle 和必要的 debug metadata。
+
+MemoryRecallProvider 不负责：
+
+- 维护 Session Topic Tags；
+- 写入或修改 Memory；
+- 判断 Notebook 正文是否应进入上下文；
+- 创建半订阅；
+- 调用 LLM 做复杂语义筛选。
 
 ### 15.4 LLMSideChannel
 
@@ -1074,7 +1164,7 @@ flowchart TD
 
 然后生成简短、可解释的 Background Information。
 
-### 15.7 GlobalObjectSystem
+### 15.7 DIDObjectSystem
 
 负责把现实世界的数字状态抽象成对象系统。
 
@@ -1094,7 +1184,7 @@ flowchart TD
 | 子系统 | 职责 | 何时执行 |
 |---|---|---|
 | **A. Topic / Tag 更新** | 维护 Session Tag 集合（增删 + 淘汰） | `update_session_topic` 调用时 |
-| **B. 基于 Topic 的召回** | 以当前 Tag 为背景信息，从 Memory / Notebook / Global Object 中检索条目 | 任意触发点（当前仅 `update_session_topic`，但接口开放） |
+| **B. 基于 Topic 的召回** | 以当前 Tag 为背景信息，从 Memory / Notebook / DID-Object 中检索条目 | 任意触发点（当前仅 `update_session_topic`，但接口开放） |
 | **C. 召回信息的呈现** | 决定召回结果以何种形式、在何时进入 LLM 上下文 | 立即返回 / 背景注入 / 状态订阅触发 |
 
 > **关键约束**：三者必须通过定义良好的数据交换协议解耦。实现时，B 子系统必须抽象为独立的 `RecallService`，**不得**把召回逻辑直接耦合到 `update_session_topic` 工具实现内部。`update_session_topic` 是 `RecallService` 的**调用方，不是实现者**，两者必须在不同的模块 / crate 中。
@@ -1334,7 +1424,7 @@ Agent Runtime
 Session Topic
 ```
 
-系统召回一个 Global Object：
+系统召回一个 DID-Object：
 
 ```text
 Object: project://opendan/runtime
@@ -1449,13 +1539,13 @@ Tag 淘汰、权重衰减、基础召回应尽量机械、可预测。
 
 OpenDAN 的观察世界机制可以概括为：
 
-> 以 Session Topic 为当前工作记忆，以 Hints 作为相关信息的存在性线索，以 Global Object 作为现实世界状态的统一抽象，以半订阅和 Context Weaving 控制动态状态注入，从而在机械 RAG 和 Agent 主动查询之间建立一套更符合 Agent 推理流的观察系统。
+> 以 Session Topic 为当前工作记忆，以 Hints 作为相关信息的存在性线索，以 DID-Object 作为现实世界状态的统一抽象，以半订阅和 Context Weaving 控制动态状态注入，从而在机械 RAG 和 Agent 主动查询之间建立一套更符合 Agent 推理流的观察系统。
 
 它要解决的不是简单“如何把更多资料塞给 LLM”，而是：
 
 > 如何让 Agent 在有限上下文中，知道当前世界中有哪些事情可能和它正在做的任务有关。
 
-这也是 OpenDAN Cross-session Memory / Notebook / Global Object System 的核心连接点。
+这也是 OpenDAN Cross-session Memory / Notebook / DID-Object System 的核心连接点。
 
 最终，Agent 的观察路径不再是单一的：
 
@@ -1476,216 +1566,3 @@ OpenDAN 的观察世界机制可以概括为：
 ```
 
 这套机制让 Agent 既不会被机械 RAG 的上下文洪水淹没，也不会因为完全依赖主动查询而陷入“不知道自己不知道”的盲区。
-
-## 24. 附录 原始语音
-
-====
-这个文档介绍OpenDAN是如何系统性地把基于浮现的 Hints 这套体系贯穿起来，作为让 Agent 有机会获得更全面的全局信息的召回机制起点吧 
-
-这篇文章的相关领域 其实很多时候跟比较热门的 RAG 是有关系的。但从实现的角度来讲，它更加倾向于、也更加符合 Agent 的思维链吧。
-
-它要解决的首要问题是，我们都知道 Agent 其实是一个线性上下文。不管它在执行什么工作，其核心就是在一个线性上下文里，去积累必要的所谓现状或者叫观察信息。
-
-然后，基于这些现实中的观察信息，推理得到真正正确的结论。也就是说，当每一个 session 启动（即空上下文）的时候，其实 Agent 除了系统提示词以外，什么都看不到。
-
-那它在跟用户不断聊天的过程中，要如何去了解现实中的信息呢？
-
-这应该说是 Agent 架构中非常核心的一部分。如果我们把 Agent 的架构分成三部分，其核心逻辑如下：
-1. 如何观察并了解现实世界（处理逻辑是什么）
-2. 如何进行推理
-3. 如何影响现实世界
-
-所以说，如何观察现实世界是一个非常基础且重要的问题。
-
-传统的 RAG 技术其实是把它当成一种搜索引擎来看的，也就是说，它忽略了“三步走”的概念。
-
-它核心的想法是：每当用户有输入时，系统一定会通过一次机械性的 RAG 查询。这相当于在把用户输入塞进推理引擎之前，先利用输入信息的特点去走一个旁路查询。这个旁路中可能包含大量信息，但由于查询过程是非智能的机械性查询（通常是全文搜索），你无法分辨查询结果对 LLM 而言到底有没有用。
-
-在这种模式下，你唯一能做的就是把查询到的结果直接插入到上下文里，作为用户正式输入的一部分。换句话说，用户可能只说了一两句话，但你在这两句话前面插入了一大堆所谓的文本块。你希望通过这些文本块的上下文补充，指望模型能从中挑选出正确的上下文块。
-
-这就是 RAG 过去比较传统的一种模式。我们来看看这个模式中存在哪几种问题，或者说它代表的根源是什么。
-
-这里的最大问题在于，你每一次触发节点的机制中其实隐含了一个模式，叫做“机械式的上下文注入”。
-
-这种注入是非大语言模型（LLM）控制的。也就是说，每一次用户输入都可能导致一大堆文本，或者说来自于现实世界的各种信息，被强制性地注入到上下文里，供后续筛选使用。
-
-关于这个模式，有两点核心逻辑：
-1. 插入时机：固定在每一次输入时。
-2. 插入内容：基于现实世界的机械性关联度分析。
-
-从 RAG（检索增强生成）的角度来看，这是一种常用的方法：基于当前输入消息在向量空间中的相似度，把与之相关的其他对象块（无论是结构化还是非结构化的数据）统统找一遍。
-
-换句话说，考虑到现实世界的信息量非常大，通常会设置一个权重，比如只召回前 10 个相关结果。在这种情况下，所有可以通过这种方法访问到的信息其实都存储在向量数据库中。它本质上就是一个离当前输入更近的查询逻辑。
-
-这个思路的痛点就在于插入密度很高。本质上讲，它还是一个怕漏查的思路，因为非常担心漏掉信息，所以每次用户输入消息时都会去进行查询。
-
-当然也有一种逻辑是，只有在第一次输入时才去查询。但总之，如果为了解决大语言模型“知不知道要查”的问题，而采取这种“管他三七二十一”、每次用户输入都查一次的主动方式来注入信息，其实对于本来就比较精贵的上下文来讲，是非常简单粗暴的。
-
-这种方案的插入时机和插入内容，从某种意义上讲是不符合 COT（思维链）要求的：
-1. 逻辑关联度问题：大语言模型在看上下文时，总是希望知道每一个 token 是怎么来的，需要有所谓的逻辑关联度。
-2. 推理无关性：通过向量空间召回产生的这些 Block，其实是跟推理无关的东西。
-3. 契合度差：它作为一种 background environment 的信息（背景信息）插入进来，放在大语言模型的 token 流里，其实跟前后文的关联度很差。
-
-
-
-刚刚讲的这种属于被动查询，还有一种是主动查询。
-
-这种方式相当于我并不是用机械式的文本插入，而是给系统扩展一些查询函数。通过标准的 Agent Tool 方法，在系统里扩展功能。
-
-比如我可以告诉系统我有一个文件系统，里面存储了一些信息。那么 Agent 自然而然就会调用传统的文件查找工具（比如 grep 或者 glob）去寻找它想要的内容。如果你给他一个 RDB 的 schema，可能 agent 在理解这个 schema 之后，会直接写 SQL 去查询。当然，你也可以给他一个关于服务的 RPC 接口定义，agent 也有可能会去调用这些 RPC 接口。
-
-这就是所谓的 MCP还有就是说，我们可以把刚才讲的矢量库、全文索引数据库或者某种图数据库，统统都做成一种 Agent 可以理解的工具（Agent Tool）。
-
-这样做的目的是，如果我把工具放在这里，Agent 每次可以带着意图去查询。如果不去查的话，它对上下文的占用其实仅仅是一个工具定义的占用。
-
-从某种意义上讲，这种方式比上一种机械的思路要好，因为 Agent 大概能理解自己为什么会得到这些信息。
-
-主动查询的一个缺点，从哲学或认知层面来讲，就是“人不知道自己不知道”。
-
-因为 Agent 没有相关的线索，所以它不知道自己要去查某个东西。换句话说，如果它不知道某件事情的存在，也就不知道需要去查这件事，除非用户主动提到。
-
-但其实很多事情并不是主动提到的。例如：
-1. 用户说：“我明天中午要跟某某人吃饭。”
-2. 如果这个信息存在潜在的行程冲突，你必须通过非常强的逻辑告诉 Agent：在涉及到任何约会安排时，都要先调用查询工具，确认该时间点是否已经有其他安排。
-
-这种逻辑的难点在于：Agent 在处理事情 A 的时候，需要意识到上下文之外还存在事情 B，并想到去查询事情 B。从认知科学的角度来看，这其实是不太合理的，因为人确实没办法主动去寻找自己完全意识不到的信息。
-
-所以说总结一下，我们可以把现有的这种在有限记忆中试图访问不断改变的现实世界的思路进行归纳。
-
-我们不一定非要把它叫做 RAG（检索增强生成）。我觉得这更多的是一种观察。RAG 讲的是生成式检索，它其实更偏向于主动查询。
-
-从原理上讲，核心其实就是两个流派：
-
-1. 第一个流派是所谓的 自动插入 模式：大语言模型永远不主动查询。查询是一个旁路。
-2. 另一个流派是 Agent Tool模式 全部由大语言模型主动查询。
-
-这是我们可以看到的两种模式
-
-这两种模式之间的缺点也比较明显：
-
-第一种模式对上下文窗口（Context Window）的影响比较大，而且确实对 Agent 本身的整个 Session 推理流的关联度有一个比较大的影响。
-
-当然，有一种做法是每次都做两次 LLM 推理：
-1. 在任何请求进来之前，先把整个历史记录扔到一个系统空间里，让它去分析。
-2. 给它一个特别重的检索过程，去检索现在的记录与用户以及相关的 Global State 之间有哪些关系。
-
-这是一种最重的路线。原理上讲确实可行，如果可以不计成本地追求效果，或者 LLM 的算力已经无限大了，我觉得这个路线也许是可行的。但以现在这种半机械的方法来看，我觉得还是需要有一个取舍。
-
-第二种模式就是刚刚讲的，缺点也很明显（这里不再复述了），核心就是：它不可能知道自己不知道的事。
-===
-
-
-这是一个分类学的问题，其实没有第三条路。那我们怎么去解决这个问题呢？
-
-我们的思路叫做“浮现”。这种“浮现”是对认知学的一种观察或者整理。相当于说我们人在互相聊天的时候，人为什么会有记忆？目前有两种观点：
-
-1. 潜意识观点
-   (a) 所谓潜意识就是你大脑里的权重，当这个事情被激活后，你就能自然而然地把记忆提取出来。
-   (b) 但很明显，人的潜意识训练会很快，而大语言模型（LLM）并不允许在运行中实时修改权重。
-
-2. 线索与外部系统观点
-   (a) 观察个人的话，其实很多工作上一直在改变的事情，脑子里想到的往往只是一个线索。
-   (b) 在聊天的一瞬间，脑子的速度其实比嘴快，脑子里会浮现出各种各样的线索。虽然这一刻你可能想得不太清楚（人脑确实没那么强的记忆力），但如果这件事情特别重要，比如别人在微信上给你发了条信息，你在回复之前，可能会通过脑中的线索去打开文件系统或笔记本。
-   (c) 试着找到那一页，看到完整且实际写下来的事实信息后，再回头去整理、组织语言，最后回复别人。
-
-
-上面这种认知学的结论，就是我们鼓励两种系统混合使用。简单来说，我们鼓励通过所谓的“浮现机制”来实现。
-
-这个浮现机制的核心叫做 Session Topic Tag，换句话讲，就是让大模型比较轻的推理，出现在会话上下文涉及到的一些话题中。
-
-1. 召回机制的转变
-   我们并不是基于用户说的一句话去直接召回，而是基于 Agent 或大模型总结出来的 Topic 去召回。
-
-2. 召回的内容：Hints（线索）
-   召回的东西是 Hints，也就是所谓的线索。这些线索本身并不要求包含事件的全部细节，只要能说明这个事情存在就好了。
-
-3. 解决“模式二”的问题
-   这解决了模式二中“不知道这个事情在不在”的问题。也就是应对“你不知道自己不知道的事”。
-
-整个认知学流程如下：
-1. 首先浮现出一个 Topic。
-2. 通过一个全局性的机械召回系统（也可能是半机械的，这里即便有 LLM 的接入我觉得也能接受）召回一些 Hints。
-3. 最后，Agent 可以基于主动查询工具，结合这些 Hints，在自己需要的时候去了解事情的细节。
-
-
-这个机制就是我们的核心，应该说是我们整个 OpenDAN Agent （Cross-session） 全局 Memory 系统最核心的一个套路分析。
-
-从根本上讲，它其实综合了两类模式的优点（缺点也会有）
-
-这里详细讲一下刚才提到的三个步骤中的一些细节：
-
-1. Session Topic 的合并与淘汰
-   这是对“浮现”这件事最原始的管理。原理上，大语言模型每一次推理都可能调用 set_session_topic。我们的参数是一组 Tags 和一句话，这其实是一个微型的 COT（思维链）。通过推导出这一句话，模型可以得到更准确的 Tags，而这个过程的准确性对整个系统影响极大。
-
-2. Tags 的冷热度管理
-   (a) 动态更新：新的 Tags 会淘汰旧的 Tags，而反复被提到的 Tags 会得到增强，不易被淘汰。
-   (b) 核心概念：系统里会始终维持一个 Last Topic Title（或者叫 Last Session Title），即最后一次调用时的那句话，用来表征当前正在处理的任务。
-   (c) 历史积累：系统还会维护一个随时间淘汰、动态变化的 Topic 列表。
-
-按照这个思路，系统里就一直维持着一个模拟认知科学中人脑思维的列表，记录着现在的聊天与哪些事情相关。
-
-
-====
-
-然后第二个是触发环节，即触发 hints 的环节。
-
-我们现在有一个主动触发点：大模型每次调用 update_session_topic 时（也就是换场去更新 target 的时候），都可能会触发一次基于新 target 得到并更新 hints 的过程。就比如说，如果聊天聊到了 NFL，系统会基于 NFL 这个标签走一个召回流程。它可能会召回出几个 hints（提示）：
-
-1. 一句话的 hint
-   比如用户喜欢“49人队”，这就是存在 Memory（记忆）里的一条 hint。
-
-2. 从 Notebook/Session 出来的 hint
-   比如用户正在搜索今年超级碗总决赛的门票。在这个搜索过程中，如果有一个 session 谈到了这个话题，那么这个 hint 指向的并不是最终结果，而是我们之前提到的 session title.这些 title 其实是有历史记录的。如果在某个 session 里面曾经总结过一句话，而这句话跟当前的 tag 相关，就意味着该 session 与此相关。这种情况下，hint 指向的就是这个 session 本身。
-
-另一种召回比较复杂，我们把它称之为“半订阅”的一种召回。
-
-也就是说，系统在 Update Session Topic 或者某个时间点的时候，并不是返回一组 Hints，而是订阅了一组事件。这时候就涉及到我们的 Global Object System（基于文件系统的全局对象系统）。
-
-从根本上讲，这相当于回答了：对于 Agent 来说，如果它主动查询，它应该怎么了解这个世界的问题。关于 CYFS 的设计，我们给出的答案是：我们认为 Agent 可以通过文件系统来了解世界。也就是说，从简化和一致性心智模型的角度来讲，我们认为这个世界所有的状态在数字化之后，就是一个巨型的文件系统。换句话讲，这个文件系统是基于这种 URL 的：Hostname/Object ID 表明了一个对象。Path 表达了这个对象的状态（即里面的具体属性）
-基于这样的一种认知，我们就可以通过这种路径去订阅一个对象的状态改变。
-
-很多时候，我们并不一定需要现场去读取信息，因为现实世界一直在变化。比如你可能有一个 Session 已经存在很久了，很多信息都发生了改变。我们之前经常举的一个例子是：如果一个 Session Topic 涉及到一个旅游计划，它可能需要通过 Update Session Topic 的内部流程或显性流程来更新。
-
-这里很重要的一点是：
-1. 它召回的是一组相关对象。
-2. 虽然这一组对象看起来像是一组目录，但我们会通过一些 Skills 提示词（Prompt）让 Agent 知道，它其实是对象属性这类东西。
-
-比如我本地的一个开发目录，其实也可以用这个方法：
-当这个开发目录在其他地方被改变时，Agent 其实可以通过订阅这个目录的状态改变，通过 Hints 把这些变化传回来。
-
-
-也就是说，基于半订阅的事件，从原理和根本上讲，其实是披露了和当前 Session Topic 相关的 Global Object（全局对象）。这些 Hints 指向了这些全局对象，包括前面讲到的 Session Notebook，其实都是一种全局对象。
-
-如果说我们能够贯彻“所有的全局对象通过文件系统一定可以访问”，而且推荐通过事件去订阅的话，那么：
-1. 你的 Hints 只要指向了这个对象，Agent 就可以考虑要不要去订阅该对象改变的状态。
-2. 它可以决定是针对哪个具体字段的改变进行订阅，还是在需要的时候直接去查询。
-
-也就是说，我们在更多意义上构建了一个图。相当于我通过一个 Session Topic，在 Hints 这里注入了一组对象，并以此告知为什么会和这些对象有关。
-
-总结一下，我们的机制在召回环节的根本是把一组对象拉回来，后续 Agent 可以决定是要订阅这个对象的状态，还是主动查询其状态信息。
-
-基于这两种抉择，我们的设计逻辑如下：
-
-1. 解决“不知道自己不知道”的问题
-   我们首要通过 Session Topic 机制，解决 Agent 意识不到某些信息存在的问题。
-
-2. 解决主动查询的频率问题
-   一旦 Agent 订阅了对象状态，系统另一套名为“半订阅”的机制就会开始工作。当感兴趣的对象状态发生改变时，信息会注入到 background environment 中，并给出一个更具体的 hint。
-   通过“hint + 事件”的机制，我们不鼓励 Agent 没事就把所有东西读一遍，很多时候它只需要订阅一个状态即可。
-
-关于主动查询的管理，这其实是一种工程优化。在实际开发中我们发现，大模型一旦知道对象的路径是文件系统，其主动查询的意图会非常强烈。
-
-针对这种工程抉择，如果我们认为这种主动信号比较危险或不好控制，最常见的方法就是：
-1. 根本不告诉 Agent 怎么去读文件。
-2. 强制它只能选择订阅状态。
-
-这样一来，触发频率就完全在我们的控制之下。这也是之前两大流派的区分点：查询流的主动查询有时会被 Agent 用得特别凶，在工程上很难控制，因此必须做一些取舍。我们通过故意不披露查询方法，只披露这个 Event 事件来控制频度。
-
-否则会出现一种很常见的情况：明明 Search 的对象就是当前 Session，但他还是会通过文件系统去查这个 Session 里的上下文。因为这些上下文说到底都在历史聊天记录里面，有的时候他就是会做这种事情。
-
-如果我们通过 Event 事件，在这里是可以做很多工程上的优化：
-1. 当一个事件发生改变时，把它注入到 Background Environment 里面作为一条 Hint。
-2. 在这条 Hint 中，才真正暴露读取该状态全部信息的方法。
-3. 而不是在第一步 Update Session Topic、立刻召回 Hint 的时候，就把读取方法全部暴露出来。
-
-根据工程经验，如果第一步就暴露方法，会导致产生大量的冗余查询。
