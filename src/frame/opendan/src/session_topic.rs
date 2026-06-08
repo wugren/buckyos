@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::hint_recall::{
-    DefaultRecallService, HintRecallEngine, LlmRecallService, MemoryRecallProvider,
-    NotebookRecallProvider, RecallHintType, RecallInput, RecallItem, RecallPayload, RecallProvider,
-    RecallResult, RecallService, RecallSourceSystem, RecallTarget, SessionTopicRecallProvider,
+    DefaultRecallService, DidObjectRecallProvider, HintRecallEngine, LlmRecallService,
+    MemoryRecallProvider, NotebookRecallProvider, RecallHintType, RecallInput, RecallItem,
+    RecallPayload, RecallProvider, RecallResult, RecallService, RecallSourceSystem, RecallTarget,
+    SessionTopicRecallProvider,
 };
 
 const META_DIR: &str = ".meta";
@@ -23,6 +24,8 @@ const TOPIC_FILE: &str = "topic.md";
 const TOPIC_LOG_FILE: &str = "topic_log.jsonl";
 const TAG_SET_FILE: &str = "tag_set.json";
 const SUBSCRIPTIONS_FILE: &str = "subscriptions.json";
+const TOPIC_DOC_SCHEMA: &str = "opendan.session_topic";
+const TOPIC_DOC_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum SessionTopicError {
@@ -150,6 +153,145 @@ pub struct RecallPolicy {
     pub change_threshold: f32,
     pub mode: RecallMode,
     pub llm_timeout_ms: u64,
+    pub max_hints: usize,
+    pub source_budgets: RecallSourceBudgets,
+    pub memory_type_budgets: MemoryTypeBudgets,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RecallPolicyOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RecallMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hints: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_budgets: Option<RecallSourceBudgetsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_type_budgets: Option<MemoryTypeBudgetsOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RecallSourceBudgetsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notebook: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_raw: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did_object: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_event: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryTypeBudgetsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_raw: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_observation: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_relation: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<usize>,
+}
+
+pub fn apply_recall_policy_override(
+    policy: &mut RecallPolicy,
+    override_policy: Option<&RecallPolicyOverride>,
+) {
+    let Some(override_policy) = override_policy else {
+        return;
+    };
+    if let Some(mode) = override_policy.mode {
+        policy.mode = mode;
+    }
+    if let Some(timeout) = override_policy.llm_timeout_ms {
+        policy.llm_timeout_ms = timeout;
+    }
+    if let Some(max_hints) = override_policy.max_hints {
+        policy.max_hints = max_hints.max(1);
+    }
+    if let Some(source) = &override_policy.source_budgets {
+        if let Some(value) = source.memory {
+            policy.source_budgets.memory = value;
+        }
+        if let Some(value) = source.notebook {
+            policy.source_budgets.notebook = value;
+        }
+        if let Some(value) = source.session_raw {
+            policy.source_budgets.session_raw = value;
+        }
+        if let Some(value) = source.did_object {
+            policy.source_budgets.did_object = value;
+        }
+        if let Some(value) = source.background_event {
+            policy.source_budgets.background_event = value;
+        }
+    }
+    if let Some(memory) = &override_policy.memory_type_budgets {
+        if let Some(value) = memory.session_raw {
+            policy.memory_type_budgets.session_raw = value;
+        }
+        if let Some(value) = memory.event {
+            policy.memory_type_budgets.event = value;
+        }
+        if let Some(value) = memory.entity_observation {
+            policy.memory_type_budgets.entity_observation = value;
+        }
+        if let Some(value) = memory.entity_relation {
+            policy.memory_type_budgets.entity_relation = value;
+        }
+        if let Some(value) = memory.free {
+            policy.memory_type_budgets.free = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RecallSourceBudgets {
+    pub memory: usize,
+    pub notebook: usize,
+    pub session_raw: usize,
+    pub did_object: usize,
+    pub background_event: usize,
+}
+
+impl Default for RecallSourceBudgets {
+    fn default() -> Self {
+        Self {
+            memory: 4,
+            notebook: 3,
+            session_raw: 3,
+            did_object: 0,
+            background_event: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryTypeBudgets {
+    pub session_raw: usize,
+    pub event: usize,
+    pub entity_observation: usize,
+    pub entity_relation: usize,
+    pub free: usize,
+}
+
+impl Default for MemoryTypeBudgets {
+    fn default() -> Self {
+        Self {
+            session_raw: 2,
+            event: 2,
+            entity_observation: 2,
+            entity_relation: 2,
+            free: 2,
+        }
+    }
 }
 
 impl Default for RecallPolicy {
@@ -161,6 +303,9 @@ impl Default for RecallPolicy {
             change_threshold: 0.5,
             mode: RecallMode::Auto,
             llm_timeout_ms: 10_000,
+            max_hints: 8,
+            source_budgets: RecallSourceBudgets::default(),
+            memory_type_budgets: MemoryTypeBudgets::default(),
         }
     }
 }
@@ -191,6 +336,20 @@ impl SessionTopicUpdater {
 
     pub fn with_default_retrieval(policy: RecallPolicy) -> Self {
         Self::with_default_recall(policy)
+    }
+
+    pub fn with_local_recall(
+        policy: RecallPolicy,
+        memory_root: impl Into<PathBuf>,
+        notebook_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new(
+            Arc::new(DefaultRecallService::with_local_roots(
+                memory_root,
+                notebook_root,
+            )),
+            policy,
+        )
     }
 
     pub async fn update(
@@ -490,8 +649,8 @@ fn write_topic_doc(
     let tags_json = serde_json::to_string(tags)?;
     let reasons_json = serde_json::to_string(tag_reasons)?;
     let body = format!(
-        "---\nsession_id: {}\nupdated_at: {}\ntags: {}\ntag_reasons: {}\n---\n\n{}\n",
-        session_id, now, tags_json, reasons_json, topic
+        "---\nschema: {}\nversion: {}\nsession_id: {}\nupdated_at: {}\ntags: {}\ntag_reasons: {}\n---\n\n{}\n",
+        TOPIC_DOC_SCHEMA, TOPIC_DOC_VERSION, session_id, now, tags_json, reasons_json, topic
     );
     write_atomic(path, body.as_bytes())?;
     Ok(())
@@ -505,6 +664,8 @@ pub(crate) fn read_topic_doc(path: &Path) -> Result<TopicDoc, SessionTopicError>
 fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
     if !text.starts_with("---\n") {
         return Ok(TopicDoc {
+            schema: None,
+            version: None,
             session_id: String::new(),
             tags: Vec::new(),
             tag_reasons: BTreeMap::new(),
@@ -518,12 +679,18 @@ fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
     };
     let fm = &text[4..4 + end];
     let body = text[4 + end + 5..].trim().to_string();
+    let mut schema = None;
+    let mut version = None;
     let mut session_id = String::new();
     let mut tags = Vec::new();
     let mut tag_reasons = BTreeMap::new();
     for line in fm.lines() {
         let line = line.trim();
-        if let Some(raw) = line.strip_prefix("session_id:") {
+        if let Some(raw) = line.strip_prefix("schema:") {
+            schema = Some(raw.trim().to_string());
+        } else if let Some(raw) = line.strip_prefix("version:") {
+            version = raw.trim().parse::<u32>().ok();
+        } else if let Some(raw) = line.strip_prefix("session_id:") {
             session_id = raw.trim().to_string();
         } else if let Some(raw) = line.strip_prefix("tags:") {
             tags = serde_json::from_str(raw.trim()).unwrap_or_default();
@@ -532,11 +699,31 @@ fn parse_topic_doc(text: &str) -> Result<TopicDoc, SessionTopicError> {
         }
     }
     Ok(TopicDoc {
+        schema,
+        version,
         session_id,
         tags,
         tag_reasons,
         topic: body,
     })
+}
+
+pub(crate) fn read_topic_log(
+    path: &Path,
+) -> Result<Vec<SessionTopicHistoryRecord>, SessionTopicError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path)?;
+    let mut records = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_str(line)?);
+    }
+    Ok(records)
 }
 
 fn append_topic_log(
@@ -559,6 +746,8 @@ fn append_topic_log(
 
 #[derive(Debug, Clone)]
 pub(crate) struct TopicDoc {
+    pub(crate) schema: Option<String>,
+    pub(crate) version: Option<u32>,
     pub(crate) session_id: String,
     pub(crate) tags: Vec<String>,
     pub(crate) tag_reasons: BTreeMap<String, String>,
@@ -717,6 +906,9 @@ fn default_tag_capacity() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_tool::agent_notebook::{
+        AgentNotebook, AgentNotebookConfig, AppendNoteInput, Confidence, WriteReason,
+    };
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -818,6 +1010,40 @@ mod tests {
         assert!(matches!(err, SessionTopicError::InvalidInput(_)));
     }
 
+    #[test]
+    fn recall_policy_override_only_touches_recall_fields() {
+        let mut policy = RecallPolicy::default();
+        apply_recall_policy_override(
+            &mut policy,
+            Some(&RecallPolicyOverride {
+                mode: Some(RecallMode::Mechanical),
+                max_hints: Some(3),
+                source_budgets: Some(RecallSourceBudgetsOverride {
+                    memory: Some(1),
+                    did_object: Some(2),
+                    ..RecallSourceBudgetsOverride::default()
+                }),
+                memory_type_budgets: Some(MemoryTypeBudgetsOverride {
+                    free: Some(0),
+                    event: Some(1),
+                    ..MemoryTypeBudgetsOverride::default()
+                }),
+                ..RecallPolicyOverride::default()
+            }),
+        );
+        assert_eq!(policy.mode, RecallMode::Mechanical);
+        assert_eq!(policy.max_hints, 3);
+        assert_eq!(policy.source_budgets.memory, 1);
+        assert_eq!(policy.source_budgets.did_object, 2);
+        assert_eq!(policy.memory_type_budgets.event, 1);
+        assert_eq!(policy.memory_type_budgets.free, 0);
+        assert_eq!(policy.tag_capacity, default_tag_capacity());
+        assert_eq!(
+            policy.decay_tau_seconds,
+            RecallPolicy::default().decay_tau_seconds
+        );
+    }
+
     #[tokio::test]
     async fn updater_writes_topic_tag_set_and_recall_payload() {
         let dir = tempfile::tempdir().unwrap();
@@ -871,6 +1097,16 @@ mod tests {
             .read_to_string()
             .unwrap()
             .contains("Discuss session topic implementation"));
+        let topic_doc = dir
+            .path()
+            .join("s1/.meta/topic.md")
+            .read_to_string()
+            .unwrap();
+        assert!(topic_doc.contains("schema: opendan.session_topic"));
+        assert!(topic_doc.contains("version: 1"));
+        let parsed = read_topic_doc(&dir.path().join("s1/.meta/topic.md")).unwrap();
+        assert_eq!(parsed.schema.as_deref(), Some("opendan.session_topic"));
+        assert_eq!(parsed.version, Some(1));
         let tag_set: TagSet = serde_json::from_str(
             &fs::read_to_string(dir.path().join("s1/.meta/tag_set.json")).unwrap(),
         )
@@ -911,6 +1147,69 @@ mod tests {
             }
         );
         assert!(dir.path().join("s1/.meta/tag_set.json").exists());
+    }
+
+    #[tokio::test]
+    async fn updater_returns_notebook_hints_from_local_recall() {
+        let root = tempfile::tempdir().unwrap();
+        let notebook_root = root.path().join("notebook");
+        let memory_root = root.path().join("memory");
+        let sessions_root = root.path().join("sessions");
+        let session_dir = sessions_root.join("s-current");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let notebook = AgentNotebook::open(AgentNotebookConfig::new(&notebook_root)).unwrap();
+        notebook
+            .append_note(AppendNoteInput {
+                session_id: Some("seed".to_string()),
+                notebook_id: "projects/agent-memory".to_string(),
+                title: "Agent memory recall".to_string(),
+                content: "Notebook content should not be copied into the recall hint.".to_string(),
+                source_excerpt: None,
+                source_ref: None,
+                source_session_id: Some("seed".to_string()),
+                write_reason: WriteReason::UserExplicit,
+                valid_from: None,
+                valid_until: None,
+                confidence: Some(Confidence::High),
+                tags: vec!["memory".to_string()],
+                detect_conflicts: false,
+            })
+            .unwrap();
+
+        let updater = SessionTopicUpdater::with_local_recall(
+            RecallPolicy {
+                mode: RecallMode::Mechanical,
+                ..RecallPolicy::default()
+            },
+            memory_root,
+            notebook_root,
+        );
+        let out = updater
+            .update(UpdateSessionTopicInput {
+                session_id: "s-current".to_string(),
+                session_dir,
+                topic: "Discuss agent memory recall".to_string(),
+                tags: vec![tag_input("memory", "current topic tag")],
+                current_turn: 0,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(out.recall_status, RecallStatus::Mechanical { .. }));
+        let items = out.recall.unwrap().items;
+        let notebook_hint = items
+            .iter()
+            .find(|item| item.source_system == RecallSourceSystem::Notebook)
+            .expect("notebook hint should be returned");
+        assert_eq!(notebook_hint.target.id, "projects/agent-memory");
+        assert_eq!(notebook_hint.matched_tags, vec!["memory"]);
+        assert!(notebook_hint
+            .debug
+            .get("version")
+            .is_some_and(|version| !version.is_empty()));
+        assert!(!notebook_hint
+            .hint
+            .contains("Notebook content should not be copied"));
     }
 
     #[tokio::test]
@@ -996,6 +1295,10 @@ mod tests {
         assert_eq!(lines[0]["current_turn"], 1);
         assert_eq!(lines[1]["topic"], "Implement storage history");
         assert_eq!(lines[1]["current_turn"], 2);
+        let records = read_topic_log(&session_dir.join(".meta/topic_log.jsonl")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].topic, "Plan storage history");
+        assert_eq!(records[1].tags, vec!["history"]);
     }
 
     trait ReadToString {

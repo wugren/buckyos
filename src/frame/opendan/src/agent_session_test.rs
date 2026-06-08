@@ -1794,6 +1794,65 @@ fn background_hint_interval_blocks_one_minute_after_non_empty() {
 }
 
 #[test]
+fn unified_recall_item_renders_background_hint_metadata() {
+    let item = RecallItem {
+        source_system: RecallSourceSystem::Memory,
+        hint_type: RecallHintType::EntityRelation,
+        target: RecallTarget {
+            kind: "memory_item".to_string(),
+            id: "rel-1".to_string(),
+            uri: None,
+        },
+        title: None,
+        hint: "Relevant entity relation: project depends on repo".to_string(),
+        reason: "matched tags: project".to_string(),
+        matched_tags: vec!["project".to_string()],
+        score: 3.0,
+        suggested_action: "load_memory_item_if_needed".to_string(),
+        debug: BTreeMap::new(),
+    };
+
+    let hint = background_hint_from_recall_item(&item);
+    assert_eq!(hint.path, "memory/entity_relation/memory_item/rel-1");
+    assert_eq!(hint.kind, "memory");
+    assert!(hint.text.contains("[memory/entity_relation]"));
+    assert!(hint.text.contains("reason: matched tags: project"));
+    assert!(hint.text.contains("action: load_memory_item_if_needed"));
+    assert!(!hint.fingerprint.is_empty());
+}
+
+#[test]
+fn changed_background_hints_suppresses_seen_fingerprint_until_changed() {
+    let mut item = RecallItem {
+        source_system: RecallSourceSystem::Notebook,
+        hint_type: RecallHintType::TopicRelevance,
+        target: RecallTarget {
+            kind: "notebook".to_string(),
+            id: "projects/agent-memory".to_string(),
+            uri: None,
+        },
+        title: Some("Agent memory".to_string()),
+        hint: "Notebook may be relevant: Agent memory".to_string(),
+        reason: "TopicRelevance".to_string(),
+        matched_tags: vec!["memory".to_string()],
+        score: 2.0,
+        suggested_action: "read_notebook_if_needed".to_string(),
+        debug: BTreeMap::from([("version".to_string(), "v1".to_string())]),
+    };
+    let first = background_hint_from_recall_item(&item);
+    let mut old = BTreeMap::new();
+    old.insert(first.path.clone(), first.fingerprint.clone());
+
+    let (changed, _) = changed_background_hints(&old, vec![first.clone()]);
+    assert!(changed.is_empty());
+
+    item.debug.insert("version".to_string(), "v2".to_string());
+    let second = background_hint_from_recall_item(&item);
+    let (changed, _) = changed_background_hints(&old, vec![second]);
+    assert_eq!(changed.len(), 1);
+}
+
+#[test]
 fn session_meta_tolerates_missing_pending_inputs_field() {
     // Older session.json files were written before pending_inputs
     // existed; restoring them must default the field to an empty

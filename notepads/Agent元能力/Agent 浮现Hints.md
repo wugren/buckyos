@@ -327,7 +327,7 @@ update_session_topic(
 其中：
 
 - `title` 是当前 Session Topic Title，一行自然语言，单行、≤ 120 字符、人类可读、对未来的“我”友好。旧草案里的 `topic` 参数在本文统一命名为 `title`，语义不变；
-- `tags` 是当前 Topic Tags。每个 Tag 至少包含 `name`，可以包含 `reason` 供调试和后续解释使用；
+- `tags` 是当前 Topic Tags。每个 Tag 必须包含 `name` 和 `reason`；`reason` 用于调试、后续解释和统一 Hint 呈现；
 - `recall_policy_override` 是可选策略覆盖项，只能调整本次召回策略，不应改变 Topic / Tag 的存储语义。
 
 典型输出可以包括：

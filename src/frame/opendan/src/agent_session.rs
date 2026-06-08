@@ -17,12 +17,11 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig, BuildHintsInput};
+use agent_tool::agent_notebook::{AgentNotebook, AgentNotebookConfig};
 use agent_tool::todo_tools::read_todo_records;
 use agent_tool::{
     llm_compress, AgentToolManager, SessionRuntimeContext, TodoRecord, DEFAULT_READ_TOKEN_LIMIT,
 };
-use agent_tool::{AgentMemory, AgentMemoryConfig, LoadOptions};
 use llm_context::{
     behavior_loop::{
         HistoryInputRecord, SendMessageRecord, StepRecord, StepResultHook, StepResultHookOutput,
@@ -66,6 +65,12 @@ pub use crate::session_model::{
     SessionLogicalProfile, SessionMeta, SessionModelDisable, SessionModelItem,
     SessionModelItemPatch, SessionStatus, SessionSummary, TimerEventKind,
 };
+use crate::session_topic::{
+    read_topic_doc, HintRecallEngine, RecallInput, RecallItem, RecallMode, RecallPayload,
+    RecallPolicy, RecallResult, RecallService, TagEntry, TagSet, TagTier,
+};
+#[cfg(test)]
+use crate::session_topic::{RecallHintType, RecallSourceSystem, RecallTarget};
 use crate::task_dispatch::TaskDispatch;
 use crate::worksession_tools::render_workspace_inventory;
 
@@ -746,6 +751,28 @@ impl AgentSession {
 
     pub async fn append_history_event(&self, event: HistoryEvent) {
         self.history.append_event(event).await;
+    }
+
+    pub async fn record_recall_background_hints(
+        &self,
+        recall: Option<&RecallPayload>,
+    ) -> Result<()> {
+        let Some(recall) = recall else {
+            return Ok(());
+        };
+        let hints = recall_items_to_background_hints(&recall.items);
+        if hints.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut meta = self.meta.lock().await;
+            for hint in hints {
+                meta.background_hint_state
+                    .hint_fingerprints
+                    .insert(hint.path, hint.fingerprint);
+            }
+        }
+        self.flush_meta().await
     }
 
     /// Snapshot the currently-installed handle (if any). Returns `None` when
@@ -4047,7 +4074,7 @@ impl AgentSession {
 
     async fn load_changed_background_hits(&self) -> Vec<BackgroundHint> {
         let now = now_ms();
-        let (old_fingerprints, bg_events, owner) = {
+        let (old_fingerprints, bg_events) = {
             let meta = self.meta.lock().await;
             if background_hint_interval_active(
                 meta.background_hint_state
@@ -4059,28 +4086,14 @@ impl AgentSession {
             (
                 meta.background_hint_state.hint_fingerprints.clone(),
                 meta.background_events.clone(),
-                meta.owner.clone(),
             )
         };
 
-        let topic_tags = load_session_topic_tags(&self.session_dir);
+        let topic_state = load_session_topic_state(&self.session_dir);
         let mut candidates = Vec::new();
         candidates.extend(build_background_event_hints(&bg_events));
-        candidates.extend(
-            self.build_notebook_background_hints(&topic_tags, &owner)
-                .await,
-        );
-        candidates.extend(self.build_memory_hints(&topic_tags).await);
-
-        let mut next_fingerprints = BTreeMap::new();
-        let mut changed = Vec::new();
-        for hint in candidates {
-            let previous = old_fingerprints.get(&hint.path);
-            next_fingerprints.insert(hint.path.clone(), hint.fingerprint.clone());
-            if previous != Some(&hint.fingerprint) {
-                changed.push(hint);
-            }
-        }
+        candidates.extend(self.build_unified_background_hints(&topic_state).await);
+        let (changed, next_fingerprints) = changed_background_hints(&old_fingerprints, candidates);
 
         {
             let mut meta = self.meta.lock().await;
@@ -4100,148 +4113,42 @@ impl AgentSession {
         changed
     }
 
-    async fn build_notebook_background_hints(
+    async fn build_unified_background_hints(
         &self,
-        topic_tags: &[String],
-        owner: &str,
+        topic_state: &SessionTopicState,
     ) -> Vec<BackgroundHint> {
-        let owner = resolve_notebook_prompt_owner(owner, &self.agent_name);
-        if owner.is_empty() || !self.agent_config.layout.notebook_dir.exists() {
+        if topic_state.tags.tags.is_empty() {
             return Vec::new();
         }
-
-        let notebook = match AgentNotebook::open(AgentNotebookConfig::new(
-            self.agent_config.layout.notebook_dir.clone(),
-        )) {
-            Ok(notebook) => notebook,
-            Err(err) => {
-                warn!(
-                    "opendan.session[{}]: open notebook for background hints failed: {err}",
-                    self.session_id
-                );
-                return Vec::new();
-            }
-        };
-        let candidate_notebook_ids = load_subscribed_notebook_ids(&self.session_dir);
-        let hints = match notebook.build_notebook_hints(BuildHintsInput {
-            session_id: self.session_id.clone(),
-            topic_tags: if topic_tags.is_empty() {
-                None
-            } else {
-                Some(topic_tags.to_vec())
-            },
-            candidate_notebook_ids,
-            max_hints: Some(3),
-        }) {
-            Ok(hints) => hints,
-            Err(err) => {
-                warn!(
-                    "opendan.session[{}]: build notebook background hints failed: {err}",
-                    self.session_id
-                );
-                return Vec::new();
-            }
-        };
-
-        hints
-            .hints
-            .into_iter()
-            .map(|hint| {
-                let data = serde_json::to_value(&hint).unwrap_or(serde_json::Value::Null);
-                let fingerprint = stable_json_fingerprint(&data);
-                BackgroundHint {
-                    path: format!("notebook/{}", hint.notebook_id),
-                    kind: "notebook".to_string(),
-                    text: hint.text,
-                    fingerprint,
-                    data,
-                }
-            })
-            .collect()
-    }
-
-    async fn build_memory_hints(&self, topic_tags: &[String]) -> Vec<BackgroundHint> {
-        if topic_tags.is_empty() || !self.agent_config.layout.memory_dir.exists() {
-            return Vec::new();
-        }
-        let memory = match AgentMemory::open(AgentMemoryConfig::new(
+        let recall = HintRecallEngine::with_local_roots(
             self.agent_config.layout.memory_dir.clone(),
-        )) {
-            Ok(memory) => memory,
-            Err(err) => {
-                warn!(
-                    "opendan.session[{}]: open memory for background hints failed: {err}",
-                    self.session_id
-                );
-                return Vec::new();
-            }
-        };
-        let items = match memory.load(
-            topic_tags,
-            LoadOptions {
-                max_records: 5,
-                max_bytes: 8 * 1024,
-                body_truncate_bytes: 1024,
-                ..LoadOptions::default()
+            self.agent_config.layout.notebook_dir.clone(),
+        )
+        .recall(
+            RecallInput {
+                session_id: &self.session_id,
+                session_dir: &self.session_dir,
+                topic: &topic_state.title,
+                tags: &topic_state.tags,
             },
-        ) {
-            Ok(items) => items,
-            Err(err) => {
+            RecallMode::Mechanical,
+            &RecallPolicy {
+                mode: RecallMode::Mechanical,
+                ..RecallPolicy::default()
+            },
+        )
+        .await;
+        match recall {
+            RecallResult::Recalled { items, .. } => recall_items_to_background_hints(&items),
+            RecallResult::Failed { reason } => {
                 warn!(
-                    "opendan.session[{}]: load memory background hints failed: {err}",
+                    "opendan.session[{}]: unified background hint recall failed: {reason}",
                     self.session_id
                 );
-                return Vec::new();
+                Vec::new()
             }
-        };
-
-        items
-            .into_iter()
-            .map(|item| {
-                let key = item.item_id;
-                let matched_items = item.matched;
-                let ts = item.noticed_at;
-                let size = item.size;
-                let truncated = item.truncated;
-                let content = item.content;
-                let data = serde_json::json!({
-                    "key": key.clone(),
-                    "matched": matched_items,
-                    "ts": ts,
-                    "size": size,
-                    "truncated": truncated,
-                });
-                let fingerprint =
-                    stable_report_hash(&format!("{}:{}", stable_json_fingerprint(&data), content));
-                let matched = data
-                    .get("matched")
-                    .and_then(|value| value.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|value| value.as_str())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_default();
-                let key = data
-                    .get("key")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                BackgroundHint {
-                    path: format!("memory/{key}"),
-                    kind: "memory".to_string(),
-                    text: if matched.is_empty() {
-                        format!("Memory may be relevant: {key}")
-                    } else {
-                        format!("Memory may be relevant: {key} (matched: {matched})")
-                    },
-                    fingerprint,
-                    data,
-                }
-            })
-            .collect()
+            RecallResult::NotTriggered => Vec::new(),
+        }
     }
 
     async fn render_system_messages(&self, behavior: &BehaviorCfg) -> Result<Vec<AiMessage>> {
@@ -6811,6 +6718,128 @@ fn render_changed_background_hint_text(hints: &[BackgroundHint]) -> String {
         .join("\n")
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionTopicState {
+    title: String,
+    tags: TagSet,
+}
+
+fn load_session_topic_state(session_dir: &Path) -> SessionTopicState {
+    let topic_path = session_dir.join(".meta").join("topic.md");
+    let topic_doc = read_topic_doc(&topic_path).ok();
+    let title = topic_doc
+        .as_ref()
+        .map(|doc| doc.topic.clone())
+        .unwrap_or_default();
+
+    let tag_set_path = session_dir.join(".meta").join("tag_set.json");
+    if let Ok(text) = std::fs::read_to_string(&tag_set_path) {
+        if let Ok(tag_set) = serde_json::from_str::<TagSet>(&text) {
+            if !tag_set.tags.is_empty() {
+                return SessionTopicState {
+                    title,
+                    tags: tag_set,
+                };
+            }
+        }
+    }
+
+    let tags = topic_doc
+        .map(|doc| doc.tags)
+        .unwrap_or_else(|| load_session_topic_tags(session_dir))
+        .into_iter()
+        .map(|name| TagEntry {
+            name,
+            weight: 1.0,
+            last_touched: String::new(),
+            tier: TagTier::Transient,
+            reason: None,
+        })
+        .collect();
+    SessionTopicState {
+        title,
+        tags: TagSet {
+            tags,
+            ..TagSet::default()
+        },
+    }
+}
+
+fn recall_items_to_background_hints(items: &[RecallItem]) -> Vec<BackgroundHint> {
+    items.iter().map(background_hint_from_recall_item).collect()
+}
+
+fn background_hint_from_recall_item(item: &RecallItem) -> BackgroundHint {
+    let source = recall_source_label(item);
+    let hint_type = recall_hint_type_label(item);
+    let data = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
+    let fingerprint = recall_item_background_fingerprint(item);
+    BackgroundHint {
+        path: format!(
+            "{source}/{hint_type}/{}/{}",
+            item.target.kind, item.target.id
+        ),
+        kind: source,
+        text: format!(
+            "[{}/{}] {} (reason: {}; action: {})",
+            recall_source_label(item),
+            hint_type,
+            item.hint,
+            item.reason,
+            item.suggested_action
+        ),
+        fingerprint,
+        data,
+    }
+}
+
+fn recall_item_background_fingerprint(item: &RecallItem) -> String {
+    let data = serde_json::json!({
+        "source_system": item.source_system,
+        "hint_type": item.hint_type,
+        "target": item.target,
+        "matched_tags": item.matched_tags,
+        "version": item.debug.get("version"),
+        "fingerprint": item.debug.get("fingerprint"),
+        "updated_at": item.debug.get("updated_at"),
+        "noticed_at": item.debug.get("noticed_at"),
+        "hint": item.hint,
+        "reason": item.reason,
+        "suggested_action": item.suggested_action,
+    });
+    stable_json_fingerprint(&data)
+}
+
+fn changed_background_hints(
+    old_fingerprints: &BTreeMap<String, String>,
+    candidates: Vec<BackgroundHint>,
+) -> (Vec<BackgroundHint>, BTreeMap<String, String>) {
+    let mut next_fingerprints = BTreeMap::new();
+    let mut changed = Vec::new();
+    for hint in candidates {
+        let previous = old_fingerprints.get(&hint.path);
+        next_fingerprints.insert(hint.path.clone(), hint.fingerprint.clone());
+        if previous != Some(&hint.fingerprint) {
+            changed.push(hint);
+        }
+    }
+    (changed, next_fingerprints)
+}
+
+fn recall_source_label(item: &RecallItem) -> String {
+    serde_json::to_value(&item.source_system)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{:?}", item.source_system).to_ascii_lowercase())
+}
+
+fn recall_hint_type_label(item: &RecallItem) -> String {
+    serde_json::to_value(&item.hint_type)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{:?}", item.hint_type).to_ascii_lowercase())
+}
+
 fn load_session_topic_tags(session_dir: &Path) -> Vec<String> {
     let tag_set_path = session_dir.join(".meta").join("tag_set.json");
     if let Ok(value) = read_json_file(&tag_set_path) {
@@ -6863,41 +6892,6 @@ fn parse_topic_doc_tags(text: &str) -> Vec<String> {
             .collect();
     }
     Vec::new()
-}
-
-fn load_subscribed_notebook_ids(session_dir: &Path) -> Option<Vec<String>> {
-    let path = session_dir.join(".meta").join("subscriptions.json");
-    let value = read_json_file(&path).ok()?;
-    let subscriptions = value.get("subscriptions")?.as_array()?;
-    let mut ids = Vec::new();
-    for subscription in subscriptions {
-        let kind = subscription
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if kind != "notebook" {
-            continue;
-        }
-        let Some(id) = subscription
-            .get("id")
-            .or_else(|| subscription.get("notebook_id"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        ids.push(id.to_string());
-    }
-    ids.sort();
-    ids.dedup();
-    if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
-    }
 }
 
 fn read_json_file(path: &Path) -> std::io::Result<serde_json::Value> {

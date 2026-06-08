@@ -291,27 +291,27 @@ Attention Signal 中已有 Event / ObjectObservation / Relationship 的 Stage-1 
 
 ### P2：调整工具参数与文件投影命名
 
-- [ ] 对外参数从 `topic` 收敛为 `title`，或至少支持 `title` alias，并在文档 / tool description 中统一称为 Topic Title。
-- [ ] 评估 `TagInput.reason` 是否继续必填；若继续必填，需要更新设计文档中的“可以包含 reason”为实现约束。
-- [ ] 增加可选 `recall_policy_override`，仅影响本次 recall，不改变 topic/tag 存储语义。
-- [ ] `topic.md` frontmatter 增加 schema/version 字段，方便浮现层枚举时做兼容判断。
-- [ ] 给 `topic_log.jsonl` 增加 reader，用于历史 topic title 召回，而不是只写不读。
+- [x] 对外参数从 `topic` 收敛为 `title`，或至少支持 `title` alias，并在文档 / tool description 中统一称为 Topic Title。
+- [x] 评估 `TagInput.reason` 是否继续必填；若继续必填，需要更新设计文档中的“可以包含 reason”为实现约束。
+- [x] 增加可选 `recall_policy_override`，仅影响本次 recall，不改变 topic/tag 存储语义。
+- [x] `topic.md` frontmatter 增加 schema/version 字段，方便浮现层枚举时做兼容判断。
+- [x] 给 `topic_log.jsonl` 增加 reader，用于历史 topic title 召回，而不是只写不读。
 
 ### P2：Context Weaving 消费统一 Hint
 
-- [ ] 将 `load_changed_background_hits` 的 Memory / Notebook 获取路径改为消费 unified Hint provider/cache。
-- [ ] 明确首次召回与 background refresh 的分工：`update_session_topic` 负责首次同步短 Hint；Context Weaving 负责后续变化、刷新、去重和冷却。
-- [ ] Background 注入文本使用统一 Hint 的 `source_system / hint_type / reason / suggested_action` 渲染。
-- [ ] fingerprint 计算基于统一 Hint target + version/fingerprint，不再用 Memory 正文参与首次线索判断。
-- [ ] 增加测试：同一 Hint 已在工具返回出现时，下一轮 background 不重复注入；对象变化后才重新注入。
+- [x] 将 `load_changed_background_hits` 的 Memory / Notebook 获取路径改为消费 unified Hint provider/cache。
+- [x] 明确首次召回与 background refresh 的分工：`update_session_topic` 负责首次同步短 Hint；Context Weaving 负责后续变化、刷新、去重和冷却。
+- [x] Background 注入文本使用统一 Hint 的 `source_system / hint_type / reason / suggested_action` 渲染。
+- [x] fingerprint 计算基于统一 Hint target + version/fingerprint，不再用 Memory 正文参与首次线索判断。
+- [x] 增加测试：同一 Hint 已在工具返回出现时，下一轮 background 不重复注入；对象变化后才重新注入。
 
 ### P2：接入 DID-Object 的静态 Hint
 
-- [ ] 基于现有 `agent-did-object-lib` 定义最小 `DidObjectRecallProvider`。
-- [ ] 先只做静态候选：按 tags / title 命中对象 metadata，返回短 Hint 和 target handle。
-- [ ] 不在本轮实现 DID-Object 状态订阅，也不实现 LLM 判断订阅。
-- [ ] 输出结构对齐统一 `RecallItem`，source 为 `did_object`。
-- [ ] 增加测试：当前 Topic 命中 DID-Object metadata 时，返回可定位 target，不展开对象正文。
+- [x] 基于现有 `agent-did-object-lib` 定义最小 `DidObjectRecallProvider`。
+- [x] 先只做静态候选：按 tags / title 命中对象 metadata，返回短 Hint 和 target handle。
+- [x] 不在本轮实现 DID-Object 状态订阅，也不实现 LLM 判断订阅。
+- [x] 输出结构对齐统一 `RecallItem`，source 为 `did_object`。
+- [x] 增加测试：当前 Topic 命中 DID-Object metadata 时，返回可定位 target，不展开对象正文。
 
 ### P3：Tag 维护补强
 

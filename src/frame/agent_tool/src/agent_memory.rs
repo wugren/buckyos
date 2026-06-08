@@ -497,6 +497,74 @@ pub struct LoadItem {
     pub content: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryHintType {
+    SessionRaw,
+    Event,
+    EntityObservation,
+    EntityRelation,
+    Free,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryHintBudget {
+    pub candidate_limit: usize,
+    pub keep_limit: usize,
+}
+
+impl MemoryHintBudget {
+    pub fn new(candidate_limit: usize, keep_limit: usize) -> Self {
+        Self {
+            candidate_limit,
+            keep_limit,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryRecallOptions {
+    pub max_hints: usize,
+    pub body_truncate_bytes: usize,
+    pub session_raw: MemoryHintBudget,
+    pub event: MemoryHintBudget,
+    pub entity_observation: MemoryHintBudget,
+    pub entity_relation: MemoryHintBudget,
+    pub free: MemoryHintBudget,
+    pub current_time: Option<DateTime<Utc>>,
+}
+
+impl Default for MemoryRecallOptions {
+    fn default() -> Self {
+        Self {
+            max_hints: 5,
+            body_truncate_bytes: 160,
+            session_raw: MemoryHintBudget::new(8, 2),
+            event: MemoryHintBudget::new(8, 2),
+            entity_observation: MemoryHintBudget::new(8, 2),
+            entity_relation: MemoryHintBudget::new(8, 2),
+            free: MemoryHintBudget::new(8, 2),
+            current_time: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryHint {
+    pub hint_type: MemoryHintType,
+    pub target_kind: String,
+    pub target_id: String,
+    pub uri: Option<String>,
+    pub hint: String,
+    pub reason: String,
+    pub matched: Vec<String>,
+    pub score: f32,
+    pub source_occasion: String,
+    pub noticed_at: String,
+    pub evidence: Vec<String>,
+    pub kind: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VerifyReport {
     pub ok_keys: usize,
@@ -1059,6 +1127,65 @@ impl AgentMemory {
                 truncated,
                 content,
             });
+        }
+        Ok(out)
+    }
+
+    pub fn recall_hints(
+        &self,
+        tags: &[String],
+        opts: MemoryRecallOptions,
+    ) -> Result<Vec<MemoryHint>> {
+        let mut candidates = self.load(
+            tags,
+            LoadOptions {
+                max_records: memory_candidate_limit(&opts),
+                max_bytes: DEFAULT_MAX_BYTES,
+                body_truncate_bytes: opts.body_truncate_bytes,
+                current_time: opts.current_time,
+                ..LoadOptions::default()
+            },
+        )?;
+        candidates.sort_by(|a, b| {
+            memory_load_score(b)
+                .partial_cmp(&memory_load_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.item_id.cmp(&b.item_id))
+        });
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let class_order = [
+            MemoryHintType::SessionRaw,
+            MemoryHintType::Event,
+            MemoryHintType::EntityObservation,
+            MemoryHintType::EntityRelation,
+        ];
+        for hint_type in class_order {
+            let budget = memory_budget_for(&opts, hint_type);
+            append_memory_hints_for_type(
+                &mut out,
+                &mut seen,
+                &candidates,
+                hint_type,
+                budget.candidate_limit,
+                budget.keep_limit,
+                opts.max_hints,
+            );
+        }
+
+        let remaining = opts.max_hints.saturating_sub(out.len());
+        if remaining > 0 {
+            let budget = memory_budget_for(&opts, MemoryHintType::Free);
+            append_memory_hints_for_type(
+                &mut out,
+                &mut seen,
+                &candidates,
+                MemoryHintType::Free,
+                budget.candidate_limit,
+                budget.keep_limit.min(remaining),
+                opts.max_hints,
+            );
         }
         Ok(out)
     }
@@ -2567,6 +2694,125 @@ fn claim_summary(claim: &Value) -> String {
     }
 }
 
+fn memory_candidate_limit(opts: &MemoryRecallOptions) -> usize {
+    opts.session_raw
+        .candidate_limit
+        .saturating_add(opts.event.candidate_limit)
+        .saturating_add(opts.entity_observation.candidate_limit)
+        .saturating_add(opts.entity_relation.candidate_limit)
+        .saturating_add(opts.free.candidate_limit)
+        .max(opts.max_hints)
+        .max(1)
+}
+
+fn memory_budget_for(opts: &MemoryRecallOptions, hint_type: MemoryHintType) -> &MemoryHintBudget {
+    match hint_type {
+        MemoryHintType::SessionRaw => &opts.session_raw,
+        MemoryHintType::Event => &opts.event,
+        MemoryHintType::EntityObservation => &opts.entity_observation,
+        MemoryHintType::EntityRelation => &opts.entity_relation,
+        MemoryHintType::Free => &opts.free,
+    }
+}
+
+fn memory_hint_type_for_kind(kind: &str) -> MemoryHintType {
+    match kind {
+        "session_raw" | "session" | "session_topic" | "session_artifact" => {
+            MemoryHintType::SessionRaw
+        }
+        "event" | "event_effect" => MemoryHintType::Event,
+        "observation" | "attribute" | "object" => MemoryHintType::EntityObservation,
+        "relation" => MemoryHintType::EntityRelation,
+        _ => MemoryHintType::Free,
+    }
+}
+
+fn memory_load_score(item: &LoadItem) -> f32 {
+    (item.weight * 10.0 + item.confidence * 6.0) as f32
+}
+
+fn append_memory_hints_for_type(
+    out: &mut Vec<MemoryHint>,
+    seen: &mut HashSet<String>,
+    candidates: &[LoadItem],
+    hint_type: MemoryHintType,
+    candidate_limit: usize,
+    keep_limit: usize,
+    max_hints: usize,
+) {
+    if keep_limit == 0 || out.len() >= max_hints {
+        return;
+    }
+    let mut kept = 0usize;
+    for item in candidates
+        .iter()
+        .filter(|item| memory_hint_type_for_kind(&item.kind) == hint_type)
+        .take(candidate_limit)
+    {
+        if kept >= keep_limit || out.len() >= max_hints {
+            break;
+        }
+        let target_id = if matches!(hint_type, MemoryHintType::SessionRaw) {
+            item.matched
+                .iter()
+                .find_map(|m| m.strip_prefix("session:").map(ToOwned::to_owned))
+                .unwrap_or_else(|| item.item_id.clone())
+        } else {
+            item.item_id.clone()
+        };
+        let target_kind = if matches!(hint_type, MemoryHintType::SessionRaw) {
+            "session"
+        } else {
+            "memory_item"
+        };
+        let key = format!("{target_kind}:{target_id}:{hint_type:?}");
+        if !seen.insert(key) {
+            continue;
+        }
+        let matched = item.matched.clone();
+        let reason = if matched.is_empty() {
+            "memory ranking matched current topic".to_string()
+        } else {
+            format!("matched {}", matched.join(", "))
+        };
+        out.push(MemoryHint {
+            hint_type,
+            target_kind: target_kind.to_string(),
+            target_id,
+            uri: None,
+            hint: memory_short_hint(item, hint_type),
+            reason,
+            matched,
+            score: memory_load_score(item),
+            source_occasion: item.source_occasion.clone(),
+            noticed_at: item.noticed_at.clone(),
+            evidence: item.evidence.clone(),
+            kind: item.kind.clone(),
+        });
+        kept += 1;
+    }
+}
+
+fn memory_short_hint(item: &LoadItem, hint_type: MemoryHintType) -> String {
+    let prefix = match hint_type {
+        MemoryHintType::SessionRaw => "Related session memory",
+        MemoryHintType::Event => "Relevant event memory",
+        MemoryHintType::EntityObservation => "Relevant entity observation",
+        MemoryHintType::EntityRelation => "Relevant entity relation",
+        MemoryHintType::Free => "Relevant memory",
+    };
+    let mut body = collapse_whitespace(&item.content);
+    if body.len() > 120 {
+        let (truncated, _) = truncate_at_char_boundary(&body, 120);
+        body = truncated;
+    }
+    if body.is_empty() {
+        format!("{prefix}: {}", item.item_id)
+    } else {
+        format!("{prefix}: {body}")
+    }
+}
+
 fn observation_text_by_id(state: &MemoryState) -> HashMap<String, String> {
     state
         .observations
@@ -2854,6 +3100,92 @@ mod tests {
         assert!(s.contains("SIZE 5\n"));
         assert!(s.contains("MATCHED tag:a\n"));
         assert!(s.contains("---\nhello\nEND\n"));
+    }
+
+    #[test]
+    fn recall_hints_keeps_typed_items_ahead_of_free_overflow() {
+        let (_tmp, m) = open_tmp();
+        for idx in 0..5 {
+            m.set_free(FlatSetOp {
+                key: format!("/free/{idx}"),
+                content: format!("Free memory about project {idx}"),
+                reason: "test".to_string(),
+                entities: Vec::new(),
+                tags: vec!["project".to_string()],
+                weight: Some(1.0),
+                confidence: Some(1.0),
+            })
+            .unwrap();
+        }
+        m.commit(
+            "test.event",
+            "event",
+            None,
+            vec!["project".to_string()],
+            vec![GraphOperation::PutItem(PutItemOp {
+                item_id: Some("item_event".to_string()),
+                kind: "event".to_string(),
+                entities: Vec::new(),
+                claim: serde_json::json!({
+                    "type": "event_effect",
+                    "effect": "Release event affects the project timeline",
+                }),
+                weight: 0.2,
+                confidence: 0.2,
+                evidence: Vec::new(),
+                write_reason: "test".to_string(),
+                replaces: Vec::new(),
+            })],
+        )
+        .unwrap();
+        m.commit(
+            "test.relation",
+            "relation",
+            None,
+            vec!["project".to_string()],
+            vec![GraphOperation::PutItem(PutItemOp {
+                item_id: Some("item_relation".to_string()),
+                kind: "relation".to_string(),
+                entities: vec!["project".to_string(), "obj_b".to_string()],
+                claim: serde_json::json!({
+                    "type": "relation",
+                    "subject": "project",
+                    "predicate": "depends_on",
+                    "object": "obj_b",
+                }),
+                weight: 0.2,
+                confidence: 0.2,
+                evidence: Vec::new(),
+                write_reason: "test".to_string(),
+                replaces: Vec::new(),
+            })],
+        )
+        .unwrap();
+
+        let hints = m
+            .recall_hints(
+                &["project".to_string()],
+                MemoryRecallOptions {
+                    max_hints: 3,
+                    session_raw: MemoryHintBudget::new(0, 0),
+                    event: MemoryHintBudget::new(4, 1),
+                    entity_observation: MemoryHintBudget::new(0, 0),
+                    entity_relation: MemoryHintBudget::new(4, 1),
+                    free: MemoryHintBudget::new(8, 3),
+                    ..MemoryRecallOptions::default()
+                },
+            )
+            .unwrap();
+        let types: Vec<MemoryHintType> = hints.iter().map(|hint| hint.hint_type).collect();
+        assert!(types.contains(&MemoryHintType::Event));
+        assert!(types.contains(&MemoryHintType::EntityRelation));
+        assert_eq!(
+            types
+                .iter()
+                .filter(|ty| **ty == MemoryHintType::Free)
+                .count(),
+            1
+        );
     }
 
     #[test]

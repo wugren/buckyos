@@ -59,7 +59,8 @@ pub use agent_attention_signal::{
 };
 pub use agent_memory::{
     AgentMemory, AgentMemoryConfig, AgentMemoryError, Envelope as AgentMemoryEnvelope, LoadItem,
-    LoadOptions, Preamble, VerifyReport,
+    LoadOptions, MemoryHint, MemoryHintBudget, MemoryHintType, MemoryRecallOptions, Preamble,
+    VerifyReport,
 };
 pub use dcrontab_tool::{DcrontabTool, TOOL_DCRONTAB};
 pub use file_tools::{

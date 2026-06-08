@@ -45,8 +45,8 @@ use crate::local_workspace::{WorkspaceRecord, WorkspaceStatus};
 use crate::round_history::HistoryEvent;
 use crate::session_model::{SessionKind, SessionStatus, SessionSummary};
 use crate::session_topic::{
-    RecallPolicy, SessionTopicError, SessionTopicUpdater, TagInput, UpdateSessionTopicInput,
-    UpdateSessionTopicResult,
+    apply_recall_policy_override, RecallPolicy, RecallPolicyOverride, SessionTopicError,
+    SessionTopicUpdater, TagInput, UpdateSessionTopicInput, UpdateSessionTopicResult,
 };
 
 /// Cap on the number of existing worksessions surfaced in the sub-prompt.
@@ -487,19 +487,24 @@ impl TypedTool for ForwardMsgTool {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct UpdateSessionTopicArgs {
-    /// One-line topic hint for the current session. Write for the future self,
-    /// not for the user; this is not a session summary.
-    pub topic: String,
+    /// One-line Topic Title for the current session. Write for the future self,
+    /// not for the user; this is not a session summary. The old `topic`
+    /// parameter name is accepted as a compatibility alias.
+    #[serde(alias = "topic")]
+    pub title: String,
     /// Optional short tags used as coarse recall keys. Each reason should be a
     /// compact explanation of why the tag matters now.
     #[serde(default)]
     pub tags: Vec<TagInput>,
+    /// Optional per-call recall policy override. This only affects this call's
+    /// synchronous recall and does not change topic/tag storage semantics.
+    #[serde(default)]
+    pub recall_policy_override: Option<RecallPolicyOverride>,
 }
 
 pub struct UpdateSessionTopicTool {
     agent: Weak<AIAgent>,
     source_session_id: String,
-    updater: SessionTopicUpdater,
 }
 
 impl UpdateSessionTopicTool {
@@ -507,7 +512,6 @@ impl UpdateSessionTopicTool {
         Self {
             agent,
             source_session_id: source_session_id.into(),
-            updater: SessionTopicUpdater::with_default_retrieval(RecallPolicy::default()),
         }
     }
 }
@@ -522,7 +526,7 @@ impl TypedTool for UpdateSessionTopicTool {
     }
 
     fn description(&self) -> &str {
-        "Update this session's one-line topic hint and short topic tags. Call only when the topic first becomes clear, significantly drifts, or reaches a final form. Each tag must include a compact reason explaining why it matters now. Write for your future self; do not use this for detailed summaries."
+        "Update this session's one-line Topic Title and short topic tags. Call only when the topic first becomes clear, significantly drifts, or reaches a final form. Each tag must include a compact reason explaining why it matters now. Write for your future self; do not use this for detailed summaries."
     }
 
     fn calling(&self) -> CallingConventions {
@@ -530,7 +534,7 @@ impl TypedTool for UpdateSessionTopicTool {
     }
 
     fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        let mut parts = vec![format!("update_session_topic topic={}", args.topic.trim())];
+        let mut parts = vec![format!("update_session_topic title={}", args.title.trim())];
         if !args.tags.is_empty() {
             parts.push(format!(
                 "tags={}",
@@ -576,12 +580,21 @@ impl TypedTool for UpdateSessionTopicTool {
                     self.source_session_id
                 ))
             })?;
-        let (output, record) = self
-            .updater
+        let mut policy = RecallPolicy {
+            mode: crate::session_topic::RecallMode::Mechanical,
+            ..RecallPolicy::default()
+        };
+        apply_recall_policy_override(&mut policy, args.recall_policy_override.as_ref());
+        let updater = SessionTopicUpdater::with_local_recall(
+            policy,
+            agent.config.layout.memory_dir.clone(),
+            agent.config.layout.notebook_dir.clone(),
+        );
+        let (output, record) = updater
             .update_with_record(UpdateSessionTopicInput {
                 session_id: self.source_session_id.clone(),
                 session_dir: session.session_dir.clone(),
-                topic: args.topic,
+                topic: args.title,
                 tags: args.tags,
                 current_turn: ctx.session().step_idx,
             })
@@ -601,6 +614,14 @@ impl TypedTool for UpdateSessionTopicTool {
                 topic_changed: record.topic_changed,
             })
             .await;
+        if let Err(err) = session
+            .record_recall_background_hints(output.recall.as_ref())
+            .await
+        {
+            warn!(
+                "opendan.worksession_tools: record recall background fingerprints failed: {err:#}"
+            );
+        }
         Ok(output)
     }
 }
