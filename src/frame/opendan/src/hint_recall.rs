@@ -902,9 +902,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let current_dir = root.path().join("s-current");
         let old_dir = root.path().join("s-old");
+        let older_dir = root.path().join("s-older");
         let no_topic_dir = root.path().join("s-empty");
         fs::create_dir_all(current_dir.join(".meta")).unwrap();
         fs::create_dir_all(old_dir.join(".meta")).unwrap();
+        fs::create_dir_all(older_dir.join(".meta")).unwrap();
         fs::create_dir_all(&no_topic_dir).unwrap();
         fs::write(
             current_dir.join(".meta/topic.md"),
@@ -916,15 +918,31 @@ mod tests {
             "---\nsession_id: s-old\nupdated_at: 2026-05-18T00:00:00Z\ntags: [\"agent\",\"memory\"]\ntag_reasons: {}\n---\n\nAgent memory recall design\n",
         )
         .unwrap();
+        fs::write(
+            older_dir.join(".meta/topic.md"),
+            "---\nsession_id: s-older\nupdated_at: 2026-05-17T00:00:00Z\ntags: [\"memory\"]\ntag_reasons: {}\n---\n\nMemory-only recall notes\n",
+        )
+        .unwrap();
 
         let tags = TagSet {
-            tags: vec![TagEntry {
-                name: "memory".to_string(),
-                weight: 1.0,
-                last_touched: "2026-05-19T00:00:00Z".to_string(),
-                tier: TagTier::Transient,
-                reason: None,
-            }],
+            tags: vec![
+                TagEntry {
+                    name: "agent".to_string(),
+                    weight: 1.0,
+                    last_touched: "2026-05-19T00:00:00Z".to_string(),
+                    tier: TagTier::Transient,
+                    position: 0,
+                    reason: None,
+                },
+                TagEntry {
+                    name: "memory".to_string(),
+                    weight: 1.0,
+                    last_touched: "2026-05-19T00:00:00Z".to_string(),
+                    tier: TagTier::Transient,
+                    position: 1,
+                    reason: None,
+                },
+            ],
             ..TagSet::default()
         };
         let items = SessionTopicRecallProvider
@@ -940,17 +958,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 2);
         let item = &items[0];
         assert_eq!(item.source_system, RecallSourceSystem::SessionRaw);
         assert_eq!(item.hint_type, RecallHintType::SessionRaw);
         assert_eq!(item.target.kind, "session");
         assert_eq!(item.target.id, "s-old");
         assert_eq!(item.title.as_deref(), Some("Agent memory recall design"));
-        assert_eq!(item.matched_tags, vec!["memory"]);
+        assert_eq!(item.matched_tags, vec!["agent", "memory"]);
         assert!(item.hint.contains("Related previous session topic"));
         assert!(!item.hint.contains("Current topic"));
         assert!(item.score > 0.0);
+        assert_eq!(items[1].target.id, "s-older");
+        assert_eq!(items[1].matched_tags, vec!["memory"]);
     }
 
     #[tokio::test]
@@ -987,6 +1007,7 @@ mod tests {
                 weight: 1.0,
                 last_touched: "2026-05-19T00:00:00Z".to_string(),
                 tier: TagTier::Transient,
+                position: 0,
                 reason: None,
             }],
             ..TagSet::default()
@@ -1046,6 +1067,7 @@ mod tests {
                 weight: 1.0,
                 last_touched: "2026-05-19T00:00:00Z".to_string(),
                 tier: TagTier::Transient,
+                position: 0,
                 reason: None,
             }],
             ..TagSet::default()

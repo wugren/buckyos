@@ -6753,6 +6753,7 @@ fn load_session_topic_state(session_dir: &Path) -> SessionTopicState {
             weight: 1.0,
             last_touched: String::new(),
             tier: TagTier::Transient,
+            position: 0,
             reason: None,
         })
         .collect();

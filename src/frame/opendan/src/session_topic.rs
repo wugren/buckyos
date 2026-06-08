@@ -26,6 +26,7 @@ const TAG_SET_FILE: &str = "tag_set.json";
 const SUBSCRIPTIONS_FILE: &str = "subscriptions.json";
 const TOPIC_DOC_SCHEMA: &str = "opendan.session_topic";
 const TOPIC_DOC_VERSION: u32 = 1;
+const TAG_ACTIVE_REINFORCE_THRESHOLD: f32 = 3.0;
 
 #[derive(Debug, Error)]
 pub enum SessionTopicError {
@@ -125,6 +126,8 @@ pub struct TagEntry {
     pub weight: f32,
     pub last_touched: String,
     pub tier: TagTier,
+    #[serde(default)]
+    pub position: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -563,12 +566,13 @@ fn update_tag_set(
         .map(|(idx, t)| (t.name.clone(), idx))
         .collect();
 
-    for tag in incoming {
+    for (position, tag) in incoming.iter().enumerate() {
         if let Some(idx) = by_name.get(&tag.name).copied() {
             let entry = &mut tag_set.tags[idx];
             entry.weight += 1.0;
             entry.last_touched = now.to_string();
-            entry.tier = TagTier::Transient;
+            entry.tier = reinforce_tag_tier(entry.tier, entry.weight);
+            entry.position = position as u32;
             entry.reason = Some(tag.reason.clone());
         } else {
             let idx = tag_set.tags.len();
@@ -577,11 +581,28 @@ fn update_tag_set(
                 weight: 1.0,
                 last_touched: now.to_string(),
                 tier: TagTier::Transient,
+                position: position as u32,
                 reason: Some(tag.reason.clone()),
             });
             by_name.insert(tag.name.clone(), idx);
             added.push(tag.name.clone());
         }
+    }
+    let incoming_names: HashSet<&str> = incoming.iter().map(|tag| tag.name.as_str()).collect();
+    let mut retained_position = incoming.len() as u32;
+    let mut retained: Vec<_> = tag_set
+        .tags
+        .iter_mut()
+        .filter(|tag| !incoming_names.contains(tag.name.as_str()))
+        .collect();
+    retained.sort_by(|a, b| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for tag in retained {
+        tag.position = retained_position;
+        retained_position = retained_position.saturating_add(1);
     }
 
     let mut removed = Vec::new();
@@ -590,11 +611,31 @@ fn update_tag_set(
         removed.push(tag_set.tags.remove(idx).name);
     }
 
-    tag_set.tags.sort_by(|a, b| a.name.cmp(&b.name));
+    normalize_tag_positions(&mut tag_set.tags);
     TagSetDiff {
         added,
         removed,
         current: tag_set.tags.clone(),
+    }
+}
+
+fn normalize_tag_positions(tags: &mut [TagEntry]) {
+    tags.sort_by(|a, b| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for (idx, tag) in tags.iter_mut().enumerate() {
+        tag.position = idx as u32;
+    }
+}
+
+fn reinforce_tag_tier(current: TagTier, weight: f32) -> TagTier {
+    match current {
+        TagTier::Pinned => TagTier::Pinned,
+        TagTier::Active => TagTier::Active,
+        TagTier::Transient if weight >= TAG_ACTIVE_REINFORCE_THRESHOLD => TagTier::Active,
+        TagTier::Transient => TagTier::Transient,
     }
 }
 
@@ -1005,6 +1046,137 @@ mod tests {
     }
 
     #[test]
+    fn tag_eviction_prefers_lower_tier_before_score() {
+        let now = "2026-05-19T01:00:00Z";
+        let policy = RecallPolicy::default();
+        let set = TagSet {
+            capacity: 3,
+            tags: vec![
+                tag_with_tier(
+                    "active-old",
+                    0.1,
+                    "2026-05-18T00:00:00Z",
+                    TagTier::Active,
+                    0,
+                ),
+                tag_with_tier(
+                    "pinned-old",
+                    0.1,
+                    "2026-05-18T00:00:00Z",
+                    TagTier::Pinned,
+                    1,
+                ),
+                tag_with_tier("transient-fresh", 10.0, now, TagTier::Transient, 2),
+            ],
+            ..TagSet::default()
+        };
+        assert_eq!(
+            set.tags[choose_eviction_index(&set, now, &policy)].name,
+            "transient-fresh"
+        );
+
+        let set = TagSet {
+            capacity: 2,
+            tags: vec![
+                tag_with_tier(
+                    "active-old",
+                    0.1,
+                    "2026-05-18T00:00:00Z",
+                    TagTier::Active,
+                    0,
+                ),
+                tag_with_tier(
+                    "pinned-old",
+                    0.1,
+                    "2026-05-18T00:00:00Z",
+                    TagTier::Pinned,
+                    1,
+                ),
+            ],
+            ..TagSet::default()
+        };
+        assert_eq!(
+            set.tags[choose_eviction_index(&set, now, &policy)].name,
+            "active-old"
+        );
+
+        let set = TagSet {
+            capacity: 1,
+            tags: vec![tag_with_tier(
+                "pinned-only",
+                0.1,
+                "2026-05-18T00:00:00Z",
+                TagTier::Pinned,
+                0,
+            )],
+            ..TagSet::default()
+        };
+        assert_eq!(
+            set.tags[choose_eviction_index(&set, now, &policy)].name,
+            "pinned-only"
+        );
+    }
+
+    #[test]
+    fn tag_update_promotes_active_and_preserves_pinned() {
+        let now = "2026-05-19T01:00:00Z";
+        let policy = RecallPolicy::default();
+        let mut set = TagSet {
+            capacity: 4,
+            tags: vec![
+                tag_with_tier("alpha", 2.0, now, TagTier::Transient, 0),
+                tag_with_tier("beta", 1.0, now, TagTier::Pinned, 1),
+            ],
+            ..TagSet::default()
+        };
+
+        update_tag_set(
+            &mut set,
+            &[
+                tag_input("alpha", "third reinforcement"),
+                tag_input("beta", "explicitly pinned before this update"),
+            ],
+            now,
+            &policy,
+        );
+
+        let alpha = set.tags.iter().find(|tag| tag.name == "alpha").unwrap();
+        let beta = set.tags.iter().find(|tag| tag.name == "beta").unwrap();
+        assert_eq!(alpha.weight, 3.0);
+        assert_eq!(alpha.tier, TagTier::Active);
+        assert_eq!(beta.tier, TagTier::Pinned);
+    }
+
+    #[test]
+    fn tag_update_persists_current_input_order_as_position() {
+        let now = "2026-05-19T01:00:00Z";
+        let policy = RecallPolicy::default();
+        let mut set = TagSet {
+            capacity: 4,
+            tags: vec![
+                tag_with_tier("zeta", 1.0, now, TagTier::Transient, 0),
+                tag_with_tier("alpha", 1.0, now, TagTier::Transient, 1),
+            ],
+            ..TagSet::default()
+        };
+
+        update_tag_set(
+            &mut set,
+            &[
+                tag_input("beta", "first current focus"),
+                tag_input("zeta", "second current focus"),
+            ],
+            now,
+            &policy,
+        );
+
+        let names: Vec<_> = set.tags.iter().map(|tag| tag.name.as_str()).collect();
+        let positions: Vec<_> = set.tags.iter().map(|tag| tag.position).collect();
+        assert_eq!(names, vec!["beta", "zeta", "alpha"]);
+        assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn tag_normalization_requires_reason() {
         let err = normalize_tags(&[tag_input("Design", "   ")]).unwrap_err();
         assert!(matches!(err, SessionTopicError::InvalidInput(_)));
@@ -1312,11 +1484,22 @@ mod tests {
     }
 
     fn tag(name: &str, weight: f32, last_touched: &str) -> TagEntry {
+        tag_with_tier(name, weight, last_touched, TagTier::Transient, 0)
+    }
+
+    fn tag_with_tier(
+        name: &str,
+        weight: f32,
+        last_touched: &str,
+        tier: TagTier,
+        position: u32,
+    ) -> TagEntry {
         TagEntry {
             name: name.to_string(),
             weight,
             last_touched: last_touched.to_string(),
-            tier: TagTier::Transient,
+            tier,
+            position,
             reason: None,
         }
     }
