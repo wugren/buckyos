@@ -977,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn external_workspace_tools_bind_and_list_from_agent_tool_backend() {
         let temp = tempdir().expect("create tempdir");
-        let agent_root = temp.path().join("agents/jarvis");
+        let agent_root = temp.path().join("agents/buckyos_jarvis");
         let external_workspace = temp.path().join("external-workspace");
         fs::create_dir_all(&agent_root)
             .await

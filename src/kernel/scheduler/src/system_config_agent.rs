@@ -1630,7 +1630,7 @@ mod tests {
         let owner = DID::new("bns", "owner");
         let app_doc = AppDocBuilder::new(
             AppType::Agent,
-            "jarvis",
+            "buckyos_jarvis",
             "0.1.0",
             "did:web:buckyos.ai",
             &owner,
@@ -1843,16 +1843,16 @@ mod tests {
             .unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let (scheduler_ctx, _) = create_scheduler_by_system_config(&input_system_config).unwrap();
         let spec = scheduler_ctx
-            .get_service_spec("jarvis@alice")
+            .get_service_spec("buckyos_jarvis@alice")
             .expect("agent spec should be loaded");
 
-        assert_eq!(spec.app_id, "jarvis");
+        assert_eq!(spec.app_id, "buckyos_jarvis");
         assert_eq!(spec.owner_id, "alice");
         assert_eq!(spec.spec_type, ServiceSpecType::App);
         assert!(spec.need_container);
@@ -1905,14 +1905,14 @@ mod tests {
             serde_json::to_string(&device_ood1).unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
@@ -1932,8 +1932,8 @@ mod tests {
         device_list.insert("ood1".to_string(), device_ood1);
 
         let action = SchedulerAction::InstanceReplica(create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         ));
@@ -1957,12 +1957,12 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 let value = paths
-                    .get("/apps/jarvis@alice@ood1")
+                    .get("/apps/buckyos_jarvis@alice@ood1")
                     .and_then(|value| value.as_ref())
                     .expect("agent instance should be written under node apps");
                 let instance: buckyos_api::AppServiceInstanceConfig =
                     serde_json::from_value(value.clone()).expect("parse instance config");
-                assert_eq!(instance.app_spec.app_id(), "jarvis");
+                assert_eq!(instance.app_spec.app_id(), "buckyos_jarvis");
                 assert_eq!(instance.app_spec.user_id, "alice");
             }
             other => panic!("unexpected kv action: {:?}", other),
@@ -1981,8 +1981,8 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
@@ -1999,8 +1999,8 @@ mod tests {
         });
 
         let instance = create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         );
@@ -2011,8 +2011,8 @@ mod tests {
 
         let tx_actions = schedule_action_to_tx_actions(
             &SchedulerAction::RemoveInstance(
-                "jarvis@alice".to_string(),
-                "jarvis@alice@ood1".to_string(),
+                "buckyos_jarvis@alice".to_string(),
+                "buckyos_jarvis@alice@ood1".to_string(),
                 "ood1".to_string(),
             ),
             &scheduler_ctx,
@@ -2030,14 +2030,14 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Deleted)))
                 );
-                assert!(!paths.contains_key("/apps/jarvis@alice@ood1"));
+                assert!(!paths.contains_key("/apps/buckyos_jarvis@alice@ood1"));
             }
             other => panic!("unexpected kv action: {:?}", other),
         }
@@ -2055,8 +2055,8 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
@@ -2077,8 +2077,8 @@ mod tests {
 
         let tx_actions = schedule_action_to_tx_actions(
             &SchedulerAction::RemoveInstance(
-                "jarvis@alice".to_string(),
-                "jarvis@alice@ood1".to_string(),
+                "buckyos_jarvis@alice".to_string(),
+                "buckyos_jarvis@alice@ood1".to_string(),
                 "ood1".to_string(),
             ),
             &scheduler_ctx,
@@ -2096,11 +2096,11 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Deleted)))
                 );
             }
@@ -2120,8 +2120,8 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
@@ -2138,8 +2138,8 @@ mod tests {
         });
 
         let mut instance = create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         );
@@ -2165,14 +2165,14 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Stopped)))
                 );
-                assert!(!paths.contains_key("/apps/jarvis@alice@ood1"));
+                assert!(!paths.contains_key("/apps/buckyos_jarvis@alice@ood1"));
             }
             other => panic!("unexpected kv action: {:?}", other),
         }
@@ -2691,16 +2691,16 @@ mod tests {
             serde_json::to_string(&device_ood1).unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.service_infos.insert(
-            "jarvis@alice".to_string(),
+            "buckyos_jarvis@alice".to_string(),
             ServiceInfo::SingleInstance(create_test_replica_instance(
-                "jarvis@alice",
-                "jarvis@alice@ood1",
+                "buckyos_jarvis@alice",
+                "buckyos_jarvis@alice@ood1",
                 "ood1",
                 &[("www", 11080)],
             )),
@@ -2719,7 +2719,7 @@ mod tests {
             NodeGatewayAppEntry::App(entry) => entry,
             _ => panic!("jarvis should resolve to an app entry"),
         };
-        assert_eq!(jarvis.app_id, "jarvis");
+        assert_eq!(jarvis.app_id, "buckyos_jarvis");
         assert_eq!(jarvis.node_id.as_deref(), Some("ood1"));
         assert_eq!(jarvis.port, Some(11080));
         assert_eq!(jarvis.dir_pkg_id, None);

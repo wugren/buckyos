@@ -29,15 +29,13 @@ mini_agent_demo/
    cp -r doc/opendan/mini_agent_demo /tmp/echo-bot-root
    ```
 
-2. 让 opendan 用它作为 `agent_root`(三种途径任选其一,优先级见 [Agent配置改进.md §8](../Agent配置改进.md#8-部署--fs--cow保留现有契约简述)):
+2. 当前 `opendan` 不再接受 `--agent-root` / `OPENDAN_AGENT_ROOT` 作为主进程启动入口。Agent root 由 BuckyOS runtime 的 appid / owner 解析:
 
    ```bash
-   # 方式 A:CLI 参数
-   opendan --agent-root /tmp/echo-bot-root --appid echo-bot
-
-   # 方式 B:环境变量
-   OPENDAN_AGENT_ROOT=/tmp/echo-bot-root opendan --appid echo-bot
+   get_buckyos_app_data_dir(<appid>, <owner_user_id>)
    ```
+
+   本机开发时应先把 demo 内容同步到对应 app 的数据目录,再用 `service_debug <appid> <owner_user_id>` 启动。
 
 3. 启动后 opendan 会:
    - 解析 `agent.toml`,挂上 `msg_center` channel,装配 `[dispatch]` 规则表

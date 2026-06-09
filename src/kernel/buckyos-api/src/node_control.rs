@@ -2584,7 +2584,7 @@ mod tests {
             "updated_at": 1,
             "items": {
                 "scheduler": {"item_name":"scheduler","item_kind":"kernel_service","target_state":"Running","observed_state":null,"run_state":"started","last_error":null,"updated_at":1},
-                "devtest#jarvis": {"item_name":"devtest#jarvis","item_kind":"app_service","target_state":"Running","observed_state":null,"run_state":"started","last_error":null,"updated_at":1}
+                "devtest#buckyos_jarvis": {"item_name":"devtest#buckyos_jarvis","item_kind":"app_service","target_state":"Running","observed_state":null,"run_state":"started","last_error":null,"updated_at":1}
             }
         }"#;
         let parsed: RunPlistRaw = serde_json::from_str(raw).expect("parse");
@@ -2603,7 +2603,7 @@ mod tests {
         assert_eq!(snapshot.kernel_service_aliases(), vec!["scheduler"]);
         assert_eq!(
             snapshot.app_service_container_names(),
-            vec!["devtest-jarvis"]
+            vec!["devtest-buckyos_jarvis"]
         );
     }
 

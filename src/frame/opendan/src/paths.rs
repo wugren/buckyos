@@ -16,6 +16,8 @@
 
 use std::path::PathBuf;
 
+const BUCKYOS_INSTANCE_VOLUME_ENV: &str = "BUCKYOS_INSTANCE_VOLUME";
+
 /// Resolve the BuckyOS root directory. See module docs for fallback order.
 pub fn buckyos_root() -> PathBuf {
     if let Ok(v) = std::env::var("BUCKYOS_ROOT") {
@@ -44,6 +46,16 @@ pub fn buckyos_tools_root() -> PathBuf {
     buckyos_root().join("tools")
 }
 
+/// Writable tool root for layers rendered by OpenDAN itself.
+pub fn writable_tools_root() -> PathBuf {
+    if let Ok(v) = std::env::var(BUCKYOS_INSTANCE_VOLUME_ENV) {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v).join("tools");
+        }
+    }
+    buckyos_tools_root()
+}
+
 /// System Bin layer — rx, shared across every Agent on the host.
 pub fn system_bin_dir() -> PathBuf {
     buckyos_tools_root().join("store")
@@ -53,7 +65,7 @@ pub fn system_bin_dir() -> PathBuf {
 /// + ExtTool Volume. First-version is an empty directory placeholder; future
 /// Crafter / volume integrations write into it.
 pub fn runtime_bin_dir() -> PathBuf {
-    buckyos_tools_root().join("bin")
+    writable_tools_root().join("bin")
 }
 
 /// Session Exec Bin layer — rwx, per-Agent + per-Session. The runtime
@@ -61,7 +73,7 @@ pub fn runtime_bin_dir() -> PathBuf {
 /// session boot, and on every `exec_bash` invocation re-checks Agent
 /// tools mtime to pick up live changes.
 pub fn session_exec_bin_dir(agent_id: &str, session_id: &str) -> PathBuf {
-    buckyos_tools_root()
+    writable_tools_root()
         .join(sanitize_path_segment(agent_id))
         .join(sanitize_path_segment(session_id))
 }
@@ -102,20 +114,44 @@ mod tests {
     #[test]
     fn buckyos_root_layout_honors_env_override() {
         let prev = std::env::var("BUCKYOS_ROOT").ok();
+        let prev_instance = std::env::var(BUCKYOS_INSTANCE_VOLUME_ENV).ok();
         std::env::set_var("BUCKYOS_ROOT", "/tmp/buckyos_test_layout");
+        std::env::remove_var(BUCKYOS_INSTANCE_VOLUME_ENV);
         assert_eq!(buckyos_root(), PathBuf::from("/tmp/buckyos_test_layout"));
         assert_eq!(
             buckyos_tools_root(),
             PathBuf::from("/tmp/buckyos_test_layout/tools")
         );
         assert_eq!(
+            writable_tools_root(),
+            PathBuf::from("/tmp/buckyos_test_layout/tools")
+        );
+        assert_eq!(
             session_exec_bin_dir("agent-1", "ses/01"),
             PathBuf::from("/tmp/buckyos_test_layout/tools/agent-1/ses_01")
+        );
+        std::env::set_var(BUCKYOS_INSTANCE_VOLUME_ENV, "/tmp/buckyos_instance");
+        assert_eq!(
+            system_bin_dir(),
+            PathBuf::from("/tmp/buckyos_test_layout/tools/store")
+        );
+        assert_eq!(
+            runtime_bin_dir(),
+            PathBuf::from("/tmp/buckyos_instance/tools/bin")
+        );
+        assert_eq!(
+            session_exec_bin_dir("agent-1", "ses/01"),
+            PathBuf::from("/tmp/buckyos_instance/tools/agent-1/ses_01")
         );
         if let Some(p) = prev {
             std::env::set_var("BUCKYOS_ROOT", p);
         } else {
             std::env::remove_var("BUCKYOS_ROOT");
+        }
+        if let Some(p) = prev_instance {
+            std::env::set_var(BUCKYOS_INSTANCE_VOLUME_ENV, p);
+        } else {
+            std::env::remove_var(BUCKYOS_INSTANCE_VOLUME_ENV);
         }
     }
 }

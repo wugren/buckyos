@@ -31,7 +31,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUCKYOS_ROOT="${BUCKYOS_ROOT:-/opt/buckyos}"
-APP_ID="jarvis"
+APP_ID="buckyos_jarvis"
 OWNER_USER_ID="devtest"
 DEBUG_JARVIS_REFRESH="${DEBUG_JARVIS_REFRESH:-1}"
 

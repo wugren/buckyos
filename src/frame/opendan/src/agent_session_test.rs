@@ -44,7 +44,7 @@ fn schedule_task_prompt_text_extracts_source_and_failure() {
     let task = Task {
         id: 7,
         user_id: "alice".to_string(),
-        app_id: "jarvis".to_string(),
+        app_id: "buckyos_jarvis".to_string(),
         session_id: String::new(),
         parent_id: None,
         root_id: "sch-1".to_string(),
@@ -88,14 +88,14 @@ fn schedule_task_prompt_text_extracts_source_and_failure() {
 
 #[test]
 fn schedule_task_prompt_reader_uses_unfiltered_fallback_for_system_owner() {
-    let (user_id, app_id) = schedule_task_prompt_reader_identity("system", "jarvis");
+    let (user_id, app_id) = schedule_task_prompt_reader_identity("system", "buckyos_jarvis");
     if user_id.is_none() {
         assert_eq!(app_id, None);
     } else {
         assert!(app_id.is_some());
     }
 
-    let (user_id, app_id) = schedule_task_prompt_reader_identity("alice", "jarvis");
+    let (user_id, app_id) = schedule_task_prompt_reader_identity("alice", "buckyos_jarvis");
     assert_eq!(user_id, Some("alice".to_string()));
     assert!(app_id.as_deref().is_some_and(|value| !value.is_empty()));
 }
@@ -118,9 +118,18 @@ fn self_check_behavior_end_keeps_session_idle() {
 
 #[test]
 fn notebook_prompt_owner_uses_agent_appid() {
-    assert_eq!(resolve_notebook_prompt_owner("system", "jarvis"), "jarvis");
-    assert_eq!(resolve_notebook_prompt_owner("", "jarvis"), "jarvis");
-    assert_eq!(resolve_notebook_prompt_owner("alice", "jarvis"), "jarvis");
+    assert_eq!(
+        resolve_notebook_prompt_owner("system", "buckyos_jarvis"),
+        "buckyos_jarvis"
+    );
+    assert_eq!(
+        resolve_notebook_prompt_owner("", "buckyos_jarvis"),
+        "buckyos_jarvis"
+    );
+    assert_eq!(
+        resolve_notebook_prompt_owner("alice", "buckyos_jarvis"),
+        "buckyos_jarvis"
+    );
     assert_eq!(resolve_notebook_prompt_owner("alice", ""), "alice");
 }
 
@@ -153,7 +162,7 @@ fn notebook_prompt_texts_read_agent_scope_not_session_owner() {
     let (list_text, recent_text) = build_notebook_prompt_texts(
         &agent_config,
         "devtest",
-        "jarvis",
+        "buckyos_jarvis",
         0,
         SessionKind::SelfCheck,
     );

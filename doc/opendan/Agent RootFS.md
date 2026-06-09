@@ -94,7 +94,9 @@
 
 - AgentRootFS 内禁止任何二进制可执行文件（ELF / Mach-O / PE / `.so` / `.dylib` / `.dll`），通过 4 层
   Bin 的执行视图来承载二进制。
-- `sessions/<id>/` 内不放 `./bin/`，执行视图渲染到容器临时目录 `<buckyos_root>/tools/<agent_id>/<session_id>/`。
+- `sessions/<id>/` 内不放 `./bin/`，执行视图渲染到 App Instance Volume 下的
+  `<instance_volume>/tools/<agent_id>/<session_id>/`。Docker 正式环境中通常是
+  `/opt/buckyos/instance/tools/<agent_id>/<session_id>/`。
 - 路径解析单一来源 [`paths.rs`](../../src/frame/opendan/src/paths.rs)，禁止"候选 key 列表 + 祖先扫描"。
 
 **新增约束**：
@@ -428,11 +430,18 @@ behavior 永远是"已经决定推理，正在准备这一轮"的状态。
 
 | 层 | 物理路径 | 持久化 |
 |---|---|---|
-| System Bin | `<buckyos_root>/tools/store/` | 随 Worker Image |
-| Runtime Bin | `<buckyos_root>/tools/bin/` | 容器临时 |
+| System Bin | `<buckyos_root>/tools/store/` | ExtTool 共享只读卷 |
+| Runtime Bin | `<instance_volume>/tools/bin/` | App Instance Volume |
 | Agent Bin | `<agent_root>/tools/` | AgentRootFS 持久化 |
 | Session Bin 声明 | `<agent_root>/sessions/<sid>/tools/` | AgentRootFS 持久化 |
-| Session Bin 执行视图 | `<buckyos_root>/tools/<agent_id>/<sid>/` | 容器临时 |
+| Session Bin 执行视图 | `<instance_volume>/tools/<agent_id>/<sid>/` | App Instance Volume |
+
+Docker 正式环境中:
+
+- `<buckyos_root>` 固定为 `/opt/buckyos`。
+- `<instance_volume>` 来自 `BUCKYOS_INSTANCE_VOLUME`,当前 worker 容器内为 `/opt/buckyos/instance`。
+- `/opt/buckyos/tools` 是 `buckyos-exttool` 共享只读卷。OpenDAN 只能读取其中的 `store/`、预热 cache 等内容,不能在该目录下创建 session-bin。
+- Runtime Bin 和 Session Bin 都必须落在 `/opt/buckyos/instance/tools/...`,避免写入只读 ExtTool 卷。
 
 ### 6.1 PATH overlay
 ```
@@ -522,10 +531,17 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
 - **数据 / 运行时分离**：AgentRootFS 在宿主机普通文件系统；AgentRuntime 在 Linux 容器内。
 - **跨平台契约只落在 AgentRootFS**：目录结构、配置、session 数据平台无关；执行视图（PATH 里的 bin、
   tmux pane、临时挂载）允许纯 Linux 形态。
-- **`agent_root` 来源优先级**：`--agent-root` > `OPENDAN_AGENT_ROOT` > `BUCKYOS_DATA_DIR` >
-  `/opt/buckyos/opendan/agent`。
+- **`agent_root` 来源**：`opendan` 启动 BuckyOS AppService runtime 后，用 runtime 解析出的
+  `app_id` / `owner_id` 调 `get_buckyos_app_data_dir(app_id, owner_id)` 取得当前 app 数据目录。
+- **Docker 中的 `agent_root`**：容器内为 `/home/<owner>/.local/share/<agent_id>`,host 侧对应
+  `$BUCKYOS_ROOT/data/home/<owner>/.local/share/<agent_id>`。它是 AgentRootFS/user app data,不承载
+  session-bin。
+- **Docker 中的可写执行层**：`BUCKYOS_INSTANCE_VOLUME=/opt/buckyos/instance`,OpenDAN 的 Runtime Bin 和
+  Session Exec Bin 都渲染到 `/opt/buckyos/instance/tools/...`。
+- **Docker 中的 ExtTool 层**：`BUCKYOS_EXTTOOL_DIR=/opt/buckyos/tools`,由 `buckyos-exttool` 共享只读卷提供,
+  OpenDAN 只把 `/opt/buckyos/tools/store` 作为 System Bin 读取。
 - **COW 由容器内 OverlayFS 实现**：`OverlayFS(Package[RO], Data[RW])`，host 不做 overlay 生命周期。
-- **`opendan` 进程不理解 Docker**，只消费一个已经准备好的 `--agent-root`。
+- **`opendan` 进程不理解 Docker**，只消费 BuckyOS runtime 解析出的 app 数据目录。
 
 确定性读取规则（不变）：
 

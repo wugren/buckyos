@@ -649,17 +649,17 @@ Workflow DSL 时就尾大不掉。要么不要,要么一次性全要。
 
 ---
 
-## 8. 部署 / FS / COW(保留现有契约,简述)
+## 8. 部署 / FS / COW(简述)
 
 这里只列**不变事实**,方便单文件阅读:
 
 - **数据 / 运行时分离**:AgentRootFS 在宿主机普通文件系统;AgentRuntime 在 Linux 容器内。
 - **跨平台契约只落在 AgentRootFS**:目录结构、配置、session 数据平台无关;执行视图(PATH 里的 bin、
   tmux pane、临时挂载)允许纯 Linux 形态。
-- **`agent_root` 来源优先级**:`--agent-root` > `OPENDAN_AGENT_ROOT` > `BUCKYOS_DATA_DIR` >
-  `/opt/buckyos/opendan/agent`。
+- **`agent_root` 来源**:`opendan` 启动 BuckyOS AppService runtime 后,用 runtime appid / owner 调用
+  `get_buckyos_app_data_dir(appid, owner)` 获取。
 - **COW 由容器内 OverlayFS 实现**:`OverlayFS(Package[RO], Data[RW])`,host 不做 overlay 生命周期。
-- **`opendan` 进程不理解 Docker**,只消费一个已经准备好的 `--agent-root`。
+- **`opendan` 进程不理解 Docker**,只消费 BuckyOS runtime 解析出的 app data dir。
 
 确定性读取规则(不变):
 

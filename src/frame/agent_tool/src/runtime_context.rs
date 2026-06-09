@@ -272,12 +272,12 @@ mod tests {
         std::fs::create_dir_all(&meta).unwrap();
         std::fs::write(
             meta.join("agent_identity.json"),
-            r#"{"owner_user_id":"alice","agent_id":"jarvis"}"#,
+            r#"{"owner_user_id":"alice","agent_id":"buckyos_jarvis"}"#,
         )
         .unwrap();
         let identity = resolve_agent_identity(dir.path()).unwrap();
         assert_eq!(identity.owner_user_id, "alice");
-        assert_eq!(identity.agent_id, "jarvis");
+        assert_eq!(identity.agent_id, "buckyos_jarvis");
     }
 
     #[test]
@@ -285,20 +285,20 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("agent.toml"),
-            "[identity]\nowner_user_id = \"alice\"\nagent_id = \"jarvis\"\n",
+            "[identity]\nowner_user_id = \"alice\"\nagent_id = \"buckyos_jarvis\"\n",
         )
         .unwrap();
         let identity = resolve_agent_identity(dir.path()).unwrap();
         assert_eq!(identity.owner_user_id, "alice");
-        assert_eq!(identity.agent_id, "jarvis");
+        assert_eq!(identity.agent_id, "buckyos_jarvis");
     }
 
     #[test]
     fn resolves_identity_from_canonical_path() {
-        let root = PathBuf::from("/opt/buckyos/data/home/alice/.local/share/jarvis");
+        let root = PathBuf::from("/opt/buckyos/data/home/alice/.local/share/buckyos_jarvis");
         let identity = resolve_agent_identity(&root).unwrap();
         assert_eq!(identity.owner_user_id, "alice");
-        assert_eq!(identity.agent_id, "jarvis");
+        assert_eq!(identity.agent_id, "buckyos_jarvis");
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
         std::fs::create_dir_all(&meta).unwrap();
         std::fs::write(
             meta.join("agent_identity.json"),
-            r#"{"owner_user_id":"alice","agent_id":"jarvis"}"#,
+            r#"{"owner_user_id":"alice","agent_id":"buckyos_jarvis"}"#,
         )
         .unwrap();
 
@@ -334,7 +334,7 @@ mod tests {
         );
         assert_eq!(ctx.trace_id, "trace-1");
         assert!(!ctx.is_dev_fallback());
-        assert_eq!(ctx.require_identity().unwrap().agent_id, "jarvis");
+        assert_eq!(ctx.require_identity().unwrap().agent_id, "buckyos_jarvis");
         assert_eq!(ctx.require_appclient_session_token().unwrap(), "token-1");
     }
 

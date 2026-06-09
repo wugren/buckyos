@@ -1445,7 +1445,7 @@ mod tests {
             schedule_id: "sch-1".to_string(),
             owner: WorkflowOwner {
                 user_id: "devtest".to_string(),
-                app_id: "jarvis".to_string(),
+                app_id: "buckyos_jarvis".to_string(),
             },
             name: "standup".to_string(),
             description: Some("description should stay out of list".to_string()),
@@ -1526,7 +1526,7 @@ mod tests {
     fn list_summary_omits_show_level_target_fields() {
         let record = test_record(WorkflowScheduledTaskTarget {
             task_type: "agent.delegate".to_string(),
-            runner: Some("jarvis".to_string()),
+            runner: Some("buckyos_jarvis".to_string()),
             name_template: "scheduled task".to_string(),
             data_template: json!({
                 "agent_delegate": {
@@ -1546,7 +1546,7 @@ mod tests {
         assert!(text.contains("mail"));
         assert!(text.contains("long objective"));
         assert!(!text.contains("agent.delegate"));
-        assert!(!text.contains("jarvis"));
+        assert!(!text.contains("buckyos_jarvis"));
         assert!(!text.contains("repeated in list output"));
         assert!(!text.contains("work_default"));
     }

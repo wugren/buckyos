@@ -405,10 +405,9 @@ case "$BUCKYOS_APP_TYPE" in
     # OpenDAN creates sessions/, memory/, skills/, todo/, worklog/ on demand
     # — the exact layout under agent_root isn't frozen yet, so we only
     # guarantee the data root itself exists (already mkdir'd at the top).
-    log "agent=${BUCKYOS_APP_ID} port=${BUCKYOS_SERVICE_PORT} env=${BUCKYOS_DATA_DIR}"
+    log "agent=${BUCKYOS_APP_ID} port=${BUCKYOS_SERVICE_PORT} data=${BUCKYOS_DATA_DIR}"
     exec "$OPENDAN_BIN" \
       --agent-id "$BUCKYOS_APP_ID" \
-      --agent-env "$BUCKYOS_DATA_DIR" \
       --agent-bin "$BUCKYOS_PKG_DIR" \
       --service-port "$BUCKYOS_SERVICE_PORT" \
       "$@"

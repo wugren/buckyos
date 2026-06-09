@@ -314,7 +314,7 @@ mod tests {
         let owner_did = DID::from_str("did:bns:devtest").expect("parse owner did");
         let app_doc = AppDoc::builder(
             AppType::Agent,
-            "jarvis",
+            "buckyos_jarvis",
             "0.1.0",
             "did:bns:devtest",
             &owner_did,
@@ -341,14 +341,15 @@ mod tests {
 
         let (app_id, owner_user_id) =
             parse_app_identity_from_instance_config(&raw).expect("parse app_instance_config");
-        assert_eq!(app_id, "jarvis");
+        assert_eq!(app_id, "buckyos_jarvis");
         assert_eq!(owner_user_id, "devtest");
     }
 
     #[tokio::test]
     async fn init_app_service_runtime_skips_system_etc_and_uses_env_bootstrap() {
         let _lock = test_env_lock().lock().expect("lock env");
-        let token_key = get_session_token_env_key(&get_full_appid("jarvis", "devtest"), true);
+        let token_key =
+            get_session_token_env_key(&get_full_appid("buckyos_jarvis", "devtest"), true);
         let missing_root = env::temp_dir().join(format!(
             "buckyos-appservice-runtime-missing-root-{}-{}",
             std::process::id(),
@@ -364,7 +365,7 @@ mod tests {
         let prev_token = set_env_var(&token_key, "dummy-session-token");
 
         let result = init_buckyos_api_runtime(
-            "jarvis",
+            "buckyos_jarvis",
             Some("devtest".to_string()),
             BuckyOSRuntimeType::AppService,
         )
@@ -374,7 +375,7 @@ mod tests {
         restore_env_var("BUCKYOS_ROOT", prev_root);
 
         let runtime = result.expect("init app service runtime should succeed without system etc");
-        assert_eq!(runtime.get_app_id(), "jarvis");
+        assert_eq!(runtime.get_app_id(), "buckyos_jarvis");
         assert_eq!(runtime.get_owner_user_id().as_deref(), Some("devtest"));
         assert_eq!(runtime.user_id.as_deref(), Some("devtest"));
         assert_eq!(runtime.get_authenticated_user_id().as_deref(), None);

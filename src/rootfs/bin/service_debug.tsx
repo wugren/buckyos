@@ -95,12 +95,12 @@ function printUsage(): never {
       '  service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--worksession-test <json>] [--worksession-task-test <json>] [--detach]',
       '',
       'Example:',
-      '  service_debug jarvis alice',
+      '  service_debug buckyos_jarvis alice',
       '  service_debug buckyos_systest devtest',
-      '  service_debug jarvis alice --port 14060',
-      '  service_debug jarvis alice --agent-package-root ./rootfs/bin/buckyos_jarvis',
-      '  service_debug jarvis alice --worksession-test ./case.json',
-      '  service_debug jarvis alice --worksession-task-test ./case.json',
+      '  service_debug buckyos_jarvis alice --port 14060',
+      '  service_debug buckyos_jarvis alice --agent-package-root ./rootfs/bin/buckyos_jarvis',
+      '  service_debug buckyos_jarvis alice --worksession-test ./case.json',
+      '  service_debug buckyos_jarvis alice --worksession-task-test ./case.json',
     ].join('\n'),
   )
   Deno.exit(1)
@@ -786,9 +786,6 @@ async function buildLaunchContext(options: StartupOptions) {
           pkg_id: agentPackage.pkgId,
           full_path: agentPackage.fullPath,
         }),
-        OPENDAN_AGENT_ID: options.appId,
-        OPENDAN_AGENT_ENV: agentEnvRoot,
-        OPENDAN_AGENT_BIN: agentPackage.fullPath,
         OPENDAN_SERVICE_PORT: `${servicePort}`,
       },
     } satisfies AgentLaunchContext
@@ -800,7 +797,6 @@ async function buildLaunchContext(options: StartupOptions) {
 async function runForeground(
   opendanBinary: string,
   appId: string,
-  agentEnvRoot: string,
   agentPackageRoot: string,
   servicePort: number,
   opendanArgs: string[],
@@ -810,8 +806,6 @@ async function runForeground(
     args: [
       '--agent-id',
       appId,
-      '--agent-env',
-      agentEnvRoot,
       '--agent-bin',
       agentPackageRoot,
       '--service-port',
@@ -1015,7 +1009,6 @@ async function runHostScriptDetached(
 async function runDetached(
   opendanBinary: string,
   appId: string,
-  agentEnvRoot: string,
   agentPackageRoot: string,
   servicePort: number,
   opendanArgs: string[],
@@ -1025,8 +1018,6 @@ async function runDetached(
     args: [
       '--agent-id',
       appId,
-      '--agent-env',
-      agentEnvRoot,
       '--agent-bin',
       agentPackageRoot,
       '--service-port',
@@ -1066,7 +1057,6 @@ async function main() {
         await runDetached(
           launch.opendanBinary,
           options.appId,
-          launch.agentEnvRoot,
           launch.agentPackageRoot,
           launch.servicePort,
           launch.opendanArgs,
@@ -1086,7 +1076,6 @@ async function main() {
       ? await runForeground(
         launch.opendanBinary,
         options.appId,
-        launch.agentEnvRoot,
         launch.agentPackageRoot,
         launch.servicePort,
         launch.opendanArgs,

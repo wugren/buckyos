@@ -1385,8 +1385,7 @@ impl AppLoader {
 
     fn build_volume_mounts(&self) -> Result<Vec<(String, PathBuf, &'static str)>> {
         let mut mounts: HashMap<String, (PathBuf, &'static str)> = HashMap::new();
-        let app_data_container =
-            format!("/home/{}/.local/share/{}", self.owner_user_id, self.app_id);
+        let app_data_container = container_app_data_dir(&self.owner_user_id, &self.app_id);
         mounts.insert("/tmp".to_string(), (self.app_local_cache_dir(), "rw"));
         mounts.insert(app_data_container.clone(), (self.app_data_dir(), "rw"));
 
@@ -1523,8 +1522,7 @@ impl AppLoader {
         ensure_directory(&log_root, true)?;
         ensure_directory(&storage_root, true)?;
 
-        let app_data_container =
-            format!("/home/{}/.local/share/{}", self.owner_user_id, self.app_id);
+        let app_data_container = container_app_data_dir(&self.owner_user_id, &self.app_id);
         let instance_volume_mount = format!(
             "{}:{}:rw",
             self.instance_volume_name(),
@@ -1802,7 +1800,7 @@ impl AppLoader {
         );
         env_vars.insert(
             "BUCKYOS_DATA_DIR".to_string(),
-            format!("/home/{}/.local/share/{}", self.owner_user_id, self.app_id),
+            container_app_data_dir(&self.owner_user_id, &self.app_id),
         );
         env_vars.insert(
             "BUCKYOS_LOG_DIR".to_string(),
@@ -2241,8 +2239,8 @@ impl AppLoader {
         ));
         docker_run_args.push("-v".to_string());
         docker_run_args.push(format!(
-            "<app_data>:/home/{}/.local/share/{}:rw",
-            self.owner_user_id, self.app_id
+            "<app_data>:{}:rw",
+            container_app_data_dir(&self.owner_user_id, &self.app_id)
         ));
 
         if app_type_label == "agent" {
@@ -2269,8 +2267,8 @@ impl AppLoader {
         docker_run_args.push(format!("BUCKYOS_OWNER_USER_ID={}", self.owner_user_id));
         docker_run_args.push("-e".to_string());
         docker_run_args.push(format!(
-            "BUCKYOS_DATA_DIR=/home/{}/.local/share/{}",
-            self.owner_user_id, self.app_id
+            "BUCKYOS_DATA_DIR={}",
+            container_app_data_dir(&self.owner_user_id, &self.app_id)
         ));
         docker_run_args.push("-e".to_string());
         docker_run_args.push(format!("BUCKYOS_LOG_DIR={}", WORKER_CONTAINER_LOG_ROOT));
@@ -2500,30 +2498,18 @@ pub(crate) fn docker_runtime_matches_target(
         .unwrap_or(false)
 }
 
-pub(crate) fn command_matches_agent_process(
-    cmd: &[String],
-    app_id: &str,
-    agent_env_root: &Path,
-) -> bool {
-    if command_arg_value(cmd, "--agent-id") != Some(app_id) {
-        return false;
-    }
-
-    if let Some(agent_env) = command_arg_value(cmd, "--agent-env") {
-        return path_matches_value(agent_env_root, agent_env);
-    }
-
-    true
+pub(crate) fn command_matches_agent_process(cmd: &[String], app_id: &str) -> bool {
+    command_arg_value(cmd, "--agent-id") == Some(app_id)
 }
 
 pub(crate) fn command_matches_exact_agent_process(
     cmd: &[String],
     app_id: &str,
-    agent_env_root: &Path,
+    _agent_env_root: &Path,
     expected_agent_root: Option<&Path>,
     expected_pkg_objid: Option<&str>,
 ) -> bool {
-    if !command_matches_agent_process(cmd, app_id, agent_env_root) {
+    if !command_matches_agent_process(cmd, app_id) {
         return false;
     }
 
@@ -2562,11 +2548,15 @@ fn default_mount_permission(
     owner_user_id: &str,
 ) -> &'static str {
     let path = trim_trailing_slash(container_path);
-    let app_data = format!("/home/{owner_user_id}/.local/share/{app_id}");
+    let app_data = container_app_data_dir(owner_user_id, app_id);
     if path == app_data || path.starts_with(format!("{app_data}/").as_str()) {
         return "rw";
     }
     "ro"
+}
+
+fn container_app_data_dir(owner_user_id: &str, app_id: &str) -> String {
+    format!("/opt/buckyos/data/home/{owner_user_id}/.local/share/{app_id}")
 }
 
 /// Resolve a developer-declared host path (relative to BUCKYOS_ROOT) into an

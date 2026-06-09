@@ -155,7 +155,7 @@ impl SystemConfigBuilder {
 
     pub async fn add_default_agents(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
         //add jarvis agent as default agent
-        // agents/jarvis/doc -> agent doc
+        // agents/buckyos_jarvis/doc -> agent doc
         let zone_did = DID::from_str(&config.zone_name)?;
         let jarvis_did = DID::new(
             zone_did.method.as_str(),
@@ -170,11 +170,13 @@ impl SystemConfigBuilder {
         let mut jarvis_doc = AgentDocument::new(jarvis_did, owner_did, jarvis_public_key_jwk);
         jarvis_doc.public_description = Some("Default built-in OpenDAN agent for BuckyOS".into());
 
-        self.insert_json("agents/jarvis/doc", &jarvis_doc)?;
-        self.entries
-            .insert("agents/jarvis/key".to_string(), jarvis_private_key_pem);
+        self.insert_json("agents/buckyos_jarvis/doc", &jarvis_doc)?;
+        self.entries.insert(
+            "agents/buckyos_jarvis/key".to_string(),
+            jarvis_private_key_pem,
+        );
 
-        let legacy_app_spec_key = format!("users/{}/apps/jarvis/spec", config.user_name);
+        let legacy_app_spec_key = format!("users/{}/apps/buckyos_jarvis/spec", config.user_name);
         if self.entries.remove(&legacy_app_spec_key).is_some() {
             warn!(
                 "removed conflicting legacy jarvis app spec at {} while installing default agent spec",
@@ -182,16 +184,16 @@ impl SystemConfigBuilder {
             );
         }
 
-        let jarvis_spec_key = format!("users/{}/agents/jarvis/spec", config.user_name);
+        let jarvis_spec_key = format!("users/{}/agents/buckyos_jarvis/spec", config.user_name);
         let jarvis_spec = build_default_jarvis_agent_spec(config)?;
         self.insert_json(&jarvis_spec_key, &jarvis_spec)?;
 
-        // agents/jarvis/settings -> agent settings,
+        // agents/buckyos_jarvis/settings -> agent settings,
         let jarvis_settings = json!({
             "enabled": true,
             "auto_start": true
         });
-        self.insert_json_if_absent("agents/jarvis/settings", &jarvis_settings)?;
+        self.insert_json_if_absent("agents/buckyos_jarvis/settings", &jarvis_settings)?;
         Ok(self)
     }
 
@@ -576,7 +578,7 @@ fn default_jarvis_agent_doc(config: &StartConfigSummary) -> Value {
 
 fn build_default_jarvis_agent_spec(config: &StartConfigSummary) -> Result<AppServiceSpec> {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    const JARVIS_APP_ID: &str = "jarvis";
+    const JARVIS_APP_ID: &str = "buckyos_jarvis";
     const JARVIS_PKG_NAME: &str = "buckyos_jarvis";
 
     let owner_did = DID::from_str("did:bns:buckyos")?;
@@ -1568,7 +1570,7 @@ mod tests {
         assert_eq!(spec.user_id, "alice");
         assert_eq!(spec.app_doc.get_app_type(), buckyos_api::AppType::Agent);
         assert_eq!(spec.app_doc.show_name, "Jarvis");
-        assert_eq!(spec.app_doc.name, "jarvis");
+        assert_eq!(spec.app_doc.name, "buckyos_jarvis");
         assert_eq!(
             spec.app_doc.install_config_tips.service_ports.get("www"),
             Some(&OPENDAN_SERVICE_PORT)
@@ -1605,13 +1607,13 @@ mod tests {
 
         let entries = builder.build();
         let spec = entries
-            .get("users/alice/agents/jarvis/spec")
+            .get("users/alice/agents/buckyos_jarvis/spec")
             .expect("jarvis spec should exist");
         let spec: buckyos_api::AppServiceSpec =
             serde_json::from_str(spec).expect("parse jarvis spec");
 
         assert_eq!(spec.user_id, "alice");
-        assert_eq!(spec.app_doc.name, "jarvis");
+        assert_eq!(spec.app_doc.name, "buckyos_jarvis");
         assert_eq!(
             spec.app_doc.install_config_tips.service_ports.get("www"),
             Some(&OPENDAN_SERVICE_PORT)
@@ -1643,15 +1645,15 @@ mod tests {
 
         let mut entries = HashMap::new();
         entries.insert(
-            "users/alice/apps/jarvis/spec".to_string(),
+            "users/alice/apps/buckyos_jarvis/spec".to_string(),
             json!({
                 "app_doc": {
-                    "name": "jarvis",
+                    "name": "buckyos_jarvis",
                     "show_name": "Jarvis",
                     "categories": ["dapp"],
                     "pkg_list": {
                         "amd64_docker_image": {
-                            "pkg_id": "jarvis#0.1.0"
+                            "pkg_id": "buckyos_jarvis#0.1.0"
                         }
                     },
                     "service_dock": {},
@@ -1685,11 +1687,11 @@ mod tests {
 
         let entries = builder.build();
         assert!(
-            !entries.contains_key("users/alice/apps/jarvis/spec"),
+            !entries.contains_key("users/alice/apps/buckyos_jarvis/spec"),
             "legacy app spec should be removed"
         );
         assert!(
-            entries.contains_key("users/alice/agents/jarvis/spec"),
+            entries.contains_key("users/alice/agents/buckyos_jarvis/spec"),
             "agent spec should exist"
         );
     }

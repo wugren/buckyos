@@ -266,7 +266,7 @@ resolve_selected_arches() {
     local arch
     for arch in "${SELECTED_ARCHES[@]}"; do
       validate_arch "$arch"
-      if [[ ! " ${resolved[*]} " =~ " ${arch} " ]]; then
+      if [[ ! " ${resolved[*]:-} " =~ " ${arch} " ]]; then
         resolved+=("$arch")
       fi
     done
@@ -992,7 +992,7 @@ main() {
   local python_bin
   local cargo_target_dir
   local cargo_target_mode
-  local -a target_arches
+  local -a target_arches=()
 
   if [[ ! -f "$PROJECT_CONFIG_PATH" ]]; then
     echo "Missing project config: $PROJECT_CONFIG_PATH" >&2

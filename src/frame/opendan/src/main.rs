@@ -15,7 +15,7 @@ use buckyos_api::{
     set_buckyos_api_runtime, BuckyOSRuntimeType, CreateTaskOptions, KEventClient, TaskStatus,
     OPENDAN_SERVICE_NAME,
 };
-use buckyos_kit::{get_buckyos_root_dir, init_logging};
+use buckyos_kit::{get_buckyos_app_data_dir, init_logging};
 use log::{error, info, warn};
 use name_lib::{AgentDocument, DIDDocumentTrait, EncodedDocument};
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,7 @@ use opendan::worklog::{WorklogService, WorklogToolConfig};
 
 const WORKLOG_DB_ENV: &str = "OPENDAN_WORKLOG_DB";
 const DEFAULT_WORKLOG_DB: &str = "/opt/buckyos/opendan/worklog.db";
-const AGENT_ROOT_ENV: &str = "OPENDAN_AGENT_ROOT";
-const DEFAULT_AGENT_ROOT: &str = "/opt/buckyos/opendan/agent";
-const OPENDAN_APPID_ENV: [&str; 2] = ["OPENDAN_APPID", "BUCKYOS_APP_ID"];
+const BUCKYOS_APPID_ENV: [&str; 1] = ["BUCKYOS_APP_ID"];
 const PACKAGE_ROOT_ENVS: [&str; 2] = ["BUCKYOS_PKG_DIR", "BUCKYOS_PKG_SOURCE_DIR"];
 const ROOTFS_SYNC_MANIFEST: &str = ".meta/rootfs_sync.json";
 const ROOTFS_SYNC_VERSION: u32 = 1;
@@ -43,7 +41,6 @@ const ROOTFS_SYNC_VERSION: u32 = 1;
 struct StartupArgs {
     appid: Option<String>,
     owner_id: Option<String>,
-    agent_root: Option<PathBuf>,
     agent_bin: Option<PathBuf>,
     worksession_test: Option<PathBuf>,
     worksession_task_test: Option<PathBuf>,
@@ -132,10 +129,8 @@ where
                 );
             }
             "--agent-root" | "--agent-env" => {
-                parsed.agent_root = Some(PathBuf::from(
-                    args.next()
-                        .map(|value| value.as_ref().to_string())
-                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                return Err(anyhow!(
+                    "{arg} is no longer supported; opendan resolves agent_root from BuckyOS app data folder"
                 ));
             }
             "--agent-bin" => {
@@ -177,11 +172,10 @@ where
             other if other.starts_with("--owner-user-id=") => {
                 parsed.owner_id = Some(other["--owner-user-id=".len()..].to_string());
             }
-            other if other.starts_with("--agent-root=") => {
-                parsed.agent_root = Some(PathBuf::from(&other["--agent-root=".len()..]));
-            }
-            other if other.starts_with("--agent-env=") => {
-                parsed.agent_root = Some(PathBuf::from(&other["--agent-env=".len()..]));
+            other if other.starts_with("--agent-root=") || other.starts_with("--agent-env=") => {
+                return Err(anyhow!(
+                    "{other} is no longer supported; opendan resolves agent_root from BuckyOS app data folder"
+                ));
             }
             other if other.starts_with("--agent-bin=") => {
                 parsed.agent_bin = Some(PathBuf::from(&other["--agent-bin=".len()..]));
@@ -223,6 +217,14 @@ fn first_env(keys: &[&str]) -> Option<String> {
 }
 
 fn resolve_appid(startup: &StartupArgs) -> Result<String> {
+    if let Some((appid, _owner_id)) = load_app_identity_from_env()
+        .map_err(|err| anyhow!("load app identity from app_instance_config failed: {err}"))?
+    {
+        return Ok(appid);
+    }
+    if let Some(appid) = first_env(&BUCKYOS_APPID_ENV) {
+        return Ok(appid);
+    }
     if let Some(appid) = startup
         .appid
         .as_deref()
@@ -231,21 +233,18 @@ fn resolve_appid(startup: &StartupArgs) -> Result<String> {
     {
         return Ok(appid.to_string());
     }
-    if let Some(appid) = first_env(&OPENDAN_APPID_ENV) {
-        return Ok(appid);
-    }
-    if let Some((appid, _owner_id)) = load_app_identity_from_env()
-        .map_err(|err| anyhow!("load app identity from app_instance_config failed: {err}"))?
-    {
-        return Ok(appid);
-    }
     Err(anyhow!(
         "appid is required; pass --appid <id>, a positional appid, or set one of {:?}",
-        OPENDAN_APPID_ENV
+        BUCKYOS_APPID_ENV
     ))
 }
 
 fn resolve_owner_id(startup: &StartupArgs) -> Result<Option<String>> {
+    if let Some((_appid, owner_id)) = load_app_identity_from_env()
+        .map_err(|err| anyhow!("load app identity from app_instance_config failed: {err}"))?
+    {
+        return Ok(Some(owner_id));
+    }
     if let Some(owner_id) = startup
         .owner_id
         .as_deref()
@@ -254,35 +253,17 @@ fn resolve_owner_id(startup: &StartupArgs) -> Result<Option<String>> {
     {
         return Ok(Some(owner_id.to_string()));
     }
-    Ok(load_app_identity_from_env()
-        .map_err(|err| anyhow!("load app identity from app_instance_config failed: {err}"))?
-        .map(|(_appid, owner_id)| owner_id))
+    Ok(None)
 }
 
-fn resolve_agent_root(startup: &StartupArgs, appid: &str, owner_id: Option<&str>) -> PathBuf {
-    if let Some(path) = startup.agent_root.clone() {
-        return path;
-    }
-    if let Ok(path) = std::env::var(AGENT_ROOT_ENV) {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    if let Ok(path) = std::env::var("BUCKYOS_DATA_DIR") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    if let Some(owner_id) = owner_id.map(str::trim).filter(|value| !value.is_empty()) {
-        return get_buckyos_root_dir()
-            .join("data")
-            .join("home")
-            .join(owner_id)
-            .join(".local")
-            .join("share")
-            .join(appid);
-    }
-    PathBuf::from(DEFAULT_AGENT_ROOT)
+fn resolve_agent_root() -> Result<PathBuf> {
+    let runtime =
+        get_buckyos_api_runtime().map_err(|err| anyhow!("load buckyos runtime failed: {err}"))?;
+    let appid = runtime.get_app_id();
+    let owner_id = runtime
+        .get_owner_user_id()
+        .ok_or_else(|| anyhow!("resolve opendan app data folder failed: owner_user_id missing"))?;
+    Ok(get_buckyos_app_data_dir(&appid, &owner_id))
 }
 
 fn resolve_agent_package_root(startup: &StartupArgs, appid: &str) -> Option<PathBuf> {
@@ -825,8 +806,8 @@ async fn run() -> Result<()> {
         appid,
         owner_id.as_deref().unwrap_or("<runtime-env>")
     );
-    let agent_root = resolve_agent_root(&startup, &appid, owner_id.as_deref());
     let runtime = bootstrap(&appid, owner_id).await?;
+    let agent_root = resolve_agent_root()?;
 
     let agent_doc = load_agent_document(&appid).await?;
     let agent_did = agent_doc.get_id().to_string();
@@ -908,37 +889,46 @@ mod tests {
 
     #[test]
     fn parses_positional_appid() {
-        let parsed = parse_startup_args_from_iter(["jarvis"]).expect("parse args");
-        assert_eq!(parsed.appid.as_deref(), Some("jarvis"));
+        let parsed = parse_startup_args_from_iter(["buckyos_jarvis"]).expect("parse args");
+        assert_eq!(parsed.appid.as_deref(), Some("buckyos_jarvis"));
     }
 
     #[test]
     fn parses_appid_flag() {
-        let parsed = parse_startup_args_from_iter(["--appid", "jarvis"]).expect("parse args");
-        assert_eq!(parsed.appid.as_deref(), Some("jarvis"));
+        let parsed =
+            parse_startup_args_from_iter(["--appid", "buckyos_jarvis"]).expect("parse args");
+        assert_eq!(parsed.appid.as_deref(), Some("buckyos_jarvis"));
     }
 
     #[test]
     fn keeps_agent_id_as_loader_alias() {
-        let parsed = parse_startup_args_from_iter(["--agent-id=jarvis"]).expect("parse args");
-        assert_eq!(parsed.appid.as_deref(), Some("jarvis"));
+        let parsed =
+            parse_startup_args_from_iter(["--agent-id=buckyos_jarvis"]).expect("parse args");
+        assert_eq!(parsed.appid.as_deref(), Some("buckyos_jarvis"));
     }
 
     #[test]
     fn parses_agent_bin_flag() {
-        let parsed = parse_startup_args_from_iter(["--appid=jarvis", "--agent-bin", "/pkg/jarvis"])
-            .expect("parse args");
+        let parsed = parse_startup_args_from_iter([
+            "--appid=buckyos_jarvis",
+            "--agent-bin",
+            "/pkg/buckyos_jarvis",
+        ])
+        .expect("parse args");
         assert_eq!(
             parsed.agent_bin.unwrap(),
-            std::path::PathBuf::from("/pkg/jarvis")
+            std::path::PathBuf::from("/pkg/buckyos_jarvis")
         );
     }
 
     #[test]
     fn parses_worksession_test_flag() {
-        let parsed =
-            parse_startup_args_from_iter(["--appid=jarvis", "--worksession-test", "/tmp/ws.json"])
-                .expect("parse args");
+        let parsed = parse_startup_args_from_iter([
+            "--appid=buckyos_jarvis",
+            "--worksession-test",
+            "/tmp/ws.json",
+        ])
+        .expect("parse args");
         assert_eq!(
             parsed.worksession_test.unwrap(),
             std::path::PathBuf::from("/tmp/ws.json")
@@ -948,7 +938,7 @@ mod tests {
     #[test]
     fn parses_worksession_task_test_flag() {
         let parsed = parse_startup_args_from_iter([
-            "--appid=jarvis",
+            "--appid=buckyos_jarvis",
             "--worksession-task-test",
             "/tmp/ws-task.json",
         ])
@@ -962,7 +952,7 @@ mod tests {
     #[test]
     fn parses_worksession_task_test_separator_alias() {
         let parsed = parse_startup_args_from_iter([
-            "--appid=jarvis",
+            "--appid=buckyos_jarvis",
             "worksession-task-test",
             "/tmp/ws-task.json",
         ])

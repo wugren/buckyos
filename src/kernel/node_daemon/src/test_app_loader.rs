@@ -46,11 +46,17 @@ fn build_appservice_doc() -> AppDoc {
 
 fn build_agent_doc_without_category() -> AppDoc {
     let owner = DID::from_str("did:bns:test").unwrap();
-    let mut doc = AppDoc::builder(AppType::Agent, "jarvis", "0.1.0", "did:bns:test", &owner)
-        .agent_pkg(SubPkgDesc::new("jarvis-agent#0.1.0"))
-        .agent_skills_pkg(SubPkgDesc::new("jarvis-skills#0.1.0"))
-        .build()
-        .unwrap();
+    let mut doc = AppDoc::builder(
+        AppType::Agent,
+        "buckyos_jarvis",
+        "0.1.0",
+        "did:bns:test",
+        &owner,
+    )
+    .agent_pkg(SubPkgDesc::new("jarvis-agent#0.1.0"))
+    .agent_skills_pkg(SubPkgDesc::new("jarvis-skills#0.1.0"))
+    .build()
+    .unwrap();
     doc._base.categories.clear();
     doc.install_config_tips
         .service_ports
@@ -140,7 +146,7 @@ fn build_agent_loader(platform: PlatformTarget) -> AppLoader {
             ("main".to_string(), 14060),
         ]),
     };
-    AppLoader::new_for_service("jarvis@alice@ood1", config)
+    AppLoader::new_for_service("buckyos_jarvis@alice@ood1", config)
         .with_platform(platform)
         .with_container_support_override(true)
         .with_worker_image_repo_override("paios/aios")
@@ -317,14 +323,12 @@ fn docker_runtime_exact_match_uses_pkg_objid_and_digest() {
 
 #[test]
 fn agent_process_matching_distinguishes_wildcard_and_exact_checks() {
-    let agent_env = Path::new("/opt/buckyos/data/home/alice/.local/share/jarvis");
+    let agent_env = Path::new("/opt/buckyos/data/home/alice/.local/share/buckyos_jarvis");
     let expected_root = Path::new("/opt/buckyos/env/pkgs/jarvis-agent#pkg:1234567890");
     let exact_cmd = vec![
         "opendan".to_string(),
         "--agent-id".to_string(),
-        "jarvis".to_string(),
-        "--agent-env".to_string(),
-        agent_env.to_string_lossy().to_string(),
+        "buckyos_jarvis".to_string(),
         "--agent-bin".to_string(),
         expected_root.to_string_lossy().to_string(),
         "--service-port".to_string(),
@@ -333,29 +337,25 @@ fn agent_process_matching_distinguishes_wildcard_and_exact_checks() {
     let old_cmd = vec![
         "opendan".to_string(),
         "--agent-id".to_string(),
-        "jarvis".to_string(),
-        "--agent-env".to_string(),
-        agent_env.to_string_lossy().to_string(),
+        "buckyos_jarvis".to_string(),
         "--agent-bin".to_string(),
         "/opt/buckyos/env/pkgs/jarvis-agent#pkg:oldversion".to_string(),
         "--service-port".to_string(),
         "4060".to_string(),
     ];
 
-    assert!(command_matches_agent_process(
-        &exact_cmd, "jarvis", agent_env,
-    ));
-    assert!(command_matches_agent_process(&old_cmd, "jarvis", agent_env,));
+    assert!(command_matches_agent_process(&exact_cmd, "buckyos_jarvis"));
+    assert!(command_matches_agent_process(&old_cmd, "buckyos_jarvis"));
     assert!(command_matches_exact_agent_process(
         &exact_cmd,
-        "jarvis",
+        "buckyos_jarvis",
         agent_env,
         Some(expected_root),
         Some("pkg:1234567890"),
     ));
     assert!(!command_matches_exact_agent_process(
         &old_cmd,
-        "jarvis",
+        "buckyos_jarvis",
         agent_env,
         Some(expected_root),
         Some("pkg:1234567890"),
@@ -475,7 +475,10 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     let start = loader.preview_operation(ControlOperation::Start).unwrap();
     assert_eq!(start.runtime, RuntimeType::Agent);
     assert_programs(&start.commands, &["docker", "docker"]);
-    assert_eq!(start.commands[0].args, vec!["rm", "-f", "alice-jarvis"]);
+    assert_eq!(
+        start.commands[0].args,
+        vec!["rm", "-f", "alice-buckyos_jarvis"]
+    );
     assert!(start.commands[1].args.contains(&"run".to_string()));
     // Unified worker image has the dispatcher baked in, so we no longer
     // override the entrypoint or request SYS_ADMIN at the docker layer.
@@ -487,16 +490,16 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
         .contains(&"host.docker.internal:host-gateway".to_string()));
     assert!(start.commands[1]
         .args
-        .contains(&"BUCKYOS_APP_ID=jarvis".to_string()));
+        .contains(&"BUCKYOS_APP_ID=buckyos_jarvis".to_string()));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_APP_TYPE=agent".to_string()));
+    assert!(start.commands[1].args.contains(
+        &"BUCKYOS_DATA_DIR=/opt/buckyos/data/home/alice/.local/share/buckyos_jarvis".to_string(),
+    ));
     assert!(start.commands[1]
         .args
-        .contains(&"BUCKYOS_DATA_DIR=/home/alice/.local/share/jarvis".to_string()));
-    assert!(start.commands[1]
-        .args
-        .contains(&"BUCKYOS_PKG_DIR=/opt/buckyos/bin/jarvis".to_string()));
+        .contains(&"BUCKYOS_PKG_DIR=/opt/buckyos/bin/buckyos_jarvis".to_string()));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_PKG_SOURCE_DIR=/mnt/buckyos/pkg".to_string()));
@@ -521,7 +524,7 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     assert!(start.commands[1]
         .args
         .iter()
-        .any(|arg| arg == "buckyos-instance-alice-jarvis:/opt/buckyos/instance:rw"));
+        .any(|arg| arg == "buckyos-instance-alice-buckyos_jarvis:/opt/buckyos/instance:rw"));
     // Default ExtTool Volume (§6.1) mounted ro — image seeds it with
     // FreeCADCmd + pre-warmed uv/deno caches on first start.
     assert!(start.commands[1]
@@ -531,10 +534,13 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_EXTTOOL_DIR=/opt/buckyos/tools".to_string()));
-    assert!(start.commands[1]
-        .args
-        .iter()
-        .any(|arg| arg == "<app_data>:/home/alice/.local/share/jarvis:rw"));
+    assert!(
+        start.commands[1]
+            .args
+            .iter()
+            .any(|arg| arg
+                == "<app_data>:/opt/buckyos/data/home/alice/.local/share/buckyos_jarvis:rw")
+    );
     assert!(start.commands[1]
         .args
         .iter()
@@ -552,14 +558,17 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     let stop = loader.preview_operation(ControlOperation::Stop).unwrap();
     assert_eq!(stop.runtime, RuntimeType::Agent);
     assert_programs(&stop.commands, &["docker"]);
-    assert_eq!(stop.commands[0].args, vec!["rm", "-f", "alice-jarvis"]);
+    assert_eq!(
+        stop.commands[0].args,
+        vec!["rm", "-f", "alice-buckyos_jarvis"]
+    );
 
     let status = loader.preview_operation(ControlOperation::Status).unwrap();
     assert_eq!(status.runtime, RuntimeType::Agent);
     assert_programs(&status.commands, &["docker", "docker", "docker"]);
     assert_eq!(
         status.commands[0].args,
-        vec!["ps", "-q", "-f", "name=^alice-jarvis$"]
+        vec!["ps", "-q", "-f", "name=^alice-buckyos_jarvis$"]
     );
     assert_eq!(
         status.commands[2].args,
@@ -599,7 +608,10 @@ fn agent_stop_command_uses_docker_on_windows() {
     let stop = loader.preview_operation(ControlOperation::Stop).unwrap();
     assert_eq!(stop.runtime, RuntimeType::Agent);
     assert_eq!(stop.commands[0].program, "docker");
-    assert_eq!(stop.commands[0].args, vec!["rm", "-f", "alice-jarvis"]);
+    assert_eq!(
+        stop.commands[0].args,
+        vec!["rm", "-f", "alice-buckyos_jarvis"]
+    );
 }
 
 #[test]
