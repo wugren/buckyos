@@ -23,9 +23,16 @@ interface TopBarProps {
   activeTabId: string
   onSelectTab: (id: string) => void
   onCloseTab: (id: string) => void
-  onNewTab: () => void
-  closedTabs: BrowserTab[]
-  onRestoreClosedTab: (tab: BrowserTab) => void
+  onNewTab?: () => void
+  closedTabs?: BrowserTab[]
+  onRestoreClosedTab?: (tab: BrowserTab) => void
+  /** Show the new-tab button and the closed-tabs menu (hidden in the right pane). */
+  showTabControls?: boolean
+  /** Allow closing the last remaining tab (the right pane disappears when empty). */
+  allowCloseLast?: boolean
+  /** When provided, tabs get a context menu with a "Send to Right" action. */
+  onSendTabToRight?: (id: string) => void
+  canSendToRight?: boolean
   currentPath: string
   onNavigate: (path: string) => void
   onBack: () => void
@@ -77,8 +84,12 @@ export function TopBar({
   onSelectTab,
   onCloseTab,
   onNewTab,
-  closedTabs,
+  closedTabs = [],
   onRestoreClosedTab,
+  showTabControls = true,
+  allowCloseLast = false,
+  onSendTabToRight,
+  canSendToRight = false,
   currentPath,
   onNavigate,
   onBack,
@@ -96,8 +107,12 @@ export function TopBar({
   const { t } = useI18n()
   const [searchOpen, setSearchOpen] = useState(false)
   const [tabMenuAnchor, setTabMenuAnchor] = useState<HTMLElement | null>(null)
+  const [tabContextMenu, setTabContextMenu] = useState<
+    { tabId: string; top: number; left: number } | null
+  >(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const searchVisible = searchOpen || !!searchQuery
+  const canCloseTab = tabs.length > 1 || allowCloseLast
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus()
@@ -114,7 +129,11 @@ export function TopBar({
 
   const handleNewTab = () => {
     closeTabMenu()
-    onNewTab()
+    onNewTab?.()
+  }
+
+  const closeTabContextMenu = () => {
+    setTabContextMenu(null)
   }
 
   return (
@@ -132,6 +151,11 @@ export function TopBar({
                   ? 'border-[color:var(--cp-accent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_18%,var(--cp-surface))] text-[color:var(--cp-text)]'
                   : 'border-transparent text-[color:var(--cp-muted)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
               )}
+              onContextMenu={(event) => {
+                if (!onSendTabToRight) return
+                event.preventDefault()
+                setTabContextMenu({ tabId: tab.id, top: event.clientY, left: event.clientX })
+              }}
             >
               <button
                 type="button"
@@ -140,7 +164,7 @@ export function TopBar({
               >
                 {tab.title}
               </button>
-              {tabs.length > 1 ? (
+              {canCloseTab ? (
                 <button
                   type="button"
                   onClick={() => onCloseTab(tab.id)}
@@ -153,6 +177,8 @@ export function TopBar({
             </div>
           )
         })}
+        {showTabControls ? (
+        <>
         <Tooltip title={t('filebrowser.topbar.newTab', 'New tab')}>
           <button
             type="button"
@@ -187,6 +213,17 @@ export function TopBar({
           <MenuItem onClick={handleNewTab}>
             <ListItemText primary={t('filebrowser.topbar.newTab', 'New tab')} />
           </MenuItem>
+          {onSendTabToRight ? (
+            <MenuItem
+              disabled={!canSendToRight}
+              onClick={() => {
+                closeTabMenu()
+                onSendTabToRight(activeTabId)
+              }}
+            >
+              <ListItemText primary={t('filebrowser.topbar.sendToRight', 'Send to Right')} />
+            </MenuItem>
+          ) : null}
           <Divider />
           {closedTabs.length > 0 ? (
             closedTabs.map((tab) => (
@@ -194,7 +231,7 @@ export function TopBar({
                 key={tab.id}
                 onClick={() => {
                   closeTabMenu()
-                  onRestoreClosedTab(tab)
+                  onRestoreClosedTab?.(tab)
                 }}
               >
                 <ListItemText
@@ -211,6 +248,42 @@ export function TopBar({
             </MenuItem>
           )}
         </Menu>
+        </>
+        ) : null}
+        {onSendTabToRight ? (
+          <Menu
+            open={Boolean(tabContextMenu)}
+            onClose={closeTabContextMenu}
+            anchorReference="anchorPosition"
+            anchorPosition={
+              tabContextMenu
+                ? { top: tabContextMenu.top, left: tabContextMenu.left }
+                : undefined
+            }
+            slotProps={{ paper: { sx: { minWidth: 180 } } }}
+          >
+            <MenuItem
+              disabled={!canSendToRight}
+              onClick={() => {
+                const tabId = tabContextMenu?.tabId
+                closeTabContextMenu()
+                if (tabId) onSendTabToRight(tabId)
+              }}
+            >
+              <ListItemText primary={t('filebrowser.topbar.sendToRight', 'Send to Right')} />
+            </MenuItem>
+            <MenuItem
+              disabled={!canCloseTab}
+              onClick={() => {
+                const tabId = tabContextMenu?.tabId
+                closeTabContextMenu()
+                if (tabId) onCloseTab(tabId)
+              }}
+            >
+              <ListItemText primary={t('filebrowser.topbar.closeTab', 'Close tab')} />
+            </MenuItem>
+          </Menu>
+        ) : null}
       </div>
 
       {/* Nav row */}

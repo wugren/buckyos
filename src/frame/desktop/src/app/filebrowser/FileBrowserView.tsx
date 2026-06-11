@@ -32,39 +32,55 @@ import {
   fileBrowserSnapshot,
   searchFiles,
 } from './mock/data'
-import type { BrowserTab, FileEntry, ViewMode } from './types'
+import type { BrowserTab, FileEntry, Topic, ViewMode } from './types'
 
 interface HistoryState {
   back: string[]
   forward: string[]
 }
 
-export function FileBrowserView() {
-  const { t } = useI18n()
-  const isMobile = useMediaQuery('(max-width: 900px)')
+const TOPIC_SCHEME = 'topic://'
 
-  const [tabs, setTabs] = useState<BrowserTab[]>(defaultTabs)
-  const [activeTabId, setActiveTabId] = useState(defaultTabs[0].id)
-  const [closedTabs, setClosedTabs] = useState<BrowserTab[]>([])
-  const [history, setHistory] = useState<Record<string, HistoryState>>({
-    [defaultTabs[0].id]: { back: [], forward: [] },
-    [defaultTabs[1].id]: { back: [], forward: [] },
-  })
+function topicIdFromPath(path: string): string | null {
+  return path.startsWith(TOPIC_SCHEME) ? path.slice(TOPIC_SCHEME.length) : null
+}
 
+function topicForPath(path: string): Topic | null {
+  const topicId = topicIdFromPath(path)
+  if (!topicId) return null
+  return fileBrowserSnapshot.topics.find((t) => t.id === topicId) ?? null
+}
+
+function entriesForPath(path: string): FileEntry[] {
+  const topic = topicForPath(path)
+  if (topic) {
+    const ids = new Set(topic.groups.flatMap((group) => group.fileIds))
+    return Array.from(ids)
+      .map((id) => fileBrowserSnapshot.entriesById[id])
+      .filter((entry): entry is FileEntry => !!entry)
+  }
+  return fileBrowserSnapshot.entriesByPath[path] ?? []
+}
+
+interface DetachedTab {
+  tab: BrowserTab
+  history: HistoryState
+}
+
+/** Self-contained state for one browser pane (tabs, history, selection, search, view). */
+function useBrowserPane(initialTabs: BrowserTab[]) {
+  const [tabs, setTabs] = useState<BrowserTab[]>(initialTabs)
+  const [activeTabId, setActiveTabId] = useState(initialTabs[0]?.id ?? '')
+  const [history, setHistory] = useState<Record<string, HistoryState>>(() =>
+    Object.fromEntries(initialTabs.map((tab) => [tab.id, { back: [], forward: [] }])),
+  )
   const [viewMode, setViewMode] = useState<ViewMode>('list')
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [activeTopicId, setActiveTopicId] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
-  const [advancedMode, setAdvancedMode] = useState(false)
-  const [toast, setToast] = useState<string | null>(null)
 
-  // Mobile-only panel states
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
-  const [mobilePreviewOpen, setMobilePreviewOpen] = useState(false)
-  const [mobileUploadOpen, setMobileUploadOpen] = useState(false)
-
-  const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0]
+  const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null
   const currentPath = activeTab?.path ?? '/home'
+  const activeHistory = history[activeTabId] ?? { back: [], forward: [] }
 
   const updateTab = useCallback(
     (tabId: string, next: Partial<BrowserTab>) => {
@@ -91,7 +107,6 @@ export function FileBrowserView() {
       const title = path.split('/').filter(Boolean).pop() ?? 'root'
       updateTab(activeTab.id, { path, title })
       setSelectedId(null)
-      setActiveTopicId(null)
     },
     [activeTab, currentPath, pushHistory, updateTab],
   )
@@ -135,44 +150,122 @@ export function FileBrowserView() {
     if (parent !== currentPath) navigate(parent)
   }
 
-  const handleNewTab = () => {
-    const id = `tab-${Date.now()}`
-    const tab: BrowserTab = { id, title: 'Home', path: '/home' }
+  /** Append a tab (optionally with its history) and make it active. */
+  const adoptTab = useCallback((tab: BrowserTab, tabHistory?: HistoryState) => {
     setTabs((prev) => [...prev, tab])
-    setHistory((prev) => ({ ...prev, [id]: { back: [], forward: [] } }))
-    setActiveTabId(id)
+    setHistory((prev) => ({ ...prev, [tab.id]: tabHistory ?? { back: [], forward: [] } }))
+    setActiveTabId(tab.id)
+    setSelectedId(null)
+    setSearchQuery('')
+  }, [])
+
+  /** Remove a tab and hand back its data so it can be moved or remembered. */
+  const detachTab = useCallback(
+    (id: string): DetachedTab | null => {
+      const tab = tabs.find((item) => item.id === id)
+      if (!tab) return null
+      const tabHistory = history[id] ?? { back: [], forward: [] }
+      setHistory((prev) => {
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+      setTabs((prev) => {
+        const closingIndex = prev.findIndex((item) => item.id === id)
+        const next = prev.filter((item) => item.id !== id)
+        if (id === activeTabId && next.length) {
+          setActiveTabId(next[Math.min(closingIndex, next.length - 1)].id)
+        }
+        return next
+      })
+      if (id === activeTabId) {
+        setSelectedId(null)
+        setSearchQuery('')
+      }
+      return { tab, history: tabHistory }
+    },
+    [tabs, history, activeTabId],
+  )
+
+  return {
+    tabs,
+    activeTabId,
+    setActiveTabId,
+    activeTab,
+    currentPath,
+    activeHistory,
+    viewMode,
+    setViewMode,
+    selectedId,
+    setSelectedId,
+    searchQuery,
+    setSearchQuery,
+    navigate,
+    back,
+    forward,
+    goUp,
+    updateTab,
+    adoptTab,
+    detachTab,
+  }
+}
+
+type BrowserPane = ReturnType<typeof useBrowserPane>
+
+export function FileBrowserView() {
+  const { t } = useI18n()
+  const isMobile = useMediaQuery('(max-width: 900px)')
+
+  const left = useBrowserPane(defaultTabs)
+  const right = useBrowserPane([])
+  const [closedTabs, setClosedTabs] = useState<BrowserTab[]>([])
+  const [focusedSide, setFocusedSide] = useState<'left' | 'right'>('left')
+
+  const [advancedMode, setAdvancedMode] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
+
+  // Mobile-only panel states
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [mobilePreviewOpen, setMobilePreviewOpen] = useState(false)
+  const [mobileUploadOpen, setMobileUploadOpen] = useState(false)
+
+  // The split layout is desktop-only; the right pane exists while it holds tabs.
+  const splitActive = !isMobile && right.tabs.length > 0
+  const focusedIsRight = splitActive && focusedSide === 'right'
+  const focusedPane = focusedIsRight ? right : left
+
+  const rememberClosedTab = (tab: BrowserTab) => {
+    setClosedTabs((prev) => [tab, ...prev].slice(0, 10))
   }
 
-  const handleCloseTab = (id: string) => {
-    const closingTab = tabs.find((tab) => tab.id === id)
-    if (!closingTab || tabs.length <= 1) return
+  const handleNewTab = () => {
+    left.adoptTab({ id: `tab-${Date.now()}`, title: 'Home', path: '/home' })
+    setFocusedSide('left')
+  }
 
-    setClosedTabs((prev) => [closingTab, ...prev].slice(0, 10))
-    setHistory((prev) => {
-      const next = { ...prev }
-      delete next[id]
-      return next
-    })
-    setTabs((prev) => {
-      const closingIndex = prev.findIndex((tab) => tab.id === id)
-      const next = prev.filter((tab) => tab.id !== id)
-      if (id === activeTabId && next.length) {
-        setActiveTabId(next[Math.min(closingIndex, next.length - 1)].id)
-      }
-      return next
-    })
+  const handleCloseLeftTab = (id: string) => {
+    if (left.tabs.length <= 1) return
+    const detached = left.detachTab(id)
+    if (detached) rememberClosedTab(detached.tab)
+  }
+
+  const handleCloseRightTab = (id: string) => {
+    const detached = right.detachTab(id)
+    if (detached) rememberClosedTab(detached.tab)
+  }
+
+  const handleSendToRight = (id: string) => {
+    if (left.tabs.length <= 1) return
+    const detached = left.detachTab(id)
+    if (!detached) return
+    right.adoptTab(detached.tab, detached.history)
+    setFocusedSide('right')
   }
 
   const handleRestoreClosedTab = (tab: BrowserTab) => {
-    const id = `tab-${Date.now()}`
-    const restoredTab: BrowserTab = { ...tab, id }
     setClosedTabs((prev) => prev.filter((item) => item.id !== tab.id))
-    setTabs((prev) => [...prev, restoredTab])
-    setHistory((prev) => ({ ...prev, [id]: { back: [], forward: [] } }))
-    setActiveTabId(id)
-    setSelectedId(null)
-    setActiveTopicId(null)
-    setSearchQuery('')
+    left.adoptTab({ ...tab, id: `tab-${Date.now()}` })
+    setFocusedSide('left')
   }
 
   const showToast = (message: string) => {
@@ -189,61 +282,61 @@ export function FileBrowserView() {
     }
   }
 
-  const currentEntries = useMemo(() => {
-    if (activeTopicId) {
-      const topic = fileBrowserSnapshot.topics.find((t) => t.id === activeTopicId)
-      if (!topic) return []
-      const ids = new Set(topic.groups.flatMap((group) => group.fileIds))
-      return Array.from(ids)
-        .map((id) => fileBrowserSnapshot.entriesById[id])
-        .filter((entry): entry is FileEntry => !!entry)
-    }
-    return fileBrowserSnapshot.entriesByPath[currentPath] ?? []
-  }, [activeTopicId, currentPath])
+  const leftEntries = useMemo(() => entriesForPath(left.currentPath), [left.currentPath])
+  const rightEntries = useMemo(() => entriesForPath(right.currentPath), [right.currentPath])
+  const leftTopic = topicForPath(left.currentPath)
+  const rightTopic = topicForPath(right.currentPath)
 
-  const selectedEntry = selectedId
-    ? fileBrowserSnapshot.entriesById[selectedId] ?? null
+  const leftSelectedEntry = left.selectedId
+    ? fileBrowserSnapshot.entriesById[left.selectedId] ?? null
+    : null
+  const rightSelectedEntry = right.selectedId
+    ? fileBrowserSnapshot.entriesById[right.selectedId] ?? null
     : null
 
-  const searchHits = useMemo(
-    () => (searchQuery.trim() ? searchFiles(searchQuery) : []),
-    [searchQuery],
+  const leftSearchHits = useMemo(
+    () => (left.searchQuery.trim() ? searchFiles(left.searchQuery) : []),
+    [left.searchQuery],
+  )
+  const rightSearchHits = useMemo(
+    () => (right.searchQuery.trim() ? searchFiles(right.searchQuery) : []),
+    [right.searchQuery],
   )
 
-  const topicContext = activeTopicId
-    ? fileBrowserSnapshot.topics.find((t) => t.id === activeTopicId) ?? null
-    : null
-
-  const handleSelectTopic = (topicId: string) => {
-    setActiveTopicId(topicId)
-    setSelectedId(null)
-    setSearchQuery('')
-    if (!activeTab) return
-    const topic = fileBrowserSnapshot.topics.find((t) => t.id === topicId)
-    updateTab(activeTab.id, {
+  const selectTopicInPane = (pane: BrowserPane, topicId: string) => {
+    if (!pane.activeTab) return
+    const topic = fileBrowserSnapshot.topics.find((item) => item.id === topicId)
+    pane.updateTab(pane.activeTab.id, {
       title: topic?.title ?? 'Topic',
-      path: `topic://${topicId}`,
+      path: `${TOPIC_SCHEME}${topicId}`,
     })
+    pane.setSelectedId(null)
+    pane.setSearchQuery('')
   }
 
   const handleOpenEntry = (entry: FileEntry) => {
-    setSelectedId(entry.id)
+    left.setSelectedId(entry.id)
     if (isMobile) setMobilePreviewOpen(true)
   }
 
   const handleOpenFolder = (path: string) => {
-    navigate(path)
+    left.navigate(path)
     setMobileSidebarOpen(false)
   }
 
-  const hist = history[activeTabId] ?? { back: [], forward: [] }
-  const searchActive = !!searchQuery.trim()
+  const leftSearchActive = !!left.searchQuery.trim()
+  const rightSearchActive = !!right.searchQuery.trim()
 
-  const mobileTitleText = selectedEntry?.name ?? activeTab?.title ?? 'root'
+  const focusedSelectedEntry = focusedIsRight ? rightSelectedEntry : leftSelectedEntry
+  const focusedEntries = focusedIsRight ? rightEntries : leftEntries
+
+  const mobileTitleText = leftSelectedEntry?.name ?? left.activeTab?.title ?? 'root'
   const mobileSubtitleText =
-    selectedEntry?.summary ??
-    topicContext?.description ??
-    (currentPath === '/' ? t('filebrowser.mobile.rootHint', 'Root directory') : currentPath)
+    leftSelectedEntry?.summary ??
+    leftTopic?.description ??
+    (left.currentPath === '/'
+      ? t('filebrowser.mobile.rootHint', 'Root directory')
+      : left.currentPath)
 
   const mobileTitleOverride = useMemo(
     () => (isMobile ? { title: mobileTitleText, subtitle: mobileSubtitleText } : null),
@@ -251,12 +344,12 @@ export function FileBrowserView() {
   )
   useMobileTitleOverride(mobileTitleOverride)
 
-  const canMobileBack = isMobile && hist.back.length > 0
-  useMobileBackHandler(canMobileBack ? back : null)
+  const canMobileBack = isMobile && left.activeHistory.back.length > 0
+  useMobileBackHandler(canMobileBack ? left.back : null)
 
   // ─── Mobile layout ───
   if (isMobile) {
-    const segments = currentPath.split('/').filter(Boolean)
+    const segments = left.currentPath.split('/').filter(Boolean)
     const crumbs: { label: string; path: string }[] = [{ label: 'root', path: '/' }]
     {
       let running = ''
@@ -285,8 +378,8 @@ export function FileBrowserView() {
             <Search size={14} className="ml-1 shrink-0 text-[color:var(--cp-muted)]" />
             <input
               type="text"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
+              value={left.searchQuery}
+              onChange={(event) => left.setSearchQuery(event.target.value)}
               placeholder={t(
                 'filebrowser.topbar.searchPlaceholder',
                 'Search across files, folders, AI summaries…',
@@ -294,10 +387,10 @@ export function FileBrowserView() {
               className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-[color:var(--cp-muted)]"
               style={{ color: 'var(--cp-text)' }}
             />
-            {searchQuery ? (
+            {left.searchQuery ? (
               <IconButton
                 size="small"
-                onClick={() => setSearchQuery('')}
+                onClick={() => left.setSearchQuery('')}
                 aria-label={t('common.close', 'Close')}
               >
                 <X size={12} />
@@ -307,9 +400,9 @@ export function FileBrowserView() {
           <div className="flex items-center rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_80%,transparent)]">
             <IconButton
               size="small"
-              onClick={() => setViewMode('list')}
+              onClick={() => left.setViewMode('list')}
               className={clsx(
-                viewMode === 'list' &&
+                left.viewMode === 'list' &&
                   '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
               )}
               aria-label={t('filebrowser.view.list', 'List view')}
@@ -318,9 +411,9 @@ export function FileBrowserView() {
             </IconButton>
             <IconButton
               size="small"
-              onClick={() => setViewMode('icon')}
+              onClick={() => left.setViewMode('icon')}
               className={clsx(
-                viewMode === 'icon' &&
+                left.viewMode === 'icon' &&
                   '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
               )}
               aria-label={t('filebrowser.view.icon', 'Icon view')}
@@ -341,7 +434,7 @@ export function FileBrowserView() {
                     'truncate rounded-md px-1.5 py-1',
                     idx === crumbs.length - 1 && 'font-semibold text-[color:var(--cp-text)]',
                   )}
-                  onClick={() => navigate(crumb.path)}
+                  onClick={() => left.navigate(crumb.path)}
                 >
                   {crumb.label}
                 </button>
@@ -353,7 +446,7 @@ export function FileBrowserView() {
           </div>
           <button
             type="button"
-            onClick={() => navigate(currentPath)}
+            onClick={() => left.navigate(left.currentPath)}
             aria-label={t('filebrowser.topbar.refresh', 'Refresh')}
             className="shrink-0 p-1 text-[color:var(--cp-muted)] hover:text-[color:var(--cp-text)]"
           >
@@ -362,21 +455,21 @@ export function FileBrowserView() {
         </div>
 
         <div className="flex-1 overflow-hidden">
-          {searchActive ? (
+          {leftSearchActive ? (
             <SearchResultsPanel
-              hits={searchHits}
-              query={searchQuery}
+              hits={leftSearchHits}
+              query={left.searchQuery}
               onSelect={handleOpenEntry}
             />
           ) : (
             <MainContent
-              entries={currentEntries}
-              viewMode={viewMode}
-              selectedId={selectedId}
+              entries={leftEntries}
+              viewMode={left.viewMode}
+              selectedId={left.selectedId}
               onSelect={handleOpenEntry}
               onOpenFolder={handleOpenFolder}
-              currentPath={currentPath}
-              topicContext={topicContext}
+              currentPath={left.currentPath}
+              topicContext={leftTopic}
               isMobile
             />
           )}
@@ -472,12 +565,12 @@ export function FileBrowserView() {
                 dfsRoots={fileBrowserSnapshot.dfsRoots}
                 devices={fileBrowserSnapshot.devices}
                 topics={fileBrowserSnapshot.topics}
-                activePath={currentPath}
-                activeTopicId={activeTopicId}
+                activePath={left.currentPath}
+                activeTopicId={leftTopic?.id ?? null}
                 advancedMode={advancedMode}
                 onToggleAdvanced={setAdvancedMode}
-                onNavigate={navigate}
-                onSelectTopic={handleSelectTopic}
+                onNavigate={left.navigate}
+                onSelectTopic={(id) => selectTopicInPane(left, id)}
                 compact
               />
             </div>
@@ -485,7 +578,7 @@ export function FileBrowserView() {
         ) : null}
 
         {/* Preview bottom sheet */}
-        {mobilePreviewOpen && selectedEntry ? (
+        {mobilePreviewOpen && leftSelectedEntry ? (
           <div className="absolute inset-0 z-30 flex items-end">
             <div
               className="absolute inset-0 bg-black/40"
@@ -509,14 +602,14 @@ export function FileBrowserView() {
               </div>
               <div className="flex-1 overflow-hidden">
                 <PreviewPanel
-                  entry={selectedEntry}
+                  entry={leftSelectedEntry}
                   topics={fileBrowserSnapshot.topics}
                   onJumpToTopic={(id) => {
-                    handleSelectTopic(id)
+                    selectTopicInPane(left, id)
                     setMobilePreviewOpen(false)
                   }}
                   onJumpToPath={(path) => {
-                    navigate(path)
+                    left.navigate(path)
                     setMobilePreviewOpen(false)
                   }}
                   embedded
@@ -536,68 +629,131 @@ export function FileBrowserView() {
   }
 
   // ─── Desktop layout ───
+  const leftTopBar = (
+    <TopBar
+      tabs={left.tabs}
+      activeTabId={left.activeTabId}
+      onSelectTab={left.setActiveTabId}
+      onCloseTab={handleCloseLeftTab}
+      onNewTab={handleNewTab}
+      closedTabs={closedTabs}
+      onRestoreClosedTab={handleRestoreClosedTab}
+      currentPath={left.currentPath}
+      onNavigate={left.navigate}
+      onBack={left.back}
+      onForward={left.forward}
+      onUp={left.goUp}
+      canBack={left.activeHistory.back.length > 0}
+      canForward={left.activeHistory.forward.length > 0}
+      canUp={left.currentPath !== '/'}
+      viewMode={left.viewMode}
+      onViewModeChange={left.setViewMode}
+      searchQuery={left.searchQuery}
+      onSearchChange={left.setSearchQuery}
+      onCopyPath={() => copyText(left.currentPath)}
+      onSendTabToRight={handleSendToRight}
+      canSendToRight={left.tabs.length > 1}
+    />
+  )
+
   return (
     <div
       className="flex h-full w-full flex-col overflow-hidden"
       style={{ background: 'var(--cp-bg)' }}
     >
-      <TopBar
-        tabs={tabs}
-        activeTabId={activeTabId}
-        onSelectTab={setActiveTabId}
-        onCloseTab={handleCloseTab}
-        onNewTab={handleNewTab}
-        closedTabs={closedTabs}
-        onRestoreClosedTab={handleRestoreClosedTab}
-        currentPath={currentPath}
-        onNavigate={navigate}
-        onBack={back}
-        onForward={forward}
-        onUp={goUp}
-        canBack={hist.back.length > 0}
-        canForward={hist.forward.length > 0}
-        canUp={currentPath !== '/'}
-        viewMode={viewMode}
-        onViewModeChange={setViewMode}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        onCopyPath={() => copyText(currentPath)}
-      />
+      {!splitActive ? leftTopBar : null}
 
       <div className="relative flex flex-1 min-h-0">
-        <aside className="hidden w-[260px] shrink-0 flex-col overflow-hidden border-r border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_82%,transparent)] px-2 pt-2 md:flex">
+        <aside
+          className="hidden w-[260px] shrink-0 flex-col overflow-hidden border-r border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_82%,transparent)] px-2 pt-2 md:flex"
+          onMouseDownCapture={() => setFocusedSide('left')}
+        >
           <Sidebar
             dfsRoots={fileBrowserSnapshot.dfsRoots}
             devices={fileBrowserSnapshot.devices}
             topics={fileBrowserSnapshot.topics}
-            activePath={currentPath}
-            activeTopicId={activeTopicId}
+            activePath={left.currentPath}
+            activeTopicId={leftTopic?.id ?? null}
             advancedMode={advancedMode}
             onToggleAdvanced={setAdvancedMode}
-            onNavigate={navigate}
-            onSelectTopic={handleSelectTopic}
+            onNavigate={left.navigate}
+            onSelectTopic={(id) => selectTopicInPane(left, id)}
           />
         </aside>
 
-        <main className="flex min-w-0 flex-1 flex-col">
-          {searchActive ? (
-            <SearchResultsPanel
-              hits={searchHits}
-              query={searchQuery}
-              onSelect={handleOpenEntry}
-            />
-          ) : (
-            <MainContent
-              entries={currentEntries}
-              viewMode={viewMode}
-              selectedId={selectedId}
-              onSelect={handleOpenEntry}
-              onOpenFolder={handleOpenFolder}
-              currentPath={currentPath}
-              topicContext={topicContext}
-            />
-          )}
+        <main
+          className="flex min-w-0 flex-1 flex-col"
+          onMouseDownCapture={() => setFocusedSide('left')}
+        >
+          {splitActive ? leftTopBar : null}
+          <div className="min-h-0 flex-1 overflow-hidden">
+            {leftSearchActive ? (
+              <SearchResultsPanel
+                hits={leftSearchHits}
+                query={left.searchQuery}
+                onSelect={handleOpenEntry}
+              />
+            ) : (
+              <MainContent
+                entries={leftEntries}
+                viewMode={left.viewMode}
+                selectedId={left.selectedId}
+                onSelect={handleOpenEntry}
+                onOpenFolder={handleOpenFolder}
+                currentPath={left.currentPath}
+                topicContext={leftTopic}
+              />
+            )}
+          </div>
         </main>
+
+        {splitActive ? (
+          <section
+            className="flex min-w-0 flex-1 flex-col border-l border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)]"
+            onMouseDownCapture={() => setFocusedSide('right')}
+          >
+            <TopBar
+              tabs={right.tabs}
+              activeTabId={right.activeTabId}
+              onSelectTab={right.setActiveTabId}
+              onCloseTab={handleCloseRightTab}
+              showTabControls={false}
+              allowCloseLast
+              currentPath={right.currentPath}
+              onNavigate={right.navigate}
+              onBack={right.back}
+              onForward={right.forward}
+              onUp={right.goUp}
+              canBack={right.activeHistory.back.length > 0}
+              canForward={right.activeHistory.forward.length > 0}
+              canUp={right.currentPath !== '/'}
+              viewMode={right.viewMode}
+              onViewModeChange={right.setViewMode}
+              searchQuery={right.searchQuery}
+              onSearchChange={right.setSearchQuery}
+              onCopyPath={() => copyText(right.currentPath)}
+            />
+            <div className="min-h-0 flex-1 overflow-hidden">
+              {rightSearchActive ? (
+                <SearchResultsPanel
+                  hits={rightSearchHits}
+                  query={right.searchQuery}
+                  onSelect={(entry) => right.setSelectedId(entry.id)}
+                />
+              ) : (
+                <MainContent
+                  entries={rightEntries}
+                  viewMode={right.viewMode}
+                  selectedId={right.selectedId}
+                  onSelect={(entry) => right.setSelectedId(entry.id)}
+                  onOpenFolder={(path) => right.navigate(path)}
+                  currentPath={right.currentPath}
+                  topicContext={rightTopic}
+                />
+              )}
+            </div>
+          </section>
+        ) : null}
 
         <aside className="hidden w-[320px] shrink-0 flex-col overflow-hidden border-l border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_86%,transparent)] xl:flex">
           <div className="flex items-center justify-between border-b border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-4 py-2">
@@ -608,10 +764,10 @@ export function FileBrowserView() {
           </div>
           <div className="flex-1 overflow-hidden">
             <PreviewPanel
-              entry={selectedEntry}
+              entry={focusedSelectedEntry}
               topics={fileBrowserSnapshot.topics}
-              onJumpToTopic={handleSelectTopic}
-              onJumpToPath={navigate}
+              onJumpToTopic={(id) => selectTopicInPane(focusedPane, id)}
+              onJumpToPath={(path) => focusedPane.navigate(path)}
               embedded
             />
           </div>
@@ -619,9 +775,9 @@ export function FileBrowserView() {
       </div>
 
       <StatusBar
-        currentPath={currentPath}
-        totalCount={currentEntries.length}
-        selection={selectedEntry}
+        currentPath={focusedPane.currentPath}
+        totalCount={focusedEntries.length}
+        selection={focusedSelectedEntry}
         onCopy={copyText}
       />
 
