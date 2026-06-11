@@ -6,6 +6,7 @@ kevent/kmsg test plan.
 Subdirectories:
 
 - `dv`: standard devtest gateway smoke for kmsg and kevent.
+- `task_mgr`: TaskMgr `task_ready` gateway smoke.
 - `restart`: standard devtest restart recovery smoke.
 - `peer_container`: two-node peer delivery harness in Docker containers.
 - `peer_vm`: two-node peer delivery harness in QEMU/KVM VMs.
@@ -17,6 +18,7 @@ Run from the repository root:
 
 ```bash
 uv run test/run.py -p kevent_kmsg/dv
+uv run test/run.py -p kevent_kmsg/task_mgr
 uv run test/run.py -p kevent_kmsg/restart
 uv run test/run.py -p kevent_kmsg/peer_container
 uv run test/run.py -p kevent_kmsg/peer_vm

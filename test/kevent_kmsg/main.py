@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CASES = {
     "dv": "kevent_kmsg/dv",
+    "task_mgr": "kevent_kmsg/task_mgr",
     "restart": "kevent_kmsg/restart",
     "peer_container": "kevent_kmsg/peer_container",
     "peer_vm": "kevent_kmsg/peer_vm",
