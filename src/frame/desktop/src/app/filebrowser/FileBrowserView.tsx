@@ -1,6 +1,6 @@
 import { IconButton, useMediaQuery } from '@mui/material'
 import clsx from 'clsx'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import {
   Camera,
   ChevronRight,
@@ -22,6 +22,10 @@ import {
   useMobileTitleOverride,
 } from '../../desktop/windows/MobileNavContext'
 import { MainContent } from './MainContent'
+import type { MenuPosition, SelectModifiers } from './MainContent'
+import { FileContextMenu } from './menu/FileContextMenu'
+import { fileBrowserMenuRegistry } from './menu/registry'
+import type { FileMenuAction, FileMenuContext, FileMenuSection } from './menu/types'
 import { PreviewPanel } from './PreviewPanel'
 import { SearchResultsPanel } from './SearchResultsPanel'
 import { Sidebar } from './Sidebar'
@@ -32,7 +36,7 @@ import {
   fileBrowserSnapshot,
   searchFiles,
 } from './mock/data'
-import type { BrowserTab, FileEntry, Topic, ViewMode } from './types'
+import type { BrowserTab, DfsNode, FileEntry, Topic, ViewMode } from './types'
 
 interface HistoryState {
   back: string[]
@@ -75,12 +79,55 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     Object.fromEntries(initialTabs.map((tab) => [tab.id, { back: [], forward: [] }])),
   )
   const [viewMode, setViewMode] = useState<ViewMode>('list')
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  /** Anchor entry for shift range selection. */
+  const selectionAnchorRef = useRef<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null
   const currentPath = activeTab?.path ?? '/home'
   const activeHistory = history[activeTabId] ?? { back: [], forward: [] }
+
+  const clearSelection = useCallback(() => {
+    selectionAnchorRef.current = null
+    setSelectedIds([])
+  }, [])
+
+  /**
+   * Click-selection with desktop modifiers: plain click selects one entry,
+   * ctrl/cmd toggles it, shift selects the range from the current anchor
+   * within `orderedEntries` (the list as currently displayed).
+   */
+  const selectEntry = useCallback(
+    (entry: FileEntry, modifiers: SelectModifiers = {}, orderedEntries: FileEntry[] = []) => {
+      setSelectedIds((prev) => {
+        if (modifiers.shift && orderedEntries.length) {
+          const ids = orderedEntries.map((item) => item.id)
+          const anchor =
+            selectionAnchorRef.current && ids.includes(selectionAnchorRef.current)
+              ? selectionAnchorRef.current
+              : entry.id
+          const from = ids.indexOf(anchor)
+          const to = ids.indexOf(entry.id)
+          const [start, end] = from <= to ? [from, to] : [to, from]
+          return ids.slice(start, end + 1)
+        }
+        if (modifiers.toggle) {
+          selectionAnchorRef.current = entry.id
+          return prev.includes(entry.id)
+            ? prev.filter((id) => id !== entry.id)
+            : [...prev, entry.id]
+        }
+        selectionAnchorRef.current = entry.id
+        return [entry.id]
+      })
+    },
+    [],
+  )
+
+  const selectAll = useCallback((orderedEntries: FileEntry[]) => {
+    setSelectedIds(orderedEntries.map((item) => item.id))
+  }, [])
 
   const updateTab = useCallback(
     (tabId: string, next: Partial<BrowserTab>) => {
@@ -106,7 +153,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
       if (!options?.suppressHistory) pushHistory(activeTab.id, currentPath)
       const title = path.split('/').filter(Boolean).pop() ?? 'root'
       updateTab(activeTab.id, { path, title })
-      setSelectedId(null)
+      clearSelection()
     },
     [activeTab, currentPath, pushHistory, updateTab],
   )
@@ -125,7 +172,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     }))
     const title = previous.split('/').filter(Boolean).pop() ?? 'root'
     updateTab(activeTab.id, { path: previous, title })
-    setSelectedId(null)
+    clearSelection()
   }
 
   const forward = () => {
@@ -142,7 +189,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     }))
     const title = next.split('/').filter(Boolean).pop() ?? 'root'
     updateTab(activeTab.id, { path: next, title })
-    setSelectedId(null)
+    clearSelection()
   }
 
   const goUp = () => {
@@ -155,7 +202,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     setTabs((prev) => [...prev, tab])
     setHistory((prev) => ({ ...prev, [tab.id]: tabHistory ?? { back: [], forward: [] } }))
     setActiveTabId(tab.id)
-    setSelectedId(null)
+    clearSelection()
     setSearchQuery('')
   }, [])
 
@@ -179,7 +226,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
         return next
       })
       if (id === activeTabId) {
-        setSelectedId(null)
+        clearSelection()
         setSearchQuery('')
       }
       return { tab, history: tabHistory }
@@ -196,8 +243,11 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     activeHistory,
     viewMode,
     setViewMode,
-    selectedId,
-    setSelectedId,
+    selectedIds,
+    setSelectedIds,
+    selectEntry,
+    selectAll,
+    clearSelection,
     searchQuery,
     setSearchQuery,
     navigate,
@@ -291,12 +341,23 @@ export function FileBrowserView() {
   const leftTopic = topicForPath(left.currentPath)
   const rightTopic = topicForPath(right.currentPath)
 
-  const leftSelectedEntry = left.selectedId
-    ? fileBrowserSnapshot.entriesById[left.selectedId] ?? null
-    : null
-  const rightSelectedEntry = right.selectedId
-    ? fileBrowserSnapshot.entriesById[right.selectedId] ?? null
-    : null
+  const leftSelectedEntries = useMemo(
+    () =>
+      left.selectedIds
+        .map((id) => fileBrowserSnapshot.entriesById[id])
+        .filter((entry): entry is FileEntry => !!entry),
+    [left.selectedIds],
+  )
+  const rightSelectedEntries = useMemo(
+    () =>
+      right.selectedIds
+        .map((id) => fileBrowserSnapshot.entriesById[id])
+        .filter((entry): entry is FileEntry => !!entry),
+    [right.selectedIds],
+  )
+  // The preview panel & detail status only make sense for a single selection.
+  const leftSelectedEntry = leftSelectedEntries.length === 1 ? leftSelectedEntries[0] : null
+  const rightSelectedEntry = rightSelectedEntries.length === 1 ? rightSelectedEntries[0] : null
 
   const leftSearchHits = useMemo(
     () => (left.searchQuery.trim() ? searchFiles(left.searchQuery) : []),
@@ -314,18 +375,154 @@ export function FileBrowserView() {
       title: topic?.title ?? 'Topic',
       path: `${TOPIC_SCHEME}${topicId}`,
     })
-    pane.setSelectedId(null)
+    pane.clearSelection()
     pane.setSearchQuery('')
   }
 
   const handleOpenEntry = (entry: FileEntry) => {
-    left.setSelectedId(entry.id)
+    left.setSelectedIds([entry.id])
     if (isMobile) setMobilePreviewOpen(true)
   }
 
   const handleOpenFolder = (path: string) => {
     left.navigate(path)
     setMobileSidebarOpen(false)
+  }
+
+  // ─── Context menu (desktop) ───
+
+  /** Quick "Move to" targets: DFS roots and their first-level folders. */
+  const moveTargets = useMemo(() => {
+    const targets: { label: string; path: string }[] = []
+    const visit = (nodes: DfsNode[], depth: number) => {
+      for (const node of nodes) {
+        targets.push({ label: node.path, path: node.path })
+        if (node.children && depth < 1) visit(node.children, depth + 1)
+      }
+    }
+    visit(fileBrowserSnapshot.dfsRoots, 0)
+    return targets
+  }, [])
+
+  const [contextMenu, setContextMenu] = useState<{
+    side: 'left' | 'right'
+    position: MenuPosition
+    context: FileMenuContext
+    sections: FileMenuSection[]
+  } | null>(null)
+
+  const paneFor = (side: 'left' | 'right') => (side === 'right' ? right : left)
+  const paneEntriesFor = (side: 'left' | 'right') =>
+    side === 'right' ? rightEntries : leftEntries
+
+  const openMenu = (side: 'left' | 'right', position: MenuPosition, entry?: FileEntry) => {
+    const pane = paneFor(side)
+    const paneEntries = paneEntriesFor(side)
+    let selected: FileEntry[] = []
+    if (entry) {
+      // Right-clicking outside the current selection re-anchors it to the entry.
+      const ids = pane.selectedIds.includes(entry.id) ? pane.selectedIds : [entry.id]
+      if (!pane.selectedIds.includes(entry.id)) pane.setSelectedIds([entry.id])
+      selected = paneEntries.filter((item) => ids.includes(item.id))
+    }
+    const context: FileMenuContext = {
+      target: entry ? (selected.length > 1 ? 'selection' : 'item') : 'view',
+      entries: selected,
+      currentPath: pane.currentPath,
+      viewMode: pane.viewMode,
+      topic: side === 'right' ? rightTopic : leftTopic,
+      moveTargets,
+      capabilities: {
+        canOpenInNewTab: true,
+        canOpenInRightPane: side === 'left',
+      },
+    }
+    setContextMenu({
+      side,
+      position,
+      context,
+      sections: fileBrowserMenuRegistry.build(context),
+    })
+  }
+
+  const handleMenuAction = (action: FileMenuAction) => {
+    if (!contextMenu) return
+    const { side, context } = contextMenu
+    const pane = paneFor(side)
+    const entries = context.entries
+    const first = entries[0]
+    const count = entries.length
+    switch (action.command) {
+      case 'open':
+        if (!first) break
+        if (first.kind === 'folder') {
+          pane.navigate(first.path)
+        } else {
+          pane.setSelectedIds([first.id])
+          setPreviewCollapsed(false)
+        }
+        break
+      case 'open-new-tab':
+        if (first?.kind === 'folder') {
+          pane.adoptTab({ id: `tab-${Date.now()}`, title: first.name, path: first.path })
+        }
+        break
+      case 'open-right':
+        if (first?.kind === 'folder') {
+          right.adoptTab({ id: `tab-${Date.now()}`, title: first.name, path: first.path })
+          setFocusedSide('right')
+        }
+        break
+      case 'copy-path':
+        copyText(entries.length ? entries.map((item) => item.path).join('\n') : context.currentPath)
+        break
+      case 'copy-public-url':
+        if (first?.publicUrl) copyText(first.publicUrl)
+        break
+      case 'download':
+        showToast(
+          t('filebrowser.toast.download', 'Downloading {{count}} item(s) (mock)', { count }),
+        )
+        break
+      case 'share':
+        showToast(t('filebrowser.toast.share', 'Share "{{name}}" (mock)', { name: first?.name ?? '' }))
+        break
+      case 'rename':
+        showToast(t('filebrowser.toast.rename', 'Rename "{{name}}" (mock)', { name: first?.name ?? '' }))
+        break
+      case 'move-to':
+        showToast(
+          t('filebrowser.toast.move', 'Move {{count}} item(s) to {{target}} (mock)', {
+            count,
+            target: String(action.args?.path ?? ''),
+          }),
+        )
+        break
+      case 'delete':
+        showToast(t('filebrowser.toast.delete', 'Deleted {{count}} item(s) (mock)', { count }))
+        pane.clearSelection()
+        break
+      case 'new-folder':
+        showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`)
+        break
+      case 'upload':
+        showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)
+        break
+      case 'refresh':
+        showToast(t('filebrowser.toast.refresh', 'Refreshed (mock)'))
+        break
+      case 'select-all':
+        pane.selectAll(paneEntriesFor(side))
+        break
+      case 'view-list':
+        pane.setViewMode('list')
+        break
+      case 'view-icon':
+        pane.setViewMode('icon')
+        break
+      default:
+        showToast(`${action.command} (mock)`)
+    }
   }
 
   const leftSearchActive = !!left.searchQuery.trim()
@@ -468,7 +665,7 @@ export function FileBrowserView() {
             <MainContent
               entries={leftEntries}
               viewMode={left.viewMode}
-              selectedId={left.selectedId}
+              selectedIds={left.selectedIds}
               onSelect={handleOpenEntry}
               onOpenFolder={handleOpenFolder}
               currentPath={left.currentPath}
@@ -697,9 +894,12 @@ export function FileBrowserView() {
             <MainContent
               entries={leftEntries}
               viewMode={left.viewMode}
-              selectedId={left.selectedId}
-              onSelect={handleOpenEntry}
+              selectedIds={left.selectedIds}
+              onSelect={(entry, modifiers) => left.selectEntry(entry, modifiers, leftEntries)}
               onOpenFolder={handleOpenFolder}
+              onItemContextMenu={(entry, position) => openMenu('left', position, entry)}
+              onViewContextMenu={(position) => openMenu('left', position)}
+              onClearSelection={left.clearSelection}
               currentPath={left.currentPath}
               topicContext={leftTopic}
             />
@@ -708,7 +908,7 @@ export function FileBrowserView() {
         <StatusBar
           currentPath={left.currentPath}
           totalCount={leftEntries.length}
-          selection={leftSelectedEntry}
+          selectedEntries={leftSelectedEntries}
           onCopy={copyText}
           onExpandSidebar={
             !splitActive && previewCollapsed && isXl
@@ -751,15 +951,18 @@ export function FileBrowserView() {
               <SearchResultsPanel
                 hits={rightSearchHits}
                 query={right.searchQuery}
-                onSelect={(entry) => right.setSelectedId(entry.id)}
+                onSelect={(entry) => right.setSelectedIds([entry.id])}
               />
             ) : (
               <MainContent
                 entries={rightEntries}
                 viewMode={right.viewMode}
-                selectedId={right.selectedId}
-                onSelect={(entry) => right.setSelectedId(entry.id)}
+                selectedIds={right.selectedIds}
+                onSelect={(entry, modifiers) => right.selectEntry(entry, modifiers, rightEntries)}
                 onOpenFolder={(path) => right.navigate(path)}
+                onItemContextMenu={(entry, position) => openMenu('right', position, entry)}
+                onViewContextMenu={(position) => openMenu('right', position)}
+                onClearSelection={right.clearSelection}
                 currentPath={right.currentPath}
                 topicContext={rightTopic}
               />
@@ -768,7 +971,7 @@ export function FileBrowserView() {
           <StatusBar
             currentPath={right.currentPath}
             totalCount={rightEntries.length}
-            selection={rightSelectedEntry}
+            selectedEntries={rightSelectedEntries}
             onCopy={copyText}
             onExpandSidebar={
               previewCollapsed && isXl ? () => setPreviewCollapsed(false) : undefined
@@ -802,6 +1005,13 @@ export function FileBrowserView() {
           </div>
         </aside>
       ) : null}
+
+      <FileContextMenu
+        position={contextMenu?.position ?? null}
+        sections={contextMenu?.sections ?? []}
+        onInvoke={handleMenuAction}
+        onClose={() => setContextMenu(null)}
+      />
 
       {toast ? (
         <div className="pointer-events-none absolute bottom-8 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-3 py-1.5 text-xs text-white">

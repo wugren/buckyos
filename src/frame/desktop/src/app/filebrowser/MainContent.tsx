@@ -53,12 +53,29 @@ function formatDate(iso: string) {
   })
 }
 
+/** Modifier keys captured on click — drives multi-select on desktop. */
+export interface SelectModifiers {
+  shift?: boolean
+  toggle?: boolean
+}
+
+export interface MenuPosition {
+  top: number
+  left: number
+}
+
 interface MainContentProps {
   entries: FileEntry[]
   viewMode: ViewMode
-  selectedId: string | null
-  onSelect: (entry: FileEntry) => void
+  selectedIds: string[]
+  onSelect: (entry: FileEntry, modifiers?: SelectModifiers) => void
   onOpenFolder: (path: string) => void
+  /** Right-click on an entry (desktop). */
+  onItemContextMenu?: (entry: FileEntry, position: MenuPosition) => void
+  /** Right-click on blank space (desktop). */
+  onViewContextMenu?: (position: MenuPosition) => void
+  /** Click on blank space clears the selection (desktop). */
+  onClearSelection?: () => void
   currentPath: string
   topicContext: Topic | null
   isMobile?: boolean
@@ -67,9 +84,12 @@ interface MainContentProps {
 export function MainContent({
   entries,
   viewMode,
-  selectedId,
+  selectedIds,
   onSelect,
   onOpenFolder,
+  onItemContextMenu,
+  onViewContextMenu,
+  onClearSelection,
   currentPath,
   topicContext,
   isMobile = false,
@@ -78,9 +98,34 @@ export function MainContent({
 
   const isPublic = currentPath === '/public' || currentPath.startsWith('/public/')
 
+  const modifiersFromEvent = (event: React.MouseEvent): SelectModifiers => ({
+    shift: event.shiftKey,
+    toggle: event.metaKey || event.ctrlKey,
+  })
+
+  const handleItemContextMenu = (entry: FileEntry) => (event: React.MouseEvent) => {
+    if (!onItemContextMenu) return
+    event.preventDefault()
+    event.stopPropagation()
+    onItemContextMenu(entry, { top: event.clientY, left: event.clientX })
+  }
+
+  const handleViewContextMenu = (event: React.MouseEvent) => {
+    if (!onViewContextMenu) return
+    event.preventDefault()
+    onViewContextMenu({ top: event.clientY, left: event.clientX })
+  }
+
+  const handleBlankClick = (event: React.MouseEvent) => {
+    if (event.target === event.currentTarget) onClearSelection?.()
+  }
+
   if (!entries.length) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center p-10 text-center text-[color:var(--cp-muted)]">
+      <div
+        className="flex h-full w-full flex-col items-center justify-center p-10 text-center text-[color:var(--cp-muted)]"
+        onContextMenu={handleViewContextMenu}
+      >
         <FolderClosed size={40} className="opacity-50" />
         <p className="mt-3 font-display text-lg text-[color:var(--cp-text)]">
           {t('filebrowser.empty.title', 'This folder is empty')}
@@ -124,7 +169,7 @@ export function MainContent({
         <div className="flex-1 overflow-y-auto px-3 py-2">
           <div className="flex flex-col gap-1">
             {entries.map((entry) => {
-              const selected = entry.id === selectedId
+              const selected = selectedIds.includes(entry.id)
               const meta =
                 entry.kind === 'folder'
                   ? `${t('filebrowser.kind.folder', 'Folder')} · ${formatDate(entry.modifiedAt)}`
@@ -176,8 +221,12 @@ export function MainContent({
           </div>
         </div>
       ) : viewMode === 'list' ? (
-        <div className="flex-1 overflow-y-auto">
-          <table className="w-full text-sm">
+        <div
+          className="flex-1 overflow-y-auto"
+          onContextMenu={handleViewContextMenu}
+          onClick={handleBlankClick}
+        >
+          <table className="w-full select-none text-sm">
             <thead className="sticky top-0 bg-[color:color-mix(in_srgb,var(--cp-surface)_92%,transparent)] text-left text-[11px] uppercase tracking-wider text-[color:var(--cp-muted)] backdrop-blur">
               <tr>
                 <th className="py-2 pl-4 pr-2 font-medium">{t('filebrowser.column.name', 'Name')}</th>
@@ -196,7 +245,7 @@ export function MainContent({
             </thead>
             <tbody>
               {entries.map((entry) => {
-                const selected = entry.id === selectedId
+                const selected = selectedIds.includes(entry.id)
                 return (
                   <tr
                     key={entry.id}
@@ -206,10 +255,11 @@ export function MainContent({
                         ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
                         : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
                     )}
-                    onClick={() => onSelect(entry)}
+                    onClick={(event) => onSelect(entry, modifiersFromEvent(event))}
                     onDoubleClick={() => {
                       if (entry.kind === 'folder') onOpenFolder(entry.path)
                     }}
+                    onContextMenu={handleItemContextMenu(entry)}
                   >
                     <td className="py-2 pl-4 pr-2">
                       <div className="flex items-center gap-2">
@@ -260,18 +310,26 @@ export function MainContent({
           </table>
         </div>
       ) : (
-        <div className="flex-1 overflow-y-auto p-4">
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3">
+        <div
+          className="flex-1 overflow-y-auto p-4"
+          onContextMenu={handleViewContextMenu}
+          onClick={handleBlankClick}
+        >
+          <div
+            className="grid select-none grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3"
+            onClick={handleBlankClick}
+          >
             {entries.map((entry) => {
-              const selected = entry.id === selectedId
+              const selected = selectedIds.includes(entry.id)
               return (
                 <button
                   key={entry.id}
                   type="button"
-                  onClick={() => onSelect(entry)}
+                  onClick={(event) => onSelect(entry, modifiersFromEvent(event))}
                   onDoubleClick={() => {
                     if (entry.kind === 'folder') onOpenFolder(entry.path)
                   }}
+                  onContextMenu={handleItemContextMenu(entry)}
                   className={clsx(
                     'flex flex-col items-center gap-2 rounded-[18px] border border-transparent p-3 text-center transition',
                     selected

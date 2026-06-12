@@ -7,7 +7,8 @@ import type { FileEntry } from './types'
 interface StatusBarProps {
   currentPath: string
   totalCount: number
-  selection: FileEntry | null
+  /** Current selection — details are shown for a single entry, a count for many. */
+  selectedEntries: FileEntry[]
   onCopy: (text: string) => void
   /** When set, shows an expand-sidebar button at the right edge (collapsed sidebar state). */
   onExpandSidebar?: () => void
@@ -16,18 +17,39 @@ interface StatusBarProps {
 export function StatusBar({
   currentPath,
   totalCount,
-  selection,
+  selectedEntries,
   onCopy,
   onExpandSidebar,
 }: StatusBarProps) {
   const { t } = useI18n()
+
+  const selection = selectedEntries.length === 1 ? selectedEntries[0] : null
+  const multiSelection = selectedEntries.length > 1 ? selectedEntries : null
+  const multiBytes = multiSelection
+    ? multiSelection.reduce((sum, entry) => sum + (entry.sizeBytes ?? 0), 0)
+    : 0
 
   return (
     <div className="flex flex-wrap items-center gap-3 border-t border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_90%,transparent)] px-3 py-1.5 text-[11px] text-[color:var(--cp-muted)]">
       <span>
         {t('filebrowser.status.items', '{{count}} items', { count: totalCount })}
       </span>
-      {selection ? (
+      {multiSelection ? (
+        <>
+          <span className="opacity-60">·</span>
+          <span className="font-semibold text-[color:var(--cp-text)]">
+            {t('filebrowser.status.selectedCount', '{{count}} selected', {
+              count: multiSelection.length,
+            })}
+          </span>
+          {multiBytes > 0 ? (
+            <>
+              <span className="opacity-60">·</span>
+              <span>{formatBytes(multiBytes)}</span>
+            </>
+          ) : null}
+        </>
+      ) : selection ? (
         <>
           <span className="opacity-60">·</span>
           <span className="truncate">
