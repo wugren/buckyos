@@ -250,11 +250,8 @@ fn timeout_duplicate_and_bad_events_still_converge_by_truth_source() {
     truth.insert("task-timeout", "Completed");
     truth.insert("task-duplicate", "Completed");
     truth.insert("task-bad-payload", "Completed");
-    let mut consumer = TruthDrivenConsumer::new([
-        "task-timeout",
-        "task-duplicate",
-        "task-bad-payload",
-    ]);
+    let mut consumer =
+        TruthDrivenConsumer::new(["task-timeout", "task-duplicate", "task-bad-payload"]);
 
     consumer.tick(None, &mut truth);
     assert!(consumer.processed_ids.contains("task-timeout"));

@@ -1168,6 +1168,23 @@ mod tests {
     }
 
     #[test]
+    fn openai_gpt_image_pattern_stays_on_image_api() {
+        let request = DriverModelResolveRequest::new("gpt-image-2", vec![]);
+        let inventory = resolve_driver_inventory(
+            "openai-test",
+            ProviderType::CloudApi,
+            "openai",
+            &[request],
+            None,
+        );
+        let model = &inventory.models[0];
+        assert!(model.api_types.contains(&ApiType::ImageTextToImage));
+        assert!(model.api_types.contains(&ApiType::ImageToImage));
+        assert!(model.api_types.contains(&ApiType::ImageInpaint));
+        assert!(!model.api_types.contains(&ApiType::Llm));
+    }
+
+    #[test]
     fn openai_latest_gpt_mounts_family_only() {
         let requests = vec![
             DriverModelResolveRequest::new("gpt-5.4", vec![ApiType::Llm]),

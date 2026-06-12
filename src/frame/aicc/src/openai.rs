@@ -3376,7 +3376,7 @@ fn default_features() -> Vec<String> {
 
 fn is_text2image_model_name(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
-    normalized.starts_with("dall-e") || normalized == "gpt-image-1"
+    normalized.starts_with("dall-e") || normalized.starts_with("gpt-image")
 }
 
 fn is_supported_llm_model_name(model: &str) -> bool {
@@ -4486,10 +4486,16 @@ data: [DONE]
             OpenAIModelEntry {
                 id: "gpt-image-1".to_string(),
             },
+            OpenAIModelEntry {
+                id: "gpt-image-2".to_string(),
+            },
         ]);
 
         assert_eq!(llm_models, vec!["gpt-5.2".to_string()]);
-        assert_eq!(image_models, vec!["gpt-image-1".to_string()]);
+        assert_eq!(
+            image_models,
+            vec!["gpt-image-1".to_string(), "gpt-image-2".to_string()]
+        );
     }
 
     #[test]

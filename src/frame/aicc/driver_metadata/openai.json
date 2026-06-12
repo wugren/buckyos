@@ -109,6 +109,24 @@
       "estimated_latency_ms": 5000
     },
     {
+      "pattern": "gpt-image-*",
+      "api_types": ["image.txt2img", "image.img2img", "image.inpaint"],
+      "logical_mounts": [
+        "image.txt2img.{driver}",
+        "image.txt2img.gpt_image",
+        "image.txt2img.{model}",
+        "image.img2img",
+        "image.img2img.{driver}",
+        "image.img2img.{model}",
+        "image.inpaint",
+        "image.inpaint.{driver}",
+        "image.inpaint.{model}"
+      ],
+      "estimated_cost_usd": 0.04,
+      "estimated_latency_ms": 5000,
+      "quality_score": 0.9
+    },
+    {
       "pattern": "text-embedding-*",
       "api_types": ["embedding.text"],
       "logical_mounts": ["embedding.text", "embedding.text.{driver}", "embedding.text.{model}"],
