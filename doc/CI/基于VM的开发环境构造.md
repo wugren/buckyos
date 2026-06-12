@@ -89,10 +89,11 @@ OSError: [Errno 8] Exec format error: '/Users/<user>/buckycli/buckycli'
 uv run buckyos-devtest sntest exec web3-gateway.build_all --device sn
 ```
 
-`web3-gateway` 的文件会先 push 到 VM 的 `/home/ubuntu/web3-gateway-staging`，再由 remote install 命令用 sudo 同步到 `/opt/web3-gateway`。如果 push 阶段出现 `cannot write to remote file`，优先检查 staging 目录是否可写。对已经创建的 VM 可先修复 staging 目录后重试 install：
+`web3-gateway` 的文件会直接 push 到 VM 的 `/opt/web3-gateway`。如果 push 阶段出现 `cannot write to remote file` / `No space left on device`，优先检查 SN VM 根分区空间。`sntest` 配置已将新建 SN VM 磁盘设为 8G；对已经创建的旧 VM，需清理空间或重建 VM 后重试 install：
 
 ```bash
-uv run buckyos-devtest sntest run sn "rm -rf /home/ubuntu/web3-gateway-staging && mkdir -p /home/ubuntu/web3-gateway-staging"
+uv run buckyos-devtest sntest clean_vms
+uv run buckyos-devtest sntest create_vms
 uv run buckyos-devtest sntest install
 ```
 
