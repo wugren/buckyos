@@ -13,13 +13,14 @@ import {
   ChevronRight,
   FolderPlus,
   Image as ImageIcon,
-  LayoutGrid,
-  List,
+  ListChecks,
   Menu as MenuIcon,
+  MoreVertical,
   PanelRightClose,
   Plus,
   RefreshCw,
   Search,
+  Trash2,
   Upload as UploadIcon,
   X,
 } from 'lucide-react'
@@ -31,6 +32,7 @@ import {
 import { MainContent } from './MainContent'
 import type { MenuPosition, SelectModifiers } from './MainContent'
 import { FileContextMenu } from './menu/FileContextMenu'
+import { MobileMenuSheet } from './menu/MobileMenuSheet'
 import { fileBrowserMenuRegistry } from './menu/registry'
 import type { FileMenuAction, FileMenuContext, FileMenuSection } from './menu/types'
 import { PreviewPanel } from './PreviewPanel'
@@ -378,6 +380,19 @@ export function FileBrowserView() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [mobilePreviewOpen, setMobilePreviewOpen] = useState(false)
   const [mobileUploadOpen, setMobileUploadOpen] = useState(false)
+  /** Google-Drive-style multi-select mode (entered by long-press). */
+  const [mobileSelectMode, setMobileSelectMode] = useState(false)
+  /** Bottom-sheet menu — same registry sections as the desktop popup. */
+  const [mobileMenu, setMobileMenu] = useState<{
+    title?: string
+    context: FileMenuContext
+    sections: FileMenuSection[]
+  } | null>(null)
+
+  // Deselecting the last item leaves selection mode.
+  useEffect(() => {
+    if (mobileSelectMode && left.selectedKeys.size === 0) setMobileSelectMode(false)
+  }, [mobileSelectMode, left.selectedKeys])
 
   // The split layout is desktop-only; the right pane exists while it holds tabs.
   const splitActive = !isMobile && right.tabs.length > 0
@@ -461,6 +476,35 @@ export function FileBrowserView() {
   const handleOpenFolder = (url: string) => {
     left.navigate(url)
     setMobileSidebarOpen(false)
+  }
+
+  // ─── Mobile interactions: tap opens, long-press enters selection mode ───
+
+  const handleMobileItemTap = (item: FileItem) => {
+    if (mobileSelectMode) {
+      left.selectItem(item, { toggle: true })
+      return
+    }
+    if (item.entry.kind === 'folder') {
+      handleOpenFolder(item.entry.path)
+      return
+    }
+    left.applySelection([item.key], new Map([[item.key, item]]))
+    setMobilePreviewOpen(true)
+  }
+
+  const handleMobileLongPress = (item: FileItem) => {
+    if (mobileSelectMode) {
+      left.selectItem(item, { toggle: true })
+      return
+    }
+    setMobileSelectMode(true)
+    left.selectItem(item)
+  }
+
+  const exitMobileSelectMode = () => {
+    setMobileSelectMode(false)
+    left.clearSelection()
   }
 
   // ─── Collection mutations go through the reader interface (future RPC shape) ───
@@ -685,10 +729,12 @@ export function FileBrowserView() {
     })
   }
 
-  const handleMenuAction = (action: FileMenuAction) => {
-    if (!contextMenu) return
-    const { side, context } = contextMenu
-    const pane = paneFor(side)
+  /** Dispatch a menu command — shared by the desktop popup and the mobile sheet. */
+  const runMenuAction = (
+    pane: BrowserPane,
+    context: FileMenuContext,
+    action: FileMenuAction,
+  ) => {
     const items = context.items
     const first = items[0]
     const entries = context.entries
@@ -702,7 +748,8 @@ export function FileBrowserView() {
           pane.navigate(first.entry.path)
         } else {
           pane.applySelection([first.key], new Map([[first.key, first]]))
-          setPreviewCollapsed(false)
+          if (isMobile) setMobilePreviewOpen(true)
+          else setPreviewCollapsed(false)
         }
         break
       case 'open-new-tab':
@@ -820,6 +867,7 @@ export function FileBrowserView() {
         break
       case 'select-all':
         pane.selectAll()
+        if (isMobile) setMobileSelectMode(true)
         break
       case 'view-list':
         pane.setViewMode('list')
@@ -830,6 +878,62 @@ export function FileBrowserView() {
       default:
         showToast(`${action.command} (mock)`)
     }
+  }
+
+  const handleMenuAction = (action: FileMenuAction) => {
+    if (!contextMenu) return
+    runMenuAction(paneFor(contextMenu.side), contextMenu.context, action)
+  }
+
+  // ─── Mobile menus: same registry data rendered as a bottom sheet ───
+
+  /** 0 items → view menu, 1 → item menu, 2+ → selection menu. */
+  const openMobileMenu = (items: FileItem[]) => {
+    const context: FileMenuContext = {
+      target: items.length === 0 ? 'view' : items.length > 1 ? 'selection' : 'item',
+      items,
+      entries: items.map((item) => item.entry),
+      currentUrl: left.currentUrl,
+      viewMode: left.viewMode,
+      capabilities: left.list.capabilities,
+      sortKey: left.sortKey,
+      collections: collections.map((collection) => ({
+        id: collection.id,
+        title: collection.title,
+      })),
+      moveTargets,
+      pane: { canOpenInNewTab: false, canOpenInRightPane: false },
+    }
+    setMobileMenu({
+      title:
+        items.length === 1
+          ? items[0].entry.name
+          : items.length > 1
+            ? t('filebrowser.mobile.selectedCount', '{{count}} selected', {
+                count: items.length,
+              })
+            : undefined,
+      context,
+      sections: fileBrowserMenuRegistry.build(context),
+    })
+  }
+
+  const handleMobileMenuAction = (action: FileMenuAction) => {
+    if (!mobileMenu) return
+    runMenuAction(left, mobileMenu.context, action)
+  }
+
+  const handleMobileDelete = () => {
+    const keys = [...left.selectedKeys]
+    if (!keys.length) return
+    if (left.list.capabilities.removal === 'remove-ref') {
+      void removeFromCollection(left, keys)
+      return
+    }
+    showToast(
+      t('filebrowser.toast.delete', 'Deleted {{count}} item(s) (mock)', { count: keys.length }),
+    )
+    left.clearSelection()
   }
 
   const handleCreateCollection = () => {
@@ -865,67 +969,97 @@ export function FileBrowserView() {
 
     return (
       <div className="relative flex h-full w-full flex-col overflow-hidden" style={{ background: 'var(--cp-bg)' }}>
-        {/* Operations bar: drawer toggle + search + view mode */}
-        <div className="flex items-center gap-2 px-3 pt-2 pb-1">
-          <IconButton
-            size="small"
-            onClick={() => setMobileSidebarOpen((v) => !v)}
-            aria-label={t('filebrowser.mobile.places', 'Places')}
-            className={clsx(
-              mobileSidebarOpen &&
-                '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-            )}
-          >
-            <MenuIcon size={16} />
-          </IconButton>
-          <div className="relative flex min-w-0 flex-1 items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_88%,transparent)] px-2 py-1">
-            <Search size={14} className="ml-1 shrink-0 text-[color:var(--cp-muted)]" />
-            <input
-              type="text"
-              value={left.searchQuery}
-              onChange={(event) => left.setSearchQuery(event.target.value)}
-              placeholder={t(
-                'filebrowser.topbar.searchPlaceholder',
-                'Search across files, folders, AI summaries…',
-              )}
-              className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-[color:var(--cp-muted)]"
+        {/* Operations bar: drawer toggle + search + menu — or the selection bar */}
+        {mobileSelectMode ? (
+          <div className="flex items-center gap-1 px-3 pt-2 pb-1">
+            <IconButton
+              size="small"
+              onClick={exitMobileSelectMode}
+              aria-label={t('filebrowser.mobile.exitSelect', 'Exit selection')}
+            >
+              <X size={18} />
+            </IconButton>
+            <span
+              className="min-w-0 flex-1 truncate text-[15px] font-semibold"
               style={{ color: 'var(--cp-text)' }}
-            />
-            {left.searchQuery ? (
+            >
+              {t('filebrowser.mobile.selectedCount', '{{count}} selected', {
+                count: left.selectedKeys.size,
+              })}
+            </span>
+            <IconButton
+              size="small"
+              onClick={left.selectAll}
+              aria-label={t('filebrowser.menu.selectAll', 'Select all')}
+            >
+              <ListChecks size={18} />
+            </IconButton>
+            {left.list.capabilities.removal !== null ? (
               <IconButton
                 size="small"
-                onClick={() => left.setSearchQuery('')}
-                aria-label={t('common.close', 'Close')}
+                onClick={handleMobileDelete}
+                aria-label={
+                  left.list.capabilities.removal === 'remove-ref'
+                    ? t('filebrowser.actions.removeFromCollection', 'Remove from collection')
+                    : t('filebrowser.actions.delete', 'Delete')
+                }
               >
-                <X size={12} />
+                <Trash2 size={18} />
               </IconButton>
             ) : null}
-          </div>
-          <div className="flex items-center rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_80%,transparent)]">
             <IconButton
               size="small"
-              onClick={() => left.setViewMode('list')}
-              className={clsx(
-                left.viewMode === 'list' &&
-                  '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-              )}
-              aria-label={t('filebrowser.view.list', 'List view')}
+              onClick={() => openMobileMenu([...left.selectedItemsMap.values()])}
+              aria-label={t('filebrowser.mobile.moreActions', 'More actions')}
             >
-              <List size={14} />
-            </IconButton>
-            <IconButton
-              size="small"
-              onClick={() => left.setViewMode('icon')}
-              className={clsx(
-                left.viewMode === 'icon' &&
-                  '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-              )}
-              aria-label={t('filebrowser.view.icon', 'Icon view')}
-            >
-              <LayoutGrid size={14} />
+              <MoreVertical size={18} />
             </IconButton>
           </div>
-        </div>
+        ) : (
+          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+            <IconButton
+              size="small"
+              onClick={() => setMobileSidebarOpen((v) => !v)}
+              aria-label={t('filebrowser.mobile.places', 'Places')}
+              className={clsx(
+                mobileSidebarOpen &&
+                  '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
+              )}
+            >
+              <MenuIcon size={16} />
+            </IconButton>
+            <div className="relative flex min-w-0 flex-1 items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_88%,transparent)] px-2 py-1">
+              <Search size={14} className="ml-1 shrink-0 text-[color:var(--cp-muted)]" />
+              <input
+                type="text"
+                value={left.searchQuery}
+                onChange={(event) => left.setSearchQuery(event.target.value)}
+                placeholder={t(
+                  'filebrowser.topbar.searchPlaceholder',
+                  'Search across files, folders, AI summaries…',
+                )}
+                className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-[color:var(--cp-muted)]"
+                style={{ color: 'var(--cp-text)' }}
+              />
+              {left.searchQuery ? (
+                <IconButton
+                  size="small"
+                  onClick={() => left.setSearchQuery('')}
+                  aria-label={t('common.close', 'Close')}
+                >
+                  <X size={12} />
+                </IconButton>
+              ) : null}
+            </div>
+            <IconButton
+              size="small"
+              onClick={() => openMobileMenu([])}
+              aria-label={t('filebrowser.mobile.moreActions', 'More actions')}
+            >
+              <MoreVertical size={18} />
+            </IconButton>
+          </div>
+        )}
 
         {/* Address bar: path crumbs + refresh on the right */}
         <div className="flex items-center gap-2 px-3 pb-2 pt-1">
@@ -963,31 +1097,39 @@ export function FileBrowserView() {
             <SearchResultsPanel
               hits={leftSearchHits}
               query={left.searchQuery}
-              onSelect={(entry) => handleOpenEntry(itemOf(entry))}
+              onSelect={(entry) => {
+                if (entry.kind === 'folder') left.setSearchQuery('')
+                handleMobileItemTap(itemOf(entry))
+              }}
             />
           ) : (
             <MainContent
               list={left.list}
               viewMode={left.viewMode}
               selectedKeys={left.selectedKeys}
-              onSelect={handleOpenEntry}
+              onSelect={handleMobileItemTap}
               onOpenFolder={handleOpenFolder}
               currentUrl={left.currentUrl}
               isMobile
+              selectionMode={mobileSelectMode}
+              onItemMenu={(item) => openMobileMenu([item])}
+              onLongPress={handleMobileLongPress}
             />
           )}
         </div>
 
-        {/* Floating action button — upload */}
-        <button
-          type="button"
-          onClick={() => setMobileUploadOpen(true)}
-          aria-label={t('filebrowser.actions.upload', 'Upload')}
-          className="absolute bottom-5 right-5 z-20 flex h-14 w-14 items-center justify-center rounded-full text-white shadow-[0_10px_28px_rgba(0,0,0,0.22)] transition active:scale-95"
-          style={{ background: 'var(--cp-accent)' }}
-        >
-          <Plus size={26} />
-        </button>
+        {/* Floating action button — upload (hidden while selecting) */}
+        {!mobileSelectMode ? (
+          <button
+            type="button"
+            onClick={() => setMobileUploadOpen(true)}
+            aria-label={t('filebrowser.actions.upload', 'Upload')}
+            className="absolute bottom-5 right-5 z-20 flex h-14 w-14 items-center justify-center rounded-full text-white shadow-[0_10px_28px_rgba(0,0,0,0.22)] transition active:scale-95"
+            style={{ background: 'var(--cp-accent)' }}
+          >
+            <Plus size={26} />
+          </button>
+        ) : null}
 
         {/* Upload action sheet */}
         {mobileUploadOpen ? (
@@ -1089,7 +1231,7 @@ export function FileBrowserView() {
               onClick={() => setMobilePreviewOpen(false)}
             />
             <div
-              className="relative flex h-[78%] w-full flex-col rounded-t-[28px] border-t border-[color:var(--cp-border)]"
+              className="relative flex h-2/3 w-full flex-col rounded-t-[28px] border-t border-[color:var(--cp-border)]"
               style={{ background: 'var(--cp-surface)' }}
             >
               <div className="flex items-center justify-between px-4 py-2">
@@ -1122,6 +1264,15 @@ export function FileBrowserView() {
             </div>
           </div>
         ) : null}
+
+        {/* Context menu bottom sheet (item / selection / view) */}
+        <MobileMenuSheet
+          open={Boolean(mobileMenu)}
+          title={mobileMenu?.title}
+          sections={mobileMenu?.sections ?? []}
+          onInvoke={handleMobileMenuAction}
+          onClose={() => setMobileMenu(null)}
+        />
 
         {toast ? (
           <div className="pointer-events-none absolute bottom-14 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-3 py-1.5 text-xs text-white">

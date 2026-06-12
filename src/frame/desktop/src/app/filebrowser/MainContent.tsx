@@ -1,7 +1,17 @@
 import clsx from 'clsx'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { CornerUpRight, FolderClosed, Library, Sparkles, Upload, Wand2 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import {
+  CheckCircle2,
+  Circle,
+  CornerUpRight,
+  FolderClosed,
+  Library,
+  MoreVertical,
+  Sparkles,
+  Upload,
+  Wand2,
+} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useI18n } from '../../i18n/provider'
 import type { FileItemList } from './data/FileItemList'
 import type { FileItem } from './data/FolderReader'
@@ -57,12 +67,74 @@ interface MainContentProps {
   onClearSelection?: () => void
   currentUrl: string
   isMobile?: boolean
+  /** Mobile selection mode — per-item menus become checkboxes. */
+  selectionMode?: boolean
+  /** Tap on an item's ⋮ button (mobile). */
+  onItemMenu?: (item: FileItem) => void
+  /** Long-press on an item (mobile) — enters/extends selection mode. */
+  onLongPress?: (item: FileItem) => void
 }
 
 const modifiersFromEvent = (event: React.MouseEvent): SelectModifiers => ({
   shift: event.shiftKey,
   toggle: event.metaKey || event.ctrlKey,
 })
+
+const LONG_PRESS_MS = 450
+const LONG_PRESS_TOLERANCE = 12
+
+/**
+ * Touch long-press detection. Returns pointer handlers for the pressable
+ * element and `consumeLongPress`, which the click handler calls to swallow
+ * the synthetic click that follows a fired long-press.
+ */
+function useLongPress(onLongPress?: () => void) {
+  const timerRef = useRef<number | null>(null)
+  const firedRef = useRef(false)
+  const originRef = useRef({ x: 0, y: 0 })
+
+  const cancel = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => cancel, [cancel])
+
+  const consumeLongPress = useCallback(() => {
+    const fired = firedRef.current
+    firedRef.current = false
+    return fired
+  }, [])
+
+  const handlers = useMemo(() => {
+    if (!onLongPress) return {}
+    return {
+      onPointerDown: (event: React.PointerEvent) => {
+        if (event.pointerType === 'mouse') return
+        firedRef.current = false
+        originRef.current = { x: event.clientX, y: event.clientY }
+        cancel()
+        timerRef.current = window.setTimeout(() => {
+          timerRef.current = null
+          firedRef.current = true
+          onLongPress()
+        }, LONG_PRESS_MS)
+      },
+      onPointerMove: (event: React.PointerEvent) => {
+        if (timerRef.current === null) return
+        const dx = event.clientX - originRef.current.x
+        const dy = event.clientY - originRef.current.y
+        if (dx * dx + dy * dy > LONG_PRESS_TOLERANCE * LONG_PRESS_TOLERANCE) cancel()
+      },
+      onPointerUp: cancel,
+      onPointerCancel: cancel,
+    }
+  }, [onLongPress, cancel])
+
+  return { handlers, consumeLongPress }
+}
 
 /** Track the first..last visible indexes and demand-load them. */
 function useEnsureRange(list: FileItemList, first: number, last: number, active: boolean) {
@@ -91,6 +163,9 @@ export function MainContent({
   onClearSelection,
   currentUrl,
   isMobile = false,
+  selectionMode = false,
+  onItemMenu,
+  onLongPress,
 }: MainContentProps) {
   const { t } = useI18n()
 
@@ -230,8 +305,10 @@ export function MainContent({
         list={list}
         selectedKeys={selectedKeys}
         onSelect={onSelect}
-        openItem={openItem}
         isPublic={isPublic}
+        selectionMode={selectionMode}
+        onItemMenu={onItemMenu}
+        onLongPress={onLongPress}
       />
     )
   } else if (viewMode === 'list') {
@@ -257,6 +334,9 @@ export function MainContent({
         handleItemContextMenu={handleItemContextMenu}
         handleViewContextMenu={handleViewContextMenu}
         handleBlankClick={handleBlankClick}
+        selectionMode={isMobile ? selectionMode : false}
+        onItemMenu={isMobile ? onItemMenu : undefined}
+        onLongPress={isMobile ? onLongPress : undefined}
       />
     )
   }
@@ -470,6 +550,9 @@ function IconGridView({
   handleItemContextMenu,
   handleViewContextMenu,
   handleBlankClick,
+  selectionMode = false,
+  onItemMenu,
+  onLongPress,
 }: {
   list: FileItemList
   selectedKeys: ReadonlySet<string>
@@ -478,6 +561,9 @@ function IconGridView({
   handleItemContextMenu: (item: FileItem) => (event: React.MouseEvent) => void
   handleViewContextMenu: (event: React.MouseEvent) => void
   handleBlankClick: (event: React.MouseEvent) => void
+  selectionMode?: boolean
+  onItemMenu?: (item: FileItem) => void
+  onLongPress?: (item: FileItem) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const [columns, setColumns] = useState(4)
@@ -549,41 +635,110 @@ function IconGridView({
                     </div>
                   )
                 }
-                const { entry } = item
-                const selected = selectedKeys.has(item.key)
-                const broken = isBrokenItem(item)
                 return (
-                  <button
+                  <IconGridCell
                     key={item.key}
-                    type="button"
-                    onClick={(event) => onSelect(item, modifiersFromEvent(event))}
-                    onDoubleClick={() => openItem(item)}
+                    item={item}
+                    selected={selectedKeys.has(item.key)}
+                    selectionMode={selectionMode}
+                    onSelect={onSelect}
+                    openItem={openItem}
                     onContextMenu={handleItemContextMenu(item)}
-                    className={clsx(
-                      'flex flex-col items-center gap-2 rounded-[18px] border border-transparent p-3 text-center transition',
-                      selected
-                        ? 'border-[color:var(--cp-accent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
-                        : 'hover:border-[color:color-mix(in_srgb,var(--cp-border)_70%,transparent)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_8%,transparent)]',
-                      broken && 'opacity-50',
-                    )}
-                  >
-                    <div className="relative flex h-16 w-16 items-center justify-center rounded-[16px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
-                      {kindIcon(entry.kind, 28)}
-                      {isReferenceItem(item) ? <LinkBadge /> : null}
-                    </div>
-                    <span className="line-clamp-2 text-[12px] font-medium text-[color:var(--cp-text)]">
-                      {entry.name}
-                    </span>
-                    <span className="text-[10px] text-[color:var(--cp-muted)]">
-                      {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
-                    </span>
-                  </button>
+                    onMenu={onItemMenu ? () => onItemMenu(item) : undefined}
+                    onLongPress={onLongPress ? () => onLongPress(item) : undefined}
+                  />
                 )
               })}
             </div>
           )
         })}
       </div>
+    </div>
+  )
+}
+
+function IconGridCell({
+  item,
+  selected,
+  selectionMode,
+  onSelect,
+  openItem,
+  onContextMenu,
+  onMenu,
+  onLongPress,
+}: {
+  item: FileItem
+  selected: boolean
+  selectionMode: boolean
+  onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
+  openItem: (item: FileItem) => void
+  onContextMenu: (event: React.MouseEvent) => void
+  onMenu?: () => void
+  onLongPress?: () => void
+}) {
+  const { t } = useI18n()
+  const { handlers, consumeLongPress } = useLongPress(onLongPress)
+  const { entry } = item
+  const broken = isBrokenItem(item)
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        {...handlers}
+        onClick={(event) => {
+          if (consumeLongPress()) return
+          onSelect(item, modifiersFromEvent(event))
+        }}
+        onDoubleClick={() => openItem(item)}
+        onContextMenu={(event) => {
+          // Mobile long-press is selection mode, not the browser menu.
+          if (onLongPress) {
+            event.preventDefault()
+            return
+          }
+          onContextMenu(event)
+        }}
+        className={clsx(
+          'flex h-full w-full flex-col items-center gap-2 rounded-[18px] border border-transparent p-3 text-center transition',
+          selected
+            ? 'border-[color:var(--cp-accent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
+            : 'hover:border-[color:color-mix(in_srgb,var(--cp-border)_70%,transparent)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_8%,transparent)]',
+          broken && 'opacity-50',
+        )}
+      >
+        <div className="relative flex h-16 w-16 items-center justify-center rounded-[16px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
+          {kindIcon(entry.kind, 28)}
+          {isReferenceItem(item) ? <LinkBadge /> : null}
+        </div>
+        <span className="line-clamp-2 text-[12px] font-medium text-[color:var(--cp-text)]">
+          {entry.name}
+        </span>
+        <span className="text-[10px] text-[color:var(--cp-muted)]">
+          {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
+        </span>
+      </button>
+      {selectionMode ? (
+        <span
+          className={clsx(
+            'pointer-events-none absolute right-1.5 top-1.5',
+            selected ? 'text-[color:var(--cp-accent)]' : 'text-[color:var(--cp-muted)]',
+          )}
+        >
+          {selected ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+        </span>
+      ) : onMenu ? (
+        <button
+          type="button"
+          aria-label={t('filebrowser.mobile.moreActions', 'More actions')}
+          onClick={(event) => {
+            event.stopPropagation()
+            onMenu()
+          }}
+          className="absolute right-0.5 top-0.5 flex h-8 w-8 items-center justify-center rounded-full text-[color:var(--cp-muted)] active:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_18%,transparent)]"
+        >
+          <MoreVertical size={16} />
+        </button>
+      ) : null}
     </div>
   )
 }
@@ -596,16 +751,19 @@ function MobileListView({
   list,
   selectedKeys,
   onSelect,
-  openItem,
   isPublic,
+  selectionMode = false,
+  onItemMenu,
+  onLongPress,
 }: {
   list: FileItemList
   selectedKeys: ReadonlySet<string>
   onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
-  openItem: (item: FileItem) => void
   isPublic: boolean
+  selectionMode?: boolean
+  onItemMenu?: (item: FileItem) => void
+  onLongPress?: (item: FileItem) => void
 }) {
-  const { t } = useI18n()
   const parentRef = useRef<HTMLDivElement>(null)
   const count = list.totalCount ?? 0
 
@@ -648,59 +806,126 @@ function MobileListView({
               </div>
             )
           }
-          const { entry } = item
-          const selected = selectedKeys.has(item.key)
-          const broken = isBrokenItem(item)
-          const meta =
-            entry.kind === 'folder'
-              ? `${t('filebrowser.kind.folder', 'Folder')} · ${formatDate(entry.modifiedAt)}`
-              : `${formatBytes(entry.sizeBytes)} · ${formatDate(entry.modifiedAt)}`
           return (
-            <button
+            <MobileListRow
               key={item.key}
-              type="button"
+              item={item}
               style={rowStyle}
-              onClick={() => onSelect(item)}
-              onDoubleClick={() => openItem(item)}
-              className={clsx(
-                'flex items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition',
-                selected
-                  ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
-                  : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
-                broken && 'opacity-50',
-              )}
-            >
-              <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-[14px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
-                {kindIcon(entry.kind, 26)}
-                {isReferenceItem(item) ? <LinkBadge /> : null}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="truncate text-[13px] font-medium text-[color:var(--cp-text)]">
-                    {entry.name}
-                  </span>
-                  {entry.triggersActive ? (
-                    <span
-                      title="AI pipeline active"
-                      className="inline-flex shrink-0 items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[9px] font-semibold text-[color:var(--cp-accent)]"
-                    >
-                      <Wand2 size={9} className="mr-1" /> AI
-                    </span>
-                  ) : null}
-                </div>
-                <div className="mt-0.5 truncate text-[11px] text-[color:var(--cp-muted)]">
-                  {meta}
-                  {isPublic && entry.publicUrl ? (
-                    <span className="ml-1 font-mono text-[color:var(--cp-accent)]">
-                      · {entry.publicUrl}
-                    </span>
-                  ) : null}
-                </div>
-              </div>
-            </button>
+              selected={selectedKeys.has(item.key)}
+              isPublic={isPublic}
+              selectionMode={selectionMode}
+              onTap={() => onSelect(item)}
+              onMenu={onItemMenu ? () => onItemMenu(item) : undefined}
+              onLongPress={onLongPress ? () => onLongPress(item) : undefined}
+            />
           )
         })}
       </div>
+    </div>
+  )
+}
+
+function MobileListRow({
+  item,
+  style,
+  selected,
+  isPublic,
+  selectionMode,
+  onTap,
+  onMenu,
+  onLongPress,
+}: {
+  item: FileItem
+  style: React.CSSProperties
+  selected: boolean
+  isPublic: boolean
+  selectionMode: boolean
+  onTap: () => void
+  onMenu?: () => void
+  onLongPress?: () => void
+}) {
+  const { t } = useI18n()
+  const { handlers, consumeLongPress } = useLongPress(onLongPress)
+  const { entry } = item
+  const broken = isBrokenItem(item)
+  const meta =
+    entry.kind === 'folder'
+      ? `${t('filebrowser.kind.folder', 'Folder')} · ${formatDate(entry.modifiedAt)}`
+      : `${formatBytes(entry.sizeBytes)} · ${formatDate(entry.modifiedAt)}`
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      style={style}
+      {...handlers}
+      onClick={() => {
+        if (consumeLongPress()) return
+        onTap()
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') onTap()
+      }}
+      onContextMenu={(event) => {
+        // Mobile long-press is selection mode, not the browser menu.
+        if (onLongPress) event.preventDefault()
+      }}
+      className={clsx(
+        'flex select-none items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition',
+        selected
+          ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
+          : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
+        broken && 'opacity-50',
+      )}
+    >
+      <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-[14px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
+        {kindIcon(entry.kind, 26)}
+        {isReferenceItem(item) ? <LinkBadge /> : null}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-[13px] font-medium text-[color:var(--cp-text)]">
+            {entry.name}
+          </span>
+          {entry.triggersActive ? (
+            <span
+              title="AI pipeline active"
+              className="inline-flex shrink-0 items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[9px] font-semibold text-[color:var(--cp-accent)]"
+            >
+              <Wand2 size={9} className="mr-1" /> AI
+            </span>
+          ) : null}
+        </div>
+        <div className="mt-0.5 truncate text-[11px] text-[color:var(--cp-muted)]">
+          {meta}
+          {isPublic && entry.publicUrl ? (
+            <span className="ml-1 font-mono text-[color:var(--cp-accent)]">
+              · {entry.publicUrl}
+            </span>
+          ) : null}
+        </div>
+      </div>
+      {selectionMode ? (
+        <span
+          className={clsx(
+            'flex h-9 w-9 shrink-0 items-center justify-center',
+            selected ? 'text-[color:var(--cp-accent)]' : 'text-[color:var(--cp-muted)]',
+          )}
+        >
+          {selected ? <CheckCircle2 size={20} /> : <Circle size={20} />}
+        </span>
+      ) : onMenu ? (
+        <button
+          type="button"
+          aria-label={t('filebrowser.mobile.moreActions', 'More actions')}
+          onClick={(event) => {
+            event.stopPropagation()
+            onMenu()
+          }}
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[color:var(--cp-muted)] active:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_18%,transparent)]"
+        >
+          <MoreVertical size={18} />
+        </button>
+      ) : null}
     </div>
   )
 }

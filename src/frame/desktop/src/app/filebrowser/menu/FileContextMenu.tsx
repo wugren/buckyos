@@ -5,66 +5,16 @@
  */
 
 import { Divider, ListItemIcon, ListItemText, Menu, MenuItem, Typography } from '@mui/material'
-import {
-  ArrowDown,
-  ArrowUp,
-  ChevronRight,
-  Copy,
-  CornerUpRight,
-  Download,
-  ExternalLink,
-  Eye,
-  FolderInput,
-  FolderOpen,
-  FolderPlus,
-  LayoutGrid,
-  Library,
-  Link2,
-  List,
-  PanelRight,
-  PencilLine,
-  RefreshCw,
-  Share2,
-  SquareDashedMousePointer,
-  Trash2,
-  Unlink,
-  Upload,
-} from 'lucide-react'
+import { ChevronRight } from 'lucide-react'
 import { useState } from 'react'
 import { useI18n } from '../../../i18n/provider'
+import { MENU_ICONS } from './icons'
 import type {
   FileMenuAction,
-  FileMenuIcon,
   FileMenuLabel,
   FileMenuSection,
   FileMenuSubmenu,
 } from './types'
-
-const ICONS: Record<FileMenuIcon, React.ComponentType<{ size?: number | string }>> = {
-  open: FolderOpen,
-  'open-new-tab': ExternalLink,
-  'open-right': PanelRight,
-  preview: Eye,
-  copy: Copy,
-  link: Link2,
-  share: Share2,
-  download: Download,
-  rename: PencilLine,
-  move: FolderInput,
-  trash: Trash2,
-  'new-folder': FolderPlus,
-  upload: Upload,
-  refresh: RefreshCw,
-  'select-all': SquareDashedMousePointer,
-  'view-list': List,
-  'view-icon': LayoutGrid,
-  collection: Library,
-  'remove-ref': Unlink,
-  jump: CornerUpRight,
-  broken: Unlink,
-  'move-up': ArrowUp,
-  'move-down': ArrowDown,
-}
 
 export interface FileContextMenuProps {
   position: { top: number; left: number } | null
@@ -92,7 +42,7 @@ export function FileContextMenu({ position, sections, onInvoke, onClose }: FileC
   }
 
   const renderAction = (item: FileMenuAction) => {
-    const Icon = item.icon ? ICONS[item.icon] : null
+    const Icon = item.icon ? MENU_ICONS[item.icon] : null
     return (
       <MenuItem
         key={item.id}
@@ -117,7 +67,7 @@ export function FileContextMenu({ position, sections, onInvoke, onClose }: FileC
   }
 
   const renderSubmenu = (item: FileMenuSubmenu) => {
-    const Icon = item.icon ? ICONS[item.icon] : null
+    const Icon = item.icon ? MENU_ICONS[item.icon] : null
     return (
       <MenuItem
         key={item.id}
