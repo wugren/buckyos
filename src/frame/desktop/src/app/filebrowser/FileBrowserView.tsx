@@ -1,6 +1,13 @@
 import { IconButton, useMediaQuery } from '@mui/material'
 import clsx from 'clsx'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import {
   Camera,
   ChevronRight,
@@ -31,53 +38,29 @@ import { SearchResultsPanel } from './SearchResultsPanel'
 import { Sidebar } from './Sidebar'
 import { StatusBar } from './StatusBar'
 import { TopBar } from './TopBar'
+import { asCollectionReader } from './data/CollectionModel'
+import type { FileItem } from './data/FolderReader'
+import { installFileBrowserData } from './data/install'
+import { resolveReader } from './data/readerRegistry'
+import { useFolderList } from './data/useFolderList'
 import {
-  defaultTabs,
-  fileBrowserSnapshot,
-  searchFiles,
-} from './mock/data'
-import type { BrowserTab, DfsNode, FileEntry, SortDir, SortKey, Topic, ViewMode } from './types'
+  collectionUrl,
+  crumbsForUrl,
+  displayPath,
+  fallbackTitle,
+  normalizeUrl,
+  parentUrl,
+  parseCollectionUrl,
+} from './data/urls'
+import { collectionStore } from './mock/collections'
+import { defaultTabs, fileBrowserSnapshot, searchFiles } from './mock/data'
+import type { BrowserTab, DfsNode, FileEntry, SortDir, SortKey, ViewMode } from './types'
+
+installFileBrowserData()
 
 interface HistoryState {
   back: string[]
   forward: string[]
-}
-
-const TOPIC_SCHEME = 'topic://'
-
-function topicIdFromPath(path: string): string | null {
-  return path.startsWith(TOPIC_SCHEME) ? path.slice(TOPIC_SCHEME.length) : null
-}
-
-function topicForPath(path: string): Topic | null {
-  const topicId = topicIdFromPath(path)
-  if (!topicId) return null
-  return fileBrowserSnapshot.topics.find((t) => t.id === topicId) ?? null
-}
-
-function entriesForPath(path: string): FileEntry[] {
-  const topic = topicForPath(path)
-  if (topic) {
-    const ids = new Set(topic.groups.flatMap((group) => group.fileIds))
-    return Array.from(ids)
-      .map((id) => fileBrowserSnapshot.entriesById[id])
-      .filter((entry): entry is FileEntry => !!entry)
-  }
-  return fileBrowserSnapshot.entriesByPath[path] ?? []
-}
-
-/** Folders first, then the toolbar sort; name is the stable tie-breaker. */
-function sortEntries(entries: FileEntry[], key: SortKey, dir: SortDir): FileEntry[] {
-  const factor = dir === 'asc' ? 1 : -1
-  return [...entries].sort((a, b) => {
-    if ((a.kind === 'folder') !== (b.kind === 'folder')) return a.kind === 'folder' ? -1 : 1
-    let cmp = 0
-    if (key === 'size') cmp = (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0)
-    else if (key === 'modified') cmp = a.modifiedAt.localeCompare(b.modifiedAt)
-    else if (key === 'kind') cmp = a.kind.localeCompare(b.kind)
-    if (cmp === 0) cmp = a.name.localeCompare(b.name, undefined, { numeric: true })
-    return cmp * factor
-  })
 }
 
 interface DetachedTab {
@@ -85,9 +68,16 @@ interface DetachedTab {
   history: HistoryState
 }
 
-/** Self-contained state for one browser pane (tabs, history, selection, search, view). */
+/** Ad-hoc item wrapper for entry-shaped sources (search hits). */
+function itemOf(entry: FileEntry): FileItem {
+  return { key: entry.id, entry }
+}
+
+/** Self-contained state for one browser pane (tabs, history, list, selection, search, view). */
 function useBrowserPane(initialTabs: BrowserTab[]) {
-  const [tabs, setTabs] = useState<BrowserTab[]>(initialTabs)
+  const [tabs, setTabs] = useState<BrowserTab[]>(() =>
+    initialTabs.map((tab) => ({ ...tab, path: normalizeUrl(tab.path) })),
+  )
   const [activeTabId, setActiveTabId] = useState(initialTabs[0]?.id ?? '')
   const [history, setHistory] = useState<Record<string, HistoryState>>(() =>
     Object.fromEntries(initialTabs.map((tab) => [tab.id, { back: [], forward: [] }])),
@@ -95,83 +85,156 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
   const [viewMode, setViewMode] = useState<ViewMode>('list')
   const [sortKey, setSortKey] = useState<SortKey>('name')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
-  const [selectedIds, setSelectedIds] = useState<string[]>([])
-  /** Anchor entry for shift range selection. */
-  const selectionAnchorRef = useRef<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null
-  const currentPath = activeTab?.path ?? '/home'
+  const currentUrl = activeTab?.path ?? 'dfs:///home'
   const activeHistory = history[activeTabId] ?? { back: [], forward: [] }
+
+  const list = useFolderList(currentUrl, sortKey, sortDir)
+
+  // Entering a different location kind resets the sort to its default
+  // (collections open in manual order); an invalid key always resets.
+  const prevKindRef = useRef(list.capabilities.kind)
+  useEffect(() => {
+    const caps = list.capabilities
+    if (prevKindRef.current !== caps.kind || !caps.sortKeys.includes(sortKey)) {
+      prevKindRef.current = caps.kind
+      setSortKey(caps.defaultSortKey)
+      setSortDir(caps.defaultSortKey === 'modified' ? 'desc' : 'asc')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list])
+
+  // ─── Selection: keys + captured items (no global entry index lookups) ───
+  const [selectedKeys, setSelectedKeys] = useState<ReadonlySet<string>>(() => new Set())
+  const [selectedItemsMap, setSelectedItemsMap] = useState<Map<string, FileItem>>(
+    () => new Map(),
+  )
+  /** Anchor item key for shift range selection. */
+  const selectionAnchorRef = useRef<string | null>(null)
+  /** Original path waiting to be selected after a "jump to original" navigation. */
+  const pendingRevealRef = useRef<string | null>(null)
+
+  const applySelection = useCallback(
+    (keys: string[], picked?: Map<string, FileItem>) => {
+      setSelectedKeys(new Set(keys))
+      setSelectedItemsMap((prev) => {
+        const next = new Map<string, FileItem>()
+        for (const key of keys) {
+          const item = picked?.get(key) ?? list.loadedItemByKey(key) ?? prev.get(key)
+          if (item) next.set(key, item)
+        }
+        return next
+      })
+    },
+    [list],
+  )
 
   const clearSelection = useCallback(() => {
     selectionAnchorRef.current = null
-    setSelectedIds([])
+    setSelectedKeys(new Set())
+    setSelectedItemsMap(new Map())
   }, [])
 
   /**
-   * Click-selection with desktop modifiers: plain click selects one entry,
-   * ctrl/cmd toggles it, shift selects the range from the current anchor
-   * within `orderedEntries` (the list as currently displayed).
+   * Click-selection with desktop modifiers: plain click selects one item,
+   * ctrl/cmd toggles it, shift selects the loaded-key range from the anchor.
+   * Ranges across unloaded gaps are not supported (loadedKeys only).
    */
-  const selectEntry = useCallback(
-    (entry: FileEntry, modifiers: SelectModifiers = {}, orderedEntries: FileEntry[] = []) => {
-      setSelectedIds((prev) => {
-        if (modifiers.shift && orderedEntries.length) {
-          const ids = orderedEntries.map((item) => item.id)
-          const anchor =
-            selectionAnchorRef.current && ids.includes(selectionAnchorRef.current)
-              ? selectionAnchorRef.current
-              : entry.id
-          const from = ids.indexOf(anchor)
-          const to = ids.indexOf(entry.id)
+  const selectItem = useCallback(
+    (item: FileItem, modifiers: SelectModifiers = {}) => {
+      if (modifiers.shift) {
+        const keys = list.loadedKeys()
+        const anchor =
+          selectionAnchorRef.current && keys.includes(selectionAnchorRef.current)
+            ? selectionAnchorRef.current
+            : item.key
+        const from = keys.indexOf(anchor)
+        const to = keys.indexOf(item.key)
+        if (from !== -1 && to !== -1) {
           const [start, end] = from <= to ? [from, to] : [to, from]
-          return ids.slice(start, end + 1)
+          applySelection(keys.slice(start, end + 1))
+          return
         }
-        if (modifiers.toggle) {
-          selectionAnchorRef.current = entry.id
-          return prev.includes(entry.id)
-            ? prev.filter((id) => id !== entry.id)
-            : [...prev, entry.id]
-        }
-        selectionAnchorRef.current = entry.id
-        return [entry.id]
-      })
+      }
+      selectionAnchorRef.current = item.key
+      if (modifiers.toggle) {
+        const next = new Set(selectedKeys)
+        if (next.has(item.key)) next.delete(item.key)
+        else next.add(item.key)
+        applySelection([...next], new Map([[item.key, item]]))
+        return
+      }
+      applySelection([item.key], new Map([[item.key, item]]))
     },
-    [],
+    [list, selectedKeys, applySelection],
   )
 
-  const selectAll = useCallback((orderedEntries: FileEntry[]) => {
-    setSelectedIds(orderedEntries.map((item) => item.id))
+  /** Select-all semantics this iteration: all *loaded* items. */
+  const selectAll = useCallback(() => {
+    applySelection(list.loadedKeys())
+  }, [list, applySelection])
+
+  // Resolve a pending "reveal" once the destination listing is ready.
+  useEffect(() => {
+    const target = pendingRevealRef.current
+    if (!target || list.status !== 'ready') return
+    pendingRevealRef.current = null
+    for (const key of list.loadedKeys()) {
+      const item = list.loadedItemByKey(key)
+      if (item && item.entry.path === target) {
+        applySelection([key])
+        return
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, list.status, list.snapshot])
+
+  const updateTab = useCallback((tabId: string, next: Partial<BrowserTab>) => {
+    setTabs((prev) => prev.map((tab) => (tab.id === tabId ? { ...tab, ...next } : tab)))
   }, [])
 
-  const updateTab = useCallback(
-    (tabId: string, next: Partial<BrowserTab>) => {
-      setTabs((prev) => prev.map((tab) => (tab.id === tabId ? { ...tab, ...next } : tab)))
-    },
-    [],
-  )
+  // Refine the provisional tab title once the reader's meta is known
+  // (collection/view titles aren't derivable from the url).
+  useEffect(() => {
+    const title = list.meta?.title
+    if (activeTab && title && activeTab.title !== title) {
+      updateTab(activeTab.id, { title })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, list.snapshot])
 
-  const pushHistory = useCallback((tabId: string, path: string) => {
+  const pushHistory = useCallback((tabId: string, url: string) => {
     setHistory((prev) => {
       const curr = prev[tabId] ?? { back: [], forward: [] }
       return {
         ...prev,
-        [tabId]: { back: [...curr.back, path], forward: [] },
+        [tabId]: { back: [...curr.back, url], forward: [] },
       }
     })
   }, [])
 
   const navigate = useCallback(
-    (path: string, options?: { suppressHistory?: boolean }) => {
+    (input: string, options?: { suppressHistory?: boolean }) => {
       if (!activeTab) return
-      if (path === currentPath) return
-      if (!options?.suppressHistory) pushHistory(activeTab.id, currentPath)
-      const title = path.split('/').filter(Boolean).pop() ?? 'root'
-      updateTab(activeTab.id, { path, title })
+      const url = normalizeUrl(input)
+      if (url === currentUrl) return
+      if (!options?.suppressHistory) pushHistory(activeTab.id, currentUrl)
+      updateTab(activeTab.id, { path: url, title: fallbackTitle(url) })
       clearSelection()
     },
-    [activeTab, currentPath, pushHistory, updateTab],
+    [activeTab, currentUrl, pushHistory, updateTab, clearSelection],
+  )
+
+  /** Navigate to the parent of `originalPath` and select the item once loaded. */
+  const revealOriginal = useCallback(
+    (originalPath: string) => {
+      const parent = originalPath.split('/').slice(0, -1).join('/') || '/'
+      pendingRevealRef.current = originalPath
+      navigate(parent)
+    },
+    [navigate],
   )
 
   const back = () => {
@@ -183,11 +246,10 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
       ...prev,
       [activeTab.id]: {
         back: hist.back.slice(0, -1),
-        forward: [currentPath, ...hist.forward],
+        forward: [currentUrl, ...hist.forward],
       },
     }))
-    const title = previous.split('/').filter(Boolean).pop() ?? 'root'
-    updateTab(activeTab.id, { path: previous, title })
+    updateTab(activeTab.id, { path: previous, title: fallbackTitle(previous) })
     clearSelection()
   }
 
@@ -199,28 +261,31 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     setHistory((prev) => ({
       ...prev,
       [activeTab.id]: {
-        back: [...hist.back, currentPath],
+        back: [...hist.back, currentUrl],
         forward: hist.forward.slice(1),
       },
     }))
-    const title = next.split('/').filter(Boolean).pop() ?? 'root'
-    updateTab(activeTab.id, { path: next, title })
+    updateTab(activeTab.id, { path: next, title: fallbackTitle(next) })
     clearSelection()
   }
 
   const goUp = () => {
-    const parent = currentPath.split('/').slice(0, -1).join('/') || '/'
-    if (parent !== currentPath) navigate(parent)
+    const up = parentUrl(currentUrl)
+    if (up) navigate(up)
   }
 
   /** Append a tab (optionally with its history) and make it active. */
-  const adoptTab = useCallback((tab: BrowserTab, tabHistory?: HistoryState) => {
-    setTabs((prev) => [...prev, tab])
-    setHistory((prev) => ({ ...prev, [tab.id]: tabHistory ?? { back: [], forward: [] } }))
-    setActiveTabId(tab.id)
-    clearSelection()
-    setSearchQuery('')
-  }, [])
+  const adoptTab = useCallback(
+    (tab: BrowserTab, tabHistory?: HistoryState) => {
+      const normalized = { ...tab, path: normalizeUrl(tab.path) }
+      setTabs((prev) => [...prev, normalized])
+      setHistory((prev) => ({ ...prev, [tab.id]: tabHistory ?? { back: [], forward: [] } }))
+      setActiveTabId(tab.id)
+      clearSelection()
+      setSearchQuery('')
+    },
+    [clearSelection],
+  )
 
   /** Remove a tab and hand back its data so it can be moved or remembered. */
   const detachTab = useCallback(
@@ -247,7 +312,7 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
       }
       return { tab, history: tabHistory }
     },
-    [tabs, history, activeTabId],
+    [tabs, history, activeTabId, clearSelection],
   )
 
   return {
@@ -255,22 +320,25 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     activeTabId,
     setActiveTabId,
     activeTab,
-    currentPath,
+    currentUrl,
     activeHistory,
+    list,
     viewMode,
     setViewMode,
     sortKey,
     setSortKey,
     sortDir,
     setSortDir,
-    selectedIds,
-    setSelectedIds,
-    selectEntry,
+    selectedKeys,
+    selectedItemsMap,
+    applySelection,
+    selectItem,
     selectAll,
     clearSelection,
     searchQuery,
     setSearchQuery,
     navigate,
+    revealOriginal,
     back,
     forward,
     goUp,
@@ -301,6 +369,10 @@ export function FileBrowserView() {
   const [clipboard, setClipboard] = useState<{ entries: FileEntry[]; mode: 'cut' | 'copy' } | null>(
     null,
   )
+
+  // Live collection list (sidebar + "Add to Collection" submenu).
+  useSyncExternalStore(collectionStore.subscribeList, collectionStore.listSnapshot)
+  const collections = collectionStore.list()
 
   // Mobile-only panel states
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -360,34 +432,17 @@ export function FileBrowserView() {
     }
   }
 
-  const leftEntries = useMemo(
-    () => sortEntries(entriesForPath(left.currentPath), left.sortKey, left.sortDir),
-    [left.currentPath, left.sortKey, left.sortDir],
+  const leftSelectedItems = useMemo(
+    () => [...left.selectedItemsMap.values()],
+    [left.selectedItemsMap],
   )
-  const rightEntries = useMemo(
-    () => sortEntries(entriesForPath(right.currentPath), right.sortKey, right.sortDir),
-    [right.currentPath, right.sortKey, right.sortDir],
-  )
-  const leftTopic = topicForPath(left.currentPath)
-  const rightTopic = topicForPath(right.currentPath)
-
-  const leftSelectedEntries = useMemo(
-    () =>
-      left.selectedIds
-        .map((id) => fileBrowserSnapshot.entriesById[id])
-        .filter((entry): entry is FileEntry => !!entry),
-    [left.selectedIds],
-  )
-  const rightSelectedEntries = useMemo(
-    () =>
-      right.selectedIds
-        .map((id) => fileBrowserSnapshot.entriesById[id])
-        .filter((entry): entry is FileEntry => !!entry),
-    [right.selectedIds],
+  const rightSelectedItems = useMemo(
+    () => [...right.selectedItemsMap.values()],
+    [right.selectedItemsMap],
   )
   // The preview panel & detail status only make sense for a single selection.
-  const leftSelectedEntry = leftSelectedEntries.length === 1 ? leftSelectedEntries[0] : null
-  const rightSelectedEntry = rightSelectedEntries.length === 1 ? rightSelectedEntries[0] : null
+  const leftSelectedItem = leftSelectedItems.length === 1 ? leftSelectedItems[0] : null
+  const rightSelectedItem = rightSelectedItems.length === 1 ? rightSelectedItems[0] : null
 
   const leftSearchHits = useMemo(
     () => (left.searchQuery.trim() ? searchFiles(left.searchQuery) : []),
@@ -398,25 +453,57 @@ export function FileBrowserView() {
     [right.searchQuery],
   )
 
-  const selectTopicInPane = (pane: BrowserPane, topicId: string) => {
-    if (!pane.activeTab) return
-    const topic = fileBrowserSnapshot.topics.find((item) => item.id === topicId)
-    pane.updateTab(pane.activeTab.id, {
-      title: topic?.title ?? 'Topic',
-      path: `${TOPIC_SCHEME}${topicId}`,
-    })
-    pane.clearSelection()
-    pane.setSearchQuery('')
-  }
-
-  const handleOpenEntry = (entry: FileEntry) => {
-    left.setSelectedIds([entry.id])
+  const handleOpenEntry = (item: FileItem) => {
+    left.applySelection([item.key], new Map([[item.key, item]]))
     if (isMobile) setMobilePreviewOpen(true)
   }
 
-  const handleOpenFolder = (path: string) => {
-    left.navigate(path)
+  const handleOpenFolder = (url: string) => {
+    left.navigate(url)
     setMobileSidebarOpen(false)
+  }
+
+  // ─── Collection mutations go through the reader interface (future RPC shape) ───
+
+  const withCollection = async (
+    url: string,
+    fn: (reader: NonNullable<ReturnType<typeof asCollectionReader>>) => Promise<void>,
+  ) => {
+    const reader = resolveReader(url)
+    const collection = asCollectionReader(reader)
+    if (!collection) {
+      reader.dispose()
+      return
+    }
+    try {
+      await fn(collection)
+    } finally {
+      reader.dispose()
+    }
+  }
+
+  const addEntriesToCollection = async (collectionId: string, entries: FileEntry[]) => {
+    const targets = entries.map((entry) => normalizeUrl(entry.path))
+    if (!targets.length) return
+    await withCollection(collectionUrl(collectionId), (reader) =>
+      reader.addReferences(targets),
+    )
+    const title = collectionStore.get(collectionId)?.title ?? collectionId
+    showToast(
+      t('filebrowser.toast.addedToCollection', 'Added {{count}} reference(s) to {{title}}', {
+        count: targets.length,
+        title,
+      }),
+    )
+  }
+
+  const promptNewCollection = (): string | null => {
+    const name = window.prompt(
+      t('filebrowser.prompt.newCollection', 'Name for the new collection:'),
+      '',
+    )
+    if (!name?.trim()) return null
+    return collectionStore.create(name.trim())
   }
 
   // ─── Context menu (desktop) ───
@@ -426,6 +513,8 @@ export function FileBrowserView() {
     const targets: { label: string; path: string }[] = []
     const visit = (nodes: DfsNode[], depth: number) => {
       for (const node of nodes) {
+        // Only real storage destinations qualify (the Shared root is a collection now).
+        if (!node.path.startsWith('/')) continue
         targets.push({ label: node.path, path: node.path })
         if (node.children && depth < 1) visit(node.children, depth + 1)
       }
@@ -442,8 +531,6 @@ export function FileBrowserView() {
   } | null>(null)
 
   const paneFor = (side: 'left' | 'right') => (side === 'right' ? right : left)
-  const paneEntriesFor = (side: 'left' | 'right') =>
-    side === 'right' ? rightEntries : leftEntries
 
   // ─── Toolbar (desktop) ───
 
@@ -461,29 +548,65 @@ export function FileBrowserView() {
     )
   }
 
-  const pasteInto = (path: string) => {
+  const pasteInto = (pane: BrowserPane) => {
     if (!clipboard) return
+    const capabilities = pane.list.capabilities
+    if (capabilities.acceptsReferences) {
+      // Pasting into a collection builds references — no storage is touched.
+      const collection = parseCollectionUrl(pane.currentUrl)
+      if (collection) void addEntriesToCollection(collection.collectionId, clipboard.entries)
+      if (clipboard.mode === 'cut') setClipboard(null)
+      return
+    }
+    if (!capabilities.acceptsContent) return
     showToast(
       t('filebrowser.toast.paste', 'Pasted {{count}} item(s) to {{target}} (mock)', {
         count: clipboard.entries.length,
-        target: path,
+        target: displayPath(pane.currentUrl),
       }),
     )
     if (clipboard.mode === 'cut') setClipboard(null)
   }
 
+  const removeFromCollection = async (pane: BrowserPane, keys: string[]) => {
+    if (!keys.length) return
+    await withCollection(pane.currentUrl, (reader) => reader.removeItems(keys))
+    pane.clearSelection()
+    showToast(
+      t('filebrowser.toast.removedRefs', 'Removed {{count}} reference(s)', {
+        count: keys.length,
+      }),
+    )
+  }
+
+  const moveItems = async (pane: BrowserPane, items: FileItem[], delta: -1 | 1) => {
+    const withRef = items.filter((item) => item.ref)
+    if (!withRef.length) return
+    const minIndex = Math.min(...withRef.map((item) => item.ref!.orderIndex))
+    const toIndex = delta === -1 ? minIndex - 1 : minIndex + 1
+    await withCollection(pane.currentUrl, (reader) =>
+      reader.reorder(
+        withRef.map((item) => item.key),
+        Math.max(0, toIndex),
+      ),
+    )
+  }
+
   /** Everything the TopBar toolbar row needs, resolved per pane. */
   const toolbarPropsFor = (side: 'left' | 'right') => {
     const pane = paneFor(side)
-    const selected = side === 'right' ? rightSelectedEntries : leftSelectedEntries
-    const topic = side === 'right' ? rightTopic : leftTopic
+    const selected = (side === 'right' ? rightSelectedItems : leftSelectedItems).map(
+      (item) => item.entry,
+    )
+    const selectedKeys = [...(side === 'right' ? right : left).selectedKeys]
+    const capabilities = pane.list.capabilities
     return {
       selectedCount: selected.length,
-      canOrganize: !topic,
+      capabilities,
       canPaste: !!clipboard,
       onCut: () => cutEntries(selected),
       onCopy: () => copyEntries(selected),
-      onPaste: () => pasteInto(pane.currentPath),
+      onPaste: () => pasteInto(pane),
       onRename: () =>
         showToast(
           t('filebrowser.toast.rename', 'Rename "{{name}}" (mock)', {
@@ -491,6 +614,10 @@ export function FileBrowserView() {
           }),
         ),
       onDelete: () => {
+        if (capabilities.removal === 'remove-ref') {
+          void removeFromCollection(pane, selectedKeys)
+          return
+        }
         showToast(
           t('filebrowser.toast.delete', 'Deleted {{count}} item(s) (mock)', {
             count: selected.length,
@@ -520,24 +647,32 @@ export function FileBrowserView() {
     }
   }
 
-  const openMenu = (side: 'left' | 'right', position: MenuPosition, entry?: FileEntry) => {
+  const openMenu = (side: 'left' | 'right', position: MenuPosition, item?: FileItem) => {
     const pane = paneFor(side)
-    const paneEntries = paneEntriesFor(side)
-    let selected: FileEntry[] = []
-    if (entry) {
-      // Right-clicking outside the current selection re-anchors it to the entry.
-      const ids = pane.selectedIds.includes(entry.id) ? pane.selectedIds : [entry.id]
-      if (!pane.selectedIds.includes(entry.id)) pane.setSelectedIds([entry.id])
-      selected = paneEntries.filter((item) => ids.includes(item.id))
+    let items: FileItem[] = []
+    if (item) {
+      if (pane.selectedKeys.has(item.key)) {
+        items = [...pane.selectedItemsMap.values()]
+      } else {
+        // Right-clicking outside the current selection re-anchors it to the item.
+        pane.applySelection([item.key], new Map([[item.key, item]]))
+        items = [item]
+      }
     }
     const context: FileMenuContext = {
-      target: entry ? (selected.length > 1 ? 'selection' : 'item') : 'view',
-      entries: selected,
-      currentPath: pane.currentPath,
+      target: item ? (items.length > 1 ? 'selection' : 'item') : 'view',
+      items,
+      entries: items.map((entry) => entry.entry),
+      currentUrl: pane.currentUrl,
       viewMode: pane.viewMode,
-      topic: side === 'right' ? rightTopic : leftTopic,
+      capabilities: pane.list.capabilities,
+      sortKey: pane.sortKey,
+      collections: collections.map((collection) => ({
+        id: collection.id,
+        title: collection.title,
+      })),
       moveTargets,
-      capabilities: {
+      pane: {
         canOpenInNewTab: true,
         canOpenInRightPane: side === 'left',
       },
@@ -554,46 +689,113 @@ export function FileBrowserView() {
     if (!contextMenu) return
     const { side, context } = contextMenu
     const pane = paneFor(side)
+    const items = context.items
+    const first = items[0]
     const entries = context.entries
-    const first = entries[0]
     const count = entries.length
     switch (action.command) {
       case 'open':
         if (!first) break
-        if (first.kind === 'folder') {
-          pane.navigate(first.path)
+        if (first.entry.kind === 'folder') {
+          // Group entries carry collection:// paths; folder refs carry their
+          // original dfs path — navigation normalizes both.
+          pane.navigate(first.entry.path)
         } else {
-          pane.setSelectedIds([first.id])
+          pane.applySelection([first.key], new Map([[first.key, first]]))
           setPreviewCollapsed(false)
         }
         break
       case 'open-new-tab':
-        if (first?.kind === 'folder') {
-          pane.adoptTab({ id: `tab-${Date.now()}`, title: first.name, path: first.path })
+        if (first?.entry.kind === 'folder') {
+          pane.adoptTab({
+            id: `tab-${Date.now()}`,
+            title: first.entry.name,
+            path: first.entry.path,
+          })
         }
         break
       case 'open-right':
-        if (first?.kind === 'folder') {
-          right.adoptTab({ id: `tab-${Date.now()}`, title: first.name, path: first.path })
+        if (first?.entry.kind === 'folder') {
+          right.adoptTab({
+            id: `tab-${Date.now()}`,
+            title: first.entry.name,
+            path: first.entry.path,
+          })
           setFocusedSide('right')
         }
         break
       case 'copy-path':
-        copyText(entries.length ? entries.map((item) => item.path).join('\n') : context.currentPath)
+        copyText(
+          entries.length
+            ? entries.map((item) => item.path).join('\n')
+            : displayPath(context.currentUrl),
+        )
+        break
+      case 'copy-ref-path':
+        if (first?.ref) copyText(first.ref.refPath)
         break
       case 'copy-public-url':
-        if (first?.publicUrl) copyText(first.publicUrl)
+        if (first?.entry.publicUrl) copyText(first.entry.publicUrl)
         break
+      case 'jump-to-original': {
+        if (!first) break
+        const original = first.entry.link
+          ? displayPath(first.entry.link.targetUrl)
+          : first.entry.path
+        pane.revealOriginal(original)
+        break
+      }
+      case 'add-to-collection': {
+        const collectionId = String(action.args?.collectionId ?? '')
+        if (collectionId) void addEntriesToCollection(collectionId, entries)
+        break
+      }
+      case 'new-collection': {
+        const id = promptNewCollection()
+        if (id && entries.length) void addEntriesToCollection(id, entries)
+        break
+      }
+      case 'remove-from-collection':
+      case 'remove-broken':
+        void removeFromCollection(
+          pane,
+          items.map((item) => item.key),
+        )
+        break
+      case 'move-item-up':
+        void moveItems(pane, items, -1)
+        break
+      case 'move-item-down':
+        void moveItems(pane, items, 1)
+        break
+      case 'new-group': {
+        const name = window.prompt(
+          t('filebrowser.prompt.newGroup', 'Name for the new group:'),
+          '',
+        )
+        if (name?.trim()) {
+          void withCollection(pane.currentUrl, (reader) => reader.createGroup(name.trim()))
+        }
+        break
+      }
       case 'download':
         showToast(
           t('filebrowser.toast.download', 'Downloading {{count}} item(s) (mock)', { count }),
         )
         break
       case 'share':
-        showToast(t('filebrowser.toast.share', 'Share "{{name}}" (mock)', { name: first?.name ?? '' }))
+        showToast(
+          t('filebrowser.toast.share', 'Share "{{name}}" (mock)', {
+            name: first?.entry.name ?? '',
+          }),
+        )
         break
       case 'rename':
-        showToast(t('filebrowser.toast.rename', 'Rename "{{name}}" (mock)', { name: first?.name ?? '' }))
+        showToast(
+          t('filebrowser.toast.rename', 'Rename "{{name}}" (mock)', {
+            name: first?.entry.name ?? '',
+          }),
+        )
         break
       case 'move-to':
         showToast(
@@ -614,10 +816,10 @@ export function FileBrowserView() {
         showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)
         break
       case 'refresh':
-        showToast(t('filebrowser.toast.refresh', 'Refreshed (mock)'))
+        pane.list.reload()
         break
       case 'select-all':
-        pane.selectAll(paneEntriesFor(side))
+        pane.selectAll()
         break
       case 'view-list':
         pane.setViewMode('list')
@@ -630,18 +832,23 @@ export function FileBrowserView() {
     }
   }
 
+  const handleCreateCollection = () => {
+    const id = promptNewCollection()
+    if (id) left.navigate(collectionUrl(id))
+  }
+
   const leftSearchActive = !!left.searchQuery.trim()
   const rightSearchActive = !!right.searchQuery.trim()
 
-  const focusedSelectedEntry = focusedIsRight ? rightSelectedEntry : leftSelectedEntry
+  const focusedSelectedItem = focusedIsRight ? rightSelectedItem : leftSelectedItem
 
-  const mobileTitleText = leftSelectedEntry?.name ?? left.activeTab?.title ?? 'root'
+  const mobileTitleText = leftSelectedItem?.entry.name ?? left.activeTab?.title ?? 'root'
   const mobileSubtitleText =
-    leftSelectedEntry?.summary ??
-    leftTopic?.description ??
-    (left.currentPath === '/'
+    leftSelectedItem?.entry.summary ??
+    left.list.meta?.description ??
+    (displayPath(left.currentUrl) === '/'
       ? t('filebrowser.mobile.rootHint', 'Root directory')
-      : left.currentPath)
+      : displayPath(left.currentUrl))
 
   const mobileTitleOverride = useMemo(
     () => (isMobile ? { title: mobileTitleText, subtitle: mobileSubtitleText } : null),
@@ -654,15 +861,7 @@ export function FileBrowserView() {
 
   // ─── Mobile layout ───
   if (isMobile) {
-    const segments = left.currentPath.split('/').filter(Boolean)
-    const crumbs: { label: string; path: string }[] = [{ label: 'root', path: '/' }]
-    {
-      let running = ''
-      for (const segment of segments) {
-        running += `/${segment}`
-        crumbs.push({ label: segment, path: running })
-      }
-    }
+    const crumbs = crumbsForUrl(left.currentUrl, left.list.meta?.title)
 
     return (
       <div className="relative flex h-full w-full flex-col overflow-hidden" style={{ background: 'var(--cp-bg)' }}>
@@ -732,14 +931,14 @@ export function FileBrowserView() {
         <div className="flex items-center gap-2 px-3 pb-2 pt-1">
           <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto text-[13px] text-[color:var(--cp-muted)]">
             {crumbs.map((crumb, idx) => (
-              <div key={crumb.path} className="flex shrink-0 items-center gap-1">
+              <div key={crumb.url} className="flex shrink-0 items-center gap-1">
                 <button
                   type="button"
                   className={clsx(
                     'truncate rounded-md px-1.5 py-1',
                     idx === crumbs.length - 1 && 'font-semibold text-[color:var(--cp-text)]',
                   )}
-                  onClick={() => left.navigate(crumb.path)}
+                  onClick={() => left.navigate(crumb.url)}
                 >
                   {crumb.label}
                 </button>
@@ -751,7 +950,7 @@ export function FileBrowserView() {
           </div>
           <button
             type="button"
-            onClick={() => left.navigate(left.currentPath)}
+            onClick={() => left.list.reload()}
             aria-label={t('filebrowser.topbar.refresh', 'Refresh')}
             className="shrink-0 p-1 text-[color:var(--cp-muted)] hover:text-[color:var(--cp-text)]"
           >
@@ -764,17 +963,16 @@ export function FileBrowserView() {
             <SearchResultsPanel
               hits={leftSearchHits}
               query={left.searchQuery}
-              onSelect={handleOpenEntry}
+              onSelect={(entry) => handleOpenEntry(itemOf(entry))}
             />
           ) : (
             <MainContent
-              entries={leftEntries}
+              list={left.list}
               viewMode={left.viewMode}
-              selectedIds={left.selectedIds}
+              selectedKeys={left.selectedKeys}
               onSelect={handleOpenEntry}
               onOpenFolder={handleOpenFolder}
-              currentPath={left.currentPath}
-              topicContext={leftTopic}
+              currentUrl={left.currentUrl}
               isMobile
             />
           )}
@@ -870,12 +1068,13 @@ export function FileBrowserView() {
                 dfsRoots={fileBrowserSnapshot.dfsRoots}
                 devices={fileBrowserSnapshot.devices}
                 topics={fileBrowserSnapshot.topics}
-                activePath={left.currentPath}
-                activeTopicId={leftTopic?.id ?? null}
+                collections={collections}
+                activeUrl={left.currentUrl}
                 advancedMode={advancedMode}
                 onToggleAdvanced={setAdvancedMode}
                 onNavigate={left.navigate}
-                onSelectTopic={(id) => selectTopicInPane(left, id)}
+                onCreateCollection={handleCreateCollection}
+                onAfterNavigate={() => setMobileSidebarOpen(false)}
                 compact
               />
             </div>
@@ -883,7 +1082,7 @@ export function FileBrowserView() {
         ) : null}
 
         {/* Preview bottom sheet */}
-        {mobilePreviewOpen && leftSelectedEntry ? (
+        {mobilePreviewOpen && leftSelectedItem ? (
           <div className="absolute inset-0 z-30 flex items-end">
             <div
               className="absolute inset-0 bg-black/40"
@@ -907,10 +1106,10 @@ export function FileBrowserView() {
               </div>
               <div className="flex-1 overflow-hidden">
                 <PreviewPanel
-                  entry={leftSelectedEntry}
+                  item={leftSelectedItem}
                   topics={fileBrowserSnapshot.topics}
                   onJumpToTopic={(id) => {
-                    selectTopicInPane(left, id)
+                    left.navigate(`view://topic/${id}`)
                     setMobilePreviewOpen(false)
                   }}
                   onJumpToPath={(path) => {
@@ -949,12 +1148,12 @@ export function FileBrowserView() {
           dfsRoots={fileBrowserSnapshot.dfsRoots}
           devices={fileBrowserSnapshot.devices}
           topics={fileBrowserSnapshot.topics}
-          activePath={left.currentPath}
-          activeTopicId={leftTopic?.id ?? null}
+          collections={collections}
+          activeUrl={left.currentUrl}
           advancedMode={advancedMode}
           onToggleAdvanced={setAdvancedMode}
           onNavigate={left.navigate}
-          onSelectTopic={(id) => selectTopicInPane(left, id)}
+          onCreateCollection={handleCreateCollection}
         />
       </aside>
 
@@ -970,19 +1169,20 @@ export function FileBrowserView() {
           onNewTab={handleNewTab}
           closedTabs={closedTabs}
           onRestoreClosedTab={handleRestoreClosedTab}
-          currentPath={left.currentPath}
+          currentPath={left.currentUrl}
+          locationTitle={left.list.meta?.title}
           onNavigate={left.navigate}
           onBack={left.back}
           onForward={left.forward}
           onUp={left.goUp}
           canBack={left.activeHistory.back.length > 0}
           canForward={left.activeHistory.forward.length > 0}
-          canUp={left.currentPath !== '/'}
+          canUp={parentUrl(left.currentUrl) !== null}
           viewMode={left.viewMode}
           onViewModeChange={left.setViewMode}
           searchQuery={left.searchQuery}
           onSearchChange={left.setSearchQuery}
-          onCopyPath={() => copyText(left.currentPath)}
+          onCopyPath={() => copyText(displayPath(left.currentUrl))}
           onSendTabToRight={handleSendToRight}
           canSendToRight={left.tabs.length > 1}
           {...toolbarPropsFor('left')}
@@ -992,27 +1192,26 @@ export function FileBrowserView() {
             <SearchResultsPanel
               hits={leftSearchHits}
               query={left.searchQuery}
-              onSelect={handleOpenEntry}
+              onSelect={(entry) => handleOpenEntry(itemOf(entry))}
             />
           ) : (
             <MainContent
-              entries={leftEntries}
+              list={left.list}
               viewMode={left.viewMode}
-              selectedIds={left.selectedIds}
-              onSelect={(entry, modifiers) => left.selectEntry(entry, modifiers, leftEntries)}
+              selectedKeys={left.selectedKeys}
+              onSelect={(item, modifiers) => left.selectItem(item, modifiers)}
               onOpenFolder={handleOpenFolder}
-              onItemContextMenu={(entry, position) => openMenu('left', position, entry)}
+              onItemContextMenu={(item, position) => openMenu('left', position, item)}
               onViewContextMenu={(position) => openMenu('left', position)}
               onClearSelection={left.clearSelection}
-              currentPath={left.currentPath}
-              topicContext={leftTopic}
+              currentUrl={left.currentUrl}
             />
           )}
         </div>
         <StatusBar
-          currentPath={left.currentPath}
-          totalCount={leftEntries.length}
-          selectedEntries={leftSelectedEntries}
+          currentUrl={left.currentUrl}
+          totalCount={left.list.totalCount}
+          selectedItems={leftSelectedItems}
           onCopy={copyText}
           onExpandSidebar={
             !splitActive && previewCollapsed && isXl
@@ -1034,19 +1233,20 @@ export function FileBrowserView() {
             onCloseTab={handleCloseRightTab}
             showTabControls={false}
             allowCloseLast
-            currentPath={right.currentPath}
+            currentPath={right.currentUrl}
+            locationTitle={right.list.meta?.title}
             onNavigate={right.navigate}
             onBack={right.back}
             onForward={right.forward}
             onUp={right.goUp}
             canBack={right.activeHistory.back.length > 0}
             canForward={right.activeHistory.forward.length > 0}
-            canUp={right.currentPath !== '/'}
+            canUp={parentUrl(right.currentUrl) !== null}
             viewMode={right.viewMode}
             onViewModeChange={right.setViewMode}
             searchQuery={right.searchQuery}
             onSearchChange={right.setSearchQuery}
-            onCopyPath={() => copyText(right.currentPath)}
+            onCopyPath={() => copyText(displayPath(right.currentUrl))}
             {...toolbarPropsFor('right')}
           />
           <div className="min-h-0 flex-1 overflow-hidden">
@@ -1054,27 +1254,28 @@ export function FileBrowserView() {
               <SearchResultsPanel
                 hits={rightSearchHits}
                 query={right.searchQuery}
-                onSelect={(entry) => right.setSelectedIds([entry.id])}
+                onSelect={(entry) =>
+                  right.applySelection([entry.id], new Map([[entry.id, itemOf(entry)]]))
+                }
               />
             ) : (
               <MainContent
-                entries={rightEntries}
+                list={right.list}
                 viewMode={right.viewMode}
-                selectedIds={right.selectedIds}
-                onSelect={(entry, modifiers) => right.selectEntry(entry, modifiers, rightEntries)}
-                onOpenFolder={(path) => right.navigate(path)}
-                onItemContextMenu={(entry, position) => openMenu('right', position, entry)}
+                selectedKeys={right.selectedKeys}
+                onSelect={(item, modifiers) => right.selectItem(item, modifiers)}
+                onOpenFolder={(url) => right.navigate(url)}
+                onItemContextMenu={(item, position) => openMenu('right', position, item)}
                 onViewContextMenu={(position) => openMenu('right', position)}
                 onClearSelection={right.clearSelection}
-                currentPath={right.currentPath}
-                topicContext={rightTopic}
+                currentUrl={right.currentUrl}
               />
             )}
           </div>
           <StatusBar
-            currentPath={right.currentPath}
-            totalCount={rightEntries.length}
-            selectedEntries={rightSelectedEntries}
+            currentUrl={right.currentUrl}
+            totalCount={right.list.totalCount}
+            selectedItems={rightSelectedItems}
             onCopy={copyText}
             onExpandSidebar={
               previewCollapsed && isXl ? () => setPreviewCollapsed(false) : undefined
@@ -1099,9 +1300,9 @@ export function FileBrowserView() {
           </div>
           <div className="flex-1 overflow-hidden">
             <PreviewPanel
-              entry={focusedSelectedEntry}
+              item={focusedSelectedItem}
               topics={fileBrowserSnapshot.topics}
-              onJumpToTopic={(id) => selectTopicInPane(focusedPane, id)}
+              onJumpToTopic={(id) => focusedPane.navigate(`view://topic/${id}`)}
               onJumpToPath={(path) => focusedPane.navigate(path)}
               embedded
             />

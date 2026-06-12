@@ -2,32 +2,39 @@ import clsx from 'clsx'
 import {
   ChevronDown,
   ChevronRight,
+  Clock,
   Cpu,
   FolderClosed,
   FolderOpen,
   Globe,
   Hash,
   HardDrive,
+  Library,
   Lock,
+  Plus,
   Share2,
   Sparkles,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useI18n } from '../../i18n/provider'
+import type { CollectionSummary } from './mock/collections'
+import { collectionUrl, normalizeUrl } from './data/urls'
 import type { DeviceNode, DfsNode, Topic } from './types'
 
-type Section = 'dfs' | 'devices' | 'topics'
+type Section = 'dfs' | 'devices' | 'views' | 'collections'
 
 interface SidebarProps {
   dfsRoots: DfsNode[]
   devices: DeviceNode[]
   topics: Topic[]
-  activePath: string
-  activeTopicId: string | null
+  collections: CollectionSummary[]
+  /** Canonical url of the active pane location. */
+  activeUrl: string
   advancedMode: boolean
   onToggleAdvanced: (value: boolean) => void
-  onNavigate: (path: string) => void
-  onSelectTopic: (topicId: string) => void
+  /** Accepts bare paths and canonical urls alike (normalized by the pane). */
+  onNavigate: (url: string) => void
+  onCreateCollection: () => void
   compact?: boolean
   onAfterNavigate?: () => void
 }
@@ -49,18 +56,19 @@ function nodeIcon(kind: DfsNode['kind']) {
 
 function DfsTreeNode({
   node,
-  activePath,
+  activeUrl,
   onNavigate,
   depth,
 }: {
   node: DfsNode
-  activePath: string
+  activeUrl: string
   onNavigate: (path: string) => void
   depth: number
 }) {
   const hasChildren = !!node.children?.length
-  const [expanded, setExpanded] = useState(depth < 1 || activePath.startsWith(node.path))
-  const active = activePath === node.path
+  const nodeUrl = normalizeUrl(node.path)
+  const [expanded, setExpanded] = useState(depth < 1 || activeUrl.startsWith(nodeUrl))
+  const active = activeUrl === nodeUrl
 
   return (
     <div>
@@ -96,7 +104,7 @@ function DfsTreeNode({
             <DfsTreeNode
               key={child.id}
               node={child}
-              activePath={activePath}
+              activeUrl={activeUrl}
               onNavigate={onNavigate}
               depth={depth + 1}
             />
@@ -111,10 +119,12 @@ function SectionHeader({
   icon,
   label,
   hint,
+  action,
 }: {
   icon: React.ReactNode
   label: string
   hint?: string
+  action?: React.ReactNode
 }) {
   return (
     <div className="flex items-center gap-2 px-2 pb-1.5 pt-3">
@@ -123,7 +133,44 @@ function SectionHeader({
       {hint ? (
         <span className="ml-auto text-[10px] text-[color:var(--cp-muted)]">{hint}</span>
       ) : null}
+      {action ? <span className={hint ? '' : 'ml-auto'}>{action}</span> : null}
     </div>
+  )
+}
+
+function navButton({
+  key,
+  icon,
+  label,
+  hint,
+  active,
+  onClick,
+}: {
+  key: string
+  icon: React.ReactNode
+  label: string
+  hint?: string
+  active: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      key={key}
+      type="button"
+      onClick={onClick}
+      className={clsx(
+        'flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-sm transition',
+        active
+          ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] text-[color:var(--cp-text)]'
+          : 'text-[color:var(--cp-muted)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,transparent)] hover:text-[color:var(--cp-text)]',
+      )}
+    >
+      {icon}
+      <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
+      {hint ? (
+        <span className="shrink-0 text-[11px] text-[color:var(--cp-muted)]">{hint}</span>
+      ) : null}
+    </button>
   )
 }
 
@@ -131,12 +178,12 @@ export function Sidebar({
   dfsRoots,
   devices,
   topics,
-  activePath,
-  activeTopicId,
+  collections,
+  activeUrl,
   advancedMode,
   onToggleAdvanced,
   onNavigate,
-  onSelectTopic,
+  onCreateCollection,
   compact = false,
   onAfterNavigate,
 }: SidebarProps) {
@@ -145,39 +192,65 @@ export function Sidebar({
 
   const sections: { id: Section; label: string; icon: React.ReactNode }[] = [
     { id: 'dfs', label: t('filebrowser.sidebar.dfs', 'DFS'), icon: <FolderOpen size={14} /> },
-    { id: 'topics', label: t('filebrowser.sidebar.topics', 'Topics'), icon: <Sparkles size={14} /> },
+    { id: 'views', label: t('filebrowser.sidebar.views', 'Views'), icon: <Sparkles size={14} /> },
+    {
+      id: 'collections',
+      label: t('filebrowser.sidebar.collections', 'Collections'),
+      icon: <Library size={14} />,
+    },
     { id: 'devices', label: t('filebrowser.sidebar.devices', 'Devices'), icon: <Cpu size={14} /> },
   ]
 
-  const goto = (path: string) => {
-    onNavigate(path)
+  const goto = (url: string) => {
+    onNavigate(url)
     onAfterNavigate?.()
   }
 
-  const renderTopics = (
+  // Views — recent + AI topics, all read-only query results.
+  const renderViews = (
     <div className="space-y-0.5">
-      {topics.map((topic) => (
-        <button
-          key={topic.id}
-          type="button"
-          onClick={() => {
-            onSelectTopic(topic.id)
-            onAfterNavigate?.()
-          }}
-          className={clsx(
-            'flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-sm transition',
-            activeTopicId === topic.id
-              ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] text-[color:var(--cp-text)]'
-              : 'text-[color:var(--cp-muted)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,transparent)] hover:text-[color:var(--cp-text)]',
-          )}
-        >
-          <Hash size={12} className="shrink-0 text-[color:var(--cp-accent)]" />
-          <span className="min-w-0 flex-1 truncate font-medium">{topic.title}</span>
-          <span className="shrink-0 text-[11px] text-[color:var(--cp-muted)]">
-            {topic.coverageCount}
-          </span>
-        </button>
-      ))}
+      {navButton({
+        key: 'view-recent',
+        icon: <Clock size={12} className="shrink-0 text-[color:var(--cp-accent)]" />,
+        label: t('filebrowser.sidebar.recent', 'Recent'),
+        active: activeUrl === 'view://recent',
+        onClick: () => goto('view://recent'),
+      })}
+      {topics.map((topic) =>
+        navButton({
+          key: topic.id,
+          icon: <Hash size={12} className="shrink-0 text-[color:var(--cp-accent)]" />,
+          label: topic.title,
+          hint: `${topic.coverageCount}`,
+          active: activeUrl === `view://topic/${topic.id}`,
+          onClick: () => goto(`view://topic/${topic.id}`),
+        }),
+      )}
+    </div>
+  )
+
+  const renderCollections = (
+    <div className="space-y-0.5">
+      {collections.map((collection) =>
+        navButton({
+          key: collection.id,
+          icon: <Library size={12} className="shrink-0 text-[color:var(--cp-accent)]" />,
+          label: collection.title,
+          hint: `${collection.refCount}`,
+          active: activeUrl.startsWith(collectionUrl(collection.id)),
+          onClick: () => goto(collectionUrl(collection.id)),
+        }),
+      )}
+      <button
+        type="button"
+        onClick={onCreateCollection}
+        className="flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-sm text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,transparent)] hover:text-[color:var(--cp-text)]"
+      >
+        <Plus size={12} className="shrink-0" />
+        <span className="min-w-0 flex-1 truncate">
+          {t('filebrowser.sidebar.newCollection', 'New collection…')}
+        </span>
+      </button>
     </div>
   )
 
@@ -245,14 +318,15 @@ export function Sidebar({
           <DfsTreeNode
             key={root.id}
             node={root}
-            activePath={activePath}
+            activeUrl={activeUrl}
             onNavigate={goto}
             depth={0}
           />
         ))}
       </div>
     ),
-    topics: renderTopics,
+    views: renderViews,
+    collections: renderCollections,
     devices: renderDevices,
   }
 
@@ -290,10 +364,17 @@ export function Sidebar({
       <div className="flex-1 space-y-1 overflow-y-auto pr-1">
         <SectionHeader
           icon={<Sparkles size={13} className="text-[color:var(--cp-accent)]" />}
-          label={t('filebrowser.sidebar.topics', 'AI Topics')}
+          label={t('filebrowser.sidebar.views', 'AI Topics')}
           hint={`${topics.length}`}
         />
-        {renderTopics}
+        {renderViews}
+
+        <SectionHeader
+          icon={<Library size={13} className="text-[color:var(--cp-accent)]" />}
+          label={t('filebrowser.sidebar.collections', 'Collections')}
+          hint={`${collections.length}`}
+        />
+        {renderCollections}
 
         <SectionHeader
           icon={<FolderOpen size={13} />}

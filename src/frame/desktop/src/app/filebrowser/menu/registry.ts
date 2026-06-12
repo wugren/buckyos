@@ -73,6 +73,7 @@ function action(
 const isItem = (ctx: FileMenuContext) => ctx.target === 'item'
 const isSelection = (ctx: FileMenuContext) => ctx.target === 'selection'
 const isView = (ctx: FileMenuContext) => ctx.target === 'view'
+const hasItems = (ctx: FileMenuContext) => isItem(ctx) || isSelection(ctx)
 
 /** Open / preview — single item only. */
 const openProvider: FileMenuProvider = {
@@ -86,14 +87,14 @@ const openProvider: FileMenuProvider = {
       const section: FileMenuSection = [
         action('open', label('open', 'Open'), { icon: 'open' }),
       ]
-      if (ctx.capabilities.canOpenInNewTab) {
+      if (ctx.pane.canOpenInNewTab) {
         section.push(
           action('open-new-tab', label('openNewTab', 'Open in new tab'), {
             icon: 'open-new-tab',
           }),
         )
       }
-      if (ctx.capabilities.canOpenInRightPane) {
+      if (ctx.pane.canOpenInRightPane) {
         section.push(
           action('open-right', label('openRight', 'Open in right pane'), {
             icon: 'open-right',
@@ -110,7 +111,7 @@ const openProvider: FileMenuProvider = {
 const transferProvider: FileMenuProvider = {
   id: 'default.transfer',
   order: 200,
-  when: (ctx) => isItem(ctx) || isSelection(ctx),
+  when: hasItems,
   build: (ctx) => {
     const section: FileMenuSection = []
     const count = ctx.entries.length
@@ -130,20 +131,34 @@ const transferProvider: FileMenuProvider = {
   },
 }
 
-/** Clipboard — copy paths / public URL. */
+/** Clipboard — copy paths / public URL; collection items expose both paths. */
 const clipboardProvider: FileMenuProvider = {
   id: 'default.clipboard',
   order: 300,
-  when: (ctx) => isItem(ctx) || isSelection(ctx),
+  when: hasItems,
   build: (ctx) => {
     const count = ctx.entries.length
+    const item = ctx.items[0]
     const section: FileMenuSection = [
       isSelection(ctx)
         ? action('copy-path', label('copyPaths', 'Copy {{count}} paths', { count }), {
             icon: 'copy',
           })
-        : action('copy-path', label('copyPath', 'Copy path'), { icon: 'copy' }),
+        : action(
+            'copy-path',
+            item?.ref
+              ? label('copyOriginalPath', 'Copy original path')
+              : label('copyPath', 'Copy path'),
+            { icon: 'copy' },
+          ),
     ]
+    if (isItem(ctx) && item?.ref) {
+      section.push(
+        action('copy-ref-path', label('copyCollectionPath', 'Copy collection path'), {
+          icon: 'copy',
+        }),
+      )
+    }
     if (isItem(ctx) && ctx.entries[0]?.publicUrl) {
       section.push(
         action('copy-public-url', label('copyPublicUrl', 'Copy public URL'), {
@@ -155,14 +170,11 @@ const clipboardProvider: FileMenuProvider = {
   },
 }
 
-/**
- * Rename / move — hidden inside topic views, where entries are aggregated
- * references rather than real children of the current folder.
- */
+/** Rename / move — storage reorganisation, folders only (real children). */
 const organizeProvider: FileMenuProvider = {
   id: 'default.organize',
   order: 400,
-  when: (ctx) => (isItem(ctx) || isSelection(ctx)) && !ctx.topic,
+  when: (ctx) => hasItems(ctx) && ctx.capabilities.acceptsContent,
   build: (ctx) => {
     const section: FileMenuSection = []
     if (isItem(ctx)) {
@@ -187,13 +199,114 @@ const organizeProvider: FileMenuProvider = {
   },
 }
 
-/** Destructive actions — last section; hidden inside topic views. */
+/**
+ * "Add to Collection ▸" — the core entry point for (AI-driven) organising.
+ * Available on any selection in folders and views; building references never
+ * moves or copies the underlying files.
+ */
+const addToCollectionProvider: FileMenuProvider = {
+  id: 'default.add-to-collection',
+  order: 450,
+  when: (ctx) => hasItems(ctx) && ctx.capabilities.kind !== 'collection',
+  build: (ctx) => [
+    [
+      {
+        type: 'submenu',
+        id: 'add-to-collection',
+        label: label('addToCollection', 'Add to Collection'),
+        icon: 'collection',
+        items: [
+          ...ctx.collections.map((collection) =>
+            action(
+              `add-to-collection:${collection.id}`,
+              { key: '', fallback: collection.title },
+              {
+                command: 'add-to-collection',
+                args: { collectionId: collection.id },
+                icon: 'collection',
+              },
+            ),
+          ),
+          action('new-collection', label('newCollection', 'New collection…'), {
+            icon: 'new-folder',
+          }),
+        ],
+      },
+    ],
+  ],
+}
+
+/** Collection member management — order, dangling refs. */
+const collectionMemberProvider: FileMenuProvider = {
+  id: 'default.collection-member',
+  order: 500,
+  when: (ctx) => hasItems(ctx) && ctx.capabilities.kind === 'collection',
+  build: (ctx) => {
+    const section: FileMenuSection = []
+    if (ctx.capabilities.canReorder && ctx.sortKey === 'manual') {
+      section.push(
+        action('move-item-up', label('moveUp', 'Move up'), { icon: 'move-up' }),
+        action('move-item-down', label('moveDown', 'Move down'), { icon: 'move-down' }),
+      )
+    }
+    if (ctx.items.some((item) => item.ref?.broken)) {
+      section.push(
+        action('remove-broken', label('removeBroken', 'Remove dangling reference'), {
+          icon: 'broken',
+          danger: true,
+        }),
+      )
+    }
+    return section.length ? [section] : []
+  },
+}
+
+/** Jump from a reference (collection member, view hit, folder link) to the original. */
+const jumpToOriginalProvider: FileMenuProvider = {
+  id: 'default.jump-original',
+  order: 550,
+  when: (ctx) =>
+    isItem(ctx) &&
+    !!(ctx.items[0]?.ref || ctx.entries[0]?.link || ctx.capabilities.kind === 'view') &&
+    !ctx.items[0]?.ref?.broken &&
+    !ctx.entries[0]?.link?.broken,
+  build: () => [
+    [
+      action('jump-to-original', label('jumpToOriginal', 'Jump to original location'), {
+        icon: 'jump',
+      }),
+    ],
+  ],
+}
+
+/**
+ * Destructive actions — last section. The wording follows the location's
+ * removal semantics: folders destroy data, collections only drop references
+ * (the original file is untouched), views offer nothing.
+ */
 const dangerProvider: FileMenuProvider = {
   id: 'default.danger',
   order: 900,
-  when: (ctx) => (isItem(ctx) || isSelection(ctx)) && !ctx.topic,
+  when: (ctx) => hasItems(ctx) && ctx.capabilities.removal !== null,
   build: (ctx) => {
     const count = ctx.entries.length
+    if (ctx.capabilities.removal === 'remove-ref') {
+      return [
+        [
+          isSelection(ctx)
+            ? action(
+                'remove-from-collection',
+                label('removeFromCollectionN', 'Remove {{count}} from collection', { count }),
+                { icon: 'remove-ref', danger: true },
+              )
+            : action(
+                'remove-from-collection',
+                label('removeFromCollection', 'Remove from collection'),
+                { icon: 'remove-ref', danger: true },
+              ),
+        ],
+      ]
+    }
     return [
       [
         isSelection(ctx)
@@ -207,16 +320,26 @@ const dangerProvider: FileMenuProvider = {
   },
 }
 
-/** Blank-area: create — hidden inside topic views (aggregated, not a folder). */
+/** Blank-area: create — only where content can actually be stored. */
 const viewCreateProvider: FileMenuProvider = {
   id: 'default.view-create',
   order: 100,
-  when: (ctx) => isView(ctx) && !ctx.topic,
+  when: (ctx) => isView(ctx) && ctx.capabilities.acceptsContent,
   build: () => [
     [
       action('new-folder', label('newFolder', 'New folder'), { icon: 'new-folder' }),
       action('upload', label('upload', 'Upload…'), { icon: 'upload' }),
     ],
+  ],
+}
+
+/** Blank-area inside a collection: structure management. */
+const collectionViewProvider: FileMenuProvider = {
+  id: 'default.collection-view',
+  order: 100,
+  when: (ctx) => isView(ctx) && ctx.capabilities.kind === 'collection',
+  build: () => [
+    [action('new-group', label('newGroup', 'New group…'), { icon: 'new-folder' })],
   ],
 }
 
@@ -259,8 +382,12 @@ export function createDefaultFileMenuRegistry(): FileMenuRegistry {
   registry.register(transferProvider)
   registry.register(clipboardProvider)
   registry.register(organizeProvider)
+  registry.register(addToCollectionProvider)
+  registry.register(collectionMemberProvider)
+  registry.register(jumpToOriginalProvider)
   registry.register(dangerProvider)
   registry.register(viewCreateProvider)
+  registry.register(collectionViewProvider)
   registry.register(viewDisplayProvider)
   registry.register(viewSelectProvider)
   return registry

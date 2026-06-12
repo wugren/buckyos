@@ -1,56 +1,34 @@
 import clsx from 'clsx'
-import {
-  Archive,
-  Code,
-  FileAudio,
-  FileText,
-  FileVideo,
-  FolderClosed,
-  Image as ImageIcon,
-  Sparkles,
-  Upload,
-  Wand2,
-} from 'lucide-react'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { CornerUpRight, FolderClosed, Library, Sparkles, Upload, Wand2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import { useI18n } from '../../i18n/provider'
-import type { FileEntry, Topic, ViewMode } from './types'
+import type { FileItemList } from './data/FileItemList'
+import type { FileItem } from './data/FolderReader'
+import { COLLECTION_SCHEME, displayPath } from './data/urls'
+import { formatBytes, formatDate, kindIcon } from './fileDisplay'
+import type { ViewMode } from './types'
 
-function kindIcon(kind: FileEntry['kind'], size = 18) {
-  switch (kind) {
-    case 'folder':
-      return <FolderClosed size={size} className="text-[color:var(--cp-accent)]" />
-    case 'image':
-      return <ImageIcon size={size} className="text-[color:var(--cp-success)]" />
-    case 'video':
-      return <FileVideo size={size} className="text-[color:var(--cp-warning)]" />
-    case 'audio':
-      return <FileAudio size={size} className="text-[color:var(--cp-warning)]" />
-    case 'archive':
-      return <Archive size={size} className="text-[color:var(--cp-muted)]" />
-    case 'code':
-      return <Code size={size} className="text-[color:var(--cp-accent)]" />
-    default:
-      return <FileText size={size} className="text-[color:var(--cp-muted)]" />
-  }
+/** A list item is a reference when it's a link entry or a collection member (not a group). */
+function isReferenceItem(item: FileItem): boolean {
+  if (item.entry.link) return true
+  return !!item.ref && !item.entry.path.startsWith(COLLECTION_SCHEME)
 }
 
-function formatBytes(bytes?: number) {
-  if (!bytes) return '—'
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+function isBrokenItem(item: FileItem): boolean {
+  return !!item.ref?.broken || !!item.entry.link?.broken
 }
 
-function formatDate(iso: string) {
-  const date = new Date(iso)
-  return date.toLocaleString('en-CA', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  })
+/** Finder-alias style corner badge for reference items. */
+function LinkBadge({ size = 10 }: { size?: number }) {
+  return (
+    <span
+      className="absolute -bottom-0.5 -left-0.5 flex items-center justify-center rounded-full border border-[color:var(--cp-border)] bg-[color:var(--cp-surface)] p-[1px] text-[color:var(--cp-muted)]"
+      data-testid="link-badge"
+    >
+      <CornerUpRight size={size} />
+    </span>
+  )
 }
 
 /** Modifier keys captured on click — drives multi-select on desktop. */
@@ -65,49 +43,67 @@ export interface MenuPosition {
 }
 
 interface MainContentProps {
-  entries: FileEntry[]
+  list: FileItemList
   viewMode: ViewMode
-  selectedIds: string[]
-  onSelect: (entry: FileEntry, modifiers?: SelectModifiers) => void
-  onOpenFolder: (path: string) => void
-  /** Right-click on an entry (desktop). */
-  onItemContextMenu?: (entry: FileEntry, position: MenuPosition) => void
+  selectedKeys: ReadonlySet<string>
+  onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
+  /** Open a container (folder path or collection/view url). */
+  onOpenFolder: (url: string) => void
+  /** Right-click on an item (desktop). */
+  onItemContextMenu?: (item: FileItem, position: MenuPosition) => void
   /** Right-click on blank space (desktop). */
   onViewContextMenu?: (position: MenuPosition) => void
   /** Click on blank space clears the selection (desktop). */
   onClearSelection?: () => void
-  currentPath: string
-  topicContext: Topic | null
+  currentUrl: string
   isMobile?: boolean
 }
 
+const modifiersFromEvent = (event: React.MouseEvent): SelectModifiers => ({
+  shift: event.shiftKey,
+  toggle: event.metaKey || event.ctrlKey,
+})
+
+/** Track the first..last visible indexes and demand-load them. */
+function useEnsureRange(list: FileItemList, first: number, last: number, active: boolean) {
+  useEffect(() => {
+    if (active) list.ensureRange(first, last)
+  }, [list, first, last, active])
+}
+
+function SkeletonBar({ width }: { width: string }) {
+  return (
+    <span
+      className="inline-block h-3 animate-pulse rounded-full bg-[color:color-mix(in_srgb,var(--cp-border)_55%,transparent)]"
+      style={{ width }}
+    />
+  )
+}
+
 export function MainContent({
-  entries,
+  list,
   viewMode,
-  selectedIds,
+  selectedKeys,
   onSelect,
   onOpenFolder,
   onItemContextMenu,
   onViewContextMenu,
   onClearSelection,
-  currentPath,
-  topicContext,
+  currentUrl,
   isMobile = false,
 }: MainContentProps) {
   const { t } = useI18n()
 
-  const isPublic = currentPath === '/public' || currentPath.startsWith('/public/')
+  const path = displayPath(currentUrl)
+  const isPublic = path === '/public' || path.startsWith('/public/')
+  const capabilities = list.capabilities
+  const meta = list.meta
 
-  const modifiersFromEvent = (event: React.MouseEvent): SelectModifiers => ({
-    shift: event.shiftKey,
-    toggle: event.metaKey || event.ctrlKey,
-  })
-
-  const handleItemContextMenu = (entry: FileEntry) => (event: React.MouseEvent) => {
+  const handleItemContextMenu = (item: FileItem) => (event: React.MouseEvent) => {
     if (!onItemContextMenu) return
     event.preventDefault()
     event.stopPropagation()
-    onItemContextMenu(entry, { top: event.clientY, left: event.clientX })
+    onItemContextMenu(item, { top: event.clientY, left: event.clientX })
   }
 
   const handleViewContextMenu = (event: React.MouseEvent) => {
@@ -120,240 +116,591 @@ export function MainContent({
     if (event.target === event.currentTarget) onClearSelection?.()
   }
 
-  if (!entries.length) {
-    return (
+  const openItem = (item: FileItem) => {
+    if (item.entry.kind === 'folder') onOpenFolder(item.entry.path)
+  }
+
+  // ─── Location banner (views & collections — replaces the old topic banner) ───
+  const banner =
+    capabilities.kind !== 'folder' && meta ? (
+      <div className="flex items-center gap-3 border-b border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,var(--cp-surface))] px-4 py-2.5">
+        {capabilities.kind === 'collection' ? (
+          <Library size={16} className="text-[color:var(--cp-accent)]" />
+        ) : (
+          <Sparkles size={16} className="text-[color:var(--cp-accent)]" />
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-[color:var(--cp-text)]">
+            {capabilities.kind === 'collection'
+              ? `${t('filebrowser.collection.badge', 'Collection')}: ${meta.title}`
+              : `${t('filebrowser.view.badge', 'View')}: ${meta.title}`}
+          </div>
+          {meta.description ? (
+            <div className="mt-0.5 line-clamp-1 text-[11px] text-[color:var(--cp-muted)]">
+              {meta.description}
+            </div>
+          ) : null}
+        </div>
+        <span className="rounded-full bg-[color:color-mix(in_srgb,var(--cp-surface)_86%,transparent)] px-2 py-0.5 text-[11px] font-semibold text-[color:var(--cp-muted)]">
+          {capabilities.kind === 'collection'
+            ? t('filebrowser.collection.refCount', '{{count}} references · zero disk', {
+                count: list.totalCount ?? '…',
+              })
+            : t('filebrowser.topic.aggregation', 'Aggregated · not copied')}
+        </span>
+      </div>
+    ) : null
+
+  // ─── Error / initial loading / empty states ───
+  let body: React.ReactNode
+  if (list.status === 'error') {
+    body = (
+      <div className="flex h-full w-full flex-col items-center justify-center gap-3 p-10 text-center text-[color:var(--cp-muted)]">
+        <p className="text-sm">{list.error?.message ?? t('filebrowser.error', 'Failed to load')}</p>
+        <button
+          type="button"
+          onClick={() => list.reload()}
+          className="rounded-full border border-[color:var(--cp-border)] px-4 py-1.5 text-sm text-[color:var(--cp-text)] hover:border-[color:var(--cp-accent)]"
+        >
+          {t('filebrowser.retry', 'Retry')}
+        </button>
+      </div>
+    )
+  } else if (list.totalCount === undefined) {
+    // First page still in flight — skeleton screen.
+    body = (
+      <div className="flex-1 overflow-hidden px-4 py-3" data-testid="filebrowser-skeleton">
+        {Array.from({ length: 12 }, (_, i) => (
+          <div key={i} className="flex items-center gap-3 py-2.5">
+            <span className="h-5 w-5 animate-pulse rounded-md bg-[color:color-mix(in_srgb,var(--cp-border)_55%,transparent)]" />
+            <SkeletonBar width={`${36 - (i % 4) * 6}%`} />
+            <span className="flex-1" />
+            <SkeletonBar width="48px" />
+            <SkeletonBar width="96px" />
+          </div>
+        ))}
+      </div>
+    )
+  } else if (list.totalCount === 0 && list.status === 'ready') {
+    body = (
       <div
         className="flex h-full w-full flex-col items-center justify-center p-10 text-center text-[color:var(--cp-muted)]"
         onContextMenu={handleViewContextMenu}
       >
-        <FolderClosed size={40} className="opacity-50" />
+        {capabilities.kind === 'collection' ? (
+          <Library size={40} className="opacity-50" />
+        ) : capabilities.kind === 'view' ? (
+          <Sparkles size={40} className="opacity-50" />
+        ) : (
+          <FolderClosed size={40} className="opacity-50" />
+        )}
         <p className="mt-3 font-display text-lg text-[color:var(--cp-text)]">
-          {t('filebrowser.empty.title', 'This folder is empty')}
+          {capabilities.kind === 'collection'
+            ? t('filebrowser.empty.collectionTitle', 'This collection is empty')
+            : capabilities.kind === 'view'
+              ? t('filebrowser.empty.viewTitle', 'Nothing here')
+              : t('filebrowser.empty.title', 'This folder is empty')}
         </p>
         <p className="mt-1 max-w-sm text-sm leading-6">
-          {t(
-            'filebrowser.empty.body',
-            'No files here yet. Upload from your device, drop files from chat, or wait for the next sync.',
-          )}
+          {capabilities.kind === 'collection'
+            ? t(
+                'filebrowser.empty.collectionBody',
+                'Drag files in, or use "Add to Collection" from any file\'s context menu. References never move the originals.',
+              )
+            : capabilities.kind === 'view'
+              ? t('filebrowser.empty.viewBody', 'No content matches this view\'s conditions.')
+              : t(
+                  'filebrowser.empty.body',
+                  'No files here yet. Upload from your device, drop files from chat, or wait for the next sync.',
+                )}
         </p>
-        <button
-          type="button"
-          className="mt-4 inline-flex items-center gap-2 rounded-full border border-[color:var(--cp-border)] px-4 py-1.5 text-sm text-[color:var(--cp-text)] hover:border-[color:var(--cp-accent)]"
-        >
-          <Upload size={14} /> {t('filebrowser.actions.upload', 'Upload')}
-        </button>
+        {capabilities.acceptsContent ? (
+          <button
+            type="button"
+            className="mt-4 inline-flex items-center gap-2 rounded-full border border-[color:var(--cp-border)] px-4 py-1.5 text-sm text-[color:var(--cp-text)] hover:border-[color:var(--cp-accent)]"
+          >
+            <Upload size={14} /> {t('filebrowser.actions.upload', 'Upload')}
+          </button>
+        ) : null}
       </div>
+    )
+  } else if (viewMode === 'list' && isMobile) {
+    body = (
+      <MobileListView
+        list={list}
+        selectedKeys={selectedKeys}
+        onSelect={onSelect}
+        openItem={openItem}
+        isPublic={isPublic}
+      />
+    )
+  } else if (viewMode === 'list') {
+    body = (
+      <DesktopListView
+        list={list}
+        selectedKeys={selectedKeys}
+        onSelect={onSelect}
+        openItem={openItem}
+        isPublic={isPublic}
+        handleItemContextMenu={handleItemContextMenu}
+        handleViewContextMenu={handleViewContextMenu}
+        handleBlankClick={handleBlankClick}
+      />
+    )
+  } else {
+    body = (
+      <IconGridView
+        list={list}
+        selectedKeys={selectedKeys}
+        onSelect={onSelect}
+        openItem={openItem}
+        handleItemContextMenu={handleItemContextMenu}
+        handleViewContextMenu={handleViewContextMenu}
+        handleBlankClick={handleBlankClick}
+      />
     )
   }
 
   return (
     <div className="flex h-full w-full flex-col">
-      {topicContext ? (
-        <div className="flex items-center gap-3 border-b border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,var(--cp-surface))] px-4 py-2.5">
-          <Sparkles size={16} className="text-[color:var(--cp-accent)]" />
-          <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold text-[color:var(--cp-text)]">
-              {t('filebrowser.topic.badge', 'Topic view')}: {topicContext.title}
-            </div>
-            <div className="mt-0.5 line-clamp-1 text-[11px] text-[color:var(--cp-muted)]">
-              {topicContext.reason}
-            </div>
-          </div>
-          <span className="rounded-full bg-[color:color-mix(in_srgb,var(--cp-surface)_86%,transparent)] px-2 py-0.5 text-[11px] font-semibold text-[color:var(--cp-muted)]">
-            {t('filebrowser.topic.aggregation', 'Aggregated · not copied')}
-          </span>
-        </div>
-      ) : null}
-
-      {viewMode === 'list' && isMobile ? (
-        <div className="flex-1 overflow-y-auto px-3 py-2">
-          <div className="flex flex-col gap-1">
-            {entries.map((entry) => {
-              const selected = selectedIds.includes(entry.id)
-              const meta =
-                entry.kind === 'folder'
-                  ? `${t('filebrowser.kind.folder', 'Folder')} · ${formatDate(entry.modifiedAt)}`
-                  : `${formatBytes(entry.sizeBytes)} · ${formatDate(entry.modifiedAt)}`
-              return (
-                <button
-                  key={entry.id}
-                  type="button"
-                  onClick={() => onSelect(entry)}
-                  onDoubleClick={() => {
-                    if (entry.kind === 'folder') onOpenFolder(entry.path)
-                  }}
-                  className={clsx(
-                    'flex w-full items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition',
-                    selected
-                      ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
-                      : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
-                  )}
-                >
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[14px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
-                    {kindIcon(entry.kind, 26)}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate text-[13px] font-medium text-[color:var(--cp-text)]">
-                        {entry.name}
-                      </span>
-                      {entry.triggersActive ? (
-                        <span
-                          title="AI pipeline active"
-                          className="inline-flex shrink-0 items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[9px] font-semibold text-[color:var(--cp-accent)]"
-                        >
-                          <Wand2 size={9} className="mr-1" /> AI
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="mt-0.5 truncate text-[11px] text-[color:var(--cp-muted)]">
-                      {meta}
-                      {isPublic && entry.publicUrl ? (
-                        <span className="ml-1 font-mono text-[color:var(--cp-accent)]">
-                          · {entry.publicUrl}
-                        </span>
-                      ) : null}
-                    </div>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      ) : viewMode === 'list' ? (
-        <div
-          className="flex-1 overflow-y-auto"
-          onContextMenu={handleViewContextMenu}
-          onClick={handleBlankClick}
-        >
-          <table className="w-full select-none text-sm">
-            <thead className="sticky top-0 bg-[color:color-mix(in_srgb,var(--cp-surface)_92%,transparent)] text-left text-[11px] uppercase tracking-wider text-[color:var(--cp-muted)] backdrop-blur">
-              <tr>
-                <th className="py-2 pl-4 pr-2 font-medium">{t('filebrowser.column.name', 'Name')}</th>
-                <th className="px-2 py-2 font-medium">{t('filebrowser.column.kind', 'Kind')}</th>
-                <th className="px-2 py-2 font-medium">{t('filebrowser.column.size', 'Size')}</th>
-                <th className="px-2 py-2 font-medium">
-                  {t('filebrowser.column.modified', 'Modified')}
-                </th>
-                <th className="px-2 py-2 font-medium">{t('filebrowser.column.tags', 'Tags')}</th>
-                {isPublic ? (
-                  <th className="px-2 py-2 font-medium">
-                    {t('filebrowser.column.publicUrl', 'Public URL')}
-                  </th>
-                ) : null}
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((entry) => {
-                const selected = selectedIds.includes(entry.id)
-                return (
-                  <tr
-                    key={entry.id}
-                    className={clsx(
-                      'cursor-pointer border-b border-[color:color-mix(in_srgb,var(--cp-border)_40%,transparent)] transition',
-                      selected
-                        ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
-                        : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
-                    )}
-                    onClick={(event) => onSelect(entry, modifiersFromEvent(event))}
-                    onDoubleClick={() => {
-                      if (entry.kind === 'folder') onOpenFolder(entry.path)
-                    }}
-                    onContextMenu={handleItemContextMenu(entry)}
-                  >
-                    <td className="py-2 pl-4 pr-2">
-                      <div className="flex items-center gap-2">
-                        {kindIcon(entry.kind, 16)}
-                        <span className="truncate font-medium text-[color:var(--cp-text)]">
-                          {entry.name}
-                        </span>
-                        {entry.triggersActive ? (
-                          <span
-                            title="AI pipeline active"
-                            className="inline-flex items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[10px] font-semibold text-[color:var(--cp-accent)]"
-                          >
-                            <Wand2 size={10} className="mr-1" /> AI
-                          </span>
-                        ) : null}
-                      </div>
-                    </td>
-                    <td className="px-2 py-2 capitalize text-[color:var(--cp-muted)]">
-                      {entry.kind}
-                    </td>
-                    <td className="px-2 py-2 text-[color:var(--cp-muted)]">
-                      {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
-                    </td>
-                    <td className="px-2 py-2 text-[color:var(--cp-muted)]">
-                      {formatDate(entry.modifiedAt)}
-                    </td>
-                    <td className="px-2 py-2">
-                      <div className="flex flex-wrap gap-1">
-                        {entry.tags?.slice(0, 2).map((tag) => (
-                          <span
-                            key={tag}
-                            className="rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_16%,var(--cp-surface))] px-2 py-0.5 text-[10px] text-[color:var(--cp-muted)]"
-                          >
-                            #{tag}
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-                    {isPublic ? (
-                      <td className="truncate px-2 py-2 font-mono text-[10px] text-[color:var(--cp-accent)]">
-                        {entry.publicUrl ?? '—'}
-                      </td>
-                    ) : null}
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div
-          className="flex-1 overflow-y-auto p-4"
-          onContextMenu={handleViewContextMenu}
-          onClick={handleBlankClick}
-        >
-          <div
-            className="grid select-none grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3"
-            onClick={handleBlankClick}
-          >
-            {entries.map((entry) => {
-              const selected = selectedIds.includes(entry.id)
-              return (
-                <button
-                  key={entry.id}
-                  type="button"
-                  onClick={(event) => onSelect(entry, modifiersFromEvent(event))}
-                  onDoubleClick={() => {
-                    if (entry.kind === 'folder') onOpenFolder(entry.path)
-                  }}
-                  onContextMenu={handleItemContextMenu(entry)}
-                  className={clsx(
-                    'flex flex-col items-center gap-2 rounded-[18px] border border-transparent p-3 text-center transition',
-                    selected
-                      ? 'border-[color:var(--cp-accent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
-                      : 'hover:border-[color:color-mix(in_srgb,var(--cp-border)_70%,transparent)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_8%,transparent)]',
-                  )}
-                >
-                  <div className="flex h-16 w-16 items-center justify-center rounded-[16px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
-                    {kindIcon(entry.kind, 28)}
-                  </div>
-                  <span className="line-clamp-2 text-[12px] font-medium text-[color:var(--cp-text)]">
-                    {entry.name}
-                  </span>
-                  <span className="text-[10px] text-[color:var(--cp-muted)]">
-                    {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
+      {banner}
+      {body}
     </div>
   )
 }
 
-export { formatBytes, formatDate, kindIcon }
+// ─── Desktop list (virtualized div-grid table — <table> doesn't virtualize) ───
+
+const LIST_ROW_HEIGHT = 37
+
+function DesktopListView({
+  list,
+  selectedKeys,
+  onSelect,
+  openItem,
+  isPublic,
+  handleItemContextMenu,
+  handleViewContextMenu,
+  handleBlankClick,
+}: {
+  list: FileItemList
+  selectedKeys: ReadonlySet<string>
+  onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
+  openItem: (item: FileItem) => void
+  isPublic: boolean
+  handleItemContextMenu: (item: FileItem) => (event: React.MouseEvent) => void
+  handleViewContextMenu: (event: React.MouseEvent) => void
+  handleBlankClick: (event: React.MouseEvent) => void
+}) {
+  const { t } = useI18n()
+  const parentRef = useRef<HTMLDivElement>(null)
+  const count = list.totalCount ?? 0
+
+  const virtualizer = useVirtualizer({
+    count,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => LIST_ROW_HEIGHT,
+    overscan: 12,
+  })
+  const virtualItems = virtualizer.getVirtualItems()
+  const first = virtualItems[0]?.index ?? 0
+  const last = virtualItems[virtualItems.length - 1]?.index ?? 0
+  useEnsureRange(list, first, last, count > 0)
+
+  const gridTemplateColumns = `minmax(240px, 2fr) 110px 90px 150px minmax(120px, 1fr)${
+    isPublic ? ' minmax(160px, 1fr)' : ''
+  }`
+
+  const headerCell = (label: string) => (
+    <div role="columnheader" className="px-2 py-2 font-medium">
+      {label}
+    </div>
+  )
+
+  return (
+    <div
+      ref={parentRef}
+      className="flex-1 overflow-y-auto"
+      onContextMenu={handleViewContextMenu}
+      onClick={handleBlankClick}
+    >
+      <div role="table" className="w-full select-none text-sm">
+        <div
+          role="row"
+          className="sticky top-0 z-10 grid bg-[color:color-mix(in_srgb,var(--cp-surface)_92%,transparent)] text-left text-[11px] uppercase tracking-wider text-[color:var(--cp-muted)] backdrop-blur"
+          style={{ gridTemplateColumns }}
+        >
+          <div role="columnheader" className="py-2 pl-4 pr-2 font-medium">
+            {t('filebrowser.column.name', 'Name')}
+          </div>
+          {headerCell(t('filebrowser.column.kind', 'Kind'))}
+          {headerCell(t('filebrowser.column.size', 'Size'))}
+          {headerCell(t('filebrowser.column.modified', 'Modified'))}
+          {headerCell(t('filebrowser.column.tags', 'Tags'))}
+          {isPublic ? headerCell(t('filebrowser.column.publicUrl', 'Public URL')) : null}
+        </div>
+
+        <div
+          className="relative w-full"
+          style={{ height: virtualizer.getTotalSize() }}
+          onClick={handleBlankClick}
+        >
+          {virtualItems.map((virtualRow) => {
+            const item = list.itemAt(virtualRow.index)
+            const rowStyle: React.CSSProperties = {
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: virtualRow.size,
+              transform: `translateY(${virtualRow.start}px)`,
+              gridTemplateColumns,
+            }
+            if (!item) {
+              return (
+                <div
+                  key={`skeleton-${virtualRow.index}`}
+                  role="row"
+                  className="grid items-center border-b border-[color:color-mix(in_srgb,var(--cp-border)_40%,transparent)]"
+                  style={rowStyle}
+                >
+                  <div className="py-2 pl-4 pr-2">
+                    <SkeletonBar width="55%" />
+                  </div>
+                  <div className="px-2 py-2">
+                    <SkeletonBar width="60%" />
+                  </div>
+                  <div className="px-2 py-2">
+                    <SkeletonBar width="70%" />
+                  </div>
+                  <div className="px-2 py-2">
+                    <SkeletonBar width="80%" />
+                  </div>
+                  <div className="px-2 py-2" />
+                  {isPublic ? <div className="px-2 py-2" /> : null}
+                </div>
+              )
+            }
+            const { entry } = item
+            const selected = selectedKeys.has(item.key)
+            const broken = isBrokenItem(item)
+            return (
+              <div
+                key={item.key}
+                role="row"
+                className={clsx(
+                  'grid cursor-pointer items-center border-b border-[color:color-mix(in_srgb,var(--cp-border)_40%,transparent)] transition',
+                  selected
+                    ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
+                    : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
+                  broken && 'opacity-50',
+                )}
+                style={rowStyle}
+                onClick={(event) => onSelect(item, modifiersFromEvent(event))}
+                onDoubleClick={() => openItem(item)}
+                onContextMenu={handleItemContextMenu(item)}
+              >
+                <div role="cell" className="min-w-0 py-2 pl-4 pr-2">
+                  <div className="flex items-center gap-2">
+                    <span className="relative inline-flex shrink-0">
+                      {kindIcon(entry.kind, 16)}
+                      {isReferenceItem(item) ? <LinkBadge size={8} /> : null}
+                    </span>
+                    <span className="truncate font-medium text-[color:var(--cp-text)]">
+                      {entry.name}
+                    </span>
+                    {entry.triggersActive ? (
+                      <span
+                        title="AI pipeline active"
+                        className="inline-flex items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[10px] font-semibold text-[color:var(--cp-accent)]"
+                      >
+                        <Wand2 size={10} className="mr-1" /> AI
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+                <div role="cell" className="px-2 py-2 capitalize text-[color:var(--cp-muted)]">
+                  {entry.kind}
+                </div>
+                <div role="cell" className="px-2 py-2 text-[color:var(--cp-muted)]">
+                  {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
+                </div>
+                <div role="cell" className="px-2 py-2 text-[color:var(--cp-muted)]">
+                  {formatDate(entry.modifiedAt)}
+                </div>
+                <div role="cell" className="min-w-0 px-2 py-2">
+                  <div className="flex flex-wrap gap-1 overflow-hidden">
+                    {entry.tags?.slice(0, 2).map((tag) => (
+                      <span
+                        key={tag}
+                        className="rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_16%,var(--cp-surface))] px-2 py-0.5 text-[10px] text-[color:var(--cp-muted)]"
+                      >
+                        #{tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {isPublic ? (
+                  <div
+                    role="cell"
+                    className="truncate px-2 py-2 font-mono text-[10px] text-[color:var(--cp-accent)]"
+                  >
+                    {entry.publicUrl ?? '—'}
+                  </div>
+                ) : null}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Icon grid (virtualized by row, column count tracks container width) ───
+
+const GRID_CELL_WIDTH = 172
+const GRID_ROW_HEIGHT = 152
+
+function IconGridView({
+  list,
+  selectedKeys,
+  onSelect,
+  openItem,
+  handleItemContextMenu,
+  handleViewContextMenu,
+  handleBlankClick,
+}: {
+  list: FileItemList
+  selectedKeys: ReadonlySet<string>
+  onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
+  openItem: (item: FileItem) => void
+  handleItemContextMenu: (item: FileItem) => (event: React.MouseEvent) => void
+  handleViewContextMenu: (event: React.MouseEvent) => void
+  handleBlankClick: (event: React.MouseEvent) => void
+}) {
+  const parentRef = useRef<HTMLDivElement>(null)
+  const [columns, setColumns] = useState(4)
+
+  useEffect(() => {
+    const element = parentRef.current
+    if (!element) return
+    const compute = () =>
+      setColumns(Math.max(1, Math.floor((element.clientWidth - 32) / GRID_CELL_WIDTH)))
+    compute()
+    const observer = new ResizeObserver(compute)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  const count = list.totalCount ?? 0
+  const rowCount = Math.ceil(count / columns)
+
+  const virtualizer = useVirtualizer({
+    count: rowCount,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => GRID_ROW_HEIGHT,
+    overscan: 6,
+  })
+  const virtualRows = virtualizer.getVirtualItems()
+  const firstIndex = (virtualRows[0]?.index ?? 0) * columns
+  const lastIndex = ((virtualRows[virtualRows.length - 1]?.index ?? 0) + 1) * columns - 1
+  useEnsureRange(list, firstIndex, lastIndex, count > 0)
+
+  return (
+    <div
+      ref={parentRef}
+      className="flex-1 overflow-y-auto p-4"
+      onContextMenu={handleViewContextMenu}
+      onClick={handleBlankClick}
+    >
+      <div
+        className="relative w-full select-none"
+        style={{ height: virtualizer.getTotalSize() }}
+        onClick={handleBlankClick}
+      >
+        {virtualRows.map((virtualRow) => {
+          const start = virtualRow.index * columns
+          const cells = Array.from(
+            { length: Math.min(columns, count - start) },
+            (_, i) => start + i,
+          )
+          return (
+            <div
+              key={virtualRow.index}
+              className="absolute left-0 grid w-full gap-3"
+              style={{
+                top: 0,
+                transform: `translateY(${virtualRow.start}px)`,
+                height: virtualRow.size,
+                gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+              }}
+            >
+              {cells.map((index) => {
+                const item = list.itemAt(index)
+                if (!item) {
+                  return (
+                    <div
+                      key={`skeleton-${index}`}
+                      className="flex flex-col items-center gap-2 rounded-[18px] p-3"
+                    >
+                      <span className="h-16 w-16 animate-pulse rounded-[16px] bg-[color:color-mix(in_srgb,var(--cp-border)_45%,transparent)]" />
+                      <SkeletonBar width="70%" />
+                    </div>
+                  )
+                }
+                const { entry } = item
+                const selected = selectedKeys.has(item.key)
+                const broken = isBrokenItem(item)
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={(event) => onSelect(item, modifiersFromEvent(event))}
+                    onDoubleClick={() => openItem(item)}
+                    onContextMenu={handleItemContextMenu(item)}
+                    className={clsx(
+                      'flex flex-col items-center gap-2 rounded-[18px] border border-transparent p-3 text-center transition',
+                      selected
+                        ? 'border-[color:var(--cp-accent)] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
+                        : 'hover:border-[color:color-mix(in_srgb,var(--cp-border)_70%,transparent)] hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_8%,transparent)]',
+                      broken && 'opacity-50',
+                    )}
+                  >
+                    <div className="relative flex h-16 w-16 items-center justify-center rounded-[16px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
+                      {kindIcon(entry.kind, 28)}
+                      {isReferenceItem(item) ? <LinkBadge /> : null}
+                    </div>
+                    <span className="line-clamp-2 text-[12px] font-medium text-[color:var(--cp-text)]">
+                      {entry.name}
+                    </span>
+                    <span className="text-[10px] text-[color:var(--cp-muted)]">
+                      {entry.kind === 'folder' ? '—' : formatBytes(entry.sizeBytes)}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─── Mobile list (virtualized rows) ───
+
+const MOBILE_ROW_HEIGHT = 64
+
+function MobileListView({
+  list,
+  selectedKeys,
+  onSelect,
+  openItem,
+  isPublic,
+}: {
+  list: FileItemList
+  selectedKeys: ReadonlySet<string>
+  onSelect: (item: FileItem, modifiers?: SelectModifiers) => void
+  openItem: (item: FileItem) => void
+  isPublic: boolean
+}) {
+  const { t } = useI18n()
+  const parentRef = useRef<HTMLDivElement>(null)
+  const count = list.totalCount ?? 0
+
+  const virtualizer = useVirtualizer({
+    count,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => MOBILE_ROW_HEIGHT,
+    overscan: 10,
+  })
+  const virtualItems = virtualizer.getVirtualItems()
+  const first = virtualItems[0]?.index ?? 0
+  const last = virtualItems[virtualItems.length - 1]?.index ?? 0
+  useEnsureRange(list, first, last, count > 0)
+
+  return (
+    <div ref={parentRef} className="flex-1 overflow-y-auto px-3 py-2">
+      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+        {virtualItems.map((virtualRow) => {
+          const item = list.itemAt(virtualRow.index)
+          const rowStyle: React.CSSProperties = {
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: virtualRow.size,
+            transform: `translateY(${virtualRow.start}px)`,
+          }
+          if (!item) {
+            return (
+              <div
+                key={`skeleton-${virtualRow.index}`}
+                className="flex items-center gap-3 px-2.5 py-2"
+                style={rowStyle}
+              >
+                <span className="h-12 w-12 shrink-0 animate-pulse rounded-[14px] bg-[color:color-mix(in_srgb,var(--cp-border)_45%,transparent)]" />
+                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                  <SkeletonBar width="48%" />
+                  <SkeletonBar width="32%" />
+                </div>
+              </div>
+            )
+          }
+          const { entry } = item
+          const selected = selectedKeys.has(item.key)
+          const broken = isBrokenItem(item)
+          const meta =
+            entry.kind === 'folder'
+              ? `${t('filebrowser.kind.folder', 'Folder')} · ${formatDate(entry.modifiedAt)}`
+              : `${formatBytes(entry.sizeBytes)} · ${formatDate(entry.modifiedAt)}`
+          return (
+            <button
+              key={item.key}
+              type="button"
+              style={rowStyle}
+              onClick={() => onSelect(item)}
+              onDoubleClick={() => openItem(item)}
+              className={clsx(
+                'flex items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition',
+                selected
+                  ? 'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))]'
+                  : 'hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,transparent)]',
+                broken && 'opacity-50',
+              )}
+            >
+              <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-[14px] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_86%,transparent)]">
+                {kindIcon(entry.kind, 26)}
+                {isReferenceItem(item) ? <LinkBadge /> : null}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-[13px] font-medium text-[color:var(--cp-text)]">
+                    {entry.name}
+                  </span>
+                  {entry.triggersActive ? (
+                    <span
+                      title="AI pipeline active"
+                      className="inline-flex shrink-0 items-center rounded-full bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_26%,var(--cp-surface))] px-1.5 py-0.5 text-[9px] font-semibold text-[color:var(--cp-accent)]"
+                    >
+                      <Wand2 size={9} className="mr-1" /> AI
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-0.5 truncate text-[11px] text-[color:var(--cp-muted)]">
+                  {meta}
+                  {isPublic && entry.publicUrl ? (
+                    <span className="ml-1 font-mono text-[color:var(--cp-accent)]">
+                      · {entry.publicUrl}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}

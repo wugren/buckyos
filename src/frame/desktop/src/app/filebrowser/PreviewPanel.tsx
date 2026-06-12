@@ -15,11 +15,13 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { useI18n } from '../../i18n/provider'
-import { formatBytes, formatDate, kindIcon } from './MainContent'
-import type { FileEntry, Topic } from './types'
+import { formatBytes, formatDate, kindIcon } from './fileDisplay'
+import type { FileItem } from './data/FolderReader'
+import { displayPath } from './data/urls'
+import type { Topic } from './types'
 
 interface PreviewPanelProps {
-  entry: FileEntry | null
+  item: FileItem | null
   topics: Topic[]
   onClose?: () => void
   onJumpToTopic: (topicId: string) => void
@@ -37,7 +39,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 export function PreviewPanel({
-  entry,
+  item,
   topics,
   onClose,
   onJumpToTopic,
@@ -47,7 +49,7 @@ export function PreviewPanel({
   const { t } = useI18n()
   const [tab, setTab] = useState(0)
 
-  if (!entry) {
+  if (!item) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center text-[color:var(--cp-muted)]">
         <Info size={24} className="opacity-60" />
@@ -58,9 +60,16 @@ export function PreviewPanel({
     )
   }
 
+  const entry = item.entry
   const topicChips = (entry.topicIds ?? [])
     .map((id) => topics.find((topic) => topic.id === id))
     .filter((topic): topic is Topic => !!topic)
+
+  // Reference items carry two paths: the collection-side path and the original.
+  const refPath = item.ref && item.ref.refPath !== entry.path ? item.ref.refPath : null
+  const linkTarget = entry.link ? displayPath(entry.link.targetUrl) : null
+  const originalPath = linkTarget ?? entry.path
+  const originalParent = originalPath.split('/').slice(0, -1).join('/') || '/'
 
   return (
     <div className="flex h-full w-full flex-col">
@@ -72,9 +81,24 @@ export function PreviewPanel({
           <div className="line-clamp-2 font-display text-[15px] font-semibold text-[color:var(--cp-text)]">
             {entry.name}
           </div>
-          <div className="mt-0.5 truncate font-mono text-[10px] text-[color:var(--cp-muted)]">
-            {entry.path}
-          </div>
+          {refPath ? (
+            <div className="mt-0.5 truncate font-mono text-[10px] text-[color:var(--cp-muted)]">
+              {refPath}
+            </div>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => onJumpToPath(originalParent)}
+            title={t('filebrowser.preview.jumpOriginal', 'Jump to original location')}
+            className="mt-0.5 block max-w-full truncate text-left font-mono text-[10px] text-[color:var(--cp-muted)] hover:text-[color:var(--cp-accent)] hover:underline"
+          >
+            {originalPath}
+          </button>
+          {entry.link?.broken || item.ref?.broken ? (
+            <span className="mt-1 inline-block rounded-full bg-[color:color-mix(in_srgb,var(--cp-warning)_18%,var(--cp-surface))] px-2 py-0.5 text-[10px] font-semibold text-[color:var(--cp-warning)]">
+              {t('filebrowser.preview.brokenRef', 'Dangling reference')}
+            </span>
+          ) : null}
         </div>
         {!embedded && onClose ? (
           <IconButton size="small" onClick={onClose} aria-label={t('common.close', 'Close')}>
@@ -206,7 +230,7 @@ export function PreviewPanel({
 
             <button
               type="button"
-              onClick={() => onJumpToPath(entry.path.split('/').slice(0, -1).join('/') || '/')}
+              onClick={() => onJumpToPath(originalParent)}
               className="inline-flex items-center gap-1.5 rounded-full border border-[color:var(--cp-border)] px-3 py-1 text-[11px] text-[color:var(--cp-muted)] hover:border-[color:var(--cp-accent)] hover:text-[color:var(--cp-accent)]"
             >
               <FolderClosed size={12} /> {t('filebrowser.preview.reveal', 'Reveal in folder')}

@@ -6,8 +6,11 @@
 
 import { Divider, ListItemIcon, ListItemText, Menu, MenuItem, Typography } from '@mui/material'
 import {
+  ArrowDown,
+  ArrowUp,
   ChevronRight,
   Copy,
+  CornerUpRight,
   Download,
   ExternalLink,
   Eye,
@@ -15,6 +18,7 @@ import {
   FolderOpen,
   FolderPlus,
   LayoutGrid,
+  Library,
   Link2,
   List,
   PanelRight,
@@ -23,6 +27,7 @@ import {
   Share2,
   SquareDashedMousePointer,
   Trash2,
+  Unlink,
   Upload,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -53,6 +58,12 @@ const ICONS: Record<FileMenuIcon, React.ComponentType<{ size?: number | string }
   'select-all': SquareDashedMousePointer,
   'view-list': List,
   'view-icon': LayoutGrid,
+  collection: Library,
+  'remove-ref': Unlink,
+  jump: CornerUpRight,
+  broken: Unlink,
+  'move-up': ArrowUp,
+  'move-down': ArrowDown,
 }
 
 export interface FileContextMenuProps {

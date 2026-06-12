@@ -230,6 +230,26 @@ const entries: FileEntry[] = [
     source: { type: 'local', label: 'Downloaded from browser' },
   },
 
+  // ─── Reference (soft link) item living in a plain folder ───
+  {
+    id: 'doc-link-kyoto-photo',
+    name: 'kyoto-temple-0412 (alias).jpg',
+    kind: 'image',
+    path: '/home/Documents/kyoto-temple-0412 (alias).jpg',
+    modifiedAt: '2026-04-12T08:00:00Z',
+    link: { targetUrl: 'dfs:///home/Pictures/Trips/Kyoto/kyoto-temple-0412.jpg' },
+    source: { type: 'system', label: 'Link created from Pictures' },
+  },
+
+  // ─── Stress folder root (10k generated children, see below) ───
+  {
+    id: 'home-stress-10k',
+    name: 'stress-10k',
+    kind: 'folder',
+    path: '/home/stress-10k',
+    modifiedAt: '2026-04-01T00:00:00Z',
+  },
+
   // ─── Sub folders (for tree expansion) ───
   {
     id: 'pic-trips',
@@ -281,6 +301,70 @@ const entries: FileEntry[] = [
     modifiedAt: '2026-03-31T20:04:00Z',
   },
 ]
+
+// ─── /home/stress-10k — 10,000 generated entries (virtualization stress) ───
+
+/** Deterministic PRNG so the stress data is stable across reloads. */
+function mulberry32(seed: number) {
+  let a = seed
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+const STRESS_COUNT = 10_000
+
+function generateStressEntries(): FileEntry[] {
+  const rand = mulberry32(0xb0c5)
+  const kinds: FileEntry['kind'][] = [
+    'document',
+    'image',
+    'video',
+    'audio',
+    'archive',
+    'code',
+    'other',
+  ]
+  const exts: Record<string, string> = {
+    document: 'pdf',
+    image: 'jpg',
+    video: 'mp4',
+    audio: 'flac',
+    archive: 'zip',
+    code: 'ts',
+    other: 'bin',
+  }
+  const result: FileEntry[] = []
+  for (let i = 0; i < STRESS_COUNT; i += 1) {
+    const folder = rand() < 0.08
+    const kind = folder ? 'folder' : kinds[Math.floor(rand() * kinds.length)]
+    // Numbered names exercise numeric sorting (item-2 < item-10).
+    const name = folder ? `bucket-${i}` : `item-${i}.${exts[kind]}`
+    const modified = new Date(
+      Date.UTC(2025, 0, 1) + Math.floor(rand() * 470 * 24 * 3600 * 1000),
+    ).toISOString()
+    result.push({
+      id: `stress-${i}`,
+      name,
+      kind,
+      path: `/home/stress-10k/${name}`,
+      sizeBytes: folder ? undefined : Math.floor(rand() * 512_000_000),
+      modifiedAt: modified,
+    })
+  }
+  return result
+}
+
+/** Generated lazily and kept out of `entries` so search stays over curated data. */
+let stressEntriesCache: FileEntry[] | null = null
+function stressEntries(): FileEntry[] {
+  if (!stressEntriesCache) stressEntriesCache = generateStressEntries()
+  return stressEntriesCache
+}
 
 function buildIndex(list: FileEntry[]) {
   const byPath: Record<string, FileEntry[]> = {}
@@ -366,18 +450,12 @@ const dfsRoots: DfsNode[] = [
     ],
   },
   {
+    // "Shares" is, by the three-kind model, a collection — the sidebar entry
+    // points at the seed collection that absorbs the old /shared root.
     id: 'dfs-shared',
     name: 'Shared',
-    path: '/shared',
+    path: 'collection://shares',
     kind: 'shared',
-    children: [
-      {
-        id: 'dfs-shared-incoming',
-        name: 'incoming',
-        path: '/shared/incoming',
-        kind: 'shared',
-      },
-    ],
   },
 ]
 
@@ -508,7 +586,7 @@ const triggers: TriggerRule[] = [
   },
 ]
 
-const { byPath, byId } = buildIndex(entries)
+const { byPath, byId } = buildIndex([...entries, ...stressEntries()])
 
 export const fileBrowserSnapshot: FileBrowserSnapshot = {
   dfsRoots,
@@ -517,6 +595,28 @@ export const fileBrowserSnapshot: FileBrowserSnapshot = {
   triggers,
   entriesByPath: byPath,
   entriesById: byId,
+}
+
+// ─── Accessors for the mock readers (data/mockReader.ts) ───
+// UI code must not touch entriesByPath/entriesById directly anymore; readers
+// are the only consumers of these.
+
+export function mockEntriesAtPath(path: string): FileEntry[] | undefined {
+  return byPath[path]
+}
+
+export function mockEntryById(id: string): FileEntry | undefined {
+  return byId[id]
+}
+
+export function mockEntryByPath(path: string): FileEntry | undefined {
+  const parent = path.split('/').slice(0, -1).join('/') || '/'
+  return byPath[parent]?.find((entry) => entry.path === path)
+}
+
+/** Curated (non-stress) file entries — the "library" recent/search run over. */
+export function mockLibraryEntries(): FileEntry[] {
+  return entries
 }
 
 export const defaultTab: BrowserTab = {

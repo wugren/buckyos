@@ -36,6 +36,8 @@ import {
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { useI18n } from '../../i18n/provider'
+import type { LocationCapabilities } from './data/FolderReader'
+import { crumbsForUrl, displayPath } from './data/urls'
 import type { BrowserTab, SortDir, SortKey, ViewMode } from './types'
 
 interface TopBarProps {
@@ -53,7 +55,10 @@ interface TopBarProps {
   /** When provided, tabs get a context menu with a "Send to Right" action. */
   onSendTabToRight?: (id: string) => void
   canSendToRight?: boolean
+  /** Canonical location url of the pane. */
   currentPath: string
+  /** Title for non-dfs locations (drives the breadcrumb root label). */
+  locationTitle?: string
   onNavigate: (path: string) => void
   onBack: () => void
   onForward: () => void
@@ -71,8 +76,8 @@ interface TopBarProps {
   onNewFile?: () => void
   /** Number of selected entries in the pane — drives the clipboard ops. */
   selectedCount?: number
-  /** False inside topic views, where entries are aggregated references. */
-  canOrganize?: boolean
+  /** Location capabilities — every toolbar affordance trims itself by these. */
+  capabilities?: LocationCapabilities
   canPaste?: boolean
   onCut?: () => void
   onCopy?: () => void
@@ -128,19 +133,22 @@ function ToolbarDivider() {
   )
 }
 
-function PathCrumbs({ path, onNavigate }: { path: string; onNavigate: (p: string) => void }) {
-  const segments = path.split('/').filter(Boolean)
-  const crumbs: { label: string; path: string }[] = [{ label: 'root', path: '/' }]
-  let running = ''
-  for (const segment of segments) {
-    running += `/${segment}`
-    crumbs.push({ label: segment, path: running })
-  }
+function PathCrumbs({
+  url,
+  rootLabel,
+  onNavigate,
+}: {
+  url: string
+  /** Title for non-dfs roots (collection/view name from reader meta). */
+  rootLabel?: string
+  onNavigate: (url: string) => void
+}) {
+  const crumbs = crumbsForUrl(url, rootLabel)
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto text-sm text-[color:var(--cp-muted)]">
       {crumbs.map((crumb, idx) => (
-        <div key={crumb.path} className="flex shrink-0 items-center gap-1">
+        <div key={crumb.url} className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             className={clsx(
@@ -149,7 +157,7 @@ function PathCrumbs({ path, onNavigate }: { path: string; onNavigate: (p: string
             )}
             onClick={(event) => {
               event.stopPropagation()
-              onNavigate(crumb.path)
+              onNavigate(crumb.url)
             }}
           >
             {crumb.label}
@@ -174,6 +182,7 @@ export function TopBar({
   onSendTabToRight,
   canSendToRight = false,
   currentPath,
+  locationTitle,
   onNavigate,
   onBack,
   onForward,
@@ -190,7 +199,7 @@ export function TopBar({
   onNewFolder,
   onNewFile,
   selectedCount = 0,
-  canOrganize = true,
+  capabilities,
   canPaste = false,
   onCut,
   onCopy,
@@ -221,11 +230,22 @@ export function TopBar({
   const searchVisible = searchOpen || !!searchQuery
   const canCloseTab = tabs.length > 1 || allowCloseLast
   const sortLabels: Record<SortKey, string> = {
+    manual: t('filebrowser.sort.manual', 'Custom order'),
     name: t('filebrowser.column.name', 'Name'),
     size: t('filebrowser.column.size', 'Size'),
     modified: t('filebrowser.column.modified', 'Modified'),
     kind: t('filebrowser.column.kind', 'Kind'),
   }
+  // Capability-derived affordances (default to plain-folder behaviour).
+  const acceptsContent = capabilities?.acceptsContent ?? true
+  const acceptsReferences = capabilities?.acceptsReferences ?? false
+  const removal = capabilities ? capabilities.removal : 'destroy'
+  const sortKeys = capabilities?.sortKeys ?? (['name', 'size', 'modified', 'kind'] as SortKey[])
+  const pasteEnabled = canPaste && (acceptsContent || acceptsReferences)
+  const deleteLabel =
+    removal === 'remove-ref'
+      ? t('filebrowser.actions.removeFromCollection', 'Remove from collection')
+      : t('filebrowser.actions.delete', 'Delete')
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus()
@@ -240,14 +260,14 @@ export function TopBar({
 
   const startPathEdit = () => {
     if (searchVisible || pathEditing) return
-    setPathDraft(currentPath)
+    setPathDraft(displayPath(currentPath))
     setPathEditing(true)
   }
 
   const commitPathEdit = () => {
     const next = pathDraft.trim()
     setPathEditing(false)
-    if (next && next !== currentPath) onNavigate(next)
+    if (next && next !== displayPath(currentPath)) onNavigate(next)
   }
 
   const closeSearch = () => {
@@ -499,7 +519,7 @@ export function TopBar({
             />
           ) : (
             <>
-              <PathCrumbs path={currentPath} onNavigate={onNavigate} />
+              <PathCrumbs url={currentPath} rootLabel={locationTitle} onNavigate={onNavigate} />
               <Tooltip title={t('filebrowser.topbar.copyPath', 'Copy path')}>
                 <button
                   type="button"
@@ -524,7 +544,7 @@ export function TopBar({
           <button
             type="button"
             onClick={onUpload}
-            disabled={!canOrganize}
+            disabled={!acceptsContent}
             className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)] disabled:pointer-events-none disabled:opacity-40"
           >
             <Upload size={14} />
@@ -535,7 +555,7 @@ export function TopBar({
           <>
             <ToolbarIconButton
               title={t('filebrowser.actions.new', 'New')}
-              disabled={!canOrganize}
+              disabled={!acceptsContent}
               active={Boolean(newMenuAnchor)}
               onClick={(event) => setNewMenuAnchor(event.currentTarget)}
             >
@@ -584,7 +604,7 @@ export function TopBar({
 
         <ToolbarIconButton
           title={t('filebrowser.actions.cut', 'Cut')}
-          disabled={!canOrganize || !selectedCount || !onCut}
+          disabled={!acceptsContent || !selectedCount || !onCut}
           onClick={onCut}
         >
           <Scissors size={14} />
@@ -597,22 +617,26 @@ export function TopBar({
           <Copy size={14} />
         </ToolbarIconButton>
         <ToolbarIconButton
-          title={t('filebrowser.actions.paste', 'Paste')}
-          disabled={!canOrganize || !canPaste || !onPaste}
+          title={
+            acceptsReferences
+              ? t('filebrowser.actions.pasteAsRef', 'Paste as references')
+              : t('filebrowser.actions.paste', 'Paste')
+          }
+          disabled={!pasteEnabled || !onPaste}
           onClick={onPaste}
         >
           <ClipboardPaste size={14} />
         </ToolbarIconButton>
         <ToolbarIconButton
           title={t('filebrowser.actions.rename', 'Rename')}
-          disabled={!canOrganize || selectedCount !== 1 || !onRename}
+          disabled={!acceptsContent || selectedCount !== 1 || !onRename}
           onClick={onRename}
         >
           <PenLine size={14} />
         </ToolbarIconButton>
         <ToolbarIconButton
           title={t('filebrowser.actions.moveTo', 'Move to')}
-          disabled={!canOrganize || !selectedCount || !moveTargets.length || !onMoveTo}
+          disabled={!acceptsContent || !selectedCount || !moveTargets.length || !onMoveTo}
           active={Boolean(moveMenuAnchor)}
           onClick={(event) => setMoveMenuAnchor(event.currentTarget)}
         >
@@ -636,13 +660,15 @@ export function TopBar({
             </MenuItem>
           ))}
         </Menu>
-        <ToolbarIconButton
-          title={t('filebrowser.actions.delete', 'Delete')}
-          disabled={!canOrganize || !selectedCount || !onDelete}
-          onClick={onDelete}
-        >
-          <Trash2 size={14} />
-        </ToolbarIconButton>
+        {removal !== null ? (
+          <ToolbarIconButton
+            title={deleteLabel}
+            disabled={!selectedCount || !onDelete}
+            onClick={onDelete}
+          >
+            <Trash2 size={14} />
+          </ToolbarIconButton>
+        ) : null}
 
         <ToolbarDivider />
 
@@ -720,7 +746,7 @@ export function TopBar({
           onClose={() => setSortMenuAnchor(null)}
           slotProps={{ paper: { sx: { minWidth: 160 } } }}
         >
-          {(Object.keys(sortLabels) as SortKey[]).map((key) => (
+          {sortKeys.map((key) => (
             <MenuItem
               key={key}
               selected={sortKey === key}
@@ -733,8 +759,10 @@ export function TopBar({
             </MenuItem>
           ))}
           <Divider />
+          {/* Direction is meaningless under manual order (always collection-defined). */}
           <MenuItem
             selected={sortDir === 'asc'}
+            disabled={sortKey === 'manual'}
             onClick={() => {
               setSortMenuAnchor(null)
               onSortChange?.(sortKey, 'asc')
@@ -744,6 +772,7 @@ export function TopBar({
           </MenuItem>
           <MenuItem
             selected={sortDir === 'desc'}
+            disabled={sortKey === 'manual'}
             onClick={() => {
               setSortMenuAnchor(null)
               onSortChange?.(sortKey, 'desc')

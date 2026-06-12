@@ -12,7 +12,8 @@
  * hide or reorder what the defaults contribute.
  */
 
-import type { FileEntry, Topic, ViewMode } from '../types'
+import type { FileEntry, SortKey, ViewMode } from '../types'
+import type { FileItem, LocationCapabilities } from '../data/FolderReader'
 
 /** What the menu was invoked on. */
 export type FileMenuTarget = 'item' | 'selection' | 'view'
@@ -43,6 +44,12 @@ export type FileMenuIcon =
   | 'select-all'
   | 'view-list'
   | 'view-icon'
+  | 'collection'
+  | 'remove-ref'
+  | 'jump'
+  | 'broken'
+  | 'move-up'
+  | 'move-down'
 
 export interface FileMenuAction {
   type: 'action'
@@ -75,15 +82,22 @@ export type FileMenuSection = FileMenuEntryItem[]
 
 export interface FileMenuContext {
   target: FileMenuTarget
-  /** Exactly 1 entry for 'item', 2+ for 'selection', 0 for 'view'. */
+  /** Exactly 1 item for 'item', 2+ for 'selection', 0 for 'view'. */
+  items: FileItem[]
+  /** Convenience projection of `items` — same order. */
   entries: FileEntry[]
-  currentPath: string
+  /** Canonical location url of the invoking pane. */
+  currentUrl: string
   viewMode: ViewMode
-  /** Topic aggregation view, when active (entries are virtual there). */
-  topic: Topic | null
+  /** Location capabilities — providers trim themselves by these, never by scheme. */
+  capabilities: LocationCapabilities
+  /** Active sort key (manual ordering actions only make sense under 'manual'). */
+  sortKey: SortKey
+  /** Existing collections for the "Add to Collection" submenu. */
+  collections: { id: string; title: string }[]
   /** Folders offered as quick "Move to" targets. */
   moveTargets: { label: string; path: string }[]
-  capabilities: {
+  pane: {
     canOpenInNewTab: boolean
     canOpenInRightPane: boolean
   }

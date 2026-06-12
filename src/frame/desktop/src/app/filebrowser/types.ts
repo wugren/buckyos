@@ -54,6 +54,12 @@ export interface FileEntry {
   }
   /** Story entries — contextual memories attached to the file. */
   story?: StoryEntry[]
+  /**
+   * This entry itself is a reference (soft link). The target is a canonical
+   * URL whose scheme decides how it resolves (`dfs://` today; more later).
+   * Item-level: link entries can live in any container, not just collections.
+   */
+  link?: { targetUrl: string; broken?: boolean }
 }
 
 export interface StoryEntry {
@@ -125,8 +131,12 @@ export interface SearchHit {
 
 export type ViewMode = 'list' | 'icon'
 
-/** Toolbar sort model — applied to the entries of the current folder. */
-export type SortKey = 'name' | 'size' | 'modified' | 'kind'
+/**
+ * Toolbar sort model — pushed down to the FolderReader as part of the
+ * ListQuery; the UI never sorts items itself. `manual` is the collection
+ * member order (sortDir is ignored there).
+ */
+export type SortKey = 'manual' | 'name' | 'size' | 'modified' | 'kind'
 export type SortDir = 'asc' | 'desc'
 
 export interface BrowserTab {
