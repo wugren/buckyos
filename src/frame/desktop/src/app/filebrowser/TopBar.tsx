@@ -1,23 +1,42 @@
 import clsx from 'clsx'
-import { Divider, IconButton, ListItemText, Menu, MenuItem, TextField, Tooltip } from '@mui/material'
+import {
+  Divider,
+  IconButton,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
+  TextField,
+  Tooltip,
+} from '@mui/material'
 import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  ArrowUpDown,
   ChevronDown,
   ChevronRight,
+  ClipboardPaste,
   Copy,
+  FilePlus,
+  FolderInput,
   FolderPlus,
   LayoutGrid,
   List,
+  PenLine,
   Plus,
+  Scissors,
   Search,
+  SearchX,
+  Settings,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { useI18n } from '../../i18n/provider'
-import type { BrowserTab, ViewMode } from './types'
+import type { BrowserTab, SortDir, SortKey, ViewMode } from './types'
 
 interface TopBarProps {
   tabs: BrowserTab[]
@@ -49,6 +68,64 @@ interface TopBarProps {
   onCopyPath: () => void
   onUpload?: () => void
   onNewFolder?: () => void
+  onNewFile?: () => void
+  /** Number of selected entries in the pane — drives the clipboard ops. */
+  selectedCount?: number
+  /** False inside topic views, where entries are aggregated references. */
+  canOrganize?: boolean
+  canPaste?: boolean
+  onCut?: () => void
+  onCopy?: () => void
+  onPaste?: () => void
+  onRename?: () => void
+  onDelete?: () => void
+  onSettings?: () => void
+  moveTargets?: { label: string; path: string }[]
+  onMoveTo?: (path: string) => void
+  sortKey?: SortKey
+  sortDir?: SortDir
+  onSortChange?: (key: SortKey, dir: SortDir) => void
+}
+
+/** Icon-only toolbar button with a tooltip (span keeps the tooltip alive when disabled). */
+function ToolbarIconButton({
+  title,
+  disabled,
+  active,
+  onClick,
+  children,
+}: {
+  title: string
+  disabled?: boolean
+  active?: boolean
+  onClick?: (event: ReactMouseEvent<HTMLButtonElement>) => void
+  children: ReactNode
+}) {
+  return (
+    <Tooltip title={title}>
+      <span className="inline-flex">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={onClick}
+          aria-label={title}
+          className={clsx(
+            'flex h-7 min-w-7 shrink-0 items-center justify-center rounded-md px-1.5 text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)] disabled:pointer-events-none disabled:opacity-40',
+            active &&
+              'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] text-[color:var(--cp-text)]',
+          )}
+        >
+          {children}
+        </button>
+      </span>
+    </Tooltip>
+  )
+}
+
+function ToolbarDivider() {
+  return (
+    <div className="mx-1 h-4 w-px shrink-0 bg-[color:color-mix(in_srgb,var(--cp-border)_70%,transparent)]" />
+  )
 }
 
 function PathCrumbs({ path, onNavigate }: { path: string; onNavigate: (p: string) => void }) {
@@ -111,10 +188,29 @@ export function TopBar({
   onCopyPath,
   onUpload,
   onNewFolder,
+  onNewFile,
+  selectedCount = 0,
+  canOrganize = true,
+  canPaste = false,
+  onCut,
+  onCopy,
+  onPaste,
+  onRename,
+  onDelete,
+  onSettings,
+  moveTargets = [],
+  onMoveTo,
+  sortKey = 'name',
+  sortDir = 'asc',
+  onSortChange,
 }: TopBarProps) {
   const { t } = useI18n()
   const [searchOpen, setSearchOpen] = useState(false)
   const [tabMenuAnchor, setTabMenuAnchor] = useState<HTMLElement | null>(null)
+  const [newMenuAnchor, setNewMenuAnchor] = useState<HTMLElement | null>(null)
+  const [moveMenuAnchor, setMoveMenuAnchor] = useState<HTMLElement | null>(null)
+  const [viewMenuAnchor, setViewMenuAnchor] = useState<HTMLElement | null>(null)
+  const [sortMenuAnchor, setSortMenuAnchor] = useState<HTMLElement | null>(null)
   const [tabContextMenu, setTabContextMenu] = useState<
     { tabId: string; top: number; left: number } | null
   >(null)
@@ -124,6 +220,12 @@ export function TopBar({
   const pathInputRef = useRef<HTMLInputElement | null>(null)
   const searchVisible = searchOpen || !!searchQuery
   const canCloseTab = tabs.length > 1 || allowCloseLast
+  const sortLabels: Record<SortKey, string> = {
+    name: t('filebrowser.column.name', 'Name'),
+    size: t('filebrowser.column.size', 'Size'),
+    modified: t('filebrowser.column.modified', 'Modified'),
+    kind: t('filebrowser.column.kind', 'Kind'),
+  }
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus()
@@ -416,69 +518,251 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Toolbar row: file operations + view mode + search toggle */}
-      <div className="flex items-center gap-1.5">
+      {/* Toolbar row: upload / new | clipboard ops | settings ··· view mode / sort / search */}
+      <div className="flex items-center gap-0.5 overflow-x-auto">
         {onUpload ? (
           <button
             type="button"
             onClick={onUpload}
-            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)]"
+            disabled={!canOrganize}
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)] disabled:pointer-events-none disabled:opacity-40"
           >
             <Upload size={14} />
             {t('filebrowser.actions.upload', 'Upload')}
           </button>
         ) : null}
-        {onNewFolder ? (
-          <button
-            type="button"
-            onClick={onNewFolder}
-            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)]"
-          >
-            <FolderPlus size={14} />
-            {t('filebrowser.actions.newFolder', 'New folder')}
-          </button>
+        {onNewFolder || onNewFile ? (
+          <>
+            <ToolbarIconButton
+              title={t('filebrowser.actions.new', 'New')}
+              disabled={!canOrganize}
+              active={Boolean(newMenuAnchor)}
+              onClick={(event) => setNewMenuAnchor(event.currentTarget)}
+            >
+              <span className="flex items-center">
+                <Plus size={14} />
+                <ChevronDown size={10} />
+              </span>
+            </ToolbarIconButton>
+            <Menu
+              anchorEl={newMenuAnchor}
+              open={Boolean(newMenuAnchor)}
+              onClose={() => setNewMenuAnchor(null)}
+              slotProps={{ paper: { sx: { minWidth: 180 } } }}
+            >
+              {onNewFolder ? (
+                <MenuItem
+                  onClick={() => {
+                    setNewMenuAnchor(null)
+                    onNewFolder()
+                  }}
+                >
+                  <ListItemIcon>
+                    <FolderPlus size={15} />
+                  </ListItemIcon>
+                  <ListItemText primary={t('filebrowser.actions.newFolder', 'New folder')} />
+                </MenuItem>
+              ) : null}
+              {onNewFile ? (
+                <MenuItem
+                  onClick={() => {
+                    setNewMenuAnchor(null)
+                    onNewFile()
+                  }}
+                >
+                  <ListItemIcon>
+                    <FilePlus size={15} />
+                  </ListItemIcon>
+                  <ListItemText primary={t('filebrowser.actions.newTextFile', 'New text file')} />
+                </MenuItem>
+              ) : null}
+            </Menu>
+          </>
         ) : null}
 
-        <div className="flex-1" />
+        <ToolbarDivider />
 
-        <div className="flex items-center rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_80%,transparent)]">
-          <IconButton
-            size="small"
-            onClick={() => onViewModeChange('list')}
-            className={clsx(
-              viewMode === 'list' &&
-                '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-            )}
-            aria-label={t('filebrowser.view.list', 'List view')}
-          >
-            <List size={14} />
-          </IconButton>
-          <IconButton
-            size="small"
-            onClick={() => onViewModeChange('icon')}
-            className={clsx(
-              viewMode === 'icon' &&
-                '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-            )}
-            aria-label={t('filebrowser.view.icon', 'Icon view')}
-          >
-            <LayoutGrid size={14} />
-          </IconButton>
-        </div>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.cut', 'Cut')}
+          disabled={!canOrganize || !selectedCount || !onCut}
+          onClick={onCut}
+        >
+          <Scissors size={14} />
+        </ToolbarIconButton>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.copy', 'Copy')}
+          disabled={!selectedCount || !onCopy}
+          onClick={onCopy}
+        >
+          <Copy size={14} />
+        </ToolbarIconButton>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.paste', 'Paste')}
+          disabled={!canOrganize || !canPaste || !onPaste}
+          onClick={onPaste}
+        >
+          <ClipboardPaste size={14} />
+        </ToolbarIconButton>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.rename', 'Rename')}
+          disabled={!canOrganize || selectedCount !== 1 || !onRename}
+          onClick={onRename}
+        >
+          <PenLine size={14} />
+        </ToolbarIconButton>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.moveTo', 'Move to')}
+          disabled={!canOrganize || !selectedCount || !moveTargets.length || !onMoveTo}
+          active={Boolean(moveMenuAnchor)}
+          onClick={(event) => setMoveMenuAnchor(event.currentTarget)}
+        >
+          <FolderInput size={14} />
+        </ToolbarIconButton>
+        <Menu
+          anchorEl={moveMenuAnchor}
+          open={Boolean(moveMenuAnchor)}
+          onClose={() => setMoveMenuAnchor(null)}
+          slotProps={{ paper: { sx: { minWidth: 200, maxHeight: 320 } } }}
+        >
+          {moveTargets.map((target) => (
+            <MenuItem
+              key={target.path}
+              onClick={() => {
+                setMoveMenuAnchor(null)
+                onMoveTo?.(target.path)
+              }}
+            >
+              <ListItemText primary={target.label} primaryTypographyProps={{ noWrap: true, fontSize: 13 }} />
+            </MenuItem>
+          ))}
+        </Menu>
+        <ToolbarIconButton
+          title={t('filebrowser.actions.delete', 'Delete')}
+          disabled={!canOrganize || !selectedCount || !onDelete}
+          onClick={onDelete}
+        >
+          <Trash2 size={14} />
+        </ToolbarIconButton>
 
-        <Tooltip title={t('filebrowser.topbar.search', 'Search')}>
-          <IconButton
-            size="small"
-            onClick={() => setSearchOpen((v) => !v)}
-            className={clsx(
-              searchVisible &&
-                '!bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] !text-[color:var(--cp-text)]',
-            )}
-            aria-label={t('filebrowser.topbar.search', 'Search')}
+        <ToolbarDivider />
+
+        <ToolbarIconButton
+          title={t('filebrowser.actions.settings', 'Settings')}
+          disabled={!onSettings}
+          onClick={onSettings}
+        >
+          <Settings size={14} />
+        </ToolbarIconButton>
+
+        <div className="min-w-2 flex-1" />
+
+        <ToolbarIconButton
+          title={t('filebrowser.topbar.viewMode', 'View mode')}
+          active={Boolean(viewMenuAnchor)}
+          onClick={(event) => setViewMenuAnchor(event.currentTarget)}
+        >
+          <span className="flex items-center">
+            {viewMode === 'list' ? <List size={14} /> : <LayoutGrid size={14} />}
+            <ChevronDown size={10} />
+          </span>
+        </ToolbarIconButton>
+        <Menu
+          anchorEl={viewMenuAnchor}
+          open={Boolean(viewMenuAnchor)}
+          onClose={() => setViewMenuAnchor(null)}
+          slotProps={{ paper: { sx: { minWidth: 160 } } }}
+        >
+          <MenuItem
+            selected={viewMode === 'list'}
+            onClick={() => {
+              setViewMenuAnchor(null)
+              onViewModeChange('list')
+            }}
           >
-            <Search size={14} />
-          </IconButton>
-        </Tooltip>
+            <ListItemIcon>
+              <List size={15} />
+            </ListItemIcon>
+            <ListItemText primary={t('filebrowser.view.list', 'List view')} />
+          </MenuItem>
+          <MenuItem
+            selected={viewMode === 'icon'}
+            onClick={() => {
+              setViewMenuAnchor(null)
+              onViewModeChange('icon')
+            }}
+          >
+            <ListItemIcon>
+              <LayoutGrid size={15} />
+            </ListItemIcon>
+            <ListItemText primary={t('filebrowser.view.icon', 'Icon view')} />
+          </MenuItem>
+        </Menu>
+
+        <button
+          type="button"
+          onClick={(event) => setSortMenuAnchor(event.currentTarget)}
+          className={clsx(
+            'flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)]',
+            sortMenuAnchor &&
+              'bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_28%,var(--cp-surface))] text-[color:var(--cp-text)]',
+          )}
+          aria-label={t('filebrowser.topbar.sort', 'Sort by')}
+          aria-haspopup="menu"
+          aria-expanded={Boolean(sortMenuAnchor)}
+        >
+          <ArrowUpDown size={13} />
+          {sortLabels[sortKey]}
+          <ChevronDown size={10} />
+        </button>
+        <Menu
+          anchorEl={sortMenuAnchor}
+          open={Boolean(sortMenuAnchor)}
+          onClose={() => setSortMenuAnchor(null)}
+          slotProps={{ paper: { sx: { minWidth: 160 } } }}
+        >
+          {(Object.keys(sortLabels) as SortKey[]).map((key) => (
+            <MenuItem
+              key={key}
+              selected={sortKey === key}
+              onClick={() => {
+                setSortMenuAnchor(null)
+                onSortChange?.(key, sortDir)
+              }}
+            >
+              <ListItemText primary={sortLabels[key]} />
+            </MenuItem>
+          ))}
+          <Divider />
+          <MenuItem
+            selected={sortDir === 'asc'}
+            onClick={() => {
+              setSortMenuAnchor(null)
+              onSortChange?.(sortKey, 'asc')
+            }}
+          >
+            <ListItemText primary={t('filebrowser.sort.asc', 'Ascending')} />
+          </MenuItem>
+          <MenuItem
+            selected={sortDir === 'desc'}
+            onClick={() => {
+              setSortMenuAnchor(null)
+              onSortChange?.(sortKey, 'desc')
+            }}
+          >
+            <ListItemText primary={t('filebrowser.sort.desc', 'Descending')} />
+          </MenuItem>
+        </Menu>
+
+        <ToolbarIconButton
+          title={
+            searchVisible
+              ? t('common.close', 'Close')
+              : t('filebrowser.topbar.search', 'Search')
+          }
+          onClick={() => (searchVisible ? closeSearch() : setSearchOpen(true))}
+        >
+          {searchVisible ? <SearchX size={14} /> : <Search size={14} />}
+        </ToolbarIconButton>
       </div>
     </div>
   )

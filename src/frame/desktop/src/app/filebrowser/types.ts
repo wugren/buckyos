@@ -125,6 +125,10 @@ export interface SearchHit {
 
 export type ViewMode = 'list' | 'icon'
 
+/** Toolbar sort model — applied to the entries of the current folder. */
+export type SortKey = 'name' | 'size' | 'modified' | 'kind'
+export type SortDir = 'asc' | 'desc'
+
 export interface BrowserTab {
   id: string
   title: string

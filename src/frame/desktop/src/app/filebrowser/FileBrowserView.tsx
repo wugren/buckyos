@@ -36,7 +36,7 @@ import {
   fileBrowserSnapshot,
   searchFiles,
 } from './mock/data'
-import type { BrowserTab, DfsNode, FileEntry, Topic, ViewMode } from './types'
+import type { BrowserTab, DfsNode, FileEntry, SortDir, SortKey, Topic, ViewMode } from './types'
 
 interface HistoryState {
   back: string[]
@@ -66,6 +66,20 @@ function entriesForPath(path: string): FileEntry[] {
   return fileBrowserSnapshot.entriesByPath[path] ?? []
 }
 
+/** Folders first, then the toolbar sort; name is the stable tie-breaker. */
+function sortEntries(entries: FileEntry[], key: SortKey, dir: SortDir): FileEntry[] {
+  const factor = dir === 'asc' ? 1 : -1
+  return [...entries].sort((a, b) => {
+    if ((a.kind === 'folder') !== (b.kind === 'folder')) return a.kind === 'folder' ? -1 : 1
+    let cmp = 0
+    if (key === 'size') cmp = (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0)
+    else if (key === 'modified') cmp = a.modifiedAt.localeCompare(b.modifiedAt)
+    else if (key === 'kind') cmp = a.kind.localeCompare(b.kind)
+    if (cmp === 0) cmp = a.name.localeCompare(b.name, undefined, { numeric: true })
+    return cmp * factor
+  })
+}
+
 interface DetachedTab {
   tab: BrowserTab
   history: HistoryState
@@ -79,6 +93,8 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     Object.fromEntries(initialTabs.map((tab) => [tab.id, { back: [], forward: [] }])),
   )
   const [viewMode, setViewMode] = useState<ViewMode>('list')
+  const [sortKey, setSortKey] = useState<SortKey>('name')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   /** Anchor entry for shift range selection. */
   const selectionAnchorRef = useRef<string | null>(null)
@@ -243,6 +259,10 @@ function useBrowserPane(initialTabs: BrowserTab[]) {
     activeHistory,
     viewMode,
     setViewMode,
+    sortKey,
+    setSortKey,
+    sortDir,
+    setSortDir,
     selectedIds,
     setSelectedIds,
     selectEntry,
@@ -277,6 +297,10 @@ export function FileBrowserView() {
   const [advancedMode, setAdvancedMode] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [previewCollapsed, setPreviewCollapsed] = useState(false)
+  /** Toolbar cut/copy clipboard, shared by both panes (mock — entries only). */
+  const [clipboard, setClipboard] = useState<{ entries: FileEntry[]; mode: 'cut' | 'copy' } | null>(
+    null,
+  )
 
   // Mobile-only panel states
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -336,8 +360,14 @@ export function FileBrowserView() {
     }
   }
 
-  const leftEntries = useMemo(() => entriesForPath(left.currentPath), [left.currentPath])
-  const rightEntries = useMemo(() => entriesForPath(right.currentPath), [right.currentPath])
+  const leftEntries = useMemo(
+    () => sortEntries(entriesForPath(left.currentPath), left.sortKey, left.sortDir),
+    [left.currentPath, left.sortKey, left.sortDir],
+  )
+  const rightEntries = useMemo(
+    () => sortEntries(entriesForPath(right.currentPath), right.sortKey, right.sortDir),
+    [right.currentPath, right.sortKey, right.sortDir],
+  )
   const leftTopic = topicForPath(left.currentPath)
   const rightTopic = topicForPath(right.currentPath)
 
@@ -414,6 +444,81 @@ export function FileBrowserView() {
   const paneFor = (side: 'left' | 'right') => (side === 'right' ? right : left)
   const paneEntriesFor = (side: 'left' | 'right') =>
     side === 'right' ? rightEntries : leftEntries
+
+  // ─── Toolbar (desktop) ───
+
+  const cutEntries = (entries: FileEntry[]) => {
+    if (!entries.length) return
+    setClipboard({ entries, mode: 'cut' })
+    showToast(t('filebrowser.toast.cut', 'Cut {{count}} item(s)', { count: entries.length }))
+  }
+
+  const copyEntries = (entries: FileEntry[]) => {
+    if (!entries.length) return
+    setClipboard({ entries, mode: 'copy' })
+    showToast(
+      t('filebrowser.toast.copyItems', 'Copied {{count}} item(s)', { count: entries.length }),
+    )
+  }
+
+  const pasteInto = (path: string) => {
+    if (!clipboard) return
+    showToast(
+      t('filebrowser.toast.paste', 'Pasted {{count}} item(s) to {{target}} (mock)', {
+        count: clipboard.entries.length,
+        target: path,
+      }),
+    )
+    if (clipboard.mode === 'cut') setClipboard(null)
+  }
+
+  /** Everything the TopBar toolbar row needs, resolved per pane. */
+  const toolbarPropsFor = (side: 'left' | 'right') => {
+    const pane = paneFor(side)
+    const selected = side === 'right' ? rightSelectedEntries : leftSelectedEntries
+    const topic = side === 'right' ? rightTopic : leftTopic
+    return {
+      selectedCount: selected.length,
+      canOrganize: !topic,
+      canPaste: !!clipboard,
+      onCut: () => cutEntries(selected),
+      onCopy: () => copyEntries(selected),
+      onPaste: () => pasteInto(pane.currentPath),
+      onRename: () =>
+        showToast(
+          t('filebrowser.toast.rename', 'Rename "{{name}}" (mock)', {
+            name: selected[0]?.name ?? '',
+          }),
+        ),
+      onDelete: () => {
+        showToast(
+          t('filebrowser.toast.delete', 'Deleted {{count}} item(s) (mock)', {
+            count: selected.length,
+          }),
+        )
+        pane.clearSelection()
+      },
+      onSettings: () => showToast(`${t('filebrowser.actions.settings', 'Settings')} (mock)`),
+      moveTargets,
+      onMoveTo: (path: string) =>
+        showToast(
+          t('filebrowser.toast.move', 'Move {{count}} item(s) to {{target}} (mock)', {
+            count: selected.length,
+            target: path,
+          }),
+        ),
+      sortKey: pane.sortKey,
+      sortDir: pane.sortDir,
+      onSortChange: (key: SortKey, dir: SortDir) => {
+        pane.setSortKey(key)
+        pane.setSortDir(dir)
+      },
+      onUpload: () => showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`),
+      onNewFolder: () => showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`),
+      onNewFile: () =>
+        showToast(`${t('filebrowser.actions.newTextFile', 'New text file')} (mock)`),
+    }
+  }
 
   const openMenu = (side: 'left' | 'right', position: MenuPosition, entry?: FileEntry) => {
     const pane = paneFor(side)
@@ -880,8 +985,7 @@ export function FileBrowserView() {
           onCopyPath={() => copyText(left.currentPath)}
           onSendTabToRight={handleSendToRight}
           canSendToRight={left.tabs.length > 1}
-          onUpload={() => showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)}
-          onNewFolder={() => showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`)}
+          {...toolbarPropsFor('left')}
         />
         <div className="min-h-0 flex-1 overflow-hidden">
           {leftSearchActive ? (
@@ -943,8 +1047,7 @@ export function FileBrowserView() {
             searchQuery={right.searchQuery}
             onSearchChange={right.setSearchQuery}
             onCopyPath={() => copyText(right.currentPath)}
-            onUpload={() => showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)}
-            onNewFolder={() => showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`)}
+            {...toolbarPropsFor('right')}
           />
           <div className="min-h-0 flex-1 overflow-hidden">
             {rightSearchActive ? (
