@@ -1,5 +1,3 @@
-import type { LayoutState } from '../../models/ui'
-
 export const desktopWindowViewportPadding = {
   top: 8,
   right: 12,
@@ -11,28 +9,23 @@ export const desktopWindowTitleBarHeight = 32
 export const desktopWindowMinVisibleTitleBarWidth = 120
 
 export function getDesktopWindowWorkspaceBounds({
-  deadZone,
   safeArea,
   topInset,
   viewportSize,
 }: {
-  deadZone: LayoutState['deadZone']
   safeArea: { top: number; bottom: number; left: number; right: number }
   topInset: number
   viewportSize: { width: number; height: number }
 }) {
-  const minX =
-    safeArea.left + deadZone.left + desktopWindowViewportPadding.left
+  const minX = safeArea.left + desktopWindowViewportPadding.left
   const minY = topInset + desktopWindowViewportPadding.top
   const maxRight =
     viewportSize.width -
     safeArea.right -
-    deadZone.right -
     desktopWindowViewportPadding.right
   const maxBottom =
     viewportSize.height -
     safeArea.bottom -
-    deadZone.bottom -
     desktopWindowViewportPadding.bottom
 
   return {

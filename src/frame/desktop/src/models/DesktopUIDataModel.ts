@@ -732,19 +732,12 @@ export class DesktopUIStore {
    */
   normalizeOpenWindowsForViewport(
     viewportSize: { width: number; height: number },
-    deadZone?: DeadZone,
     safeArea?: { top: number; bottom: number; left: number; right: number },
   ) {
-    const resolvedDeadZone =
-      deadZone ?? this.snapshot.syncData.appearance.deadZone ?? defaultDeadZone
     const resolvedSafeArea = safeArea ?? { top: 0, bottom: 0, left: 0, right: 0 }
     const bounds = getDesktopWindowWorkspaceBounds({
-      deadZone: resolvedDeadZone,
       safeArea: resolvedSafeArea,
-      topInset:
-        resolvedSafeArea.top +
-        resolvedDeadZone.top +
-        shellStatusBarHeight('desktop'),
+      topInset: resolvedSafeArea.top + shellStatusBarHeight('desktop'),
       viewportSize,
     })
 
@@ -1037,7 +1030,7 @@ export class DesktopUIStore {
     })
 
     if (this.snapshot.formFactor === 'desktop') {
-      this.normalizeOpenWindowsForViewport(callbacks.viewportSize, nextDeadZone)
+      this.normalizeOpenWindowsForViewport(callbacks.viewportSize)
     }
     this.persistLayout()
   }

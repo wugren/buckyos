@@ -181,6 +181,9 @@ function nextSupportedLocale(locale: SupportedLocale) {
   return supportedLocales[(currentIndex + 1) % supportedLocales.length]
 }
 
+// Dead-zone insets only apply on mobile; desktop windows and grid use the full viewport.
+const zeroDeadZone = { top: 0, bottom: 0, left: 0, right: 0 }
+
 // ---------------------------------------------------------------------------
 // DesktopRoute — now a thin view that delegates to the unified store
 // ---------------------------------------------------------------------------
@@ -308,12 +311,11 @@ export function DesktopRoute() {
   const hasError = status === 'error'
   const connectionState = useConnectionState(runtimeContainer)
 
-  const resolvedDeadZone = store.getResolvedDeadZone()
+  const resolvedDeadZone = isMobile ? store.getResolvedDeadZone() : zeroDeadZone
   const safeArea = useSafeAreaInsets()
   const desktopWorkspaceTopInset =
-    safeArea.top + resolvedDeadZone.top + shellStatusBarHeight('desktop')
+    safeArea.top + shellStatusBarHeight('desktop')
   const desktopViewportBounds = getDesktopWindowWorkspaceBounds({
-    deadZone: resolvedDeadZone,
     safeArea,
     topInset: desktopWorkspaceTopInset,
     viewportSize,
@@ -810,7 +812,6 @@ export function DesktopRoute() {
               {!isMobile && (
                 <DesktopWindowLayer
                   activityLog={activityLog}
-                  deadZone={resolvedDeadZone}
                   layoutState={resolvedLayout}
                   locale={locale}
                   onClose={handleCloseWindow}

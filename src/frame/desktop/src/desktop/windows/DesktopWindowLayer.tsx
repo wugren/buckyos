@@ -23,7 +23,6 @@ import type {
 
 export function DesktopWindowLayer({
   activityLog,
-  deadZone,
   layoutState,
   locale,
   onClose,
@@ -41,7 +40,6 @@ export function DesktopWindowLayer({
   workspaceSize,
 }: {
   activityLog: string[]
-  deadZone: LayoutState['deadZone']
   layoutState: LayoutState
   locale: string
   onClose: (windowId: string) => void
@@ -143,7 +141,6 @@ export function DesktopWindowLayer({
       const activeResize = resizeState.current
       if (activeResize) {
         const workspaceBounds = getDesktopWindowWorkspaceBounds({
-          deadZone,
           safeArea,
           topInset,
           viewportSize: workspaceSize,
@@ -215,7 +212,6 @@ export function DesktopWindowLayer({
         )
         const measured = draggingWindow ?? { width: 540, height: 380 }
         const workspaceBounds = getDesktopWindowWorkspaceBounds({
-          deadZone,
           safeArea,
           topInset,
           viewportSize: workspaceSize,
@@ -258,7 +254,6 @@ export function DesktopWindowLayer({
       window.removeEventListener('pointercancel', handleUp)
     }
   }, [
-    deadZone,
     onFocus,
     onGeometryChange,
     safeArea,
@@ -286,18 +281,13 @@ export function DesktopWindowLayer({
             }
             style={{
               zIndex: windowItem.zIndex,
-              left: isMaximized ? safeArea.left + deadZone.left + 12 : windowItem.x,
-              top: isMaximized ? topInset + 12 : windowItem.y,
+              left: isMaximized ? safeArea.left : windowItem.x,
+              top: isMaximized ? topInset : windowItem.y,
               width: isMaximized
-                ? workspaceSize.width -
-                  safeArea.left -
-                  deadZone.left -
-                  safeArea.right -
-                  deadZone.right -
-                  24
+                ? workspaceSize.width - safeArea.left - safeArea.right
                 : windowItem.width,
               height: isMaximized
-                ? workspaceSize.height - topInset - safeArea.bottom - deadZone.bottom - 24
+                ? workspaceSize.height - topInset - safeArea.bottom
                 : windowItem.height,
               transform: isFront ? 'translateY(0)' : 'translateY(4px)',
             }}
