@@ -7,11 +7,12 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  FolderPlus,
   LayoutGrid,
   List,
   Plus,
-  RefreshCw,
   Search,
+  Upload,
   X,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
@@ -46,6 +47,8 @@ interface TopBarProps {
   searchQuery: string
   onSearchChange: (query: string) => void
   onCopyPath: () => void
+  onUpload?: () => void
+  onNewFolder?: () => void
 }
 
 function PathCrumbs({ path, onNavigate }: { path: string; onNavigate: (p: string) => void }) {
@@ -67,7 +70,10 @@ function PathCrumbs({ path, onNavigate }: { path: string; onNavigate: (p: string
               'truncate rounded-md px-1.5 py-0.5 hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_14%,transparent)]',
               idx === crumbs.length - 1 && 'font-semibold text-[color:var(--cp-text)]',
             )}
-            onClick={() => onNavigate(crumb.path)}
+            onClick={(event) => {
+              event.stopPropagation()
+              onNavigate(crumb.path)
+            }}
           >
             {crumb.label}
           </button>
@@ -103,6 +109,8 @@ export function TopBar({
   searchQuery,
   onSearchChange,
   onCopyPath,
+  onUpload,
+  onNewFolder,
 }: TopBarProps) {
   const { t } = useI18n()
   const [searchOpen, setSearchOpen] = useState(false)
@@ -110,13 +118,35 @@ export function TopBar({
   const [tabContextMenu, setTabContextMenu] = useState<
     { tabId: string; top: number; left: number } | null
   >(null)
+  const [pathEditing, setPathEditing] = useState(false)
+  const [pathDraft, setPathDraft] = useState(currentPath)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const pathInputRef = useRef<HTMLInputElement | null>(null)
   const searchVisible = searchOpen || !!searchQuery
   const canCloseTab = tabs.length > 1 || allowCloseLast
 
   useEffect(() => {
     if (searchVisible) searchInputRef.current?.focus()
   }, [searchVisible])
+
+  useEffect(() => {
+    if (pathEditing) {
+      pathInputRef.current?.focus()
+      pathInputRef.current?.select()
+    }
+  }, [pathEditing])
+
+  const startPathEdit = () => {
+    if (searchVisible || pathEditing) return
+    setPathDraft(currentPath)
+    setPathEditing(true)
+  }
+
+  const commitPathEdit = () => {
+    const next = pathDraft.trim()
+    setPathEditing(false)
+    if (next && next !== currentPath) onNavigate(next)
+  }
 
   const closeSearch = () => {
     onSearchChange('')
@@ -286,22 +316,39 @@ export function TopBar({
         ) : null}
       </div>
 
-      {/* Nav row */}
+      {/* Address row: history navigation + path / search input */}
       <div className="flex items-center gap-1.5">
-        <IconButton size="small" disabled={!canBack} onClick={onBack} aria-label="back">
-          <ArrowLeft size={16} />
-        </IconButton>
-        <IconButton size="small" disabled={!canForward} onClick={onForward} aria-label="forward">
-          <ArrowRight size={16} />
-        </IconButton>
+        <div className="flex h-8 shrink-0 items-stretch overflow-hidden rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_80%,transparent)]">
+          <IconButton
+            size="small"
+            disabled={!canBack}
+            onClick={onBack}
+            aria-label="back"
+            className="!h-auto !w-9 !rounded-none !p-0"
+          >
+            <ArrowLeft size={16} />
+          </IconButton>
+          <IconButton
+            size="small"
+            disabled={!canForward}
+            onClick={onForward}
+            aria-label="forward"
+            className="!h-auto !w-9 !rounded-none !p-0"
+          >
+            <ArrowRight size={16} />
+          </IconButton>
+        </div>
         <IconButton size="small" disabled={!canUp} onClick={onUp} aria-label="up">
           <ArrowUp size={16} />
         </IconButton>
-        <IconButton size="small" onClick={() => onNavigate(currentPath)} aria-label="refresh">
-          <RefreshCw size={14} />
-        </IconButton>
 
-        <div className="relative ml-1 flex min-w-0 flex-1 items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_88%,transparent)] px-2 py-1">
+        <div
+          className={clsx(
+            'relative ml-1 flex h-8 min-w-0 flex-1 items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_88%,transparent)] pl-2 pr-1.5',
+            !searchVisible && !pathEditing && 'cursor-text',
+          )}
+          onClick={startPathEdit}
+        >
           {searchVisible ? (
             <>
               <Search size={14} className="ml-1 shrink-0 text-[color:var(--cp-muted)]" />
@@ -333,17 +380,66 @@ export function TopBar({
                 </IconButton>
               </Tooltip>
             </>
+          ) : pathEditing ? (
+            <input
+              ref={pathInputRef}
+              value={pathDraft}
+              onChange={(event) => setPathDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') commitPathEdit()
+                if (event.key === 'Escape') setPathEditing(false)
+              }}
+              onBlur={() => setPathEditing(false)}
+              spellCheck={false}
+              aria-label="path"
+              className="min-w-0 flex-1 bg-transparent px-1 font-mono text-[13px] outline-none"
+              style={{ color: 'var(--cp-text)' }}
+            />
           ) : (
             <>
               <PathCrumbs path={currentPath} onNavigate={onNavigate} />
               <Tooltip title={t('filebrowser.topbar.copyPath', 'Copy path')}>
-                <IconButton size="small" onClick={onCopyPath}>
+                <button
+                  type="button"
+                  aria-label={t('filebrowser.topbar.copyPath', 'Copy path')}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onCopyPath()
+                  }}
+                  className="ml-auto flex shrink-0 items-center self-stretch pl-2 pr-1 text-[color:var(--cp-muted)] transition hover:text-[color:var(--cp-text)]"
+                >
                   <Copy size={13} />
-                </IconButton>
+                </button>
               </Tooltip>
             </>
           )}
         </div>
+      </div>
+
+      {/* Toolbar row: file operations + view mode + search toggle */}
+      <div className="flex items-center gap-1.5">
+        {onUpload ? (
+          <button
+            type="button"
+            onClick={onUpload}
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)]"
+          >
+            <Upload size={14} />
+            {t('filebrowser.actions.upload', 'Upload')}
+          </button>
+        ) : null}
+        {onNewFolder ? (
+          <button
+            type="button"
+            onClick={onNewFolder}
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-[color:var(--cp-muted)] transition hover:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_12%,transparent)] hover:text-[color:var(--cp-text)]"
+          >
+            <FolderPlus size={14} />
+            {t('filebrowser.actions.newFolder', 'New folder')}
+          </button>
+        ) : null}
+
+        <div className="flex-1" />
 
         <div className="flex items-center rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface-2)_80%,transparent)]">
           <IconButton

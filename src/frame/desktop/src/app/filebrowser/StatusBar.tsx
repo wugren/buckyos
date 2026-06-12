@@ -1,4 +1,4 @@
-import { Copy, Link2, Wand2 } from 'lucide-react'
+import { Copy, Link2, PanelRightOpen, Wand2 } from 'lucide-react'
 import { Tooltip } from '@mui/material'
 import { useI18n } from '../../i18n/provider'
 import { formatBytes } from './MainContent'
@@ -9,9 +9,17 @@ interface StatusBarProps {
   totalCount: number
   selection: FileEntry | null
   onCopy: (text: string) => void
+  /** When set, shows an expand-sidebar button at the right edge (collapsed sidebar state). */
+  onExpandSidebar?: () => void
 }
 
-export function StatusBar({ currentPath, totalCount, selection, onCopy }: StatusBarProps) {
+export function StatusBar({
+  currentPath,
+  totalCount,
+  selection,
+  onCopy,
+  onExpandSidebar,
+}: StatusBarProps) {
   const { t } = useI18n()
 
   return (
@@ -68,6 +76,18 @@ export function StatusBar({ currentPath, totalCount, selection, onCopy }: Status
           <span className="truncate font-mono text-[10px]">{currentPath}</span>
         </>
       )}
+      {onExpandSidebar ? (
+        <Tooltip title={t('filebrowser.preview.expand', 'Expand sidebar')}>
+          <button
+            type="button"
+            onClick={onExpandSidebar}
+            className="ml-auto inline-flex shrink-0 items-center rounded-md p-0.5 hover:text-[color:var(--cp-text)]"
+            aria-label={t('filebrowser.preview.expand', 'Expand sidebar')}
+          >
+            <PanelRightOpen size={13} />
+          </button>
+        </Tooltip>
+      ) : null}
     </div>
   )
 }

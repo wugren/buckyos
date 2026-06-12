@@ -9,7 +9,7 @@ import {
   LayoutGrid,
   List,
   Menu as MenuIcon,
-  PanelRight,
+  PanelRightClose,
   Plus,
   RefreshCw,
   Search,
@@ -215,6 +215,9 @@ type BrowserPane = ReturnType<typeof useBrowserPane>
 export function FileBrowserView() {
   const { t } = useI18n()
   const isMobile = useMediaQuery('(max-width: 900px)')
+  // Tailwind xl — the preview sidebar only exists at this width, so the
+  // expand control in the status bar should follow the same gate.
+  const isXl = useMediaQuery('(min-width: 1280px)')
 
   const left = useBrowserPane(defaultTabs)
   const right = useBrowserPane([])
@@ -223,6 +226,7 @@ export function FileBrowserView() {
 
   const [advancedMode, setAdvancedMode] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const [previewCollapsed, setPreviewCollapsed] = useState(false)
 
   // Mobile-only panel states
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -328,7 +332,6 @@ export function FileBrowserView() {
   const rightSearchActive = !!right.searchQuery.trim()
 
   const focusedSelectedEntry = focusedIsRight ? rightSelectedEntry : leftSelectedEntry
-  const focusedEntries = focusedIsRight ? rightEntries : leftEntries
 
   const mobileTitleText = leftSelectedEntry?.name ?? left.activeTab?.title ?? 'root'
   const mobileSubtitleText =
@@ -629,138 +632,164 @@ export function FileBrowserView() {
   }
 
   // ─── Desktop layout ───
-  const leftTopBar = (
-    <TopBar
-      tabs={left.tabs}
-      activeTabId={left.activeTabId}
-      onSelectTab={left.setActiveTabId}
-      onCloseTab={handleCloseLeftTab}
-      onNewTab={handleNewTab}
-      closedTabs={closedTabs}
-      onRestoreClosedTab={handleRestoreClosedTab}
-      currentPath={left.currentPath}
-      onNavigate={left.navigate}
-      onBack={left.back}
-      onForward={left.forward}
-      onUp={left.goUp}
-      canBack={left.activeHistory.back.length > 0}
-      canForward={left.activeHistory.forward.length > 0}
-      canUp={left.currentPath !== '/'}
-      viewMode={left.viewMode}
-      onViewModeChange={left.setViewMode}
-      searchQuery={left.searchQuery}
-      onSearchChange={left.setSearchQuery}
-      onCopyPath={() => copyText(left.currentPath)}
-      onSendTabToRight={handleSendToRight}
-      canSendToRight={left.tabs.length > 1}
-    />
-  )
-
+  // VS Code-like shell: full-height nav tree | one or two self-contained panes
+  // (tabs + address row + toolbar + content + status bar) | collapsible sidebar.
   return (
     <div
-      className="flex h-full w-full flex-col overflow-hidden"
+      className="relative flex h-full w-full overflow-hidden"
       style={{ background: 'var(--cp-bg)' }}
     >
-      {!splitActive ? leftTopBar : null}
+      <aside
+        className="hidden w-[260px] shrink-0 flex-col overflow-hidden border-r border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_82%,transparent)] px-2 pt-2 md:flex"
+        onMouseDownCapture={() => setFocusedSide('left')}
+      >
+        <Sidebar
+          dfsRoots={fileBrowserSnapshot.dfsRoots}
+          devices={fileBrowserSnapshot.devices}
+          topics={fileBrowserSnapshot.topics}
+          activePath={left.currentPath}
+          activeTopicId={leftTopic?.id ?? null}
+          advancedMode={advancedMode}
+          onToggleAdvanced={setAdvancedMode}
+          onNavigate={left.navigate}
+          onSelectTopic={(id) => selectTopicInPane(left, id)}
+        />
+      </aside>
 
-      <div className="relative flex flex-1 min-h-0">
-        <aside
-          className="hidden w-[260px] shrink-0 flex-col overflow-hidden border-r border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_82%,transparent)] px-2 pt-2 md:flex"
-          onMouseDownCapture={() => setFocusedSide('left')}
+      <main
+        className="flex min-w-0 flex-1 flex-col"
+        onMouseDownCapture={() => setFocusedSide('left')}
+      >
+        <TopBar
+          tabs={left.tabs}
+          activeTabId={left.activeTabId}
+          onSelectTab={left.setActiveTabId}
+          onCloseTab={handleCloseLeftTab}
+          onNewTab={handleNewTab}
+          closedTabs={closedTabs}
+          onRestoreClosedTab={handleRestoreClosedTab}
+          currentPath={left.currentPath}
+          onNavigate={left.navigate}
+          onBack={left.back}
+          onForward={left.forward}
+          onUp={left.goUp}
+          canBack={left.activeHistory.back.length > 0}
+          canForward={left.activeHistory.forward.length > 0}
+          canUp={left.currentPath !== '/'}
+          viewMode={left.viewMode}
+          onViewModeChange={left.setViewMode}
+          searchQuery={left.searchQuery}
+          onSearchChange={left.setSearchQuery}
+          onCopyPath={() => copyText(left.currentPath)}
+          onSendTabToRight={handleSendToRight}
+          canSendToRight={left.tabs.length > 1}
+          onUpload={() => showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)}
+          onNewFolder={() => showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`)}
+        />
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {leftSearchActive ? (
+            <SearchResultsPanel
+              hits={leftSearchHits}
+              query={left.searchQuery}
+              onSelect={handleOpenEntry}
+            />
+          ) : (
+            <MainContent
+              entries={leftEntries}
+              viewMode={left.viewMode}
+              selectedId={left.selectedId}
+              onSelect={handleOpenEntry}
+              onOpenFolder={handleOpenFolder}
+              currentPath={left.currentPath}
+              topicContext={leftTopic}
+            />
+          )}
+        </div>
+        <StatusBar
+          currentPath={left.currentPath}
+          totalCount={leftEntries.length}
+          selection={leftSelectedEntry}
+          onCopy={copyText}
+          onExpandSidebar={
+            !splitActive && previewCollapsed && isXl
+              ? () => setPreviewCollapsed(false)
+              : undefined
+          }
+        />
+      </main>
+
+      {splitActive ? (
+        <section
+          className="flex min-w-0 flex-1 flex-col border-l border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)]"
+          onMouseDownCapture={() => setFocusedSide('right')}
         >
-          <Sidebar
-            dfsRoots={fileBrowserSnapshot.dfsRoots}
-            devices={fileBrowserSnapshot.devices}
-            topics={fileBrowserSnapshot.topics}
-            activePath={left.currentPath}
-            activeTopicId={leftTopic?.id ?? null}
-            advancedMode={advancedMode}
-            onToggleAdvanced={setAdvancedMode}
-            onNavigate={left.navigate}
-            onSelectTopic={(id) => selectTopicInPane(left, id)}
+          <TopBar
+            tabs={right.tabs}
+            activeTabId={right.activeTabId}
+            onSelectTab={right.setActiveTabId}
+            onCloseTab={handleCloseRightTab}
+            showTabControls={false}
+            allowCloseLast
+            currentPath={right.currentPath}
+            onNavigate={right.navigate}
+            onBack={right.back}
+            onForward={right.forward}
+            onUp={right.goUp}
+            canBack={right.activeHistory.back.length > 0}
+            canForward={right.activeHistory.forward.length > 0}
+            canUp={right.currentPath !== '/'}
+            viewMode={right.viewMode}
+            onViewModeChange={right.setViewMode}
+            searchQuery={right.searchQuery}
+            onSearchChange={right.setSearchQuery}
+            onCopyPath={() => copyText(right.currentPath)}
+            onUpload={() => showToast(`${t('filebrowser.actions.upload', 'Upload')} (mock)`)}
+            onNewFolder={() => showToast(`${t('filebrowser.actions.newFolder', 'New folder')} (mock)`)}
           />
-        </aside>
-
-        <main
-          className="flex min-w-0 flex-1 flex-col"
-          onMouseDownCapture={() => setFocusedSide('left')}
-        >
-          {splitActive ? leftTopBar : null}
           <div className="min-h-0 flex-1 overflow-hidden">
-            {leftSearchActive ? (
+            {rightSearchActive ? (
               <SearchResultsPanel
-                hits={leftSearchHits}
-                query={left.searchQuery}
-                onSelect={handleOpenEntry}
+                hits={rightSearchHits}
+                query={right.searchQuery}
+                onSelect={(entry) => right.setSelectedId(entry.id)}
               />
             ) : (
               <MainContent
-                entries={leftEntries}
-                viewMode={left.viewMode}
-                selectedId={left.selectedId}
-                onSelect={handleOpenEntry}
-                onOpenFolder={handleOpenFolder}
-                currentPath={left.currentPath}
-                topicContext={leftTopic}
+                entries={rightEntries}
+                viewMode={right.viewMode}
+                selectedId={right.selectedId}
+                onSelect={(entry) => right.setSelectedId(entry.id)}
+                onOpenFolder={(path) => right.navigate(path)}
+                currentPath={right.currentPath}
+                topicContext={rightTopic}
               />
             )}
           </div>
-        </main>
+          <StatusBar
+            currentPath={right.currentPath}
+            totalCount={rightEntries.length}
+            selection={rightSelectedEntry}
+            onCopy={copyText}
+            onExpandSidebar={
+              previewCollapsed && isXl ? () => setPreviewCollapsed(false) : undefined
+            }
+          />
+        </section>
+      ) : null}
 
-        {splitActive ? (
-          <section
-            className="flex min-w-0 flex-1 flex-col border-l border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)]"
-            onMouseDownCapture={() => setFocusedSide('right')}
-          >
-            <TopBar
-              tabs={right.tabs}
-              activeTabId={right.activeTabId}
-              onSelectTab={right.setActiveTabId}
-              onCloseTab={handleCloseRightTab}
-              showTabControls={false}
-              allowCloseLast
-              currentPath={right.currentPath}
-              onNavigate={right.navigate}
-              onBack={right.back}
-              onForward={right.forward}
-              onUp={right.goUp}
-              canBack={right.activeHistory.back.length > 0}
-              canForward={right.activeHistory.forward.length > 0}
-              canUp={right.currentPath !== '/'}
-              viewMode={right.viewMode}
-              onViewModeChange={right.setViewMode}
-              searchQuery={right.searchQuery}
-              onSearchChange={right.setSearchQuery}
-              onCopyPath={() => copyText(right.currentPath)}
-            />
-            <div className="min-h-0 flex-1 overflow-hidden">
-              {rightSearchActive ? (
-                <SearchResultsPanel
-                  hits={rightSearchHits}
-                  query={right.searchQuery}
-                  onSelect={(entry) => right.setSelectedId(entry.id)}
-                />
-              ) : (
-                <MainContent
-                  entries={rightEntries}
-                  viewMode={right.viewMode}
-                  selectedId={right.selectedId}
-                  onSelect={(entry) => right.setSelectedId(entry.id)}
-                  onOpenFolder={(path) => right.navigate(path)}
-                  currentPath={right.currentPath}
-                  topicContext={rightTopic}
-                />
-              )}
-            </div>
-          </section>
-        ) : null}
-
+      {!previewCollapsed ? (
         <aside className="hidden w-[320px] shrink-0 flex-col overflow-hidden border-l border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_86%,transparent)] xl:flex">
           <div className="flex items-center justify-between border-b border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-4 py-2">
             <span className="shell-kicker">
               {t('filebrowser.preview.title', 'Preview & Meta')}
             </span>
-            <PanelRight size={14} className="text-[color:var(--cp-muted)]" />
+            <IconButton
+              size="small"
+              onClick={() => setPreviewCollapsed(true)}
+              aria-label={t('filebrowser.preview.collapse', 'Collapse sidebar')}
+            >
+              <PanelRightClose size={14} />
+            </IconButton>
           </div>
           <div className="flex-1 overflow-hidden">
             <PreviewPanel
@@ -772,14 +801,7 @@ export function FileBrowserView() {
             />
           </div>
         </aside>
-      </div>
-
-      <StatusBar
-        currentPath={focusedPane.currentPath}
-        totalCount={focusedEntries.length}
-        selection={focusedSelectedEntry}
-        onCopy={copyText}
-      />
+      ) : null}
 
       {toast ? (
         <div className="pointer-events-none absolute bottom-8 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-3 py-1.5 text-xs text-white">
