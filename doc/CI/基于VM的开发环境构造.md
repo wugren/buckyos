@@ -9,11 +9,10 @@
 整个基础设施围绕 **Workspace Group**（工作区组）的概念组织。每个 Group 代表一种典型的分布式网络拓扑（例如 `full`），包含一组虚拟机定义和应用配置。
 
 
-### 典型环境：2zone_sn
-这是目前最常用的开发环境，模拟了一个包含 3 个节点的最小化 BuckyOS 网络：
+### 典型环境：sntest
+这是目前最常用的开发环境，模拟了一个包含 SN 和 OOD 的最小化 BuckyOS 网络：
 - **SN**：Super Node，提供网络发现服务。
-- **Alice.ood1**：模拟 OOD1 设备（配置了端口映射）。
-- **Bob.ood1**：模拟 OOD1 设备（LAN 环境）。
+- **Alice.ood1**：模拟 OOD1 设备（LAN 环境）。
 *注：宿主机通常作为无 SN 的 WLAN 节点参与网络。*
 
 ## 2. 前置准备
@@ -32,31 +31,111 @@
 
 ```bash
 # 1. 清理旧环境（可选）
-buckyos-devtest 2zone_sn clean_vms
+uv run buckyos-devtest sntest clean_vms
 
 # 2. 创建虚拟机
-# 这会根据 nodes.json 创建 VM，并在启动后执行初始化脚本（如设置 iptables、安装 CA 证书）
-buckyos-devtest 2zone_sn create_vms
+# 这会根据 nodes.json 创建 VM，并在启动后执行初始化脚本（如设置 hostname、目录权限、hosts 记录）
+uv run buckyos-devtest sntest create_vms
 
 # 3. 创建纯净快照 'init'
-buckyos-devtest 2zone_sn snapshot init
+uv run buckyos-devtest sntest snapshot init
 ```
 
 ### 阶段二：软件部署 (Install)
 将当前代码库中的 BuckyOS 组件构建并部署到虚拟机。
 
 ```bash
-# 0. 本地 Build Linux 版本，再安装到 rootfs
-# Apple Silicon 主机使用 aarch64；Intel/AMD64 主机使用 amd64
+# 0. 本地 Build Linux 版本，准备后续推送给 VM 的 rootfs/bin。
+# Apple Silicon 主机通常构建 aarch64；Intel/AMD64 主机构建 amd64。
 uv run ./buckyos-build.py aarch64
+
+# 1. 再恢复宿主机可执行的 buckycli。
+# buckyos-build.py 成功后会继续执行 buckyos-update，可能把 Linux 版 buckycli
+# 覆盖到 ~/buckycli/buckycli；make_config.py 在宿主机执行，必须调用 host-native buckycli。
+# macOS Apple Silicon 上这里应得到 Mach-O arm64，而不是 Linux ELF。
+./build_host_buckycli.sh
+
+# 2. 编译并安装所有配置的 App。
+# 脚本会自动执行 host build_all -> push -> remote install 流程。
+# web3-gateway.build_all 会在调用 make_config.py sn_server 前按需生成
+# alice/bob/charlie 的开发用户环境，供 SN DB 注册使用。
+uv run buckyos-devtest sntest install
+
+# 3. 创建已安装快照 'installed'
+uv run buckyos-devtest sntest snapshot installed
+```
+
+`uv run ./buckyos-build.py aarch64` 不是纯 build：它会先调用 `buckyos-build`，成功后再调用 `buckyos-update`。当前 `buckyos-update` 会更新所有 app，因此会把 `src/rootfs/bin/buckycli/buckycli` 覆盖到宿主机 `~/buckycli/buckycli`。这就是为什么必须在 Linux build 之后、`buckyos-devtest sntest install` 之前重新恢复 host-native `buckycli`。
+
+同理，**不要**在 Linux 交叉构建之后直接执行：
+
+```bash
 uv run ./buckyos-install.py --all
+```
 
-# 1. 编译并安装所有配置的 App
-# 脚本会自动执行 build -> push -> install 流程
-buckyos-devtest 2zone_sn install
+`bucky_project.yaml` 中单独的 `buckycli` app 默认安装目标是 `~/buckycli/`。如果此时 `src/rootfs/bin/buckycli/buckycli` 是 Linux 版本，裸 `--all` 也会把 Linux ELF 覆盖到宿主机 `~/buckycli/buckycli`，随后 `make_config.py` 会在 macOS 上执行这个 ELF，并报：
 
-# 2. 创建已安装快照 'installed'
-buckyos-devtest 2zone_sn snapshot installed
+```text
+OSError: [Errno 8] Exec format error: '/Users/<user>/buckycli/buckycli'
+```
+
+`uv run buckyos-devtest sntest install` 内部的 `buckyos` app 会执行 `uv run buckyos-install --all --app=buckyos`，只把 BuckyOS rootfs 安装到宿主机 staging 目录，不会安装单独的 `buckycli` app 到 `~/buckycli/`。因此只要在 Linux build 之后按上面的顺序恢复 host-native `buckycli`，当前流程可以跑通。
+
+如果已经出现 `Exec format error`，先用 `file ~/buckycli/buckycli` 确认格式；若显示 `ELF 64-bit ...`，重新执行上面的第 1 步恢复宿主机版本。
+
+如果 `sn_server` 阶段仍报 `Failed to read user_config.json`，说明 `web3-gateway.build_all` 中的用户环境 bootstrap 未执行成功。可先单独重试：
+
+```bash
+uv run buckyos-devtest sntest exec web3-gateway.build_all --device sn
+```
+
+`web3-gateway` 的文件会先 push 到 VM 的 `/home/ubuntu/web3-gateway-staging`，再由 remote install 命令用 sudo 同步到 `/opt/web3-gateway`。如果 push 阶段出现 `cannot write to remote file`，优先检查 staging 目录是否可写。对已经创建的 VM 可先修复 staging 目录后重试 install：
+
+```bash
+uv run buckyos-devtest sntest run sn "rm -rf /home/ubuntu/web3-gateway-staging && mkdir -p /home/ubuntu/web3-gateway-staging"
+uv run buckyos-devtest sntest install
+```
+
+#### 自签发 CA 证书
+
+开发环境默认使用 `src/make_config.py` 生成的自签发 CA 来签发测试 TLS 证书。默认 CA 目录在本机的 `~/buckycli/ca/`，常见文件名为 `buckyos_test_ca_ca_cert.pem` 和 `buckyos_test_ca_ca_key.pem`。每个 BuckyOS 节点生成配置后，节点 rootfs 内会包含：
+
+- `etc/zone_cert.cert`：该 Zone 的服务端证书。
+- `etc/zone_cert_key.pem`：该 Zone 的服务端私钥。
+- `etc/ca.cert`：需要被客户端信任的 CA 证书。
+
+在 `sntest` 环境里，`uv run buckyos-devtest sntest install` 会把节点 rootfs 推送到 VM 的 `/opt/buckyos`，并通过 `src/dev_configs/apps/buckyos.json` 的 install 命令在 VM 内执行：
+
+```bash
+sudo cp /opt/buckyos/etc/ca.cert /usr/local/share/ca-certificates/buckyos_ca.crt
+sudo chmod 644 /usr/local/share/ca-certificates/buckyos_ca.crt
+sudo update-ca-certificates
+```
+
+这只解决 VM 内系统进程、curl、Python requests 等访问测试域名时的信任问题。宿主机浏览器或宿主机命令行要直接访问 `https://sn.devtests.org`、`https://alice.web3.devtests.org` 等测试域名时，也需要把同一个 CA 证书导入宿主机信任库。
+
+macOS 宿主机可执行：
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/buckycli/ca/buckyos_test_ca_ca_cert.pem
+```
+
+Linux 宿主机可执行：
+
+```bash
+sudo cp ~/buckycli/ca/buckyos_test_ca_ca_cert.pem /usr/local/share/ca-certificates/buckyos_test_ca.crt
+sudo update-ca-certificates
+```
+
+如果需要重新生成一套 CA，先删除 `~/buckycli/ca/` 下旧的 `*_ca_cert.pem` 和 `*_ca_key.pem`，再重新运行 install 流程。已经创建过的 VM 快照不会自动继承新 CA，应从 `init` 快照重新 install，或在目标 VM 内重新复制 `/opt/buckyos/etc/ca.cert` 并执行 `sudo update-ca-certificates`。
+
+验证 VM 内 CA 是否已生效：
+
+```bash
+uv run buckyos-devtest sntest run alice-ood1 "openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt /opt/buckyos/etc/zone_cert.cert"
+uv run buckyos-devtest sntest run alice-ood1 "curl -v https://sn.devtests.org/kapi/sn"
 ```
 
 ### 阶段三：运行与测试 (Runtime)
@@ -64,14 +143,14 @@ buckyos-devtest 2zone_sn snapshot installed
 
 ```bash
 # 1. 启动 (为了方便观察，也可以登录vm的ssh启动)
-buckyos-devtest 2zone_sn start app=$appname
+uv run buckyos-devtest sntest start app=$appname
 
 # 2. 创建运行态快照 'started'（可选，用于快速恢复服务运行状态）
-buckyos-devtest snapshot started
+uv run buckyos-devtest sntest snapshot started
 
 # 3. 执行测试用例
 # 在指定节点（如 alice）上运行测试脚本
-buckyos-devtest  2zone_sn run alice "python3 /opt/testcases/test_demo.py"
+uv run buckyos-devtest sntest run alice-ood1 "python3 /opt/testcases/test_demo.py"
 ```
 
 ### 阶段四：快速迭代循环
@@ -82,11 +161,11 @@ buckyos-devtest  2zone_sn run alice "python3 /opt/testcases/test_demo.py"
 # Apple Silicon 主机使用 aarch64；Intel/AMD64 主机使用 amd64
 uv run ./buckyos-build.py aarch64
 # 增量更新（执行 update 流程，通常比完整 install 快）
-buckyos-devtest 2zone_sn update
+uv run buckyos-devtest sntest update
 
 # 或者回滚到 init 状态全新安装（更干净）
-buckyos-devtest restore init
-buckyos-devtest install
+uv run buckyos-devtest sntest restore init
+uv run buckyos-devtest sntest install
 ```
 
 ## 4. 命令参考手册
