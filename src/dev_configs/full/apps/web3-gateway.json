@@ -12,10 +12,7 @@
       "echo 'MAKE sure you already build the linux version of cyfs-gateway (result store in web3-gateway/)'"
     ],
     "build_all": [
-      "test -f \"$HOME/buckycli/alice.bns.did/user_config.json\" || uv run ./make_config.py alice.ood1 --rootfs /tmp/buckyos-devtest/bootstrap/alice.ood1",
-      "test -f \"$HOME/buckycli/bob.bns.did/user_config.json\" || uv run ./make_config.py bob.ood1 --rootfs /tmp/buckyos-devtest/bootstrap/bob.ood1",
-      "test -f \"$HOME/buckycli/charlie.me/user_config.json\" || uv run ./make_config.py charlie.ood1 --rootfs /tmp/buckyos-devtest/bootstrap/charlie.ood1",
-      "uv run ./make_config.py sn_server --sn_ip {{sn.ip}}"
+      "deno task make_sn_configs --rootfs /opt/web3-gateway --sn_ip {{sn.ip}}"
     ],
     "update":[
       "echo 'update web3-gateway'"

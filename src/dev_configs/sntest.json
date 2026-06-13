@@ -33,7 +33,7 @@
         "node_id": "alice_ood1",
         "vm_template": "ubuntu_basic",
         "vm_params": {
-          "disk": "8G"
+          "disk": "10G"
         },
         "network": {
           "lan_id": "lan",
@@ -51,9 +51,8 @@
           "sudo iptables -I INPUT 2 ! -i lo -p tcp -m multiport --dports 80,443,2980 -j REJECT"
         ],
         "instance_commands": [
-            "sudo sh -c \"echo '{{sn.ip}} sn.devtests.org' >> /etc/hosts\"",
             "sudo mkdir -p /etc/systemd/resolved.conf.d",
-            "sudo sh -c \"echo '[Resolve]\\nDNS={{sn.ip}}\\nFallbackDNS=8.8.8.8 1.1.1.1' > /etc/systemd/resolved.conf.d/buckyos-dns.conf\"",
+            "sudo sh -c \"echo '[Resolve]\\nDNS={{sn.ip}}\\nDomains=~devtests.org\\nFallbackDNS=8.8.8.8 1.1.1.1' > /etc/systemd/resolved.conf.d/buckyos-dns.conf\"",
             "sudo systemctl restart systemd-resolved"
         ],
         "directories": {

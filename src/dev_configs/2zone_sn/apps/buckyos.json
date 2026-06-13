@@ -13,7 +13,7 @@
       ],
       "build_all": [
         "uv run buckyos-install --all --app=buckyos",
-        "uv run ./make_config.py {{buckyos.node_group}}"
+        "deno task make_config {{buckyos.node_group}}"
       ],
       "install": [
         "sudo chmod 777 -R /opt/buckyos/bin/",

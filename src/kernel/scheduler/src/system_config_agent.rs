@@ -24,6 +24,7 @@ use name_lib::{get_x_from_jwk, DeviceInfo, ZoneConfig};
 
 const SYSTEM_CONFIG_SERVICE_PORT: u16 = 3200;
 const FIXED_SERVICE_WEIGHT: u32 = 100;
+const DEFAULT_REQUIRED_CPU_MHZ: u32 = 50;
 const DEFAULT_REQUIRED_MEMORY: u64 = 32 * 1024 * 1024;
 
 fn map_api_user_type(user_type: &ApiUserType) -> UserType {
@@ -93,7 +94,7 @@ fn create_service_spec_by_app_config(
         state: spec_state,
         need_container,
         best_instance_count: app_config.expected_instance_count,
-        required_cpu_mhz: 200,
+        required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
         required_memory: DEFAULT_REQUIRED_MEMORY,
         required_gpu_tflops: 0.0,
         required_gpu_mem: 0,
@@ -118,7 +119,7 @@ fn create_service_spec_by_service_config(
         state: spec_state,
         need_container: false,
         best_instance_count: service_config.expected_instance_count,
-        required_cpu_mhz: 200,
+        required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
         required_memory: DEFAULT_REQUIRED_MEMORY,
         required_gpu_tflops: 0.0,
         required_gpu_mem: 0,
@@ -1919,7 +1920,7 @@ mod tests {
             state: ServiceSpecState::Deployed,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -1989,7 +1990,7 @@ mod tests {
             state: ServiceSpecState::Deleted,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -2063,7 +2064,7 @@ mod tests {
             state: ServiceSpecState::Deleted,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -2128,7 +2129,7 @@ mod tests {
             state: ServiceSpecState::Disable,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -2203,7 +2204,7 @@ mod tests {
             state: ServiceSpecState::Deployed,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,

@@ -7,8 +7,6 @@ import sys
 import platform
 from pathlib import Path
 
-from make_config import make_config_by_group_name
-
 
 DEVKIT_SPEC = "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
 
@@ -54,6 +52,31 @@ def _run_command(command: str, args: list[str]) -> int:
         env=os.environ.copy(),
         **_windows_subprocess_kwargs(),
     ).returncode
+
+
+def _run_make_config(config_group_name: str, target_root: Path) -> None:
+    executable = _find_command("deno")
+    if executable is None:
+        raise RuntimeError("deno not found. make_config.ts requires Deno >= 2.2")
+
+    env = os.environ.copy()
+    env["BUCKYOS_ROOT"] = str(target_root)
+    result = subprocess.run(
+        [
+            executable,
+            "run",
+            "-A",
+            "make_config.ts",
+            config_group_name,
+            "--rootfs",
+            str(target_root),
+        ],
+        cwd=build_dir,
+        env=env,
+        **_windows_subprocess_kwargs(),
+    ).returncode
+    if result != 0:
+        raise RuntimeError(f"make_config.ts failed with return code {result}")
 
 
 def _windows_subprocess_kwargs(detached: bool = False) -> dict[str, object]:
@@ -146,7 +169,7 @@ def update_files(install_all=False,config_group_name=None):
 
         if config_group_name:
            target_root = resolve_buckyos_root()
-           make_config_by_group_name(config_group_name, target_root, None, None, None)
+           _run_make_config(config_group_name, target_root)
         print("Files updated successfully")
     except Exception as e:
         print(f"Failed to update files: {e}")
