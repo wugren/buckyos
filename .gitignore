@@ -88,3 +88,4 @@ test/**/Cargo.lock
 test/**/target/
 src/rootfs/bin/workflow/workflow
 *.codex
+src/deno.lock
