@@ -101,6 +101,13 @@ uv run buckyos-devtest sntest create_vms
 uv run buckyos-devtest sntest install
 ```
 
+如果 push 阶段报 `cannot create remote directory /opt/web3-gateway: Permission denied`，说明当前 SN VM 没有执行到最新的目录初始化权限配置。可以重建 VM，或先对现有 VM 补一次目录授权后重试：
+
+```bash
+multipass exec sn -- bash -c "sudo mkdir -p /opt/web3-gateway && sudo chown -R ubuntu:ubuntu /opt/web3-gateway"
+uv run buckyos-devtest sntest install
+```
+
 #### 自签发 CA 证书
 
 开发环境默认使用 `src/make_config.ts` 生成的自签发 CA 来签发测试 TLS 证书。默认 CA 目录在本机的 `~/buckycli/ca/`，常见文件名为 `buckyos_test_ca_ca_cert.pem` 和 `buckyos_test_ca_ca_key.pem`。每个 BuckyOS 节点生成配置后，节点 rootfs 内会包含：

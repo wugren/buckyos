@@ -17,7 +17,8 @@
         },
         "init_commands": [
           "sudo hostnamectl set-hostname sn",
-          "sudo chmod 777 /opt/",
+          "sudo mkdir -p /opt/web3-gateway",
+          "sudo chown -R ubuntu:ubuntu /opt/web3-gateway",
           "sudo iptables -I INPUT -p udp --dport 53 -j ACCEPT",
           "sudo iptables -I INPUT -p tcp --dport 53 -j ACCEPT"
         ],
@@ -46,7 +47,8 @@
         },
         "init_commands": [
           "hostnamectl set-hostname alice-ood1",
-          "sudo chmod 777 /opt/",
+          "sudo mkdir -p /opt/buckyos",
+          "sudo chown -R ubuntu:ubuntu /opt/buckyos",
           "sudo iptables -I INPUT 1 -i lo -j ACCEPT",
           "sudo iptables -I INPUT 2 ! -i lo -p tcp -m multiport --dports 80,443,2980 -j REJECT"
         ],
