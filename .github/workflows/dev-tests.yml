@@ -72,8 +72,8 @@ jobs:
             runner_json: '["ubuntu-24.04"]'
             platform_key: linux
             arch: x86_64
-            rust_target: x86_64-unknown-linux-musl
-            needs_musl: true
+            rust_target: x86_64-unknown-linux-gnu
+            needs_musl: false
             needs_tauri: false
             needs_nsis: false
           - name: Linux ARM64 Dev Test
@@ -280,12 +280,12 @@ jobs:
           }
 
           pushd ../cyfs-gateway/src
-          buckyos-build
+          buckyos-build --target=${{ matrix.rust_target }}
           buckyos-install --all
           popd
 
           pushd src
-          buckyos-build
+          buckyos-build --target=${{ matrix.rust_target }}
           buckyos-install --all
           sudo HOME="$HOME" PATH="$PATH" BUCKYOS_ROOT="$BUCKYOS_ROOT" "$PYTHON_BIN" start.py --all
           wait_for_port "node gateway" 127.0.0.1 3180
@@ -387,12 +387,12 @@ jobs:
           Clear-RequiredPorts -Ports @(3180, 80, 443)
 
           Push-Location ..\cyfs-gateway\src
-          buckyos-build
+          buckyos-build --target=${{ matrix.rust_target }}
           buckyos-install --all
           Pop-Location
 
           Push-Location .\src
-          buckyos-build
+          buckyos-build --target=${{ matrix.rust_target }}
           buckyos-install --all
           python .\start.py --all
           Wait-ForPort -Name "node gateway" -TargetHost "127.0.0.1" -Port 3180
@@ -427,7 +427,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$LOCAL_PKG_DIR"
-          python3 ./make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --out-dir "$LOCAL_PKG_DIR"
+          python3 ./make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --rust-target ${{ matrix.rust_target }} --out-dir "$LOCAL_PKG_DIR"
 
       - name: Build local package (Windows)
         if: ${{ runner.os == 'Windows' }}
@@ -435,7 +435,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path $env:LOCAL_PKG_DIR -Force | Out-Null
-          python .\make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --out-dir $env:LOCAL_PKG_DIR
+          python .\make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --rust-target ${{ matrix.rust_target }} --out-dir $env:LOCAL_PKG_DIR
 
       - name: Capture package path (Unix)
         id: package_unix
