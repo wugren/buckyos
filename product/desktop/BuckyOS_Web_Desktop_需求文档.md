@@ -365,6 +365,8 @@ BuckyOS Web Desktop 中，App 的打开模式是核心抽象之一。
 - 复杂状态栏
 - 额外系统 UI
 
+> **实现现状（2026-06）**：当前实现已落地一条**轻量顶部状态栏（StatusBar）**和一个**侧滑系统抽屉（SystemSidebar）**，作为最小化的 System UI。它们仍遵循“尽量薄”的原则，不构成 taskbar / start menu。详见 §11.4 与 §27.3 / §27.4。
+
 ### 10.2 设计原因
 
 当前应优先把桌面底层抽象稳定下来，而不是过早绑定某一种系统 UI 样式（例如偏 Windows、偏 macOS 或偏 Android 的具体入口结构）。
@@ -387,27 +389,45 @@ BuckyOS Web Desktop 中，App 的打开模式是核心抽象之一。
 
 ### 11.2 Dead Zone 抽象
 
-为避免过早决定 System UI 的具体形式，桌面层应支持定义四个方向的不可放置区域（Dead Zone）：
+为避免过早决定 System UI 的具体形式，桌面层最初设计了四个方向的不可放置区域（Dead Zone）：
 
 - top
 - bottom
 - left
 - right
 
-Dead Zone 的作用：
+Dead Zone 的原始设计作用：
 
 - 不影响壁纸铺设
 - 只限制桌面元素（Icon / Widget）的可放置区域
 - 同时决定窗口工作区可用范围
 
-### 11.3 Dead Zone 的价值
+### 11.3 Dead Zone 现状：桌面端已停用，仅移动端保留
 
-通过 Dead Zone，可以在不破坏桌面布局与窗口系统的前提下，在后续版本中迭代：
+> **实现现状（2026-06，commit `disable desktop dead-area`）**
 
-- 顶部系统栏
-- 底部任务区
-- 侧边启动器
-- 移动端系统切换区域
+Dead Zone 抽象**没有被整体删除**，但其作用范围已经显著收缩：
+
+- **桌面端：已停用。** 桌面端的网格工作区与窗口工作区一律使用满视口（`resolvedDeadZone = zeroDeadZone`），不再为系统栏预留四向内边距。桌面顶部 StatusBar 改为浮层覆盖，不再通过 Dead Zone 推挤布局。
+- **移动端：仍然生效。** 移动端继续通过 `getResolvedDeadZone()` 消费 Dead Zone，用于：
+  - 顶部 StatusBar / safe-area 的内边距
+  - 系统抽屉（SystemSidebar）的安全区
+  - 网格容器的上下左右 padding
+  - 移动端窗口 Sheet 的顶部 inset
+- **数据结构保留。** `LayoutState.deadZone`、按 form factor 分开的持久化、`systemPreferencesInputSchema` 中的 `deadZoneTop/Bottom/Left/Right` 字段、以及历史值迁移逻辑（`migrateDeadZone`）都仍然存在，向后兼容旧布局数据。
+- **不再是用户可调项。** 设置页（Appearance）已不再渲染 Dead Zone 的四向数值输入控件；保存其它偏好时只是原样透传当前 `deadZone` 值。Dead Zone 现在是一个**内部布局机制**，而非面向用户的设置。
+- **默认值（mock）：** `top: 0, bottom: 8, left: 5, right: 5`。
+
+> 结论：Dead Zone 从“桌面 + 移动通用的四向可放置区抽象”退化为“移动端系统栏/抽屉的安全区内部机制”。需要为桌面系统栏让位的场景，现在直接由浮层 StatusBar + 满视口窗口工作区承担。
+
+### 11.4 System UI 的实际落地形态
+
+原始设计把所有 System UI 后置为“未来再定”。当前实现已落地两个最小 System UI 组件（均仍属于薄桌面层范畴）：
+
+- **顶部 StatusBar**（§27.3）：常驻顶栏，承载连接状态、主题 / 语言切换、通知托盘、时钟；移动端额外承担 App 标题栏与返回 / 最小化语义。
+- **侧滑 SystemSidebar**（§27.4）：点击左上角 Logo 唤出的抽屉，提供“回桌面”、最小化窗口切换列表、固定系统应用入口（settings / diagnostics / users-agents）。
+
+底部任务区 / Recent Apps / 独立 launcher 仍未实现，留待后续版本（与 §23 一致）。
 
 ---
 
@@ -669,6 +689,35 @@ Layout State 是整个 Desktop Layout System 的核心数据模型。
 - 自动平铺排列
 - 高级分屏
 - 更复杂的窗口编排算法
+
+### 16.4 窗口唯一 ID（Window ID）
+
+#### 背景
+
+当前的窗口 ID 直接使用 APP ID，这隐含了一个前提：每个 APP 只能拥有一个窗口。但在实际使用中，窗口的创建既可能是主动的，也可能是被动的：
+
+1. 用户通过桌面双击图标启动 APP 打开窗口；
+2. 应用 A 调用应用 B，直接打开一个特定窗口。
+
+因此，系统内部需要建立一套通过“窗口 ID”来打开窗口的逻辑，使窗口标识不再与 APP 一一绑定。
+
+#### 窗口 ID 的组成
+
+窗口 ID 由两部分组成：
+
+1. **APP ID**：标明该窗口所属的应用；
+2. **路径（Path）**：一个在该 APP 内部唯一的路径。
+
+路径的语义完全由 APP 内部自行定义，可以是一个参数，也可以类似于 URL 后面的参数列表。只要它对该 APP 有意义即可。
+
+基于该结构，窗口管理系统支持通过协议调用的方式让第三方应用打开特定窗口——开发者只需传入“APP ID + 路径”即可。
+
+#### 状态保持
+
+升级后，窗口状态的保持基于“APP ID + 窗口路径”这一完整标识：
+
+1. **状态保存**：如果一个应用创建了两个 APP ID 相同但路径不同的窗口，系统会分别保存它们的状态；
+2. **窗口聚合**：由于仍然保有 APP ID，未来如需对同一应用的多个窗口进行聚合显示，实现也会非常方便。
 
 ---
 
@@ -1058,8 +1107,87 @@ Manifest 生效逻辑建议为：
 
 ## 参考使用下面基础库：
 
-MUI (Material UI): 提供标准的 Android/Material Design 视觉组件（图标、纸张、波纹）。
-Swiper.js (React version): 处理多屏幕的左右滑动和分页指示器。
-React-Grid-Layout: 处理单一屏幕内，网格布局、拖拽重排、碰撞检测和大小调整。这是核心逻辑。
-WinBox.js：窗口系统
+> 以下为初版选型。带 ⚠️ 的条目与当前实现已有出入，以实现为准。
+
+MUI (Material UI): 提供标准的 Android/Material Design 视觉组件（图标、纸张、波纹）。**已采用**（`@mui/material` v7）。图标另用 `lucide-react`。
+Swiper.js (React version): 处理多屏幕的左右滑动和分页指示器。**已采用**（`swiper` v12，分页圆点 + 壁纸视差进度来源）。
+React-Grid-Layout: 处理单一屏幕内，网格布局、拖拽重排。**已采用**（`react-grid-layout` v2）。⚠️ 实际使用时**关闭了自动 compaction（`noCompactor`）与 resize**，元素位置稳定保存、不做碰撞重排；越界项改走“未定位”再由 `resolveLayout()` 落位。
+WinBox.js：窗口系统。⚠️ **未采用。** `winbox` 仍残留在 `package.json` 依赖中但代码未引用；桌面窗口系统是**自研实现**（`DesktopWindowContainer` / `DesktopWindowLayer`，自管理拖动 / 缩放 / 最大化 / 最小化 / z-order），移动端走 `MobileWindowSheet`。
+
+---
+
+## 27. 实现现状补充（Implementation Addendum，2026-06）
+
+> 本节按“现有实现”往回补充原始需求未覆盖或已偏离的部分。数据结构层面的权威描述见 [Desktop_UI_DataModel.md](./Desktop_UI_DataModel.md)，本节只做需求侧的对照说明。
+
+### 27.1 已实现 / 未实现总览
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| Grid / Page / Icon / Widget 布局 | ✅ | 分页二维网格，桌面 col-major、移动 row-major 自动落位 |
+| 拖拽 + 本地持久化 | ✅ | 按 form factor 分 key 存 `localStorage` |
+| Window Manifest 协议 | ✅ | 见 §21，字段已扩展（见 §27.5） |
+| 桌面自研窗口系统 | ✅ | 拖动 / 缩放 / 最大化 / 最小化 / z-order / 几何持久化 |
+| 移动端兜底 Title Bar | ✅ | StatusBar 充当移动端系统 Title Bar |
+| 壁纸系统 | ✅（新增） | panorama / tile / infinite 三模式 + 分页视差，见 §27.2 |
+| 顶部 StatusBar | ✅（新增） | 见 §27.3 |
+| 侧滑 SystemSidebar | ✅（新增） | 见 §27.4 |
+| 窗口外观偏好（透明度） | ✅（新增） | 标题栏 / 背景透明度，见 §27.5 |
+| 移动端重定向（mobileRedirectPath） | ✅（新增） | 见 §27.6 |
+| 多端 / 设备 Session 配置 | ✅（部分） | 设置页支持“克隆到设备 Session” |
+| Dead Zone（桌面） | ⛔ 已停用 | 见 §11.3 |
+| 底部任务区 / Recent Apps / 独立 launcher | ❌ 未实现 | 见 §23 |
+| Personal Server 同步 / 冲突合并 | ❌ 未实现 | 仍为本地 `localStorage` + mock provider |
+| `fullscreen` 运行态 | ❌ 未实现 | 仅为 manifest 能力声明；运行态只有 `windowed / maximized / minimized` |
+
+### 27.2 壁纸系统（Wallpaper）
+
+`DesktopPayload.wallpaper` 已成为一级数据，`DesktopWallpaper = { mode, imageUrl?, tileSize? }`：
+
+- `panorama`：横向全景图，随分页滑动做视差位移（消费 Swiper 的 `viewportProgress`）。
+- `tile`：平铺背景，`tileSize` 控制瓦片尺寸。
+- `infinite`：默认模式，铺满视口的渐变 / 图片。
+
+壁纸独立于 Dead Zone，始终满视口铺设。
+
+### 27.3 顶部 StatusBar
+
+常驻顶部状态栏（桌面端浮层 `absolute`，移动端 `fixed`），高度按场景取 `42 / 40 / 46 / 58 px`：
+
+- **桌面端**：左侧连接状态点（online / degraded / offline），右侧通知托盘（消息计数、通知 tips 弹层、备份状态、时钟）。
+- **移动端**：左上 Logo 唤出 SystemSidebar；打开 App 后充当 App Title Bar（标题 / 副标题 / 返回 / `…` 菜单 / 最小化），由 `MobileNavContext` 提供返回栈与标题覆盖。
+- 主题切换、语言循环切换在此承载。
+
+### 27.4 侧滑 SystemSidebar
+
+左侧抽屉（宽约 144px），内容：
+
+- 顶部用户卡片（用户名 + 运行容器 + 连接状态）。
+- “回到桌面”入口。
+- **切换区（switchApps）**：来自被最小化的窗口，按 `minimizedOrder` 升序；`settings` / `diagnostics` 不进切换区。
+- **固定系统区（systemApps）**：`settings` / `diagnostics` / `users-agents`。
+- 注意：`users-agents` 既在固定区，也可能因被最小化而临时出现在切换区。
+
+### 27.5 Window Manifest 字段扩展
+
+§21 的 Manifest 草案在实现中扩展为（详见数据模型文档）：
+
+- `contentPadding: 'default' | 'none'`：窗口内容是否全出血。
+- `mobileStatusBarMode: 'compact' | 'standard'`：移动端状态栏形态。`standard` 对应 §18.2 的“保留系统 UI 模式”，`compact` 更接近沉浸式。
+- `mobileRedirectPath`：移动端点击直接路由（见 §27.6）。
+- `desktopWindow: { width, height, minWidth?, minHeight? }`：桌面窗口默认 / 最小尺寸。
+- `supportedFormFactors?` / `showInLauncher?`：按 form factor 过滤应用与 launcher 可见性。
+- `mobileFullscreenBehavior: 'cover_dead_zone' | 'keep_dead_zone'`：对应 §18.2 两类最大化。
+
+此外新增**窗口外观偏好** `WindowAppearancePreferences { titleBarOpacity, backgroundOpacity }`（0–100），独立持久化，作用于所有窗口的标题栏 / 背景透明度。
+
+### 27.6 移动端重定向（mobileRedirectPath）
+
+移动端点击声明了 `mobileRedirectPath` 的应用时，不开窗口而是直接 `navigate()` 到对应路由（如 `files → /files`、`task-center → /taskcenter`）。这是移动端“尽量复用系统级整页应用”原则（§6.3 / §22）的落地方式。
+
+### 27.7 与原文若干表述的偏差
+
+- §8.1 的 `fullscreen` 显示模式、§16.2 的 fullscreen：当前仅是 manifest 能力声明，**没有独立运行态**。
+- §10.1 “不含复杂状态栏 / 系统 UI”：当前已含薄 StatusBar + SystemSidebar（见 §11.4）。
+- §16.4 窗口 ID = `APP ID + Path`：当前运行态 `WindowRecord.id` 仍为 `appId + 时间戳`，按 `appId` 复用几何信息；“APP ID + 路径”的多窗口标识尚未完全落地。
 

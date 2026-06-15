@@ -151,7 +151,7 @@ export interface LayoutState {
   - 桌面：`col-major`，先上到下，再左到右
   - 移动：`row-major`，先左到右，再上到下
 - 当网格尺寸缩小导致项目越界时，`invalidatePositions()` 会把该项目改回未定位状态。
-- `deadZone` 既影响桌面图标工作区，也影响窗口工作区和侧边栏安全区域。
+- `deadZone` 仍是布局的稳定字段，但**桌面端已停用**（commit `disable desktop dead-area`）：桌面网格与窗口工作区一律用满视口（`resolvedDeadZone = zeroDeadZone`）。`deadZone` 当前**只在移动端生效**，影响顶部 StatusBar inset、侧边栏安全区、网格 padding 与移动窗口 Sheet 顶部 inset；读取入口为 `DesktopUIDataModel.getResolvedDeadZone()`。
 
 ### 3.3 壁纸与窗口外观模型
 
@@ -322,7 +322,8 @@ const defaultWallpaper = {
 
 补充：
 
-- `DesktopRoute` 内含历史 dead zone 迁移逻辑，旧值会迁移到当前默认值。
+- `DesktopRoute` 内含历史 dead zone 迁移逻辑（`migrateDeadZone`），旧值会迁移到当前默认值。
+- 该默认值仅对移动端有实际效果；桌面端忽略 `deadZone`，使用满视口。详见 §3.2 说明。
 
 ### 4.2 当前应用目录
 
@@ -394,11 +395,12 @@ export const systemPreferencesInputSchema = z.object({
 
 - 旧文档缺少 `titleBarOpacity` 和 `backgroundOpacity`。
 - `z.coerce.number()` 表示表单字符串输入也会先被转成数字再校验。
+- `deadZoneTop/Bottom/Left/Right` 仍保留在 schema 中以兼容数据，但**设置页（Appearance）已不再渲染这四个输入控件**；保存其它偏好时只是把当前 `layoutState.deadZone` 原样透传。Dead Zone 现在是内部布局机制，非用户可调项。
 - `applySettings()` 会同时更新：
   - 语言
   - 主题
   - 运行容器
-  - 布局中的 `deadZone`
+  - 布局中的 `deadZone`（写入仍有效，但只对移动端布局产生可见效果）
   - 窗口外观偏好
 
 默认示例：
