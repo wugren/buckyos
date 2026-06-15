@@ -111,7 +111,7 @@ sudo /opt/buckyos/bin/node-daemon/node_daemon --enable_active
 #### 常见坑点与排查（过渡期）
 
 - **经常需要 `cargo update`**：尤其是新环境或依赖锁漂移时。
-- **`make_config.py` 依赖 `buckycli`**：通常需要先在 buckyos 的 `src/` 目录执行 `uv run ./buckyos-build.py && uv run ./buckyos-install.py --all`，确保 `buckycli` 就绪。
+- **`make_config.ts` 依赖 Deno >= 2.2**：在 buckyos 的 `src/` 目录执行 `deno task make_config <group> --rootfs <rootfs>`。
 - **不要手工 kill 一个由服务管理的 `node_daemon` 后就认为它会保持停止**：launchd、systemd 或 Windows keepalive 任务都可能自动重新拉起它。应使用与启动方式匹配的 BuckyOS stop/uninstall 路径。
 - **除非明确管理 runtime，否则不要把源码开发环境和 BuckyOS Desktop 混在同一台机器上**：两者可能同时触碰相同的已安装 rootfs 和 host service 状态。把 Desktop 放在 VM 里是更低摩擦的推荐做法。
 

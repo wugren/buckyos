@@ -775,3 +775,35 @@ Agent 的 message endpoint、服务 endpoint、运行容器、节点位置和 pa
 - 非 OOD 节点的完整 boot 连接流程仍有未实现分支。
 - `/sso/login` 已有 app-specific token 基础，但完整联合登录协议还需要补齐 redirect、audience、scope、challenge 和跨 Zone token 验证规则。
 - AppDoc / content meta 的链上发布、版权转移和支付 receipt 还需要与 RepoService、支付合约和客户端安装器联动定义。
+
+
+## 思考：寻找真实场景，可以覆盖BNS的所有关键能力?
+
+### 没有https, 通过indexer找到一个app并安装，app的owner发布新版本，完成自动升级 
+
+- 异常分支：indexer想阻止app发布新版本？
+- 异常分支: app的新版本有病毒，导致app owner的私钥丢失，如何撤回发布？
+  鼓励所有的app都基于source dao,不会出现高权限私钥
+  定义“信用机构”，信用机构发布第三方Review Report（指向名字或特定ObjId)
+  系统有2个固定“信用结构” + 1个Indexer 信用
+
+
+
+### 通过did:bns:bob 添加好友后，得到其头像信息
+
+bob没有自己的zone,使用其家庭的zone作为默认zone
+
+did:bns:bob在 OwnerConfig中配置 face url (cyfs:///$objid) 和 binded zone: did:web:zhicong.me
+（注意一个属性一旦在OwnerConfig中配置，就无法被覆盖）
+
+得到头像的方法
+首先是 User Zero Config
+然后根据其 owner_config 的 binded zone，去尝试拼接一个链接 `cyfs://zhicong.me/ndn/$objid`
+通过这个链接去下载这个头像
+
+通过 https://bob.zhicong.me/.well-known/doc.json 也能得到一个非上链的profile(UserInfo),可以定义更多的实时信息
+如果通过 http://bob.zhicong.me/.well-known/doc.json 访问，这个就必须是一个JWT（有必要的签名），密钥用的是 key@zone
+
+
+
+

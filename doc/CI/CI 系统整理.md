@@ -21,7 +21,7 @@
 - 构建(cargo update && uv run ./buckyos-build.py <linux-arch>)
 - 制作rootfs
   - uv run ./buckyos-install.py --all
-  - uv run ./make_config.py release
+  - deno task make_config release
   - 集成其它组件: download artifact 
     - 每个artifact通常是由另一个CI流程制作的
     - artifact通常已经有数字签名，最好是已经发布
@@ -107,4 +107,3 @@ Windows / OSX 平台通过BuckyOS Desktop Service分发
 - 出厂预装安装，
 - 使用该发行版支持的软件包安装(deb, rpm, pkg)
 - 下载一个.sh脚本安装 (类似rustup)
-

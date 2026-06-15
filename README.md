@@ -110,7 +110,7 @@ sudo /opt/buckyos/bin/node-daemon/node_daemon --enable_active
 #### Common pitfalls and troubleshooting during the transition period
 
 - **You may need `cargo update` frequently**: especially in a fresh environment or when the lockfile has drifted.
-- **`make_config.py` depends on `buckycli`**: in practice, you usually need to run `uv run ./buckyos-build.py && uv run ./buckyos-install.py --all` in the buckyos `src/` directory first to make sure `buckycli` is available.
+- **`make_config.ts` requires Deno >= 2.2**: run it from the buckyos `src/` directory with `deno task make_config <group> --rootfs <rootfs>`.
 - **Do not manually kill a service-managed `node_daemon` and expect it to stay stopped**: launchd, systemd, or Windows keepalive tasks can restart it. Use the BuckyOS stop/uninstall path that matches how it was started.
 - **Avoid mixing source development and BuckyOS Desktop on the same machine unless you manage the runtime deliberately**: both environments can touch the same installed rootfs and host service state. Keeping Desktop in a VM is the recommended low-friction setup.
 
