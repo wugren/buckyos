@@ -134,6 +134,9 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.rust_target }}
 
+      - name: Ensure Rust target for repository toolchain
+        run: rustup target add ${{ matrix.rust_target }}
+
       - name: Setup MSVC
         if: ${{ runner.os == 'Windows' }}
         uses: ilammy/msvc-dev-cmd@v1
