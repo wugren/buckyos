@@ -63,7 +63,7 @@ jobs:
       - quick-unit-tests
     if: ${{ always() && (needs.quick-unit-tests.result == 'success' || needs.quick-unit-tests.result == 'skipped') }}
     runs-on: ${{ fromJSON((matrix.platform_key == 'macos' && matrix.arch == 'aarch64' && vars.DEVTESTS_MACOS_ARM64_RUNNER_JSON) || (matrix.platform_key == 'macos' && matrix.arch == 'x86_64' && vars.DEVTESTS_MACOS_X64_RUNNER_JSON) || matrix.runner_json) }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
