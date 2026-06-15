@@ -73,6 +73,8 @@ jobs:
             platform_key: linux
             arch: x86_64
             rust_target: x86_64-unknown-linux-gnu
+            build_target_arg: --target=x86_64-unknown-linux-gnu
+            package_rust_target_args: --rust-target x86_64-unknown-linux-gnu
             needs_musl: false
             needs_tauri: false
             needs_nsis: false
@@ -81,6 +83,8 @@ jobs:
             platform_key: linux
             arch: aarch64
             rust_target: aarch64-unknown-linux-gnu
+            build_target_arg: ""
+            package_rust_target_args: ""
             needs_musl: false
             needs_tauri: false
             needs_nsis: false
@@ -89,6 +93,8 @@ jobs:
             platform_key: macos
             arch: aarch64
             rust_target: aarch64-apple-darwin
+            build_target_arg: ""
+            package_rust_target_args: ""
             needs_musl: false
             needs_tauri: true
             needs_nsis: false
@@ -97,6 +103,8 @@ jobs:
             platform_key: macos
             arch: x86_64
             rust_target: x86_64-apple-darwin
+            build_target_arg: ""
+            package_rust_target_args: ""
             needs_musl: false
             needs_tauri: true
             needs_nsis: false
@@ -105,6 +113,8 @@ jobs:
             platform_key: windows
             arch: x86_64
             rust_target: x86_64-pc-windows-msvc
+            build_target_arg: ""
+            package_rust_target_args: ""
             needs_musl: false
             needs_tauri: true
             needs_nsis: true
@@ -280,12 +290,12 @@ jobs:
           }
 
           pushd ../cyfs-gateway/src
-          buckyos-build --target=${{ matrix.rust_target }}
+          buckyos-build ${{ matrix.build_target_arg }}
           buckyos-install --all
           popd
 
           pushd src
-          buckyos-build --target=${{ matrix.rust_target }}
+          buckyos-build ${{ matrix.build_target_arg }}
           buckyos-install --all
           sudo HOME="$HOME" PATH="$PATH" BUCKYOS_ROOT="$BUCKYOS_ROOT" "$PYTHON_BIN" start.py --all
           wait_for_port "node gateway" 127.0.0.1 3180
@@ -387,12 +397,12 @@ jobs:
           Clear-RequiredPorts -Ports @(3180, 80, 443)
 
           Push-Location ..\cyfs-gateway\src
-          buckyos-build --target=${{ matrix.rust_target }}
+          buckyos-build ${{ matrix.build_target_arg }}
           buckyos-install --all
           Pop-Location
 
           Push-Location .\src
-          buckyos-build --target=${{ matrix.rust_target }}
+          buckyos-build ${{ matrix.build_target_arg }}
           buckyos-install --all
           python .\start.py --all
           Wait-ForPort -Name "node gateway" -TargetHost "127.0.0.1" -Port 3180
@@ -427,7 +437,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$LOCAL_PKG_DIR"
-          python3 ./make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --rust-target ${{ matrix.rust_target }} --out-dir "$LOCAL_PKG_DIR"
+          python3 ./make_local_pkg.py build-pkg --arch ${{ matrix.arch }} ${{ matrix.package_rust_target_args }} --out-dir "$LOCAL_PKG_DIR"
 
       - name: Build local package (Windows)
         if: ${{ runner.os == 'Windows' }}
@@ -435,7 +445,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path $env:LOCAL_PKG_DIR -Force | Out-Null
-          python .\make_local_pkg.py build-pkg --arch ${{ matrix.arch }} --rust-target ${{ matrix.rust_target }} --out-dir $env:LOCAL_PKG_DIR
+          python .\make_local_pkg.py build-pkg --arch ${{ matrix.arch }} ${{ matrix.package_rust_target_args }} --out-dir $env:LOCAL_PKG_DIR
 
       - name: Capture package path (Unix)
         id: package_unix
