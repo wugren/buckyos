@@ -141,41 +141,70 @@ rust_env:
   OPENSSL_STATIC: '1'
 
 publish:
+  linux_pkg:
+    apps:
+      buckyos:
+        name: BuckyOS Service
+        type: app
+        system_service: true
+        optional: true
+        default_selected: true
+        default_target: "/opt/buckyos/"
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
   macos_pkg:
     apps:
       BuckyOSApp:
         name: BuckyOS Desktop App
         type: bundle # 已经打包好的app bundle
-        optional: false
+        optional: true
+        default_selected: true
         src: BuckyOS.app # PUBLISH_DIR/$appname/BuckyOS.app
-        # Stage into a system location; the pkg postinstall script will copy to the current console user's home.
-        default_target: "/Library/Application Support/BuckyOS/BuckyOS.app"
+        default_target: "/Applications/BuckyOS.app"
       buckycli:
         name: BuckyOS CLI
         type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
-        optional: false
-        # Stage into a system location; the pkg postinstall script will copy to the current console user's home.
-        default_target: "/Library/Application Support/BuckyOS/buckycli/"
+        optional: true
+        default_selected: true
+        default_target: "/usr/local/bin/"
       buckyos:
         name: BuckyOS Desktop Service
         type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
         optional: true
+        default_selected: true
         default_target: "/opt/buckyos/"
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
   win_pkg:
     apps:
       BuckyOSApp:
         name: BuckyOS App
         type: bundle 
-        optional: false
+        optional: true
+        default_selected: true
         src: buckyosapp.exe # PUBLISH_DIR/$appname/buckyosapp.exe
-        # Stage into a system location; the pkg postinstall script will copy to the current console user's home.
-        default_target: "C:\\Program Files\\BuckyOS\\buckyosapp" #window下运行用户选择安装位置
+        default_target: "C:\\BuckyOS\\BuckyOSApp" #window下运行用户选择安装位置
+      buckycli:
+        name: BuckyOS CLI
+        type: app
+        optional: true
+        default_selected: true
+        default_target: "%USERPROFILE%\\buckycli\\" #window下运行用户选择安装位置
       buckyos:
         name: BuckyOS Desktop Service
         type: app
-        system_service: true,
+        system_service: true
         optional: true
-        default_target: "%APPDATA%\\BuckyOS\\" #window下运行用户选择安装位置
+        default_selected: true
+        default_target: "C:\\BuckyOS\\" #window下运行用户选择安装位置
+        deps:
+          cyfs-gateway:
+            type: buckyos_project
+            source: "../../cyfs-gateway/src"
 
       
       

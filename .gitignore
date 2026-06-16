@@ -74,7 +74,10 @@ src/apps/sys_test/dist/
 old/*
 src/frame/desktop/dist/favicon.svg
 aicc_remote_runner.toml
-test/aicc_test/rust_runner/targettest/deno.lock
+test/aicc_test/rust_runner/target
+.dev_buckyos
+.dev_buckyos_*
+test/deno.lock
 .claude/
 uv.lock
 test/aicc_test/deno.lock
