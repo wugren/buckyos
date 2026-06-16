@@ -5,6 +5,8 @@ mod scheduler_server;
 mod service;
 mod system_config_agent;
 mod system_config_builder;
+mod thunk_runner;
+mod zone_route_builder;
 
 #[cfg(test)]
 mod scheduler_test;
@@ -21,11 +23,11 @@ use anyhow::Result;
 use app::*;
 use buckyos_api::*;
 use buckyos_api::*;
+use buckyos_http_server::*;
 use buckyos_kit::*;
 use name_client::*;
 use name_lib::*;
 use scheduler_server::*;
-use server_runner::*;
 use service::*;
 use std::sync::Arc;
 use system_config_agent::schedule_loop;
@@ -118,6 +120,8 @@ async fn create_init_list_by_template(
         .add_aicc(&start_config)
         .await?
         .add_msg_center(&start_config)
+        .await?
+        .add_workflow()
         .await?
         .add_control_panel()
         .await?;

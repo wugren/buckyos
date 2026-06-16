@@ -31,7 +31,9 @@ pub struct AccountBinding {
     pub platform: String,       // e.g., "telegram", "email", "wechat"
     pub account_id: String,     // 平台唯一ID, e.g., "123456789" (TG UserID)
     pub display_id: String,     // 可读ID, e.g., "@username"
-    pub tunnel_id: String,      // 绑定的 Tunnel ID (用于发送路由)
+    pub tunnel_id: String,      // 稳定短 tunnel id (如 "tg-main")，非 box-owner DID
+    pub account_type: String,   // 平台实体类型: user/group/channel/addr (非 endpoint 为空)
+    pub endpoint_did: Option<DID>, // 二级 endpoint DID: did:msgtunnel:<enc>.<type>.<tunnel_id>
     pub last_active_at: u64,    // 最后活跃时间 (用于合并时的活跃度判断)
     pub meta: Map<String, String>, // 平台特定的额外数据 (头像URL等)
 }
@@ -158,13 +160,41 @@ class ContactMgr:
     # ==========================
     def resolve_did(self, platform: str, account_id: str, profile_hint: dict = None) -> DID:
         """
-        查找 DID。如果不存在，基于 profile_hint 自动创建 Shadow Contact。
+        查找 DID。profile_hint 同时含 account_type+tunnel_id 时返回二级
+        endpoint DID (did:msgtunnel:*)；否则创建 did:bns:mc-* Shadow Contact。
         """
+        pass
+
+    def resolve_endpoint_did(self, platform, account_id, account_type, tunnel_id) -> DID:
+        """
+        确定性构造二级 endpoint DID：
+        did:msgtunnel:<encoded_account_id>.<account_type>.<tunnel_id>。
+        同一三元组始终得到同一 DID。
+        """
+        pass
+
+    def resolve_target(self, contact_did: DID, selector: str) -> DID:
+        """
+        构造期 target 解析：按 selector (先 tunnel_id 后 platform) 在联系人
+        的 binding 中选出唯一 endpoint DID。命中非唯一即失败，不做 fallback。
+        """
+        pass
+
+    def resolve_contact_for_endpoint(self, endpoint_did: DID) -> Optional[DID]:
+        """endpoint DID 反查归属的 canonical/contact DID。"""
+        pass
+
+    def resolve_canonical_did(self, did: DID) -> DID:
+        """把 merge 后的 alias/tombstone DID 解析为当前 canonical DID。"""
+        pass
+
+    def list_alias_dids(self, canonical_did: DID) -> List[DID]:
+        """列出 merge 到该 canonical DID 的所有 alias 源 DID。"""
         pass
 
     def get_preferred_binding(self, did: DID) -> AccountBinding:
         """
-        获取该联系人最近活跃或首选的发送通道 (用于 Outbox 路由)
+        UI 默认建议用的首选通道。不参与 post_send 的确定性投递。
         """
         pass
 
@@ -199,7 +229,9 @@ class ContactMgr:
 
     def merge_contacts(self, target_did: DID, source_did: DID):
         """
-        手动合并两个 DID。
+        手动合并两个 DID。source 的 binding/grant/group/tag 迁移到 target，
+        但 source DID 不删除，而是登记为 target 的 alias/tombstone，使历史
+        MsgObject 和旧 session peer DID 仍可通过 resolve_canonical_did 解释。
         """
         pass
 

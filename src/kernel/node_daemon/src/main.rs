@@ -4,12 +4,18 @@
 mod active_server;
 mod app_loader;
 mod app_mgr; // support manager app service (run in docker,run for one user)
+mod boot;
 mod finder;
 mod frame_service_mgr; // support manager frame service (run in docker,run for all users)
+mod gateway_name_provider;
+mod gateway_tunnel_probe;
 mod kernel_mgr; // support manager kernel service (run in native, run for system)
+mod kevent_server;
 mod local_app_mgr;
 mod node_daemon;
+mod node_executor;
 mod run_item;
+mod run_plist;
 mod service_pkg;
 #[cfg(test)]
 mod test_app_loader;

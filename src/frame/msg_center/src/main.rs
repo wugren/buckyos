@@ -1,4 +1,5 @@
 mod contact_mgr;
+mod group_mgr;
 mod msg_box_db;
 mod msg_center;
 mod msg_tunnel;
@@ -13,19 +14,19 @@ use buckyos_api::{
     BoxKind, BuckyOSRuntimeType, DeliveryReportResult, MsgCenterClient, MsgCenterServerHandler,
     MsgState, UserSettings, UserState, MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
 };
-use buckyos_kit::{get_buckyos_service_data_dir, init_logging};
-use bytes::Bytes;
-use cyfs_gateway_lib::{
+use buckyos_http_server::Runner;
+use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
     StreamInfo,
 };
+use buckyos_kit::{get_buckyos_service_data_dir, init_logging};
+use bytes::Bytes;
 use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
 use log::{error, info, warn};
 use name_lib::DID;
 use serde::Deserialize;
 use serde_json::Value;
-use server_runner::Runner;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -110,6 +111,9 @@ struct TelegramTunnelSettings {
     enabled: bool,
     #[serde(default = "default_tg_tunnel_did")]
     tunnel_did: String,
+    /// Stable short tunnel id embedded in second-level DIDs (e.g. `tg-main`).
+    #[serde(default = "default_tg_tunnel_id")]
+    tunnel_id: String,
     #[serde(default = "default_true")]
     supports_ingress: bool,
     #[serde(default = "default_true")]
@@ -125,6 +129,7 @@ impl Default for TelegramTunnelSettings {
         Self {
             enabled: default_tg_tunnel_enabled(),
             tunnel_did: default_tg_tunnel_did(),
+            tunnel_id: default_tg_tunnel_id(),
             supports_ingress: default_true(),
             supports_egress: default_true(),
             gateway: TelegramGatewaySettings::default(),
@@ -237,6 +242,10 @@ fn default_tg_tunnel_enabled() -> bool {
 
 fn default_tg_tunnel_did() -> String {
     MSG_CENTER_DEFAULT_TG_TUNNEL_DID.to_string()
+}
+
+fn default_tg_tunnel_id() -> String {
+    "tg-main".to_string()
 }
 
 fn default_tg_session_dir() -> PathBuf {
@@ -513,6 +522,8 @@ fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUs
                 account_id,
                 display_id,
                 tunnel_id,
+                account_type: String::new(),
+                endpoint_did: None,
                 last_active_at: now_ms(),
                 meta: binding.meta,
             });
@@ -580,6 +591,7 @@ async fn sync_zone_user_contacts_once(center: &MessageCenter, raw_settings: &Val
     for owner in owner_scopes {
         let updated = center
             .upsert_zone_user_contacts(contacts.clone(), owner.clone())
+            .await
             .map_err(|error| {
                 anyhow::anyhow!(
                     "zone user sync failed for owner_scope={}: {}",
@@ -664,6 +676,7 @@ fn build_tg_tunnel(cfg: TgTunnelConfig, settings: &TelegramTunnelSettings) -> Re
                 api_hash,
                 session_dir,
                 tunnel_did: Some(cfg.tunnel_did.clone()),
+                tunnel_id: Some(cfg.tunnel_id.clone()),
             };
             info!(
                 "telegram tunnel initialized with grammers gateway (session_dir={})",
@@ -774,9 +787,23 @@ async fn apply_tg_tunnel_settings(
     }
 
     let tunnel_did = resolve_tg_tunnel_did(&settings.telegram_tunnel)?;
+    let tunnel_id = settings.telegram_tunnel.tunnel_id.trim().to_string();
+    let tunnel_id = if tunnel_id.is_empty() {
+        default_tg_tunnel_id()
+    } else {
+        tunnel_id
+    };
     let mut cfg = TgTunnelConfig::new(tunnel_did.clone());
+    cfg.tunnel_id = tunnel_id.clone();
     cfg.supports_ingress = settings.telegram_tunnel.supports_ingress;
     cfg.supports_egress = settings.telegram_tunnel.supports_egress;
+    // Register the tunnel route so post_send can map a second-level DID's short
+    // tunnel_id back to this tunnel box-owner DID.
+    center.register_tunnel(
+        tunnel_id.clone(),
+        tunnel_did.clone(),
+        "telegram".to_string(),
+    );
     let tg_tunnel = Arc::new(build_tg_tunnel(cfg, &settings.telegram_tunnel)?);
 
     tg_tunnel
@@ -860,7 +887,8 @@ pub async fn start_msg_center_service() -> Result<()> {
     set_buckyos_api_runtime(runtime)
         .map_err(|err| anyhow::anyhow!("register msg-center runtime failed: {}", err))?;
 
-    let center = MessageCenter::try_new()
+    let center = MessageCenter::open_from_service_spec()
+        .await
         .map_err(|err| anyhow::anyhow!("create message center failed: {:?}", err))?;
 
     let tunnel_mgr = Arc::new(MsgTunnelInstanceMgr::new());

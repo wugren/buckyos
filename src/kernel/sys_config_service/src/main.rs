@@ -17,18 +17,18 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ::kRPC::*;
-use buckyos_kit::*;
-use bytes::Bytes;
-use cyfs_gateway_lib::{
+use buckyos_http_server::*;
+use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
     StreamInfo,
 };
+use buckyos_kit::*;
+use bytes::Bytes;
 use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
 use kv_provider::KVStoreProvider;
 use name_lib::*;
 use rbac::*;
-use server_runner::*;
 use sled_provider::SledStore;
 
 use crate::zone_did_resolver::ZoneDidResolver;
@@ -1221,6 +1221,7 @@ mod test {
     use tokio::{task, time::sleep};
 
     use super::*;
+    #[allow(dead_code)]
     //#[tokio::test(flavor = "current_thread")]
     async fn test_server_interface() {
         {
@@ -1360,6 +1361,7 @@ mod test {
         drop(server);
     }
 
+    #[allow(dead_code)]
     //#[tokio::test(flavor = "current_thread")]
     async fn test_transaction_processing() {
         // Setup trust keys like in the existing test

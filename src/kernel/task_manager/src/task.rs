@@ -1,12 +1,14 @@
 use serde_json::Value;
 
-pub use buckyos_api::{Task, TaskPermissions, TaskScope, TaskStatus};
+pub use buckyos_api::{Task, TaskNote, TaskPermissions, TaskScope, TaskStatus};
 
 pub fn new_task(
     name: String,
     task_type: String,
+    runner: String,
     user_id: String,
     app_id: String,
+    session_id: String,
     parent_id: Option<i64>,
     permissions: TaskPermissions,
     data: Value,
@@ -16,10 +18,12 @@ pub fn new_task(
         id: 0,
         user_id,
         app_id,
+        session_id,
         parent_id,
         root_id: String::new(),
         name,
         task_type,
+        runner,
         status: TaskStatus::Pending,
         progress: 0.0,
         message: None,

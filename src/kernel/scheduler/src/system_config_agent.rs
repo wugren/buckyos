@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::app::*;
 use crate::scheduler::*;
 use crate::service::*;
+use crate::zone_route_builder::{build_forward_plan, DidIpHint, NodeGatewayRouteCandidate};
 use buckyos_api::{
     get_buckyos_api_runtime, AppServiceSpec, KernelServiceSpec, NodeConfig,
     ServiceInstanceReportInfo, ServiceState, UserSettings, UserType as ApiUserType,
@@ -23,6 +24,7 @@ use name_lib::{get_x_from_jwk, DeviceInfo, ZoneConfig};
 
 const SYSTEM_CONFIG_SERVICE_PORT: u16 = 3200;
 const FIXED_SERVICE_WEIGHT: u32 = 100;
+const DEFAULT_REQUIRED_CPU_MHZ: u32 = 50;
 const DEFAULT_REQUIRED_MEMORY: u64 = 32 * 1024 * 1024;
 
 fn map_api_user_type(user_type: &ApiUserType) -> UserType {
@@ -92,7 +94,7 @@ fn create_service_spec_by_app_config(
         state: spec_state,
         need_container,
         best_instance_count: app_config.expected_instance_count,
-        required_cpu_mhz: 200,
+        required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
         required_memory: DEFAULT_REQUIRED_MEMORY,
         required_gpu_tflops: 0.0,
         required_gpu_mem: 0,
@@ -117,7 +119,7 @@ fn create_service_spec_by_service_config(
         state: spec_state,
         need_container: false,
         best_instance_count: service_config.expected_instance_count,
-        required_cpu_mhz: 300,
+        required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
         required_memory: DEFAULT_REQUIRED_MEMORY,
         required_gpu_tflops: 0.0,
         required_gpu_mem: 0,
@@ -682,6 +684,10 @@ struct NodeGatewayInfo {
     app_info: HashMap<String, NodeGatewayAppEntry>,
     service_info: HashMap<String, NodeGatewayServiceInfoEntry>,
     node_route_map: HashMap<String, String>,
+    #[serde(default)]
+    routes: HashMap<String, Vec<NodeGatewayRouteCandidate>>,
+    #[serde(default)]
+    did_ip_hints: HashMap<String, Vec<DidIpHint>>,
     trust_key: HashMap<String, String>,
 }
 
@@ -797,10 +803,15 @@ fn build_app_host_entry(
     }?;
 
     let port = select_gateway_port(&pick_instance.service_ports, service_name)?;
+    let access_mode = if app_spec.install_config.allow_public_access {
+        NodeGatewayAccessMode::Public
+    } else {
+        NodeGatewayAccessMode::Private
+    };
     Some(NodeGatewayAppInfoEntry {
         app_id: app_spec.app_id().to_string(),
         sdk_version: parse_sdk_version(app_spec),
-        access_mode: NodeGatewayAccessMode::Private,
+        access_mode,
         node_id: Some(pick_instance.node_id.clone()),
         port: Some(port),
         dir_pkg_id: None,
@@ -832,10 +843,15 @@ fn build_app_host_entry_from_persisted_service_info(
         .min_by(|left, right| left.0.cmp(right.0))?;
 
     let port = select_gateway_port(&node_info.service_port, service_name)?;
+    let access_mode = if app_spec.install_config.allow_public_access {
+        NodeGatewayAccessMode::Public
+    } else {
+        NodeGatewayAccessMode::Private
+    };
     Some(NodeGatewayAppInfoEntry {
         app_id: app_spec.app_id().to_string(),
         sdk_version: parse_sdk_version(app_spec),
-        access_mode: NodeGatewayAccessMode::Private,
+        access_mode,
         node_id: Some(node_id.clone()),
         port: Some(port),
         dir_pkg_id: None,
@@ -955,6 +971,7 @@ pub(crate) async fn update_node_gateway_info(
     let zone_gateway_settings = get_zone_gateway_settings(input_system_config)?;
     let device_list = get_device_list(input_system_config)?;
     let zone_host = zone_config.id.to_host_name();
+    let forward_plan = build_forward_plan(node_id, &zone_config, &zone_host, &device_list);
 
     let mut node_gateway_info = NodeGatewayInfo {
         node_info: NodeGatewayNodeInfo {
@@ -964,6 +981,8 @@ pub(crate) async fn update_node_gateway_info(
         app_info: HashMap::new(),
         service_info: HashMap::new(),
         node_route_map: build_node_route_map(node_id, &zone_host, &device_list),
+        routes: forward_plan.routes,
+        did_ip_hints: forward_plan.did_ip_hints,
         trust_key: build_trust_keys(node_id, &zone_config, &device_list),
     };
 
@@ -1155,18 +1174,9 @@ pub(crate) async fn update_node_gateway_config(
                     "zone_tls": {
                         "bind": "0.0.0.0:443",
                         "protocol": "tls",
-                        "certs": [
-                            {
-                                "domain": wildcard_zone_domain,
-                                "acme_type": "dns-01",
-                                "dns_provider": "sn-dns"
-                            },
-                            {
-                                "domain": zone_hostname
-                            },
-                            {
-                                "domain": "*"
-                            }
+                        "hosts": [
+                            wildcard_zone_domain,
+                            zone_hostname
                         ],
                         "hook_point": {
                             "main": {
@@ -1612,7 +1622,7 @@ mod tests {
         let owner = DID::new("bns", "owner");
         let app_doc = AppDocBuilder::new(
             AppType::Agent,
-            "jarvis",
+            "buckyos_jarvis",
             "0.1.0",
             "did:web:buckyos.ai",
             &owner,
@@ -1673,6 +1683,72 @@ mod tests {
             expected_instance_count: 1,
             state: ServiceState::Running,
             install_config,
+        }
+    }
+
+    fn create_expected_node_gateway_info_for_files_app(
+        zone_config: &ZoneConfig,
+        input_system_config: &HashMap<String, String>,
+    ) -> NodeGatewayInfo {
+        let zone_host = zone_config.id.to_host_name();
+        let device_list = get_device_list(input_system_config).unwrap();
+        let control_panel_selector = HashMap::from([(
+            "ood1".to_string(),
+            NodeGatewaySelectorTarget {
+                port: 4020,
+                weight: FIXED_SERVICE_WEIGHT,
+            },
+        )]);
+        let system_config_selector =
+            build_fixed_selector_from_oods(zone_config, SYSTEM_CONFIG_SERVICE_PORT);
+
+        let mut service_info = HashMap::new();
+        service_info.insert(
+            "control-panel".to_string(),
+            NodeGatewayServiceInfoEntry {
+                selector: control_panel_selector.clone(),
+            },
+        );
+        service_info.insert(
+            "system_config".to_string(),
+            NodeGatewayServiceInfoEntry {
+                selector: system_config_selector,
+            },
+        );
+
+        let files_entry = NodeGatewayAppEntry::App(NodeGatewayAppInfoEntry {
+            app_id: "files".to_string(),
+            sdk_version: 10,
+            access_mode: NodeGatewayAccessMode::Private,
+            node_id: Some("ood2".to_string()),
+            port: Some(10160),
+            dir_pkg_id: None,
+            dir_pkg_objid: None,
+            block_services: vec![],
+        });
+        let control_panel_entry = NodeGatewayAppEntry::Service(NodeGatewayAppServiceInfoEntry {
+            service_id: "control-panel".to_string(),
+            selector: control_panel_selector,
+        });
+
+        let mut app_info = HashMap::new();
+        app_info.insert("files".to_string(), files_entry);
+        app_info.insert("sys".to_string(), control_panel_entry.clone());
+        app_info.insert("_".to_string(), control_panel_entry.clone());
+        app_info.insert("www".to_string(), control_panel_entry);
+
+        let forward_plan = build_forward_plan("ood1", zone_config, &zone_host, &device_list);
+        NodeGatewayInfo {
+            node_info: NodeGatewayNodeInfo {
+                this_node_id: "ood1".to_string(),
+                this_zone_host: zone_host.clone(),
+            },
+            app_info,
+            service_info,
+            node_route_map: build_node_route_map("ood1", &zone_host, &device_list),
+            routes: forward_plan.routes,
+            did_ip_hints: forward_plan.did_ip_hints,
+            trust_key: build_trust_keys("ood1", zone_config, &device_list),
         }
     }
 
@@ -1759,16 +1835,16 @@ mod tests {
             .unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let (scheduler_ctx, _) = create_scheduler_by_system_config(&input_system_config).unwrap();
         let spec = scheduler_ctx
-            .get_service_spec("jarvis@alice")
+            .get_service_spec("buckyos_jarvis@alice")
             .expect("agent spec should be loaded");
 
-        assert_eq!(spec.app_id, "jarvis");
+        assert_eq!(spec.app_id, "buckyos_jarvis");
         assert_eq!(spec.owner_id, "alice");
         assert_eq!(spec.spec_type, ServiceSpecType::App);
         assert!(spec.need_container);
@@ -1821,21 +1897,21 @@ mod tests {
             serde_json::to_string(&device_ood1).unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
             state: ServiceSpecState::Deployed,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -1848,8 +1924,8 @@ mod tests {
         device_list.insert("ood1".to_string(), device_ood1);
 
         let action = SchedulerAction::InstanceReplica(create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         ));
@@ -1873,12 +1949,12 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 let value = paths
-                    .get("/apps/jarvis@alice@ood1")
+                    .get("/apps/buckyos_jarvis@alice@ood1")
                     .and_then(|value| value.as_ref())
                     .expect("agent instance should be written under node apps");
                 let instance: buckyos_api::AppServiceInstanceConfig =
                     serde_json::from_value(value.clone()).expect("parse instance config");
-                assert_eq!(instance.app_spec.app_id(), "jarvis");
+                assert_eq!(instance.app_spec.app_id(), "buckyos_jarvis");
                 assert_eq!(instance.app_spec.user_id, "alice");
             }
             other => panic!("unexpected kv action: {:?}", other),
@@ -1897,15 +1973,15 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
             state: ServiceSpecState::Deleted,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -1915,8 +1991,8 @@ mod tests {
         });
 
         let instance = create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         );
@@ -1927,8 +2003,8 @@ mod tests {
 
         let tx_actions = schedule_action_to_tx_actions(
             &SchedulerAction::RemoveInstance(
-                "jarvis@alice".to_string(),
-                "jarvis@alice@ood1".to_string(),
+                "buckyos_jarvis@alice".to_string(),
+                "buckyos_jarvis@alice@ood1".to_string(),
                 "ood1".to_string(),
             ),
             &scheduler_ctx,
@@ -1946,14 +2022,14 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Deleted)))
                 );
-                assert!(!paths.contains_key("/apps/jarvis@alice@ood1"));
+                assert!(!paths.contains_key("/apps/buckyos_jarvis@alice@ood1"));
             }
             other => panic!("unexpected kv action: {:?}", other),
         }
@@ -1971,15 +2047,15 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
             state: ServiceSpecState::Deleted,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -1993,8 +2069,8 @@ mod tests {
 
         let tx_actions = schedule_action_to_tx_actions(
             &SchedulerAction::RemoveInstance(
-                "jarvis@alice".to_string(),
-                "jarvis@alice@ood1".to_string(),
+                "buckyos_jarvis@alice".to_string(),
+                "buckyos_jarvis@alice@ood1".to_string(),
                 "ood1".to_string(),
             ),
             &scheduler_ctx,
@@ -2012,11 +2088,11 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Deleted)))
                 );
             }
@@ -2036,15 +2112,15 @@ mod tests {
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.add_service_spec(ServiceSpec {
-            id: "jarvis@alice".to_string(),
-            app_id: "jarvis".to_string(),
+            id: "buckyos_jarvis@alice".to_string(),
+            app_id: "buckyos_jarvis".to_string(),
             app_index: 2,
             owner_id: "alice".to_string(),
             spec_type: ServiceSpecType::App,
             state: ServiceSpecState::Disable,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -2054,8 +2130,8 @@ mod tests {
         });
 
         let mut instance = create_test_replica_instance(
-            "jarvis@alice",
-            "jarvis@alice@ood1",
+            "buckyos_jarvis@alice",
+            "buckyos_jarvis@alice@ood1",
             "ood1",
             &[("www", 11080)],
         );
@@ -2081,14 +2157,14 @@ mod tests {
         match node_action {
             KVAction::SetByJsonPath(paths) => {
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/target_state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/target_state"),
                     Some(&Some(json!(ServiceInstanceState::Stopped)))
                 );
                 assert_eq!(
-                    paths.get("/apps/jarvis@alice@ood1/app_spec/state"),
+                    paths.get("/apps/buckyos_jarvis@alice@ood1/app_spec/state"),
                     Some(&Some(json!(ServiceState::Stopped)))
                 );
-                assert!(!paths.contains_key("/apps/jarvis@alice@ood1"));
+                assert!(!paths.contains_key("/apps/buckyos_jarvis@alice@ood1"));
             }
             other => panic!("unexpected kv action: {:?}", other),
         }
@@ -2119,7 +2195,7 @@ mod tests {
             state: ServiceSpecState::Deployed,
             need_container: true,
             best_instance_count: 1,
-            required_cpu_mhz: 200,
+            required_cpu_mhz: DEFAULT_REQUIRED_CPU_MHZ,
             required_memory: DEFAULT_REQUIRED_MEMORY,
             required_gpu_tflops: 0.0,
             required_gpu_mem: 0,
@@ -2369,38 +2445,11 @@ mod tests {
             KVAction::Update(value) => value,
             other => panic!("unexpected kv action: {:?}", other),
         };
-        println!("gateway_info_str: {}", gateway_info_str);
         let gateway_info: NodeGatewayInfo = serde_json::from_str(gateway_info_str).unwrap();
+        let expected_gateway_info =
+            create_expected_node_gateway_info_for_files_app(&zone_config, &input_system_config);
 
-        assert_eq!(gateway_info.node_info.this_node_id, "ood1");
-        assert_eq!(gateway_info.node_info.this_zone_host, "test.buckyos.io");
-        assert_eq!(
-            gateway_info.node_route_map.get("ood2").unwrap(),
-            "rtcp://ood2.test.buckyos.io:2981/"
-        );
-        assert!(gateway_info.trust_key.contains_key("verify-hub"));
-        assert!(gateway_info.trust_key.contains_key("ood1"));
-
-        let system_config = gateway_info.service_info.get("system_config").unwrap();
-        assert_eq!(system_config.selector.get("ood1").unwrap().port, 3200);
-        assert_eq!(system_config.selector.get("ood2").unwrap().port, 3200);
-
-        let files = match gateway_info.app_info.get("files").unwrap() {
-            NodeGatewayAppEntry::App(entry) => entry,
-            _ => panic!("files should resolve to an app entry"),
-        };
-        assert_eq!(files.app_id, "files");
-        assert_eq!(files.node_id.as_deref(), Some("ood2"));
-        assert_eq!(files.port, Some(10160));
-        assert_eq!(files.dir_pkg_id, None);
-        assert_eq!(files.sdk_version, 10);
-
-        let sys = match gateway_info.app_info.get("sys").unwrap() {
-            NodeGatewayAppEntry::Service(entry) => entry,
-            _ => panic!("sys should resolve to a service entry"),
-        };
-        assert_eq!(sys.service_id, "control-panel");
-        assert_eq!(sys.selector.get("ood1").unwrap().port, 4020);
+        assert_eq!(gateway_info, expected_gateway_info);
     }
 
     #[tokio::test]
@@ -2467,7 +2516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_node_gateway_config_keeps_acme_and_zone_tls() {
+    async fn test_update_node_gateway_config_keeps_acme_and_zone_tls_hosts() {
         let mut input_system_config = HashMap::new();
         let mut zone_config = create_test_zone_config();
         zone_config.sn = Some("sn.test.buckyos.io".to_string());
@@ -2493,6 +2542,11 @@ mod tests {
             "https://sn.test.buckyos.io/kapi/sn"
         );
         assert_eq!(gateway_config["stacks"]["zone_tls"]["bind"], "0.0.0.0:443");
+        assert_eq!(
+            gateway_config["stacks"]["zone_tls"]["hosts"],
+            json!(["*.test.buckyos.io", "test.buckyos.io"])
+        );
+        assert!(gateway_config["stacks"]["zone_tls"]["certs"].is_null());
         assert_eq!(
             gateway_config["stacks"]["zone_tls"]["hook_point"]["main"]["blocks"]["default"]
                 ["block"],
@@ -2634,16 +2688,16 @@ mod tests {
             serde_json::to_string(&device_ood1).unwrap(),
         );
         input_system_config.insert(
-            "users/alice/agents/jarvis/spec".to_string(),
+            "users/alice/agents/buckyos_jarvis/spec".to_string(),
             serde_json::to_string(&agent_spec).unwrap(),
         );
 
         let mut scheduler_ctx = NodeScheduler::new_empty(1);
         scheduler_ctx.service_infos.insert(
-            "jarvis@alice".to_string(),
+            "buckyos_jarvis@alice".to_string(),
             ServiceInfo::SingleInstance(create_test_replica_instance(
-                "jarvis@alice",
-                "jarvis@alice@ood1",
+                "buckyos_jarvis@alice",
+                "buckyos_jarvis@alice@ood1",
                 "ood1",
                 &[("www", 11080)],
             )),
@@ -2662,7 +2716,7 @@ mod tests {
             NodeGatewayAppEntry::App(entry) => entry,
             _ => panic!("jarvis should resolve to an app entry"),
         };
-        assert_eq!(jarvis.app_id, "jarvis");
+        assert_eq!(jarvis.app_id, "buckyos_jarvis");
         assert_eq!(jarvis.node_id.as_deref(), Some("ood1"));
         assert_eq!(jarvis.port, Some(11080));
         assert_eq!(jarvis.dir_pkg_id, None);

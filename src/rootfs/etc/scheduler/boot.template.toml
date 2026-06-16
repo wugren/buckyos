@@ -65,7 +65,8 @@
                 }
             },
             "bind_address": "0.0.0.0",
-            "res_pool_id": "default"
+            "res_pool_id": "default",
+            "allow_public_access": false
         },
         "buckyos_systest": {
             "app_doc": {
@@ -81,11 +82,15 @@
                 "author": "did:web:buckyos.ai",
                 "owner": "did:web:buckyos.ai",
                 "show_name": "BuckyOS System Test",
-                "selector_type": "static",
-                "install_config_tips": {},
+                "selector_type": "single",
+                "install_config_tips": {
+                    "service_ports": {
+                        "www": 3000
+                    }
+                },
                 "pkg_list": {
-                    "web": {
-                        "pkg_id": "nightly-linux-amd64.buckyos_systest#0.5.1"
+                    "script": {
+                        "pkg_id": "buckyos_systest"
                     }
                 }
             },
@@ -101,7 +106,8 @@
                     "sub_hostname": ["systest"]
                 }
             },
-            "res_pool_id": ""
+            "res_pool_id": "",
+            "allow_public_access": true
         }
     }
 }
@@ -170,7 +176,7 @@ p, admin,/config/system/rbac/policy,read,allow
 p, admin,/config/system/scheduler/*,read,allow
 p, admin,/config/agents/*/doc,read|write,allow
 p, admin,/config/agents/*/settings,read|write,allow
-p, admin,/config/users/{user}/*,read|write,allow
+p, admin,/config/users/*,read|write,allow
 p, admin,/config/services/*,read|write,allow
 
 p, user,/config/boot/*, read,allow

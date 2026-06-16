@@ -1,12 +1,18 @@
 use crate::aicc::{
-    AIComputeCenter, CostEstimate, Provider, ProviderError, ProviderInstance, ProviderStartResult,
-    ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, AIComputeCenter, Provider, ProviderError, ProviderInstance,
+    ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
-use crate::claude_protocol::convert_complete_request;
+use crate::claude_protocol::{convert_complete_request_with_dialect, ProtocolDialect};
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
+use crate::model_types::{
+    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
+    ProviderTypeTrustedSource, QuotaState,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use buckyos_api::{
-    features, AiCost, AiResponseSummary, AiToolCall, AiUsage, Capability, CompleteRequest, Feature,
+    ai_methods, features, AiCost, AiMethodRequest, AiResponse, AiToolCall, AiUsage, Capability,
+    Feature,
 };
 use log::{info, warn};
 use reqwest::{Client, StatusCode};
@@ -23,19 +29,23 @@ const DEFAULT_MINIMAX_MODELS: &str =
 
 #[derive(Debug, Clone)]
 pub struct MiniMaxInstanceConfig {
-    pub instance_id: String,
+    pub provider_instance_name: String,
     pub provider_type: String,
+    pub provider_driver: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
     pub default_model: Option<String>,
     pub features: Vec<Feature>,
+    #[allow(dead_code)]
     pub alias_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MiniMaxProvider {
     instance: ProviderInstance,
+    inventory: ProviderInventory,
     client: Client,
     api_token: String,
     base_url: String,
@@ -54,17 +64,41 @@ impl MiniMaxProvider {
             .build()
             .context("failed to build reqwest client for minimax provider")?;
 
+        let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
+        let provider_instance_name = cfg.provider_instance_name.clone();
+        let provider_driver = cfg.provider_driver.clone();
         let instance = ProviderInstance {
-            instance_id: cfg.instance_id,
-            provider_type: cfg.provider_type,
-            capabilities: vec![Capability::LlmRouter],
-            features: cfg.features,
+            provider_instance_name: provider_instance_name.clone(),
+            provider_type: provider_type.clone(),
+            provider_driver: provider_driver.clone(),
+            provider_origin: ProviderOrigin::SystemConfig,
+            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
+            provider_type_revision: None,
+            capabilities: vec![Capability::Llm],
+            features: cfg.features.clone(),
             endpoint: Some(cfg.base_url.clone()),
             plugin_key: None,
         };
+        let requests = cfg
+            .models
+            .iter()
+            .map(|model| {
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(1400))
+            })
+            .collect::<Vec<_>>();
+        let inventory = resolve_driver_inventory(
+            provider_instance_name.as_str(),
+            provider_type,
+            provider_driver.as_str(),
+            requests.as_slice(),
+            Some("settings-v1".to_string()),
+        );
 
         Ok(Self {
             instance,
+            inventory,
             client,
             api_token,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -82,7 +116,9 @@ impl MiniMaxProvider {
         }
     }
 
-    fn estimate_tokens(req: &CompleteRequest) -> (u64, u64) {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
         if let Some(text) = req.payload.text.as_ref() {
@@ -90,15 +126,29 @@ impl MiniMaxProvider {
         }
 
         for message in req.payload.messages.iter() {
-            text_len += message.content.len();
+            text_len += message.estimate_text_len();
+        }
+        if let Some(input_json) = req.payload.input_json.as_ref() {
+            text_len += json_text_len(input_json);
         }
 
         let input_tokens = ((text_len as f64) / 4.0).ceil() as u64;
         let output_tokens = req
             .payload
-            .options
+            .input_json
             .as_ref()
-            .and_then(|value| value.get("max_tokens").and_then(|value| value.as_u64()))
+            .and_then(|value| {
+                value
+                    .get("max_output_tokens")
+                    .and_then(|value| value.as_u64())
+                    .or_else(|| value.get("max_tokens").and_then(|value| value.as_u64()))
+            })
+            .or_else(|| {
+                req.payload
+                    .options
+                    .as_ref()
+                    .and_then(|value| value.get("max_tokens").and_then(|value| value.as_u64()))
+            })
             .unwrap_or(1024);
 
         (input_tokens.max(1), output_tokens.max(1))
@@ -170,9 +220,14 @@ impl MiniMaxProvider {
         &self,
         ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
-        req: &CompleteRequest,
+        req: &AiMethodRequest,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        let (request_obj, _ignored) = convert_complete_request(req, provider_model)?;
+        let (request_obj, _ignored) = convert_complete_request_with_dialect(
+            req,
+            provider_model,
+            ProtocolDialect::MiniMax,
+            None,
+        )?;
         let request_value = Value::Object(request_obj.clone());
         let endpoint = format!("{}/messages", self.base_url);
 
@@ -202,8 +257,8 @@ impl MiniMaxProvider {
                 .unwrap_or("minimax api returned non-success status")
                 .to_string();
             warn!(
-                "aicc.minimax.llm.error instance_id={} model={} trace_id={:?} status={} body={}",
-                self.instance.instance_id,
+                "aicc.minimax.llm.error provider_instance_name={} model={} trace_id={:?} status={} body={}",
+                self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
                 status.as_u16(),
@@ -241,10 +296,8 @@ impl MiniMaxProvider {
             }),
         );
 
-        Ok(ProviderStartResult::Immediate(AiResponseSummary {
-            text: content,
-            tool_calls,
-            artifacts: vec![],
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            message: AiResponse::message_from_parts(content, tool_calls, vec![]),
             usage,
             cost,
             finish_reason: body
@@ -259,22 +312,28 @@ impl MiniMaxProvider {
 
 #[async_trait]
 impl Provider for MiniMaxProvider {
-    fn instance(&self) -> &ProviderInstance {
-        &self.instance
+    fn inventory(&self) -> ProviderInventory {
+        self.inventory.clone()
     }
 
-    fn estimate_cost(&self, req: &CompleteRequest, provider_model: &str) -> CostEstimate {
-        let (input_tokens, output_tokens) = Self::estimate_tokens(req);
+    fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
+        let provider_model = provider_model_from_exact(input.exact_model.as_str());
+        let input_tokens = input.input_tokens.max(1);
+        let output_tokens = input.estimated_output_tokens.unwrap_or(1024).max(1);
         let usage = AiUsage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             total_tokens: Some(input_tokens.saturating_add(output_tokens)),
         };
 
-        CostEstimate {
+        CostEstimateOutput {
             estimated_cost_usd: self
                 .estimate_cost_for_usage(provider_model, &usage)
-                .map(|cost| cost.amount),
+                .map(|cost| cost.amount)
+                .unwrap_or(1.0),
+            pricing_mode: PricingMode::PerToken,
+            quota_state: QuotaState::Normal,
+            confidence: 0.7,
             estimated_latency_ms: Some(1400),
         }
     }
@@ -286,14 +345,14 @@ impl Provider for MiniMaxProvider {
         req: ResolvedRequest,
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        match req.request.capability {
-            Capability::LlmRouter => {
+        match req.method.as_str() {
+            ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
                     .await
             }
-            capability => Err(ProviderError::fatal(format!(
-                "minimax provider does not support capability '{:?}'",
-                capability
+            method => Err(ProviderError::fatal(format!(
+                "minimax provider does not support method '{}'",
+                method
             ))),
         }
     }
@@ -304,6 +363,24 @@ impl Provider for MiniMaxProvider {
         _task_id: &str,
     ) -> std::result::Result<(), ProviderError> {
         Ok(())
+    }
+}
+
+fn provider_model_from_exact(exact_model: &str) -> &str {
+    exact_model
+        .rsplit_once('@')
+        .map(|(model, _)| model)
+        .unwrap_or(exact_model)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn json_text_len(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(json_text_len).sum(),
+        Value::Object(map) => map.values().map(json_text_len).sum(),
+        _ => 0,
     }
 }
 
@@ -322,9 +399,13 @@ struct MiniMaxSettings {
 #[derive(Debug, Clone, Deserialize)]
 struct SettingsMiniMaxInstanceConfig {
     #[serde(default = "default_instance_id")]
-    instance_id: String,
+    provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default = "default_provider_driver")]
+    provider_driver: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -348,6 +429,10 @@ fn default_instance_id() -> String {
 }
 
 fn default_provider_type() -> String {
+    "cloud_api".to_string()
+}
+
+fn default_provider_driver() -> String {
     "minimax".to_string()
 }
 
@@ -422,8 +507,10 @@ fn parse_minimax_settings(settings: &Value) -> Result<Option<MiniMaxSettings>> {
 fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInstanceConfig>> {
     let raw_instances = if settings.instances.is_empty() {
         vec![SettingsMiniMaxInstanceConfig {
-            instance_id: default_instance_id(),
+            provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            provider_driver: default_provider_driver(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             models: vec![],
@@ -444,7 +531,7 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
         if models.is_empty() {
             return Err(anyhow!(
                 "minimax instance {} has no models configured",
-                raw_instance.instance_id
+                raw_instance.provider_instance_name
             ));
         }
 
@@ -458,8 +545,14 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
         };
 
         instances.push(MiniMaxInstanceConfig {
-            instance_id: raw_instance.instance_id,
+            provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
+            provider_driver: raw_instance.provider_driver,
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             timeout_ms: raw_instance.timeout_ms,
             models,
@@ -472,6 +565,8 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
     Ok(instances)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -480,14 +575,14 @@ fn register_default_aliases(
 ) {
     for model in models.iter() {
         center.model_catalog().set_mapping(
-            Capability::LlmRouter,
+            Capability::Llm,
             model.as_str(),
             provider_type,
             model.as_str(),
         );
 
         center.model_catalog().set_mapping(
-            Capability::LlmRouter,
+            Capability::Llm,
             format!("llm.{}", model),
             provider_type,
             model.as_str(),
@@ -495,14 +590,9 @@ fn register_default_aliases(
     }
 
     if let Some(default_model) = default_model {
-        for alias in [
-            "llm.default",
-            "llm.chat.default",
-            "llm.plan.default",
-            "llm.code.default",
-        ] {
+        for alias in ["llm.default", "llm.plan.default", "llm.code.default"] {
             center.model_catalog().set_mapping(
-                Capability::LlmRouter,
+                Capability::Llm,
                 alias,
                 provider_type,
                 default_model,
@@ -511,6 +601,8 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -518,7 +610,7 @@ fn register_custom_aliases(
 ) {
     for (alias, model) in alias_map.iter() {
         center.model_catalog().set_mapping(
-            Capability::LlmRouter,
+            Capability::Llm,
             alias.as_str(),
             provider_type,
             model.as_str(),
@@ -531,13 +623,6 @@ pub fn register_minimax_providers(center: &AIComputeCenter, settings: &Value) ->
         info!("aicc minimax provider is disabled (settings.minimax missing or disabled)");
         return Ok(0);
     };
-    if minimax_settings.api_token.trim().is_empty() {
-        warn!("aicc minimax provider enabled but api_token is empty");
-        return Err(anyhow!(
-            "settings.minimax.api_token (or api_key) is required when minimax provider is enabled"
-        ));
-    }
-
     let instances = build_minimax_instances(&minimax_settings)?;
     info!(
         "aicc minimax registering instances={} default_models={:?}",
@@ -549,29 +634,28 @@ pub fn register_minimax_providers(center: &AIComputeCenter, settings: &Value) ->
     );
     let mut prepared = Vec::<(MiniMaxInstanceConfig, Arc<dyn Provider>)>::new();
     for config in instances.iter() {
-        let provider = MiniMaxProvider::new(config.clone(), minimax_settings.api_token.clone())?;
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "minimax instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
+        let provider = MiniMaxProvider::new(config.clone(), config.api_token.clone())?;
         prepared.push((config.clone(), Arc::new(provider)));
     }
 
     for (config, provider) in prepared.into_iter() {
-        center.registry().add_provider(provider);
-        register_default_aliases(
-            center,
-            config.provider_type.as_str(),
-            &config.models,
-            config.default_model.as_deref(),
-        );
-        register_custom_aliases(
-            center,
-            config.provider_type.as_str(),
-            &minimax_settings.alias_map,
-        );
-        register_custom_aliases(center, config.provider_type.as_str(), &config.alias_map);
-
+        let inventory = center.registry().add_provider(provider);
         info!(
-            "registered minimax instance id={} provider_type={} base_url={} models={:?}",
-            config.instance_id, config.provider_type, config.base_url, config.models,
+            "registered minimax base_url={} inventory={:?}",
+            config.base_url, inventory
         );
+        center
+            .model_registry()
+            .write()
+            .map_err(|_| anyhow!("model registry lock poisoned"))?
+            .apply_inventory(inventory)
+            .map_err(|err| anyhow!("failed to apply minimax inventory: {}", err))?;
     }
 
     Ok(instances.len())
@@ -580,7 +664,6 @@ pub fn register_minimax_providers(center: &AIComputeCenter, settings: &Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aicc::ModelCatalog;
 
     #[test]
     fn build_minimax_instances_uses_defaults() {
@@ -593,21 +676,23 @@ mod tests {
 
         let instances = build_minimax_instances(&settings).expect("instances should build");
         assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].provider_type, "minimax");
+        assert_eq!(instances[0].provider_type, "cloud_api");
+        assert_eq!(instances[0].provider_driver, "minimax");
         assert_eq!(instances[0].default_model.as_deref(), Some("MiniMax-M2.5"));
     }
 
     #[test]
-    fn register_minimax_aliases_exposes_defaults() {
-        let center = AIComputeCenter::new(Default::default(), ModelCatalog::default());
+    fn register_minimax_inventory_exposes_default_mounts() {
+        let center = AIComputeCenter::default();
         let settings = json!({
             "minimax": {
                 "enabled": true,
                 "api_token": "token",
                 "instances": [
                     {
-                        "instance_id": "minimax-main",
-                        "provider_type": "minimax",
+                        "provider_instance_name": "minimax-main",
+                        "provider_type": "cloud_api",
+                        "provider_driver": "minimax",
                         "base_url": "https://api.minimaxi.com/anthropic/v1",
                         "models": ["MiniMax-M2.5"],
                         "default_model": "MiniMax-M2.5"
@@ -618,12 +703,13 @@ mod tests {
 
         let count = register_minimax_providers(&center, &settings).expect("register should work");
         assert_eq!(count, 1);
-        assert_eq!(
-            center
-                .model_catalog()
-                .resolve("", &Capability::LlmRouter, "llm.plan.default", "minimax")
-                .as_deref(),
-            Some("MiniMax-M2.5")
-        );
+        let items = center
+            .model_registry()
+            .read()
+            .expect("model registry lock")
+            .default_items_for_path("llm.minimax");
+        assert!(items
+            .values()
+            .any(|item| item.target == "MiniMax-M2.5@minimax-main"));
     }
 }

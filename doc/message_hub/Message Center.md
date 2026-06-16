@@ -139,9 +139,9 @@ pub enum ReceiptStatus {
 
 * 幂等：同 msg_id 重复 dispatch 不应重复生成 record（或需要按业务允许生成“重复记录”时，用不同 record_id variant）。
 
-#### `post_send(msg_obj, send_ctx)`
+#### `post_send(msg_obj, idempotency_key)`
 
-用于**出站**：agent/人/系统产生消息，进入 outbox，并创建投递计划（由 tunnel 消费）。
+用于**出站**：agent/人/系统产生消息，进入 outbox，并创建投递计划（由 tunnel 消费）。`SendContext` 已删除——`post_send` 只接受已确定的 `MsgObject.to`，不做 target/binding/tunnel 选择；选择必须发生在构造 `MsgObject` 之前（见 ContactMgr `resolve_target`）。
 
 > 在参考循环里已经有 dispatch/post_send 的最小版。
 > 下面是“可生产落地版”的职责补全。
@@ -270,21 +270,26 @@ def _is_group_chat(msg_obj):
 * **Tunnel OUTBOX**：给投递使用（按 tunnel 分队列）
 
 ```python
-def message_center.post_send(msg_obj, send_ctx=None):
+def message_center.post_send(msg_obj, idempotency_key=None):
     """
     出站入口：agent/user/system -> MessageCenter
 
     目标：
       1) 存 MsgObject（幂等）
       2) 写 sender OUTBOX record（用于历史/删除策略）
-      3) 通过 ContactMgr 选路由（选 tunnel endpoint）
+      3) 对每个已确定的 MsgObject.to 规划投递（不做隐式选路/不 fallback）
       4) 写入一个或多个 tunnel outbox record（用于实际发送）
+
+    注意：to 必须是已确定 DID；target/binding/tunnel 选择在构造
+    MsgObject 之前完成（见 ContactMgr.resolve_target）。
     """
+    if not msg_obj.to:
+        raise ParseRequestError("post_send requires at least one target in msg.to")
     msg_id = msg_obj.id
     object_store.put_if_absent(f"objects/msg/{msg_id}", msg_obj)
 
     author = _logical_sender_for_outbound(msg_obj)  # 群聊 msg.source 是作者；非群聊 msg.from 是作者
-    if contact_mgr.is_block(author, context=send_ctx):
+    if contact_mgr.is_block(author, owner=author):
         return {"ok": False, "reason": "blocked_author"}
 
     # 1) 写 author 的 OUTBOX 记录（历史副本）
@@ -296,24 +301,33 @@ def message_center.post_send(msg_obj, send_ctx=None):
         initial_state="SENT",    # 注意：这里的 SENT 表示“已产生”，不是“外部平台已投递成功”
     )
 
-    # 2) 选路由：对每个“投递目标”得到 endpoint 列表
-    delivery_plans = contact_mgr.plan_delivery(msg_obj, context=send_ctx)
-    # delivery_plans: List[ {tunnel_did, address, target_did, mode, priority} ]
+    # 2) 先把所有 to 解析成投递计划；任一无法确定路由即整体失败（不 fallback）
+    plans = []
+    for target in msg_obj.to:
+        triple = parse_msgtunnel_did(target)          # (account_id, account_type, tunnel_id)
+        if triple is None:                            # 一级 DID 无直达能力
+            return {"ok": False, "reason": f"no direct delivery for {target}"}
+        route = tunnel_registry.get(triple.tunnel_id) # short tunnel_id -> (tunnel_did, platform)
+        if route is None:
+            return {"ok": False, "reason": f"unknown tunnel_id {triple.tunnel_id}"}
+        plans.append({
+            "tunnel_did": route.tunnel_did, "platform": route.platform,
+            "account_id": triple.account_id, "target_did": target, "mode": "direct",
+        })
 
     # 3) 将投递计划写入 tunnel outbox 队列（真正的 WAIT -> SENDING -> SENT）
     created = []
-    for plan in delivery_plans:
-        tunnel_id = plan["tunnel_did"]
+    for plan in plans:
         record_id = _put_record(
-            owner=tunnel_id,
+            owner=plan["tunnel_did"],
             box_kind="TUNNEL_OUTBOX",
             msg_id=msg_id,
-            route=plan,               # 每条投递记录绑定 route（tunnel+address）
+            route=plan,               # account_id 让 egress 反推平台 chat_id
             initial_state="WAIT",
         )
-        created.append({"tunnel": tunnel_id, "record_id": record_id})
+        created.append({"tunnel": plan["tunnel_did"], "record_id": record_id})
 
-    _notify_many([p["tunnel_did"] for p in delivery_plans], msg_id)
+    _notify_many([p["tunnel_did"] for p in plans], msg_id)
     return {"ok": True, "msg_id": msg_id, "deliveries": created}
 
 

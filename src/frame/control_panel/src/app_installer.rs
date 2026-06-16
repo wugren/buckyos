@@ -1,22 +1,24 @@
 use buckyos_api::{
-    get_buckyos_api_runtime, AppDoc, AppServiceSpec, AppType, CreateTaskOptions, RepoClient,
-    RepoProof, RepoProofFilter, ServiceInstanceReportInfo, ServiceInstanceState, ServiceState,
-    SubPkgDesc, SystemConfigClient, SystemConfigError, TaskManagerClient, TaskStatus,
-    REPO_PROOF_TYPE_DOWNLOAD, REPO_PROOF_TYPE_REFERRAL, REPO_STATUS_COLLECTED, REPO_STATUS_PINNED,
+    get_buckyos_api_runtime, AppDoc, AppInstallTaskData, AppInstallTaskRequest, AppServiceSpec,
+    AppStartTaskData, AppStartTaskRequest, AppType, AppUninstallTaskData, AppUninstallTaskRequest,
+    AppUpdateTaskData, AppUpdateTaskRequest, CreateTaskOptions, RepoClient, RepoProof,
+    RepoProofFilter, ServiceInstanceReportInfo, ServiceInstanceState, ServiceState, SubPkgDesc,
+    SystemConfigClient, SystemConfigError, TaskManagerClient, TaskStatus, REPO_PROOF_TYPE_DOWNLOAD,
+    REPO_PROOF_TYPE_REFERRAL, REPO_STATUS_COLLECTED, REPO_STATUS_PINNED,
 };
 use buckyos_kit::buckyos_get_unix_timestamp;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use kRPC::RPCErrors;
 use log::{info, warn};
-use named_store::NamedStoreMgr;
+use named_store::NamedDataMgr;
 use ndn_lib::{
     build_named_object_by_json, build_obj_id, ActionObject, FileObject, NamedObject, ObjId,
     StoreMode, ACTION_TYPE_DOWNLOAD, ACTION_TYPE_INSTALLED,
 };
 use ndn_toolkit::{cacl_file_object, CheckMode};
 use package_lib::{PackageId, PackageMeta};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use std::fs::File as StdFile;
 use std::io;
@@ -40,10 +42,10 @@ use uuid::Uuid;
 // 3. schedule() 四阶段: Step1 resort_nodes -> Step2 schedule_spec_change(New->选点+InstanceReplica, Deleted->RemoveInstance) -> Step4 calc_service_infos
 // 4. 输出: InstanceReplica -> nodes/{node}/config.apps, RemoveInstance -> 删 node config, UpdateServiceInfo -> services/{spec}/info
 // 5. node-daemon 读 nodes/{node}/config 收敛实例; 实例上报 services/{spec}/instances/{node}; gateway 读 service_info 做路由
-const INSTALL_TASK_TYPE: &str = "app_install";
-const UNINSTALL_TASK_TYPE: &str = "app_uninstall";
-const START_TASK_TYPE: &str = "app_start";
-const UPDATE_TASK_TYPE: &str = "app_update";
+const INSTALL_TASK_TYPE: &str = "app.install";
+const UNINSTALL_TASK_TYPE: &str = "app.uninstall";
+const START_TASK_TYPE: &str = "app.start";
+const UPDATE_TASK_TYPE: &str = "app.update";
 const WAIT_INTERVAL_MS: u64 = 1_000;
 const WAIT_TIMEOUT_SECS: u64 = 45;
 const PROOF_EXPIRE_SECS: u64 = 365 * 24 * 60 * 60;
@@ -81,6 +83,11 @@ struct PreparedSubPkg {
 struct PreparedPublishPlan {
     app_bundle: Option<PreparedPayload>,
     sub_pkgs: Vec<PreparedSubPkg>,
+}
+
+fn task_data_value<T: Serialize>(data: T) -> Result<Value, RPCErrors> {
+    serde_json::to_value(data)
+        .map_err(|error| RPCErrors::ReasonError(format!("Serialize task data failed: {error}")))
 }
 
 #[derive(Clone)]
@@ -1229,12 +1236,15 @@ impl AppInstaller {
             .create_task(
                 format!("Install app {}", spec.app_id()),
                 INSTALL_TASK_TYPE,
-                json!({
-                    "app_id": spec.app_id(),
-                    "user_id": spec.user_id,
-                    "version": spec.app_doc.version,
-                    "content_id": content_id,
-                }),
+                task_data_value(AppInstallTaskData {
+                    request: AppInstallTaskRequest {
+                        app_id: spec.app_id().to_string(),
+                        user_id: spec.user_id.clone(),
+                        version: spec.app_doc.version.clone(),
+                        content_id: content_id.clone(),
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 spec.app_id(),
             )
@@ -1281,11 +1291,14 @@ impl AppInstaller {
             .create_task(
                 format!("Uninstall app {app_id}"),
                 UNINSTALL_TASK_TYPE,
-                json!({
-                    "app_id": app_id,
-                    "user_id": spec.user_id,
-                    "remove_data": is_remove_data,
-                }),
+                task_data_value(AppUninstallTaskData {
+                    request: AppUninstallTaskRequest {
+                        app_id: app_id.to_string(),
+                        user_id: spec.user_id.clone(),
+                        remove_data: is_remove_data,
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 app_id,
             )
@@ -1369,10 +1382,13 @@ impl AppInstaller {
             .create_task(
                 format!("Start app {app_id}"),
                 START_TASK_TYPE,
-                json!({
-                    "app_id": app_id,
-                    "user_id": spec.user_id,
-                }),
+                task_data_value(AppStartTaskData {
+                    request: AppStartTaskRequest {
+                        app_id: app_id.to_string(),
+                        user_id: spec.user_id.clone(),
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 app_id,
             )
@@ -1413,13 +1429,16 @@ impl AppInstaller {
             .create_task(
                 format!("Update app {}", spec.app_id()),
                 UPDATE_TASK_TYPE,
-                json!({
-                    "app_id": spec.app_id(),
-                    "user_id": spec.user_id,
-                    "from_version": current_spec.app_doc.version,
-                    "to_version": spec.app_doc.version,
-                    "content_id": content_id,
-                }),
+                task_data_value(AppUpdateTaskData {
+                    request: AppUpdateTaskRequest {
+                        app_id: spec.app_id().to_string(),
+                        user_id: spec.user_id.clone(),
+                        from_version: current_spec.app_doc.version.clone(),
+                        to_version: spec.app_doc.version.clone(),
+                        content_id,
+                    },
+                    result: None,
+                })?,
                 spec.user_id.as_str(),
                 spec.app_id(),
             )
@@ -1885,7 +1904,7 @@ impl AppInstaller {
 
     async fn package_source_to_payload(
         &self,
-        named_store: &NamedStoreMgr,
+        named_store: &NamedDataMgr,
         temp_root: &Path,
         source: &PackageSource,
         archive_base_name: &str,
@@ -2048,6 +2067,400 @@ impl AppInstaller {
             }
         }
         Ok(())
+    }
+}
+
+use crate::{ControlPanelServer, RpcAuthPrincipal};
+use ::kRPC::{RPCRequest, RPCResponse, RPCResult};
+use buckyos_api::RepoRecord;
+
+struct RepoAppReleaseCandidate {
+    record: RepoRecord,
+    app_doc: AppDoc,
+    parsed_version: Option<semver::Version>,
+}
+
+impl ControlPanelServer {
+    pub(crate) fn resolve_target_user_id(req: &RPCRequest, principal: &RpcAuthPrincipal) -> String {
+        Self::param_str(req, "user_id").unwrap_or_else(|| principal.username.clone())
+    }
+
+    fn repo_record_version(record: &RepoRecord) -> Option<String> {
+        record
+            .meta
+            .get("version")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn repo_status_rank(status: &str) -> u8 {
+        match status {
+            "pinned" => 2,
+            "collected" => 1,
+            _ => 0,
+        }
+    }
+
+    fn compare_repo_app_release(
+        lhs: &RepoAppReleaseCandidate,
+        rhs: &RepoAppReleaseCandidate,
+    ) -> std::cmp::Ordering {
+        match (&lhs.parsed_version, &rhs.parsed_version) {
+            (Some(left), Some(right)) if left != right => return left.cmp(right),
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            _ => {}
+        }
+
+        let lhs_status = Self::repo_status_rank(lhs.record.status.as_str());
+        let rhs_status = Self::repo_status_rank(rhs.record.status.as_str());
+        if lhs_status != rhs_status {
+            return lhs_status.cmp(&rhs_status);
+        }
+
+        let lhs_updated = lhs
+            .record
+            .updated_at
+            .or(lhs.record.pinned_at)
+            .or(lhs.record.collected_at)
+            .unwrap_or(0);
+        let rhs_updated = rhs
+            .record
+            .updated_at
+            .or(rhs.record.pinned_at)
+            .or(rhs.record.collected_at)
+            .unwrap_or(0);
+        if lhs_updated != rhs_updated {
+            return lhs_updated.cmp(&rhs_updated);
+        }
+
+        lhs.app_doc.version.cmp(&rhs.app_doc.version)
+    }
+
+    async fn resolve_repo_app_release(
+        &self,
+        app_id: &str,
+        version: Option<&str>,
+    ) -> Result<RepoAppReleaseCandidate, RPCErrors> {
+        let runtime = get_buckyos_api_runtime()?;
+        info!(
+            "resolve repo app release app_id=`{}` version={:?}",
+            app_id, version
+        );
+        let repo = runtime.get_repo_client().await.map_err(|error| {
+            warn!(
+                "init repo client failed while resolving app `{}`: {}",
+                app_id, error
+            );
+            RPCErrors::ReasonError(format!("Init repo client failed: {}", error))
+        })?;
+        let requested_version = version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let records = repo
+            .list(Some(buckyos_api::RepoListFilter::new(
+                None,
+                None,
+                Some(app_id.to_string()),
+                None,
+            )))
+            .await
+            .map_err(|error| {
+                warn!(
+                    "repo.list failed while resolving app `{}` version {:?}: {}",
+                    app_id, requested_version, error
+                );
+                error
+            })?;
+
+        let mut candidates = Vec::new();
+        for record in records {
+            if record.content_name.as_deref() != Some(app_id) {
+                continue;
+            }
+
+            let Some(record_version) = Self::repo_record_version(&record) else {
+                warn!(
+                    "skip repo record without version for app `{}` content `{}`",
+                    app_id, record.content_id
+                );
+                continue;
+            };
+            if requested_version
+                .as_deref()
+                .map(|expected| expected != record_version)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let app_doc: AppDoc = match serde_json::from_value(record.meta.clone()) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "skip repo record `{}` for app `{}` because meta is not AppDoc: {}",
+                        record.content_id, app_id, error
+                    );
+                    continue;
+                }
+            };
+            if app_doc.name != app_id {
+                continue;
+            }
+
+            candidates.push(RepoAppReleaseCandidate {
+                parsed_version: semver::Version::parse(app_doc.version.as_str()).ok(),
+                record,
+                app_doc,
+            });
+        }
+
+        let release = candidates
+            .into_iter()
+            .max_by(Self::compare_repo_app_release)
+            .ok_or_else(|| {
+                let detail = requested_version
+                    .map(|value| format!(" version `{value}`"))
+                    .unwrap_or_default();
+                RPCErrors::ReasonError(format!("No repo app release found for `{app_id}`{detail}"))
+            })?;
+        info!(
+            "resolved repo app release app_id=`{}` version=`{}` content=`{}` status=`{}`",
+            release.app_doc.name,
+            release.app_doc.version,
+            release.record.content_id,
+            release.record.status
+        );
+        Ok(release)
+    }
+
+    fn build_default_install_config(
+        app_id: &str,
+        app_doc: &AppDoc,
+    ) -> buckyos_api::ServiceInstallConfig {
+        let mut install_config = buckyos_api::ServiceInstallConfig {
+            local_cache_mount_point: app_doc.install_config_tips.local_cache_mount_point.clone(),
+            container_param: app_doc.install_config_tips.container_param.clone(),
+            start_param: app_doc.install_config_tips.start_param.clone(),
+            ..Default::default()
+        };
+
+        for (service_name, service_port) in app_doc.install_config_tips.service_ports.iter() {
+            let mut expose = buckyos_api::ServiceExposeConfig::default();
+            if service_name == "www" {
+                expose.sub_hostname.push(app_id.to_string());
+            } else {
+                expose.expose_port = Some(*service_port);
+            }
+            install_config
+                .expose_config
+                .insert(service_name.clone(), expose);
+        }
+
+        if app_doc.get_app_type() == AppType::Web
+            && !install_config.expose_config.contains_key("www")
+        {
+            install_config.expose_config.insert(
+                "www".to_string(),
+                buckyos_api::ServiceExposeConfig {
+                    sub_hostname: vec![app_id.to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+
+        install_config
+    }
+
+    fn build_install_spec_for_user(app_doc: AppDoc, user_id: String) -> AppServiceSpec {
+        let app_id = app_doc.name.clone();
+        AppServiceSpec {
+            install_config: Self::build_default_install_config(app_id.as_str(), &app_doc),
+            app_doc,
+            app_index: 0,
+            user_id,
+            enable: true,
+            expected_instance_count: 1,
+            state: ServiceState::New,
+        }
+    }
+
+    fn parse_app_type(raw: &str) -> Result<AppType, RPCErrors> {
+        AppType::try_from(raw.trim()).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("Invalid app_type `{}`: {}", raw, error))
+        })
+    }
+
+    pub(crate) async fn handle_app_publish(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let _principal = Self::require_rpc_principal(principal)?;
+        let local_dir = Self::require_param_str(&req, "local_dir")
+            .or_else(|_| Self::require_param_str(&req, "path"))?;
+        let app_doc_value = req
+            .params
+            .get("app_doc")
+            .cloned()
+            .or_else(|| req.params.get("app_doc_template").cloned())
+            .ok_or_else(|| RPCErrors::ReasonError("missing app_doc payload".to_string()))?;
+        let app_doc: AppDoc = serde_json::from_value(app_doc_value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("Invalid app_doc payload: {}", error))
+        })?;
+        let app_type = Self::param_str(&req, "app_type")
+            .map(|raw| Self::parse_app_type(raw.as_str()))
+            .transpose()?
+            .unwrap_or_else(|| app_doc.get_app_type());
+
+        info!(
+            "rpc app.publish app=`{}` version=`{}` type=`{}` local_dir=`{}`",
+            app_doc.name, app_doc.version, app_type, local_dir
+        );
+        let obj_id = self
+            .app_installer
+            .publish_app_to_repo(app_type, std::path::Path::new(local_dir.as_str()), &app_doc)
+            .await
+            .map_err(|error| {
+                warn!(
+                    "rpc app.publish failed for app `{}` version `{}` local_dir `{}`: {}",
+                    app_doc.name, app_doc.version, local_dir, error
+                );
+                error
+            })?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "ok": true,
+                "obj_id": obj_id.to_string(),
+            })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_install(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let app_id = Self::require_param_str(&req, "app_id")?;
+        let user_id = Self::resolve_target_user_id(&req, principal);
+        let version = Self::param_str(&req, "version");
+        let release = self
+            .resolve_repo_app_release(app_id.as_str(), version.as_deref())
+            .await?;
+        let spec = Self::build_install_spec_for_user(release.app_doc, user_id);
+        let task_id = self.app_installer.install_app(&spec).await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "task_id": task_id.to_string(),
+            })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_update(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let app_id = Self::require_param_str(&req, "app_id")?;
+        let version = Self::require_param_str(&req, "version")?;
+        let user_id = Self::resolve_target_user_id(&req, principal);
+        let current_spec = self
+            .app_installer
+            .get_app_service_spec(app_id.as_str(), Some(user_id.as_str()))
+            .await?;
+        let release = self
+            .resolve_repo_app_release(app_id.as_str(), Some(version.as_str()))
+            .await?;
+
+        let next_spec = AppServiceSpec {
+            app_doc: release.app_doc,
+            app_index: current_spec.app_index,
+            user_id: current_spec.user_id.clone(),
+            enable: current_spec.enable,
+            expected_instance_count: current_spec.expected_instance_count,
+            state: current_spec.state,
+            install_config: current_spec.install_config.clone(),
+        };
+        let task_id = self.app_installer.upgrade_app(&next_spec).await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "task_id": task_id.to_string(),
+            })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_uninstall(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let app_id = Self::require_param_str(&req, "app_id")?;
+        let user_id = Self::resolve_target_user_id(&req, principal);
+        let remove_data = Self::param_bool(&req, "remove_data")
+            .or_else(|| Self::param_bool(&req, "is_remove_data"))
+            .unwrap_or(false);
+        let task_id = self
+            .app_installer
+            .uninstall_app(app_id.as_str(), Some(user_id.as_str()), remove_data)
+            .await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "task_id": task_id.to_string(),
+            })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_start(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let app_id = Self::require_param_str(&req, "app_id")?;
+        let user_id = Self::resolve_target_user_id(&req, principal);
+        let task_id = self
+            .app_installer
+            .start_app(app_id.as_str(), Some(user_id.as_str()))
+            .await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "ok": true,
+                "task_id": task_id.to_string(),
+            })),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_stop(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let app_id = Self::require_param_str(&req, "app_id")?;
+        let user_id = Self::resolve_target_user_id(&req, principal);
+        self.app_installer
+            .stop_app(app_id.as_str(), Some(user_id.as_str()))
+            .await?;
+
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({ "ok": true })),
+            req.seq,
+        ))
     }
 }
 

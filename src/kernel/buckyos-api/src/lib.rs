@@ -5,45 +5,71 @@ use log::{info, warn};
 
 mod content_mgr_client;
 mod control_panel;
+mod group_mgr;
 mod msg_center_client;
 pub mod msg_queue;
 mod scheduler_client;
-mod sn_client;
 mod system_config;
 mod task_mgr;
+mod taskdata;
+mod thunk_object;
 mod verify_hub_client;
+pub mod workflow_dsl;
+pub mod workflow_runtime;
+mod workflow_service;
+pub mod workflow_types;
 mod zone_gateway;
 
 mod aicc_client;
+mod aicc_usage_log;
 mod app_doc;
 mod app_mgr;
 mod gateway_control;
 mod kevent_client;
 mod kevent_ringbuffer;
+pub mod network_observation;
+pub mod node_control;
 mod opendan_client;
 mod permission;
+mod rdb_mgr;
 mod repo_client;
 mod runtime;
 pub mod test_config;
 
 pub use aicc_client::*;
+pub use aicc_usage_log::*;
 pub use app_doc::*;
 pub use content_mgr_client::*;
 pub use control_panel::*;
+pub use cyfs_gateway_api::{
+    get_real_sn_host_name, sn_bind_zone_config, sn_get_device_info, sn_register_device,
+    sn_set_user_did_document, sn_update_device_info, SnBindZoneConfigReq, SnClient,
+    SnGetDeviceInfoReq, SnHandler, SnRegisterDeviceReq, SnServerHandler, SnSetUserDidDocumentReq,
+    SnUpdateDeviceInfoReq,
+};
+pub use group_mgr::*;
 pub use msg_center_client::*;
 pub use repo_client::*;
 pub use scheduler_client::*;
-pub use sn_client::*;
 pub use system_config::*;
 pub use task_mgr::*;
+pub use taskdata::*;
+pub use thunk_object::*;
 pub use verify_hub_client::*;
+pub use workflow_dsl::*;
+pub use workflow_runtime::*;
+pub use workflow_service::*;
+pub use workflow_types::*;
 pub use zone_gateway::*;
 
 pub use app_mgr::*;
 pub use gateway_control::*;
 pub use kevent_client::*;
+pub use kevent_ringbuffer::*;
+pub use network_observation::*;
 pub use opendan_client::*;
 pub use permission::*;
+pub use rdb_mgr::*;
 pub use runtime::*;
 
 use ::kRPC::*;
@@ -261,7 +287,7 @@ mod tests {
         get_full_appid, get_session_token_env_key, init_buckyos_api_runtime,
         parse_app_identity_from_instance_config, AppDoc, AppServiceInstanceConfig, AppServiceSpec,
         AppType, BuckyOSRuntimeType, ServiceInstallConfig, ServiceInstanceState, ServiceState,
-        SubPkgDesc,
+        SubPkgDesc, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV,
     };
 
     fn test_env_lock() -> &'static Mutex<()> {
@@ -288,7 +314,7 @@ mod tests {
         let owner_did = DID::from_str("did:bns:devtest").expect("parse owner did");
         let app_doc = AppDoc::builder(
             AppType::Agent,
-            "jarvis",
+            "buckyos_jarvis",
             "0.1.0",
             "did:bns:devtest",
             &owner_did,
@@ -315,14 +341,15 @@ mod tests {
 
         let (app_id, owner_user_id) =
             parse_app_identity_from_instance_config(&raw).expect("parse app_instance_config");
-        assert_eq!(app_id, "jarvis");
+        assert_eq!(app_id, "buckyos_jarvis");
         assert_eq!(owner_user_id, "devtest");
     }
 
     #[tokio::test]
     async fn init_app_service_runtime_skips_system_etc_and_uses_env_bootstrap() {
         let _lock = test_env_lock().lock().expect("lock env");
-        let token_key = get_session_token_env_key(&get_full_appid("jarvis", "devtest"), true);
+        let token_key =
+            get_session_token_env_key(&get_full_appid("buckyos_jarvis", "devtest"), true);
         let missing_root = env::temp_dir().join(format!(
             "buckyos-appservice-runtime-missing-root-{}-{}",
             std::process::id(),
@@ -338,7 +365,7 @@ mod tests {
         let prev_token = set_env_var(&token_key, "dummy-session-token");
 
         let result = init_buckyos_api_runtime(
-            "jarvis",
+            "buckyos_jarvis",
             Some("devtest".to_string()),
             BuckyOSRuntimeType::AppService,
         )
@@ -348,13 +375,45 @@ mod tests {
         restore_env_var("BUCKYOS_ROOT", prev_root);
 
         let runtime = result.expect("init app service runtime should succeed without system etc");
-        assert_eq!(runtime.get_app_id(), "jarvis");
+        assert_eq!(runtime.get_app_id(), "buckyos_jarvis");
         assert_eq!(runtime.get_owner_user_id().as_deref(), Some("devtest"));
         assert_eq!(runtime.user_id.as_deref(), Some("devtest"));
         assert_eq!(runtime.get_authenticated_user_id().as_deref(), None);
         assert_eq!(
             runtime.session_token.read().await.as_str(),
             "dummy-session-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_appclient_runtime_uses_appclient_session_token_env() {
+        let _lock = test_env_lock().lock().expect("lock env");
+        let temp_root = env::temp_dir().join(format!(
+            "buckyos-appclient-runtime-root-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_nanos()
+        ));
+        let etc_dir = temp_root.join("etc");
+        fs::create_dir_all(&etc_dir).expect("create temp etc dir");
+
+        let prev_root = set_env_var("BUCKYOS_ROOT", temp_root.to_string_lossy().as_ref());
+        let prev_token = set_env_var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, "dummy-appclient-token");
+
+        let result =
+            init_buckyos_api_runtime("buckycli", None, BuckyOSRuntimeType::AppClient).await;
+
+        restore_env_var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, prev_token);
+        restore_env_var("BUCKYOS_ROOT", prev_root);
+        let _ = fs::remove_dir_all(&temp_root);
+
+        let runtime = result.expect("init appclient runtime should load env session token");
+        assert_eq!(runtime.get_app_id(), "buckycli");
+        assert_eq!(
+            runtime.session_token.read().await.as_str(),
+            "dummy-appclient-token"
         );
     }
 }

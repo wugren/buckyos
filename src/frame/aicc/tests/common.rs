@@ -1,15 +1,20 @@
 #![allow(dead_code)]
 
+use aicc::model_types::{
+    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
+    ProviderType, ProviderTypeTrustedSource, QuotaState,
+};
 use aicc::{
-    AIComputeCenter, CostEstimate, InvokeCtx, ModelCatalog, Provider, ProviderError,
-    ProviderInstance, ProviderStartResult, Registry, ResolvedRequest, ResourceResolver,
-    RouteConfig, TaskEvent, TaskEventSink, TaskEventSinkFactory,
+    provider_model_metadata, AIComputeCenter, CostEstimate, InvokeCtx, ModelCatalog, Provider,
+    ProviderError, ProviderInstance, ProviderStartResult, Registry, ResolvedRequest,
+    ResourceResolver, RouteConfig, TaskEvent, TaskEventSink, TaskEventSinkFactory,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
 use buckyos_api::{
-    AiPayload, Capability, CompleteRequest, CreateTaskOptions, ModelSpec, Requirements,
-    ResourceRef, Task, TaskFilter, TaskManagerClient, TaskManagerHandler, TaskStatus,
+    AiMethodRequest, AiPayload, Capability, CreateTaskOptions, ModelSpec, Requirements,
+    ResourceRef, Task, TaskFilter, TaskManagerClient, TaskManagerHandler, TaskNote, TaskStatus,
+    TypedTaskData,
 };
 use kRPC::{RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
@@ -23,9 +28,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, OnceCell};
 
-pub fn base_request() -> CompleteRequest {
-    CompleteRequest::new(
-        Capability::LlmRouter,
+pub fn base_request() -> AiMethodRequest {
+    AiMethodRequest::new(
+        Capability::Llm,
         ModelSpec::new("llm.plan.default".to_string(), None),
         Requirements::new(vec!["plan".to_string()], Some(3000), Some(0.2), None),
         AiPayload::new(
@@ -40,15 +45,30 @@ pub fn base_request() -> CompleteRequest {
     )
 }
 
+pub fn typed_aicc_task_data(task: &Task) -> Option<buckyos_api::AiccComputeTaskData> {
+    match buckyos_api::parse_typed_task_data(task.task_type.as_str(), task.data.clone()).ok()? {
+        TypedTaskData::AiccCompute(data) => Some(data),
+        _ => None,
+    }
+}
+
+pub fn typed_aicc_request(task: &Task) -> Option<Value> {
+    typed_aicc_task_data(task).and_then(|data| data.request.request)
+}
+
+pub fn typed_aicc_external_task_id(task: &Task) -> Option<String> {
+    typed_aicc_task_data(task).and_then(|data| data.request.external_task_id)
+}
+
 #[allow(dead_code)]
-pub fn request_with_resource(resource: ResourceRef) -> CompleteRequest {
+pub fn request_with_resource(resource: ResourceRef) -> AiMethodRequest {
     let mut req = base_request();
     req.payload.resources = vec![resource];
     req
 }
 
-pub fn base_request_for(capability: Capability, alias: &str) -> CompleteRequest {
-    CompleteRequest::new(
+pub fn base_request_for(capability: Capability, alias: &str) -> AiMethodRequest {
+    AiMethodRequest::new(
         capability,
         ModelSpec::new(alias.to_string(), None),
         Requirements::new(vec!["plan".to_string()], Some(3000), Some(0.2), None),
@@ -76,11 +96,23 @@ pub fn mock_instance(
     instance_id: &str,
     provider_type: &str,
     capabilities: Vec<Capability>,
-    features: Vec<String>,
+    mut features: Vec<String>,
 ) -> ProviderInstance {
+    if capabilities.iter().any(|item| item == &Capability::Llm)
+        && !features
+            .iter()
+            .any(|item| item == buckyos_api::features::WEB_SEARCH)
+    {
+        features.push(buckyos_api::features::WEB_SEARCH.to_string());
+    }
+
     ProviderInstance {
-        instance_id: instance_id.to_string(),
-        provider_type: provider_type.to_string(),
+        provider_instance_name: instance_id.to_string(),
+        provider_type: ProviderType::CloudApi,
+        provider_driver: provider_type.to_string(),
+        provider_origin: ProviderOrigin::SystemConfig,
+        provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
+        provider_type_revision: None,
         capabilities,
         features,
         endpoint: Some("http://127.0.0.1:8080".to_string()),
@@ -92,9 +124,12 @@ pub fn mock_instance(
 #[allow(dead_code)]
 pub struct MockProvider {
     instance: ProviderInstance,
+    inventory: ProviderInventory,
     cost: CostEstimate,
     start_results: Mutex<VecDeque<std::result::Result<ProviderStartResult, ProviderError>>>,
     start_calls: AtomicUsize,
+    last_provider_model: Mutex<Option<String>>,
+    last_request_options: Mutex<Option<Value>>,
     canceled: Mutex<Vec<String>>,
 }
 
@@ -105,11 +140,25 @@ impl MockProvider {
         cost: CostEstimate,
         start_results: Vec<std::result::Result<ProviderStartResult, ProviderError>>,
     ) -> Self {
+        let inventory = mock_inventory(&instance, &cost);
+        Self::with_inventory(instance, inventory, cost, start_results)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_inventory(
+        instance: ProviderInstance,
+        inventory: ProviderInventory,
+        cost: CostEstimate,
+        start_results: Vec<std::result::Result<ProviderStartResult, ProviderError>>,
+    ) -> Self {
         Self {
             instance,
+            inventory,
             cost,
             start_results: Mutex::new(start_results.into_iter().collect()),
             start_calls: AtomicUsize::new(0),
+            last_provider_model: Mutex::new(None),
+            last_request_options: Mutex::new(None),
             canceled: Mutex::new(vec![]),
         }
     }
@@ -120,6 +169,22 @@ impl MockProvider {
     }
 
     #[allow(dead_code)]
+    pub fn last_provider_model(&self) -> Option<String> {
+        self.last_provider_model
+            .lock()
+            .expect("last_provider_model lock")
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn last_request_options(&self) -> Option<Value> {
+        self.last_request_options
+            .lock()
+            .expect("last_request_options lock")
+            .clone()
+    }
+
+    #[allow(dead_code)]
     pub fn canceled_tasks(&self) -> Vec<String> {
         self.canceled.lock().expect("canceled lock").clone()
     }
@@ -127,22 +192,40 @@ impl MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
-    fn instance(&self) -> &ProviderInstance {
-        &self.instance
+    fn inventory(&self) -> ProviderInventory {
+        self.inventory.clone()
     }
 
-    fn estimate_cost(&self, _req: &CompleteRequest, _provider_model: &str) -> CostEstimate {
-        self.cost.clone()
+    fn legacy_instance(&self) -> Option<&ProviderInstance> {
+        Some(&self.instance)
+    }
+
+    fn estimate_cost(&self, _input: &CostEstimateInput) -> CostEstimateOutput {
+        CostEstimateOutput {
+            estimated_cost_usd: self.cost.estimated_cost_usd.unwrap_or(1.0),
+            pricing_mode: PricingMode::Unknown,
+            quota_state: QuotaState::Unknown,
+            confidence: 0.0,
+            estimated_latency_ms: self.cost.estimated_latency_ms,
+        }
     }
 
     async fn start(
         &self,
         _ctx: InvokeCtx,
-        _provider_model: String,
-        _req: ResolvedRequest,
+        provider_model: String,
+        req: ResolvedRequest,
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         self.start_calls.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_provider_model
+            .lock()
+            .expect("last_provider_model lock") = Some(provider_model);
+        *self
+            .last_request_options
+            .lock()
+            .expect("last_request_options lock") = req.request.payload.options.clone();
         let mut queue = self.start_results.lock().expect("start_results lock");
         queue
             .pop_front()
@@ -159,6 +242,65 @@ impl Provider for MockProvider {
             .expect("canceled lock")
             .push(task_id.to_string());
         Ok(())
+    }
+}
+
+fn mock_inventory(instance: &ProviderInstance, cost: &CostEstimate) -> ProviderInventory {
+    let mut models = Vec::new();
+    for capability in instance.capabilities.iter() {
+        let (api_type, mounts, provider_model_id) = match capability {
+            Capability::Llm => (ApiType::Llm, vec!["llm.plan.default"], "m"),
+            Capability::Image => (
+                ApiType::ImageTextToImage,
+                vec!["image.txt2img.default", "text2image.default"],
+                "m",
+            ),
+            Capability::Vision => (
+                ApiType::VisionCaption,
+                vec!["vision.caption.default", "i2t.default"],
+                "m",
+            ),
+            Capability::Audio => (
+                ApiType::AudioAsr,
+                vec!["audio.asr.default", "v2t.default", "t2v.default"],
+                "m",
+            ),
+            Capability::Video => (
+                ApiType::VideoTextToVideo,
+                vec!["video.txt2video.default", "v2t.default"],
+                "m",
+            ),
+            Capability::Embedding => (ApiType::Embedding, vec!["embedding.default"], "m"),
+            Capability::Rerank => (ApiType::Rerank, vec!["rerank.default"], "m"),
+            Capability::Agent => (
+                ApiType::AgentComputerUse,
+                vec!["agent.computer_use.default"],
+                "m",
+            ),
+        };
+        models.push(provider_model_metadata(
+            instance.provider_instance_name.as_str(),
+            instance.provider_type.clone(),
+            instance.provider_driver.as_str(),
+            provider_model_id,
+            api_type,
+            mounts.into_iter().map(str::to_string).collect(),
+            &instance.features,
+            cost.estimated_cost_usd,
+            cost.estimated_latency_ms,
+        ));
+    }
+
+    ProviderInventory {
+        provider_instance_name: instance.provider_instance_name.clone(),
+        provider_type: instance.provider_type.clone(),
+        provider_driver: instance.provider_driver.clone(),
+        provider_origin: instance.provider_origin.clone(),
+        provider_type_trusted_source: instance.provider_type_trusted_source.clone(),
+        provider_type_revision: instance.provider_type_revision.clone(),
+        version: None,
+        inventory_revision: Some("test".to_string()),
+        models,
     }
 }
 
@@ -213,14 +355,18 @@ impl TaskEventSinkFactory for CollectingSinkFactory {
 
 pub struct MockTaskMgrHandler {
     counter: Mutex<u64>,
+    note_counter: Mutex<u64>,
     tasks: Arc<Mutex<HashMap<i64, Task>>>,
+    notes: Arc<Mutex<HashMap<i64, Vec<TaskNote>>>>,
 }
 
 impl MockTaskMgrHandler {
     pub fn new() -> Self {
         Self {
             counter: Mutex::new(0),
+            note_counter: Mutex::new(0),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            notes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -253,10 +399,12 @@ impl TaskManagerHandler for MockTaskMgrHandler {
             id: *guard as i64,
             user_id: user_id.to_string(),
             app_id: app_id.to_string(),
+            session_id: opts.session_id.unwrap_or_default(),
             parent_id: opts.parent_id,
             root_id: String::new(),
             name: name.to_string(),
             task_type: task_type.to_string(),
+            runner: opts.runner.unwrap_or_default(),
             status: TaskStatus::Pending,
             progress: 0.0,
             message: None,
@@ -285,6 +433,76 @@ impl TaskManagerHandler for MockTaskMgrHandler {
             .ok_or_else(|| RPCErrors::ReasonError(format!("mock task {} not found", id)))
     }
 
+    async fn handle_add_task_note(
+        &self,
+        task_id: i64,
+        note_type: Option<&str>,
+        content: &str,
+        data: Option<Value>,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<TaskNote, RPCErrors> {
+        let task = self
+            .tasks
+            .lock()
+            .expect("tasks lock")
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| RPCErrors::ReasonError(format!("mock task {} not found", task_id)))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut guard = self.note_counter.lock().expect("note counter lock");
+        *guard += 1;
+        let note = TaskNote {
+            id: *guard as i64,
+            task_id,
+            note_type: note_type.unwrap_or("human").to_string(),
+            content: content.to_string(),
+            data: data.unwrap_or_else(|| json!({})),
+            author_user_id: source_user_id.unwrap_or(&task.user_id).to_string(),
+            author_app_id: source_app_id.unwrap_or(&task.app_id).to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.notes
+            .lock()
+            .expect("notes lock")
+            .entry(task_id)
+            .or_default()
+            .push(note.clone());
+        Ok(note)
+    }
+
+    async fn handle_list_task_notes(
+        &self,
+        task_id: i64,
+        _source_user_id: Option<&str>,
+        _source_app_id: Option<&str>,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Vec<TaskNote>, RPCErrors> {
+        if !self
+            .tasks
+            .lock()
+            .expect("tasks lock")
+            .contains_key(&task_id)
+        {
+            return Err(RPCErrors::ReasonError(format!(
+                "mock task {} not found",
+                task_id
+            )));
+        }
+        Ok(self
+            .notes
+            .lock()
+            .expect("notes lock")
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn handle_list_tasks(
         &self,
         _filter: TaskFilter,
@@ -304,6 +522,7 @@ impl TaskManagerHandler for MockTaskMgrHandler {
     async fn handle_list_tasks_by_time_range(
         &self,
         _app_id: Option<&str>,
+        _session_id: Option<&str>,
         _task_type: Option<&str>,
         _source_user_id: Option<&str>,
         _source_app_id: Option<&str>,
@@ -449,7 +668,7 @@ impl ResourceResolver for FailingResolver {
     async fn resolve(
         &self,
         _ctx: &InvokeCtx,
-        _req: &CompleteRequest,
+        _req: &AiMethodRequest,
     ) -> std::result::Result<ResolvedRequest, RPCErrors> {
         Err(RPCErrors::ReasonError(self.message.clone()))
     }
@@ -520,7 +739,7 @@ pub fn string_set(values: &[&str]) -> HashSet<String> {
 
 pub fn localhost_ctx_from_request() -> RPCContext {
     let req = kRPC::RPCRequest {
-        method: "complete".to_string(),
+        method: "llm".to_string(),
         params: json!({}),
         seq: 1,
         token: None,
@@ -958,7 +1177,6 @@ async fn build_remote_mock_openai_settings(
             }],
             "alias_map": {
                 "llm.default": model.clone(),
-                "llm.chat.default": model.clone(),
                 "llm.plan.default": model.clone(),
                 "llm.code.default": model
             }

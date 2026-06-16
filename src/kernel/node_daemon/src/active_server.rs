@@ -1,12 +1,13 @@
 use ::kRPC::*;
 use async_trait::async_trait;
 use buckyos_api::*;
-use buckyos_kit::*;
-use bytes::Bytes;
-use cyfs_gateway_lib::{
+use buckyos_http_server::*;
+use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
     StreamInfo,
 };
+use buckyos_kit::*;
+use bytes::Bytes;
 use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -16,7 +17,6 @@ use log::*;
 use name_client::*;
 use name_lib::*;
 use serde_json::{json, Map, Value};
-use server_runner::*;
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
@@ -552,7 +552,7 @@ impl ActiveServer {
                 session: None,
                 sub: Some(sn_username.clone()),
                 aud: Some("sn".to_string()), //sudo token MUST have aud filed
-                exp: Some(buckyos_get_unix_timestamp() + 60),
+                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username),
                 token: None,
                 extra: HashMap::new(),
@@ -688,7 +688,7 @@ impl ActiveServer {
                 session: None,
                 sub: Some(sn_username.to_string()),
                 aud: Some("sn".to_string()),
-                exp: Some(buckyos_get_unix_timestamp() + 60),
+                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username.to_string()),
                 token: None,
                 extra: HashMap::new(),

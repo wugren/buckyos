@@ -1,28 +1,41 @@
 use crate::aicc::{
-    AIComputeCenter, CostEstimate, Provider, ProviderError, ProviderInstance, ProviderStartResult,
-    ResolvedRequest, TaskEventSink,
+    provider_type_from_settings, redacted_json_log, AIComputeCenter, Provider, ProviderError,
+    ProviderInstance, ProviderStartResult, ResolvedRequest, TaskEventSink,
+};
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
+use crate::model_types::{
+    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
+    ProviderType, ProviderTypeTrustedSource, QuotaState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use buckyos_api::{
-    features, AiArtifact, AiCost, AiResponseSummary, AiUsage, Capability, CompleteRequest, Feature,
-    ResourceRef,
+    ai_methods, features, AiArtifact, AiContent, AiCost, AiMessage, AiMethodRequest, AiResponse,
+    AiRole, AiToolResultContent, AiUsage, Capability, Feature, ResourceRef,
 };
 use log::{info, warn};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::time;
 
 const DEFAULT_GIMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_GIMINI_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_GIMINI_MODELS: &str = "gemini-2.5-flash,gemini-2.5-pro";
 const DEFAULT_GIMINI_IMAGE_MODELS: &str =
     "gemini-2.0-flash-exp-image-generation,gemini-2.5-flash-image-preview";
+const DEFAULT_GIMINI_EMBEDDING_MODELS: &str = "gemini-embedding-001";
+const DEFAULT_GIMINI_TTS_MODELS: &str = "gemini-2.5-flash-preview-tts";
+const DEFAULT_GIMINI_MUSIC_MODELS: &str = "lyria-002";
+const DEFAULT_GIMINI_VIDEO_MODELS: &str = "veo-3.1-generate-preview";
+const DEFAULT_GIMINI_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const GIMINI_MODELS_PAGE_SIZE: u32 = 1000;
 const GIMINI_IMAGE_INPUT_ALLOWLIST: &[&str] = &[
     "candidate_count",
     "max_output_tokens",
@@ -53,27 +66,109 @@ const GIMINI_IMAGE_OPTION_ALLOWLIST: &[&str] = &[
     "top_p",
     "user",
 ];
+const GIMINI_VIDEO_PARAMETER_ALLOWLIST: &[&str] = &[
+    "aspect_ratio",
+    "duration_seconds",
+    "negative_prompt",
+    "person_generation",
+    "sample_count",
+    "seed",
+];
 
 #[derive(Debug, Clone)]
 pub struct GoogleGiminiInstanceConfig {
-    pub instance_id: String,
+    pub provider_instance_name: String,
     pub provider_type: String,
+    pub provider_driver: String,
+    pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
     pub models: Vec<String>,
+    #[allow(dead_code)]
     pub default_model: Option<String>,
     pub image_models: Vec<String>,
+    #[allow(dead_code)]
     pub default_image_model: Option<String>,
     pub features: Vec<Feature>,
+    #[allow(dead_code)]
     pub alias_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GoogleGiminiProvider {
     instance: ProviderInstance,
+    inventory: Arc<RwLock<ProviderInventory>>,
     client: Client,
     api_token: String,
     base_url: String,
+    provider_type: ProviderType,
+    provider_driver: String,
+    provider_instance_name: String,
+    features: Vec<Feature>,
+}
+
+#[derive(Debug, Default)]
+struct GiminiModelBuckets {
+    llm: Vec<String>,
+    image: Vec<String>,
+    embedding: Vec<String>,
+    tts: Vec<String>,
+    music: Vec<String>,
+    video: Vec<String>,
+}
+
+impl GiminiModelBuckets {
+    fn is_empty(&self) -> bool {
+        self.llm.is_empty()
+            && self.image.is_empty()
+            && self.embedding.is_empty()
+            && self.tts.is_empty()
+            && self.music.is_empty()
+            && self.video.is_empty()
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.llm.hash(&mut hasher);
+        self.image.hash(&mut hasher);
+        self.embedding.hash(&mut hasher);
+        self.tts.hash(&mut hasher);
+        self.music.hash(&mut hasher);
+        self.video.hash(&mut hasher);
+        format!(
+            "gimini-models-{}-{}-{}-{}-{}-{}-{:x}",
+            self.llm.len(),
+            self.image.len(),
+            self.embedding.len(),
+            self.tts.len(),
+            self.music.len(),
+            self.video.len(),
+            hasher.finish()
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GiminiModelsResponse {
+    #[serde(default)]
+    models: Vec<GiminiModelEntry>,
+    #[serde(default, alias = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GiminiModelEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default, alias = "supportedGenerationMethods")]
+    supported_generation_methods: Vec<String>,
+    // Google `/v1beta/models` 不会用一个独立字段标 deprecation，但 displayName /
+    // description 里经常有 "(Discontinued)" / "Deprecated." / "no longer" 之类的
+    // 字眼，我们用它过滤掉刷出来其实已经不能用的模型。
+    #[serde(default, alias = "displayName")]
+    display_name: String,
+    #[serde(default)]
+    description: String,
 }
 
 impl GoogleGiminiProvider {
@@ -89,21 +184,332 @@ impl GoogleGiminiProvider {
             .build()
             .context("failed to build reqwest client for google gimini provider")?;
 
+        let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
+        let provider_instance_name = cfg.provider_instance_name.clone();
+        let provider_driver = cfg.provider_driver.clone();
         let instance = ProviderInstance {
-            instance_id: cfg.instance_id,
-            provider_type: cfg.provider_type,
-            capabilities: vec![Capability::LlmRouter, Capability::Text2Image],
-            features: cfg.features,
+            provider_instance_name: provider_instance_name.clone(),
+            provider_type: provider_type.clone(),
+            provider_driver: provider_driver.clone(),
+            provider_origin: ProviderOrigin::SystemConfig,
+            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
+            provider_type_revision: None,
+            capabilities: vec![
+                Capability::Llm,
+                Capability::Embedding,
+                Capability::Image,
+                Capability::Vision,
+                Capability::Audio,
+                Capability::Video,
+            ],
+            features: cfg.features.clone(),
             endpoint: Some(cfg.base_url.clone()),
             plugin_key: None,
         };
+        let buckets = GiminiModelBuckets {
+            llm: cfg
+                .models
+                .iter()
+                .filter(|model| !is_text2image_model_name(model))
+                .cloned()
+                .collect(),
+            image: cfg.image_models.clone(),
+            embedding: parse_csv_list(DEFAULT_GIMINI_EMBEDDING_MODELS),
+            tts: parse_csv_list(DEFAULT_GIMINI_TTS_MODELS),
+            music: parse_csv_list(DEFAULT_GIMINI_MUSIC_MODELS),
+            video: parse_csv_list(DEFAULT_GIMINI_VIDEO_MODELS),
+        };
+        let inventory = Self::build_inventory_from_buckets(
+            provider_instance_name.as_str(),
+            provider_type.clone(),
+            provider_driver.as_str(),
+            &buckets,
+            cfg.features.as_slice(),
+            Some("settings-v1".to_string()),
+        );
 
         Ok(Self {
             instance,
+            inventory: Arc::new(RwLock::new(inventory)),
             client,
             api_token,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            provider_type,
+            provider_driver,
+            provider_instance_name,
+            features: cfg.features,
         })
+    }
+
+    fn build_inventory_from_buckets(
+        provider_instance_name: &str,
+        provider_type: ProviderType,
+        provider_driver: &str,
+        buckets: &GiminiModelBuckets,
+        _features: &[Feature],
+        inventory_revision: Option<String>,
+    ) -> ProviderInventory {
+        let mut requests = Vec::<DriverModelResolveRequest>::new();
+        for model in buckets.llm.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(1400)),
+            );
+        }
+        for model in buckets.image.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(
+                    model.clone(),
+                    vec![ApiType::ImageTextToImage, ApiType::ImageToImage],
+                )
+                .with_cost(Some(0.04))
+                .with_latency(Some(6000)),
+            );
+        }
+        for model in buckets.embedding.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(
+                    model.clone(),
+                    vec![ApiType::Embedding, ApiType::EmbeddingMultimodal],
+                )
+                .with_cost(Some(0.0001))
+                .with_latency(Some(800)),
+            );
+        }
+        for model in buckets.tts.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioTts])
+                    .with_cost(Some(0.01))
+                    .with_latency(Some(3000)),
+            );
+        }
+        for model in buckets.music.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioMusic])
+                    .with_cost(Some(0.10))
+                    .with_latency(Some(60_000)),
+            );
+        }
+        for model in buckets.video.iter() {
+            requests.push(
+                DriverModelResolveRequest::new(model.clone(), vec![ApiType::VideoTextToVideo])
+                    .with_cost(Some(0.50))
+                    .with_latency(Some(120_000)),
+            );
+        }
+        resolve_driver_inventory(
+            provider_instance_name,
+            provider_type,
+            provider_driver,
+            requests.as_slice(),
+            inventory_revision,
+        )
+    }
+
+    pub fn start_inventory_refresh(self: Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            if let Err(err) = self.refresh_inventory_once().await {
+                warn!(
+                    "aicc.gimini.inventory.initial_refresh_failed provider_instance_name={} err={}",
+                    self.provider_instance_name, err
+                );
+            }
+
+            let mut interval = time::interval(DEFAULT_GIMINI_INVENTORY_REFRESH_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(err) = self.refresh_inventory_once().await {
+                    warn!(
+                        "aicc.gimini.inventory.refresh_failed provider_instance_name={} err={}",
+                        self.provider_instance_name, err
+                    );
+                }
+            }
+        });
+    }
+
+    async fn refresh_inventory_once(&self) -> Result<ProviderInventory> {
+        let mut buckets = GiminiModelBuckets::default();
+        let mut llm_seen = HashSet::<String>::new();
+        let mut image_seen = HashSet::<String>::new();
+        let mut embedding_seen = HashSet::<String>::new();
+        let mut tts_seen = HashSet::<String>::new();
+        let mut music_seen = HashSet::<String>::new();
+        let mut video_seen = HashSet::<String>::new();
+        let mut page_token: Option<String> = None;
+
+        let endpoint = format!("{}/models", self.base_url);
+        let page_size = GIMINI_MODELS_PAGE_SIZE.to_string();
+        loop {
+            let mut request = self
+                .client
+                .get(endpoint.as_str())
+                .query(&[("key", self.api_token.as_str())])
+                .query(&[("pageSize", page_size.as_str())]);
+            if let Some(token) = page_token.as_deref() {
+                request = request.query(&[("pageToken", token)]);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("gimini inventory refresh request failed")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "gimini inventory refresh failed status={} body={}",
+                    status,
+                    body
+                ));
+            }
+
+            let parsed = response
+                .json::<GiminiModelsResponse>()
+                .await
+                .context("failed to parse gimini models response")?;
+
+            for entry in parsed.models.iter() {
+                let id = strip_gimini_model_prefix(entry.name.as_str()).trim();
+                if id.is_empty() {
+                    continue;
+                }
+                if is_deprecated_gimini_entry(id, &entry.display_name, &entry.description) {
+                    log::debug!(
+                        "aicc.gimini.inventory.skip_deprecated id={} display_name={:?} description={:?}",
+                        id,
+                        entry.display_name,
+                        entry.description
+                    );
+                    continue;
+                }
+                let methods = entry
+                    .supported_generation_methods
+                    .iter()
+                    .map(|method| method.to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                let key = id.to_ascii_lowercase();
+                match classify_gimini_model(id, &methods) {
+                    Some(GiminiModelKind::Llm) => {
+                        if llm_seen.insert(key) {
+                            buckets.llm.push(id.to_string());
+                        }
+                    }
+                    Some(GiminiModelKind::Image) => {
+                        if image_seen.insert(key) {
+                            buckets.image.push(id.to_string());
+                        }
+                    }
+                    Some(GiminiModelKind::Embedding) => {
+                        if embedding_seen.insert(key) {
+                            buckets.embedding.push(id.to_string());
+                        }
+                    }
+                    Some(GiminiModelKind::Tts) => {
+                        if tts_seen.insert(key) {
+                            buckets.tts.push(id.to_string());
+                        }
+                    }
+                    Some(GiminiModelKind::Music) => {
+                        if music_seen.insert(key) {
+                            buckets.music.push(id.to_string());
+                        }
+                    }
+                    Some(GiminiModelKind::Video) => {
+                        if video_seen.insert(key) {
+                            buckets.video.push(id.to_string());
+                        }
+                    }
+                    None => continue,
+                }
+            }
+
+            match parsed.next_page_token {
+                Some(token) if !token.is_empty() => page_token = Some(token),
+                _ => break,
+            }
+        }
+
+        if buckets.is_empty() {
+            return Err(anyhow!(
+                "gimini inventory refresh returned no supported models"
+            ));
+        }
+
+        // Google `/v1beta/models` 同时返回 alias（例如 `gemini-2.0-flash-lite`）
+        // 和它的版本快照（`gemini-2.0-flash-lite-001`），两者底层是同一个模型，
+        // 但 Google 弃用一般是先停版本快照、alias 再续命一段时间。如果两者并存
+        // 就把版本快照丢掉，只信 alias，避免路由命中已被 Google 拒绝的快照。
+        prefer_alias_over_versioned(&mut buckets.llm);
+        prefer_alias_over_versioned(&mut buckets.image);
+        prefer_alias_over_versioned(&mut buckets.embedding);
+        prefer_alias_over_versioned(&mut buckets.tts);
+        prefer_alias_over_versioned(&mut buckets.music);
+        prefer_alias_over_versioned(&mut buckets.video);
+
+        // Google 弃用模型时是按整个主版本族下架（例如 2.0 family 整体对新用户停服，
+        // 但 `gemini-2.0-flash` / `gemini-2.0-flash-lite` 这些 alias 仍然出现在
+        // `/v1beta/models` 列表里）。aicc 的设计也鼓励调用方用 family alias 而非
+        // 完整模型名，所以这里再加一道：每个 bucket 内识别 `gemini-X.Y-...` 的版本
+        // 前缀，只保留全局最大 (X,Y) 的那一族。无版本前缀的条目（如 `lyria-002` /
+        // `gemini-embedding-001`）当成"独立模型"原样保留。
+        keep_only_max_gemini_version(&mut buckets.llm);
+        keep_only_max_gemini_version(&mut buckets.image);
+        keep_only_max_gemini_version(&mut buckets.embedding);
+        keep_only_max_gemini_version(&mut buckets.tts);
+        keep_only_max_gemini_version(&mut buckets.music);
+        keep_only_max_gemini_version(&mut buckets.video);
+
+        // Categories that the API never returns (lyria/veo are typically not
+        // listed) fall back to defaults so we don't drop them on refresh.
+        if buckets.embedding.is_empty() {
+            buckets.embedding = parse_csv_list(DEFAULT_GIMINI_EMBEDDING_MODELS);
+        }
+        if buckets.tts.is_empty() {
+            buckets.tts = parse_csv_list(DEFAULT_GIMINI_TTS_MODELS);
+        }
+        if buckets.music.is_empty() {
+            buckets.music = parse_csv_list(DEFAULT_GIMINI_MUSIC_MODELS);
+        }
+        if buckets.video.is_empty() {
+            buckets.video = parse_csv_list(DEFAULT_GIMINI_VIDEO_MODELS);
+        }
+
+        let revision = Some(buckets.fingerprint());
+        let inventory = Self::build_inventory_from_buckets(
+            self.provider_instance_name.as_str(),
+            self.provider_type.clone(),
+            self.provider_driver.as_str(),
+            &buckets,
+            self.features.as_slice(),
+            revision,
+        );
+
+        {
+            let mut current = self
+                .inventory
+                .write()
+                .map_err(|_| anyhow!("gimini inventory lock poisoned"))?;
+            *current = inventory.clone();
+        }
+        info!(
+            "aicc.gimini.inventory.refreshed provider_instance_name={} llm={} image={} embedding={} tts={} music={} video={}",
+            self.provider_instance_name,
+            buckets.llm.len(),
+            buckets.image.len(),
+            buckets.embedding.len(),
+            buckets.tts.len(),
+            buckets.music.len(),
+            buckets.video.len(),
+        );
+        Ok(inventory)
     }
 
     fn price_per_1m_tokens(model: &str) -> (f64, f64) {
@@ -121,7 +527,9 @@ impl GoogleGiminiProvider {
         }
     }
 
-    fn estimate_tokens(req: &CompleteRequest) -> (u64, u64) {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn estimate_tokens(req: &AiMethodRequest) -> (u64, u64) {
         let mut text_len = 0usize;
 
         if let Some(text) = req.payload.text.as_ref() {
@@ -129,7 +537,10 @@ impl GoogleGiminiProvider {
         }
 
         for message in req.payload.messages.iter() {
-            text_len += message.content.len();
+            text_len += message.estimate_text_len();
+        }
+        if let Some(input_json) = req.payload.input_json.as_ref() {
+            text_len += json_text_len(input_json);
         }
 
         for resource in req.payload.resources.iter() {
@@ -149,10 +560,24 @@ impl GoogleGiminiProvider {
         let input_tokens = ((text_len as f64) / 4.0).ceil() as u64;
         let output_tokens = req
             .payload
-            .options
+            .input_json
             .as_ref()
             .and_then(|value| value.get("max_tokens"))
             .and_then(|value| value.as_u64())
+            .or_else(|| {
+                req.payload
+                    .input_json
+                    .as_ref()
+                    .and_then(|value| value.get("max_output_tokens"))
+                    .and_then(|value| value.as_u64())
+            })
+            .or_else(|| {
+                req.payload
+                    .options
+                    .as_ref()
+                    .and_then(|value| value.get("max_tokens"))
+                    .and_then(|value| value.as_u64())
+            })
             .or_else(|| {
                 req.payload
                     .options
@@ -165,7 +590,7 @@ impl GoogleGiminiProvider {
         (input_tokens.max(1), output_tokens.max(1))
     }
 
-    fn estimate_image_count(req: &CompleteRequest) -> u64 {
+    fn estimate_image_count(req: &AiMethodRequest) -> u64 {
         req.payload
             .options
             .as_ref()
@@ -196,7 +621,7 @@ impl GoogleGiminiProvider {
             .max(1)
     }
 
-    fn estimate_text2image_cost(req: &CompleteRequest, model: &str) -> Option<f64> {
+    fn estimate_text2image_cost(req: &AiMethodRequest, model: &str) -> Option<f64> {
         let lowered = model.to_ascii_lowercase();
         let per_image = if lowered.contains("2.5-flash-image") {
             0.039
@@ -233,21 +658,137 @@ impl GoogleGiminiProvider {
         }
     }
 
-    fn build_contents(&self, req: &CompleteRequest) -> Result<Vec<Value>, ProviderError> {
-        let mut contents = vec![];
+    fn resource_text(resource: &ResourceRef) -> Result<String, ProviderError> {
+        match resource {
+            ResourceRef::Url { url, .. } => Ok(format!("resource_url: {}", url)),
+            ResourceRef::NamedObject { obj_id } => Ok(format!("named_object: {}", obj_id)),
+            ResourceRef::Base64 { .. } => Err(ProviderError::fatal(
+                "google gimini provider does not support base64 resources in this version",
+            )),
+        }
+    }
 
-        for msg in req.payload.messages.iter() {
-            if msg.content.trim().is_empty() {
+    fn content_value_to_text(value: &Value) -> Result<Option<String>, ProviderError> {
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            return Ok((!text.is_empty()).then(|| text.to_string()));
+        }
+
+        let Some(parts) = value.as_array() else {
+            return Ok(None);
+        };
+
+        let mut lines = Vec::new();
+        for part in parts {
+            let Some(part_obj) = part.as_object() else {
                 continue;
-            }
-            contents.push(json!({
-                "role": Self::role_to_gimini(msg.role.as_str()),
-                "parts": [
+            };
+            match part_obj.get("type").and_then(|value| value.as_str()) {
+                Some("text") => {
+                    if let Some(text) = part_obj
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
                     {
-                        "text": msg.content
+                        lines.push(text.to_string());
                     }
-                ]
-            }));
+                }
+                Some("resource") => {
+                    if let Some(resource_value) = part_obj.get("resource") {
+                        let resource: ResourceRef = serde_json::from_value(resource_value.clone())
+                            .map_err(|err| {
+                                ProviderError::fatal(format!(
+                                    "invalid content resource part: {}",
+                                    err
+                                ))
+                            })?;
+                        lines.push(Self::resource_text(&resource)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if lines.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(lines.join("\n")))
+        }
+    }
+
+    fn canonical_message_texts(
+        req: &AiMethodRequest,
+    ) -> Result<Vec<(String, String)>, ProviderError> {
+        if let Some(messages) = req
+            .payload
+            .input_json
+            .as_ref()
+            .and_then(|value| value.get("messages"))
+            .and_then(|value| value.as_array())
+        {
+            let mut result = Vec::new();
+            for msg in messages {
+                let Some(msg_obj) = msg.as_object() else {
+                    continue;
+                };
+                let role = msg_obj
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("user")
+                    .to_string();
+                if let Some(text) = msg_obj
+                    .get("content")
+                    .map(Self::content_value_to_text)
+                    .transpose()?
+                    .flatten()
+                {
+                    result.push((role, text));
+                }
+            }
+            if !result.is_empty() {
+                return Ok(result);
+            }
+        }
+
+        Ok(req
+            .payload
+            .messages
+            .iter()
+            .filter_map(|msg| {
+                let content = msg.text_content();
+                let trimmed = content.trim();
+                (!trimmed.is_empty()).then(|| (msg.role.as_str().to_string(), trimmed.to_string()))
+            })
+            .collect())
+    }
+
+    fn build_contents(&self, req: &AiMethodRequest) -> Result<Vec<Value>, ProviderError> {
+        let mut contents: Vec<Value> = vec![];
+
+        // 主路径:消费 typed `Vec<AiMessage>`,保留 ToolUse/ToolResult/Image
+        // 等 block,转成 Gemini parts(functionCall / functionResponse /
+        // inlineData / fileData / text)。
+        if !req.payload.messages.is_empty() {
+            for msg in req.payload.messages.iter() {
+                Self::lower_message_to_gemini(msg, &mut contents)?;
+            }
+        }
+
+        // 兼容路径:caller 把 messages 塞在 input_json 里,仅做文本降级。
+        if contents.is_empty() {
+            for (role, content) in Self::canonical_message_texts(req)? {
+                contents.push(json!({
+                    "role": Self::role_to_gimini(role.as_str()),
+                    "parts": [
+                        {
+                            "text": content
+                        }
+                    ]
+                }));
+            }
         }
 
         if contents.is_empty() {
@@ -258,19 +799,7 @@ impl GoogleGiminiProvider {
 
             let mut resource_lines = vec![];
             for resource in req.payload.resources.iter() {
-                match resource {
-                    ResourceRef::Url { url, .. } => {
-                        resource_lines.push(format!("resource_url: {}", url));
-                    }
-                    ResourceRef::NamedObject { obj_id } => {
-                        resource_lines.push(format!("named_object: {}", obj_id));
-                    }
-                    ResourceRef::Base64 { .. } => {
-                        return Err(ProviderError::fatal(
-                            "google gimini provider does not support base64 resources in this version",
-                        ));
-                    }
-                }
+                resource_lines.push(Self::resource_text(resource)?);
             }
 
             if !resource_lines.is_empty() {
@@ -302,6 +831,187 @@ impl GoogleGiminiProvider {
         Ok(contents)
     }
 
+    /// Lower a single `AiMessage` to Gemini `Content` shape. Tool results
+    /// land in a separate `role: "user"` content with a `functionResponse`
+    /// part (Gemini's tool-result convention). System/Developer are folded
+    /// into the `user` role — mirroring the legacy `role_to_gimini` default —
+    /// because this provider doesn't currently surface `systemInstruction`.
+    fn lower_message_to_gemini(
+        msg: &AiMessage,
+        contents: &mut Vec<Value>,
+    ) -> Result<(), ProviderError> {
+        match msg.role {
+            AiRole::Tool => {
+                let Some(AiContent::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                }) = msg.content.first()
+                else {
+                    return Ok(());
+                };
+                let mut response_obj = Map::new();
+                let response_text = Self::tool_result_text(content);
+                response_obj.insert("output".to_string(), Value::String(response_text));
+                if *is_error {
+                    response_obj.insert("error".to_string(), Value::Bool(true));
+                }
+                // Gemini convention: functionResponse.name is the tool name; we
+                // don't always have it on the IR side, so reuse call_id as the
+                // stable correlator (model still matches on the immediately
+                // preceding functionCall by position).
+                let part = json!({
+                    "functionResponse": {
+                        "name": call_id,
+                        "response": Value::Object(response_obj),
+                    }
+                });
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [part],
+                }));
+                Ok(())
+            }
+            _ => {
+                let role = match msg.role {
+                    AiRole::Assistant => "model",
+                    _ => "user",
+                };
+                let parts = Self::lower_blocks_to_parts(&msg.content)?;
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": role,
+                        "parts": parts,
+                    }));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn lower_blocks_to_parts(content: &[AiContent]) -> Result<Vec<Value>, ProviderError> {
+        let mut parts = Vec::with_capacity(content.len());
+        for block in content {
+            match block {
+                AiContent::Text { text } => {
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                }
+                AiContent::Image { source } => {
+                    parts.push(Self::resource_to_gemini_part(source, None, true)?);
+                }
+                AiContent::Document { source, title } => {
+                    parts.push(Self::resource_to_gemini_part(
+                        source,
+                        title.as_deref(),
+                        false,
+                    )?);
+                }
+                AiContent::ToolUse {
+                    call_id,
+                    name,
+                    args,
+                } => {
+                    let args_value = serde_json::to_value(args).unwrap_or_else(|_| json!({}));
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": args_value,
+                            "id": call_id,
+                        }
+                    }));
+                }
+                AiContent::Thinking { text, summary, .. } => {
+                    // Gemini does not surface a verifier-signed thinking block;
+                    // we drop the cryptographic state and keep a textual hint
+                    // so the model still sees the reasoning trace.
+                    let text_slice = text
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| summary.as_deref().filter(|s| !s.is_empty()));
+                    if let Some(text) = text_slice {
+                        parts.push(json!({ "text": text }));
+                    }
+                }
+                AiContent::ProviderState { provider, value } => {
+                    if provider.eq_ignore_ascii_case("google")
+                        || provider.eq_ignore_ascii_case("gemini")
+                    {
+                        parts.push(value.clone());
+                    }
+                }
+                AiContent::ToolResult { .. } => {
+                    // Tool role is handled by the caller; ignore defensively.
+                }
+            }
+        }
+        Ok(parts)
+    }
+
+    fn resource_to_gemini_part(
+        source: &ResourceRef,
+        _title: Option<&str>,
+        is_image: bool,
+    ) -> Result<Value, ProviderError> {
+        match source {
+            ResourceRef::Url { url, mime_hint } => {
+                let mime = mime_hint.clone().unwrap_or_else(|| {
+                    if is_image {
+                        "image/*".to_string()
+                    } else {
+                        "application/octet-stream".to_string()
+                    }
+                });
+                Ok(json!({
+                    "fileData": {
+                        "fileUri": url,
+                        "mimeType": mime,
+                    }
+                }))
+            }
+            ResourceRef::Base64 { mime, data_base64 } => Ok(json!({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": data_base64,
+                }
+            })),
+            ResourceRef::NamedObject { obj_id } => Ok(json!({
+                "text": format!("named_object: {}", obj_id),
+            })),
+        }
+    }
+
+    fn tool_result_text(content: &[AiToolResultContent]) -> String {
+        let mut parts = Vec::new();
+        for item in content {
+            match item {
+                AiToolResultContent::Text { text } => parts.push(text.clone()),
+                AiToolResultContent::Image { source } => {
+                    parts.push(Self::resource_placeholder_text(source));
+                }
+                AiToolResultContent::Document { source, title } => {
+                    let mut line = Self::resource_placeholder_text(source);
+                    if let Some(title) = title {
+                        line.push_str(" (");
+                        line.push_str(title);
+                        line.push(')');
+                    }
+                    parts.push(line);
+                }
+            }
+        }
+        parts.join("\n")
+    }
+
+    fn resource_placeholder_text(source: &ResourceRef) -> String {
+        match source {
+            ResourceRef::Url { url, .. } => format!("resource_url: {}", url),
+            ResourceRef::NamedObject { obj_id } => format!("named_object: {}", obj_id),
+            ResourceRef::Base64 { mime, .. } => format!("inline_{}", mime),
+        }
+    }
+
     fn extract_text_content(body: &Value) -> Option<String> {
         let parts = body.pointer("/candidates/0/content/parts")?.as_array()?;
         let joined = parts
@@ -324,7 +1034,19 @@ impl GoogleGiminiProvider {
         }
     }
 
-    fn extract_text2image_prompt(req: &CompleteRequest) -> Option<String> {
+    fn extract_text2image_prompt(req: &AiMethodRequest) -> Option<String> {
+        if let Some(prompt) = req
+            .payload
+            .input_json
+            .as_ref()
+            .and_then(|value| value.get("prompt"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(prompt.to_string());
+        }
+
         if let Some(text) = req
             .payload
             .text
@@ -339,24 +1061,12 @@ impl GoogleGiminiProvider {
             .payload
             .messages
             .iter()
-            .map(|msg| msg.content.trim())
+            .map(|msg| msg.text_content().trim().to_string())
             .filter(|msg| !msg.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         if !message_prompt.is_empty() {
             return Some(message_prompt);
-        }
-
-        if let Some(prompt) = req
-            .payload
-            .input_json
-            .as_ref()
-            .and_then(|value| value.get("prompt"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            return Some(prompt.to_string());
         }
 
         req.payload
@@ -624,6 +1334,38 @@ impl GoogleGiminiProvider {
         Ok(ignored)
     }
 
+    fn normalize_video_parameter_key(key: &str) -> Option<&'static str> {
+        match key {
+            "aspect_ratio" | "aspectRatio" => Some("aspectRatio"),
+            "duration_seconds" | "durationSeconds" => Some("durationSeconds"),
+            "negative_prompt" | "negativePrompt" => Some("negativePrompt"),
+            "person_generation" | "personGeneration" => Some("personGeneration"),
+            "sample_count" | "sampleCount" => Some("sampleCount"),
+            "seed" => Some("seed"),
+            _ => None,
+        }
+    }
+
+    fn merge_video_parameters(target: &mut Map<String, Value>, value: &Value) -> Vec<String> {
+        let Some(map) = value.as_object() else {
+            return vec![];
+        };
+
+        let mut ignored = vec![];
+        for (key, item) in map.iter() {
+            if !GIMINI_VIDEO_PARAMETER_ALLOWLIST.contains(&key.as_str())
+                && Self::normalize_video_parameter_key(key.as_str()).is_none()
+            {
+                ignored.push(key.clone());
+                continue;
+            }
+            if let Some(normalized) = Self::normalize_video_parameter_key(key.as_str()) {
+                target.insert(normalized.to_string(), item.clone());
+            }
+        }
+        ignored
+    }
+
     fn parse_text2image_result(
         body: &Value,
     ) -> Result<(Vec<AiArtifact>, Option<String>), ProviderError> {
@@ -641,6 +1383,30 @@ impl GoogleGiminiProvider {
                 .and_then(|value| value.as_array())
             {
                 for part in parts.iter() {
+                    if let Some(file_data) =
+                        part.get("fileData").and_then(|value| value.as_object())
+                    {
+                        let Some(uri) = file_data.get("fileUri").and_then(|value| value.as_str())
+                        else {
+                            continue;
+                        };
+                        let mime = file_data
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("image/png");
+                        let seq = artifacts.len() + 1;
+                        artifacts.push(AiArtifact {
+                            name: format!("image_{}", seq),
+                            resource: ResourceRef::Url {
+                                url: uri.to_string(),
+                                mime_hint: Some(mime.to_string()),
+                            },
+                            mime: Some(mime.to_string()),
+                            metadata: None,
+                        });
+                        continue;
+                    }
+
                     if let Some(inline_data) =
                         part.get("inlineData").and_then(|value| value.as_object())
                     {
@@ -666,30 +1432,6 @@ impl GoogleGiminiProvider {
                             resource: ResourceRef::Base64 {
                                 mime: mime.to_string(),
                                 data_base64: data_base64.to_string(),
-                            },
-                            mime: Some(mime.to_string()),
-                            metadata: None,
-                        });
-                        continue;
-                    }
-
-                    if let Some(file_data) =
-                        part.get("fileData").and_then(|value| value.as_object())
-                    {
-                        let Some(uri) = file_data.get("fileUri").and_then(|value| value.as_str())
-                        else {
-                            continue;
-                        };
-                        let mime = file_data
-                            .get("mimeType")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("image/png");
-                        let seq = artifacts.len() + 1;
-                        artifacts.push(AiArtifact {
-                            name: format!("image_{}", seq),
-                            resource: ResourceRef::Url {
-                                url: uri.to_string(),
-                                mime_hint: Some(mime.to_string()),
                             },
                             mime: Some(mime.to_string()),
                             metadata: None,
@@ -764,26 +1506,165 @@ impl GoogleGiminiProvider {
         Ok((status, body, latency_ms))
     }
 
+    async fn post_model_action(
+        &self,
+        provider_model: &str,
+        action: &str,
+        request_obj: &Map<String, Value>,
+    ) -> Result<(StatusCode, Value, u64), ProviderError> {
+        let url = format!("{}/models/{}:{}", self.base_url, provider_model, action);
+        let started_at = std::time::Instant::now();
+        let response = self
+            .client
+            .post(url.as_str())
+            .header("x-goog-api-key", self.api_token.as_str())
+            .json(request_obj)
+            .send()
+            .await
+            .map_err(|err| {
+                if err.is_timeout() || err.is_connect() {
+                    ProviderError::retryable(format!("google gimini request failed: {}", err))
+                } else {
+                    ProviderError::fatal(format!("google gimini request failed: {}", err))
+                }
+            })?;
+        let latency_ms = started_at.elapsed().as_millis() as u64;
+        let status = response.status();
+        let body: Value = response.json().await.map_err(|err| {
+            Self::classify_api_error(
+                status,
+                format!("failed to parse google gimini response body: {}", err),
+            )
+        })?;
+        Ok((status, body, latency_ms))
+    }
+
+    fn resource_from_input_json(req: &AiMethodRequest, keys: &[&str]) -> Option<ResourceRef> {
+        let input = req.payload.input_json.as_ref()?;
+        for key in keys {
+            if let Some(value) = input.get(*key) {
+                if let Ok(resource) = serde_json::from_value::<ResourceRef>(value.clone()) {
+                    return Some(resource);
+                }
+            }
+        }
+        None
+    }
+
+    fn resource_part(resource: &ResourceRef) -> Result<Value, ProviderError> {
+        match resource {
+            ResourceRef::Url { url, mime_hint } => Ok(json!({
+                "fileData": {
+                    "fileUri": url,
+                    "mimeType": mime_hint.as_deref().unwrap_or("application/octet-stream")
+                }
+            })),
+            ResourceRef::Base64 { mime, data_base64 } => Ok(json!({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": data_base64
+                }
+            })),
+            ResourceRef::NamedObject { obj_id } => Err(ProviderError::fatal(format!(
+                "google gimini provider cannot resolve named object resource {} without resolver bytes",
+                obj_id
+            ))),
+        }
+    }
+
+    fn prompt_for_method(method: &str, req: &AiMethodRequest) -> String {
+        if let Some(prompt) = Self::extract_text2image_prompt(req) {
+            return prompt;
+        }
+        match method {
+            ai_methods::VISION_OCR => "Extract readable text from the image and return structured OCR JSON.".to_string(),
+            ai_methods::VISION_CAPTION => "Caption the image concisely.".to_string(),
+            ai_methods::VISION_DETECT => "Detect objects in the image. Return JSON detections with label, score and bbox.".to_string(),
+            ai_methods::VISION_SEGMENT => "Segment the requested subject in the image. Return JSON masks or mask descriptions.".to_string(),
+            ai_methods::AUDIO_TTS => "Synthesize the requested text as speech.".to_string(),
+            ai_methods::AUDIO_MUSIC => "Generate music from the requested prompt.".to_string(),
+            _ => "Process the request.".to_string(),
+        }
+    }
+
+    fn parse_media_artifacts(body: &Value, default_mime: &str) -> Vec<AiArtifact> {
+        let mut artifacts = Vec::new();
+        if let Some(parts) = body
+            .pointer("/candidates/0/content/parts")
+            .and_then(|value| value.as_array())
+        {
+            for part in parts {
+                if let Some(inline_data) =
+                    part.get("inlineData").and_then(|value| value.as_object())
+                {
+                    if let Some(data_base64) =
+                        inline_data.get("data").and_then(|value| value.as_str())
+                    {
+                        let mime = inline_data
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(default_mime);
+                        artifacts.push(AiArtifact {
+                            name: format!("artifact_{}", artifacts.len() + 1),
+                            resource: ResourceRef::Base64 {
+                                mime: mime.to_string(),
+                                data_base64: data_base64.to_string(),
+                            },
+                            mime: Some(mime.to_string()),
+                            metadata: None,
+                        });
+                    }
+                }
+                if let Some(file_data) = part.get("fileData").and_then(|value| value.as_object()) {
+                    if let Some(uri) = file_data.get("fileUri").and_then(|value| value.as_str()) {
+                        let mime = file_data
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(default_mime);
+                        artifacts.push(AiArtifact {
+                            name: format!("artifact_{}", artifacts.len() + 1),
+                            resource: ResourceRef::Url {
+                                url: uri.to_string(),
+                                mime_hint: Some(mime.to_string()),
+                            },
+                            mime: Some(mime.to_string()),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+        artifacts
+    }
+
     async fn start_llm(
         &self,
         ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
-        req: &CompleteRequest,
+        req: &AiMethodRequest,
     ) -> Result<ProviderStartResult, ProviderError> {
         let contents = self.build_contents(req)?;
         let mut request_obj = Map::new();
         request_obj.insert("contents".to_string(), Value::Array(contents));
 
-        let json_output_required = req
-            .requirements
-            .must_features
-            .iter()
-            .any(|feature| feature == features::JSON_OUTPUT);
+        let json_output_required = req.requirements.requires_feature(features::JSON_OUTPUT);
         let mut ignored_options = vec![];
+        if let Some(input_json) = req.payload.input_json.as_ref() {
+            ignored_options.extend(Self::merge_llm_options(
+                &mut request_obj,
+                input_json,
+                json_output_required,
+            )?);
+        }
         if let Some(options) = req.payload.options.as_ref() {
-            ignored_options =
-                Self::merge_llm_options(&mut request_obj, options, json_output_required)?;
-        } else if json_output_required {
+            ignored_options.extend(Self::merge_llm_options(
+                &mut request_obj,
+                options,
+                json_output_required,
+            )?);
+        }
+        if req.payload.input_json.is_none() && req.payload.options.is_none() && json_output_required
+        {
             let generation = Self::ensure_generation_config(&mut request_obj);
             generation.insert(
                 "responseMimeType".to_string(),
@@ -793,26 +1674,26 @@ impl GoogleGiminiProvider {
 
         if !ignored_options.is_empty() {
             warn!(
-                "aicc.gimini ignored unsupported llm options: instance_id={} model={} trace_id={:?} ignored={:?}",
-                self.instance.instance_id, provider_model, ctx.trace_id, ignored_options
+                "aicc.gimini ignored unsupported llm options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_options
             );
         }
 
-        let request_log = Value::Object(request_obj.clone()).to_string();
+        let request_log = redacted_json_log(&Value::Object(request_obj.clone()));
         info!(
-            "aicc.gimini.llm.input instance_id={} model={} trace_id={:?} request={}",
-            self.instance.instance_id, provider_model, ctx.trace_id, request_log
+            "aicc.gimini.llm.input provider_instance_name={} model={} trace_id={:?} request={}",
+            self.instance.provider_instance_name, provider_model, ctx.trace_id, request_log
         );
 
         let (status, body, latency_ms) = self
             .post_generate_content(provider_model, &request_obj)
             .await?;
-        let response_log = body.to_string();
+        let response_log = redacted_json_log(&body);
 
         if !status.is_success() {
             warn!(
-                "aicc.gimini.llm.output instance_id={} model={} trace_id={:?} status={} response={}",
-                self.instance.instance_id,
+                "aicc.gimini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+                self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
                 status.as_u16(),
@@ -834,8 +1715,8 @@ impl GoogleGiminiProvider {
         }
 
         info!(
-            "aicc.gimini.llm.output instance_id={} model={} trace_id={:?} status={} response={}",
-            self.instance.instance_id,
+            "aicc.gimini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+            self.instance.provider_instance_name,
             provider_model,
             ctx.trace_id,
             status.as_u16(),
@@ -862,7 +1743,7 @@ impl GoogleGiminiProvider {
         let mut extra = Map::new();
         extra.insert(
             "provider".to_string(),
-            Value::String("google_gimini".to_string()),
+            Value::String("google_gemini".to_string()),
         );
         extra.insert(
             "model".to_string(),
@@ -877,10 +1758,8 @@ impl GoogleGiminiProvider {
             }),
         );
 
-        let summary = AiResponseSummary {
-            text: content,
-            tool_calls: vec![],
-            artifacts: vec![],
+        let summary = AiResponse {
+            message: AiResponse::message_from_parts(content, vec![], vec![]),
             usage,
             cost,
             finish_reason: body
@@ -898,7 +1777,7 @@ impl GoogleGiminiProvider {
         &self,
         ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
-        req: &CompleteRequest,
+        req: &AiMethodRequest,
     ) -> Result<ProviderStartResult, ProviderError> {
         let mut request_obj = Map::new();
         if let Some(input_json) = req.payload.input_json.as_ref() {
@@ -920,8 +1799,8 @@ impl GoogleGiminiProvider {
         }
         if !ignored_options.is_empty() {
             warn!(
-                "aicc.gimini ignored unsupported text2image options: instance_id={} model={} trace_id={:?} ignored={:?}",
-                self.instance.instance_id, provider_model, ctx.trace_id, ignored_options
+                "aicc.gimini ignored unsupported text2image options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_options
             );
         }
 
@@ -948,21 +1827,21 @@ impl GoogleGiminiProvider {
         request_obj.insert("contents".to_string(), contents);
         request_obj.remove("prompt");
 
-        let request_log = Value::Object(request_obj.clone()).to_string();
+        let request_log = redacted_json_log(&Value::Object(request_obj.clone()));
         info!(
-            "aicc.gimini.text2image.input instance_id={} model={} trace_id={:?} request={}",
-            self.instance.instance_id, provider_model, ctx.trace_id, request_log
+            "aicc.gimini.text2image.input provider_instance_name={} model={} trace_id={:?} request={}",
+            self.instance.provider_instance_name, provider_model, ctx.trace_id, request_log
         );
 
         let (status, body, latency_ms) = self
             .post_generate_content(provider_model, &request_obj)
             .await?;
-        let response_log = body.to_string();
+        let response_log = redacted_json_log(&body);
 
         if !status.is_success() {
             warn!(
-                "aicc.gimini.text2image.output instance_id={} model={} trace_id={:?} status={} response={}",
-                self.instance.instance_id,
+                "aicc.gimini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+                self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
                 status.as_u16(),
@@ -984,8 +1863,8 @@ impl GoogleGiminiProvider {
         }
 
         info!(
-            "aicc.gimini.text2image.output instance_id={} model={} trace_id={:?} status={} response={}",
-            self.instance.instance_id,
+            "aicc.gimini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+            self.instance.provider_instance_name,
             provider_model,
             ctx.trace_id,
             status.as_u16(),
@@ -1002,7 +1881,7 @@ impl GoogleGiminiProvider {
         let mut extra = Map::new();
         extra.insert(
             "provider".to_string(),
-            Value::String("google_gimini".to_string()),
+            Value::String("google_gemini".to_string()),
         );
         extra.insert(
             "model".to_string(),
@@ -1017,10 +1896,8 @@ impl GoogleGiminiProvider {
             }),
         );
 
-        let summary = AiResponseSummary {
-            text,
-            tool_calls: vec![],
-            artifacts,
+        let summary = AiResponse {
+            message: AiResponse::message_from_parts(text, vec![], artifacts),
             usage: None,
             cost: estimated_cost,
             finish_reason: body
@@ -1033,23 +1910,411 @@ impl GoogleGiminiProvider {
 
         Ok(ProviderStartResult::Immediate(summary))
     }
+
+    async fn start_image2image(
+        &self,
+        _ctx: &crate::aicc::InvokeCtx,
+        provider_model: &str,
+        req: &AiMethodRequest,
+    ) -> Result<ProviderStartResult, ProviderError> {
+        let resource = req
+            .payload
+            .resources
+            .first()
+            .cloned()
+            .or_else(|| Self::resource_from_input_json(req, &["image"]))
+            .ok_or_else(|| ProviderError::fatal("image.img2img requires an image resource"))?;
+        let prompt = Self::extract_text2image_prompt(req).ok_or_else(|| {
+            ProviderError::fatal("image.img2img requires prompt in payload text/input_json/options")
+        })?;
+        let mut request_obj = Map::new();
+        request_obj.insert(
+            "contents".to_string(),
+            json!([{
+                "role": "user",
+                "parts": [
+                    Self::resource_part(&resource)?,
+                    { "text": prompt }
+                ]
+            }]),
+        );
+        Self::ensure_generation_config(&mut request_obj)
+            .insert("responseModalities".to_string(), json!(["IMAGE"]));
+        let (status, body, latency_ms) = self
+            .post_generate_content(provider_model, &request_obj)
+            .await?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("google gimini image edit returned non-success status");
+            return Err(Self::classify_api_error(status, message.to_string()));
+        }
+        let (artifacts, text) = Self::parse_text2image_result(&body)?;
+        let mut extra = Map::new();
+        extra.insert(
+            "provider".to_string(),
+            Value::String("google_gemini".to_string()),
+        );
+        extra.insert(
+            "model".to_string(),
+            Value::String(provider_model.to_string()),
+        );
+        extra.insert("latency_ms".to_string(), Value::from(latency_ms));
+        extra.insert(
+            "provider_io".to_string(),
+            json!({ "input": request_obj, "output": body }),
+        );
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            message: AiResponse::message_from_parts(text, vec![], artifacts),
+            finish_reason: Some("stop".to_string()),
+            extra: Some(Value::Object(extra)),
+            ..Default::default()
+        }))
+    }
+
+    async fn start_embedding(
+        &self,
+        _ctx: &crate::aicc::InvokeCtx,
+        provider_model: &str,
+        req: &AiMethodRequest,
+        multimodal: bool,
+    ) -> Result<ProviderStartResult, ProviderError> {
+        let text = req
+            .payload
+            .input_json
+            .as_ref()
+            .and_then(|value| value.pointer("/items/0/text"))
+            .and_then(|value| value.as_str())
+            .or(req.payload.text.as_deref())
+            .unwrap_or("");
+        let mut parts = Vec::new();
+        if !text.trim().is_empty() {
+            parts.push(json!({ "text": text }));
+        }
+        if multimodal {
+            if let Some(resource) = req
+                .payload
+                .resources
+                .first()
+                .cloned()
+                .or_else(|| Self::resource_from_input_json(req, &["image", "audio", "video"]))
+            {
+                parts.push(Self::resource_part(&resource)?);
+            }
+        }
+        if parts.is_empty() {
+            return Err(ProviderError::fatal(
+                "embedding request requires text or multimodal resource",
+            ));
+        }
+        let mut request_obj = Map::new();
+        request_obj.insert("content".to_string(), json!({ "parts": parts }));
+        if let Some(dimensions) = req
+            .payload
+            .input_json
+            .as_ref()
+            .and_then(|value| value.get("dimensions"))
+            .cloned()
+        {
+            request_obj.insert("outputDimensionality".to_string(), dimensions);
+        }
+        let (status, body, latency_ms) = self
+            .post_model_action(provider_model, "embedContent", &request_obj)
+            .await?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("google gimini embedding returned non-success status");
+            return Err(Self::classify_api_error(status, message.to_string()));
+        }
+        let dimensions = body
+            .pointer("/embedding/values")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let embedding_space_id =
+            format!("google-gemini:{}:{}:multimodal", provider_model, dimensions);
+        let mut extra = Map::new();
+        extra.insert(
+            "embedding".to_string(),
+            json!({
+                "data": [{
+                    "index": 0,
+                    "embedding": body.pointer("/embedding/values").cloned().unwrap_or(Value::Array(vec![])),
+                    "embedding_space_id": embedding_space_id
+                }],
+                "embedding_space_id": embedding_space_id,
+                "provider_io": { "input": request_obj, "output": body },
+                "latency_ms": latency_ms
+            }),
+        );
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            finish_reason: Some("stop".to_string()),
+            extra: Some(Value::Object(extra)),
+            ..Default::default()
+        }))
+    }
+
+    async fn start_vision(
+        &self,
+        _ctx: &crate::aicc::InvokeCtx,
+        provider_model: &str,
+        method: &str,
+        req: &AiMethodRequest,
+    ) -> Result<ProviderStartResult, ProviderError> {
+        let resource = req
+            .payload
+            .resources
+            .first()
+            .cloned()
+            .or_else(|| Self::resource_from_input_json(req, &["image", "document"]))
+            .ok_or_else(|| {
+                ProviderError::fatal("vision request requires image/document resource")
+            })?;
+        let request_obj = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    Self::resource_part(&resource)?,
+                    { "text": Self::prompt_for_method(method, req) }
+                ]
+            }],
+            "generationConfig": { "responseMimeType": "application/json" }
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let (status, body, latency_ms) = self
+            .post_generate_content(provider_model, &request_obj)
+            .await?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("google gimini vision returned non-success status");
+            return Err(Self::classify_api_error(status, message.to_string()));
+        }
+        let text = Self::extract_text_content(&body);
+        let parsed = text
+            .as_ref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .unwrap_or_else(|| json!({ "text": text }));
+        let extra_key = match method {
+            ai_methods::VISION_OCR => "ocr",
+            ai_methods::VISION_DETECT => "detections",
+            ai_methods::VISION_SEGMENT => "segments",
+            _ => "captions",
+        };
+        // Gemini 的 generateContent 响应里 vision 调用同样会带 usageMetadata，
+        // 不抽出来的话 UsageLoggingSink 在 emit Final 时会因为 summary.usage
+        // 缺失而打 missing_usage_protocol_error 跳过整条 usage row，导致
+        // /opt/buckyos/data/aicc/aicc-usage-log.db 里这部分调用丢账。
+        let usage = body.get("usageMetadata").map(|usage| AiUsage {
+            input_tokens: usage
+                .get("promptTokenCount")
+                .and_then(|value| value.as_u64()),
+            output_tokens: usage
+                .get("candidatesTokenCount")
+                .and_then(|value| value.as_u64()),
+            total_tokens: usage
+                .get("totalTokenCount")
+                .and_then(|value| value.as_u64()),
+        });
+        let cost = usage
+            .as_ref()
+            .and_then(|usage| self.estimate_cost_for_usage(provider_model, usage));
+        let mut extra = Map::new();
+        extra.insert(extra_key.to_string(), parsed);
+        extra.insert("latency_ms".to_string(), Value::from(latency_ms));
+        extra.insert(
+            "provider_io".to_string(),
+            json!({ "input": request_obj, "output": body }),
+        );
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            message: AiResponse::message_from_parts(text, vec![], vec![]),
+            usage,
+            cost,
+            finish_reason: Some("stop".to_string()),
+            extra: Some(Value::Object(extra)),
+            ..Default::default()
+        }))
+    }
+
+    async fn start_audio_media(
+        &self,
+        _ctx: &crate::aicc::InvokeCtx,
+        provider_model: &str,
+        method: &str,
+        req: &AiMethodRequest,
+    ) -> Result<ProviderStartResult, ProviderError> {
+        let prompt = Self::prompt_for_method(method, req);
+        let request_obj = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": prompt }]
+            }],
+            "generationConfig": { "responseModalities": ["AUDIO"] }
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let (status, body, latency_ms) = self
+            .post_generate_content(provider_model, &request_obj)
+            .await?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("google gimini audio returned non-success status");
+            return Err(Self::classify_api_error(status, message.to_string()));
+        }
+        let artifacts = Self::parse_media_artifacts(&body, "audio/mpeg");
+        let mut extra = Map::new();
+        extra.insert("latency_ms".to_string(), Value::from(latency_ms));
+        extra.insert(
+            "provider_io".to_string(),
+            json!({ "input": request_obj, "output": body }),
+        );
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            message: AiResponse::message_from_parts(None, vec![], artifacts),
+            finish_reason: Some("stop".to_string()),
+            extra: Some(Value::Object(extra)),
+            ..Default::default()
+        }))
+    }
+
+    async fn start_video(
+        &self,
+        ctx: &crate::aicc::InvokeCtx,
+        provider_model: &str,
+        method: &str,
+        req: &AiMethodRequest,
+    ) -> Result<ProviderStartResult, ProviderError> {
+        let mut instance = Map::new();
+        instance.insert(
+            "prompt".to_string(),
+            Value::String(Self::prompt_for_method(method, req)),
+        );
+        if let Some(resource) = req
+            .payload
+            .resources
+            .first()
+            .cloned()
+            .or_else(|| Self::resource_from_input_json(req, &["image", "video"]))
+        {
+            instance.insert("input".to_string(), Self::resource_part(&resource)?);
+        }
+        if let Some(handle) = req
+            .payload
+            .input_json
+            .as_ref()
+            .and_then(|value| value.get("continuation_handle"))
+            .cloned()
+        {
+            instance.insert("continuation_handle".to_string(), handle);
+        }
+        let mut request_obj = Map::new();
+        request_obj.insert(
+            "instances".to_string(),
+            Value::Array(vec![Value::Object(instance)]),
+        );
+        let mut parameters = Map::new();
+        let mut ignored_parameters = vec![];
+        if let Some(input_json) = req.payload.input_json.as_ref() {
+            ignored_parameters.extend(Self::merge_video_parameters(&mut parameters, input_json));
+        }
+        if let Some(options) = req.payload.options.as_ref() {
+            ignored_parameters.extend(Self::merge_video_parameters(&mut parameters, options));
+        }
+        if !parameters.is_empty() {
+            request_obj.insert("parameters".to_string(), Value::Object(parameters));
+        }
+        if !ignored_parameters.is_empty() {
+            warn!(
+                "aicc.gimini ignored unsupported video parameters: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_parameters
+            );
+        }
+        let (status, body, latency_ms) = self
+            .post_model_action(provider_model, "predictLongRunning", &request_obj)
+            .await?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("google gimini video returned non-success status");
+            return Err(Self::classify_api_error(status, message.to_string()));
+        }
+        let mut extra = Map::new();
+        extra.insert(
+            "provider".to_string(),
+            Value::String("google_gemini".to_string()),
+        );
+        extra.insert("method".to_string(), Value::String(method.to_string()));
+        extra.insert(
+            "model".to_string(),
+            Value::String(provider_model.to_string()),
+        );
+        extra.insert("latency_ms".to_string(), Value::from(latency_ms));
+        if let Some(name) = body.get("name").cloned() {
+            extra.insert("operation_name".to_string(), name.clone());
+            if method == ai_methods::VIDEO_EXTEND {
+                extra.insert("continuation_handle".to_string(), name);
+            }
+        }
+        extra.insert(
+            "provider_io".to_string(),
+            json!({ "input": request_obj, "output": body }),
+        );
+        Ok(ProviderStartResult::Immediate(AiResponse {
+            provider_task_ref: extra
+                .get("operation_name")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+            finish_reason: Some("started".to_string()),
+            extra: Some(Value::Object(extra)),
+            ..Default::default()
+        }))
+    }
 }
 
 #[async_trait]
 impl Provider for GoogleGiminiProvider {
-    fn instance(&self) -> &ProviderInstance {
-        &self.instance
+    fn inventory(&self) -> ProviderInventory {
+        self.inventory
+            .read()
+            .map(|inventory| inventory.clone())
+            .unwrap_or_else(|_| {
+                Self::build_inventory_from_buckets(
+                    self.provider_instance_name.as_str(),
+                    self.provider_type.clone(),
+                    self.provider_driver.as_str(),
+                    &GiminiModelBuckets::default(),
+                    self.features.as_slice(),
+                    Some("inventory-lock-poisoned".to_string()),
+                )
+            })
     }
 
-    fn estimate_cost(&self, req: &CompleteRequest, provider_model: &str) -> CostEstimate {
-        if req.capability == Capability::Text2Image {
-            return CostEstimate {
-                estimated_cost_usd: Self::estimate_text2image_cost(req, provider_model),
+    fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
+        let provider_model = provider_model_from_exact(input.exact_model.as_str());
+        if matches!(
+            input.api_type,
+            ApiType::ImageTextToImage | ApiType::ImageToImage
+        ) {
+            return CostEstimateOutput {
+                estimated_cost_usd: 0.04,
+                pricing_mode: PricingMode::PerToken,
+                quota_state: QuotaState::Normal,
+                confidence: 0.5,
                 estimated_latency_ms: Some(6000),
             };
         }
 
-        let (input_tokens, output_tokens) = Self::estimate_tokens(req);
+        let input_tokens = input.input_tokens.max(1);
+        let output_tokens = input.estimated_output_tokens.unwrap_or(1024).max(1);
         let usage = AiUsage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
@@ -1058,12 +2323,22 @@ impl Provider for GoogleGiminiProvider {
 
         let estimated_cost_usd = self
             .estimate_cost_for_usage(provider_model, &usage)
-            .map(|cost| cost.amount);
+            .map(|cost| cost.amount)
+            .unwrap_or(1.0);
 
-        CostEstimate {
+        CostEstimateOutput {
             estimated_cost_usd,
+            pricing_mode: PricingMode::PerToken,
+            quota_state: QuotaState::Normal,
+            confidence: 0.7,
             estimated_latency_ms: Some(1400),
         }
+    }
+
+    async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
+        self.refresh_inventory_once()
+            .await
+            .map_err(|err| ProviderError::retryable(err.to_string()))
     }
 
     async fn start(
@@ -1073,18 +2348,63 @@ impl Provider for GoogleGiminiProvider {
         req: ResolvedRequest,
         _sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        match req.request.capability {
-            Capability::LlmRouter => {
+        match req.method.as_str() {
+            ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
                     .await
             }
-            Capability::Text2Image => {
+            ai_methods::IMAGE_TXT2IMG => {
                 self.start_text2image(&ctx, provider_model.as_str(), &req.request)
                     .await
             }
-            capability => Err(ProviderError::fatal(format!(
-                "google gimini provider does not support capability '{:?}'",
-                capability
+            ai_methods::IMAGE_IMG2IMG => {
+                self.start_image2image(&ctx, provider_model.as_str(), &req.request)
+                    .await
+            }
+            ai_methods::EMBEDDING_TEXT => {
+                self.start_embedding(&ctx, provider_model.as_str(), &req.request, false)
+                    .await
+            }
+            ai_methods::EMBEDDING_MULTIMODAL => {
+                self.start_embedding(&ctx, provider_model.as_str(), &req.request, true)
+                    .await
+            }
+            ai_methods::VISION_OCR
+            | ai_methods::VISION_CAPTION
+            | ai_methods::VISION_DETECT
+            | ai_methods::VISION_SEGMENT => {
+                self.start_vision(
+                    &ctx,
+                    provider_model.as_str(),
+                    req.method.as_str(),
+                    &req.request,
+                )
+                .await
+            }
+            ai_methods::AUDIO_TTS | ai_methods::AUDIO_MUSIC => {
+                self.start_audio_media(
+                    &ctx,
+                    provider_model.as_str(),
+                    req.method.as_str(),
+                    &req.request,
+                )
+                .await
+            }
+            ai_methods::VIDEO_TXT2VIDEO
+            | ai_methods::VIDEO_IMG2VIDEO
+            | ai_methods::VIDEO_VIDEO2VIDEO
+            | ai_methods::VIDEO_EXTEND => {
+                self.start_video(
+                    &ctx,
+                    provider_model.as_str(),
+                    req.method.as_str(),
+                    &req.request,
+                )
+                .await
+            }
+            method => Err(ProviderError::fatal(format!(
+                "google gimini provider does not support method '{}'",
+                method
             ))),
         }
     }
@@ -1098,6 +2418,24 @@ impl Provider for GoogleGiminiProvider {
     }
 }
 
+fn provider_model_from_exact(exact_model: &str) -> &str {
+    exact_model
+        .rsplit_once('@')
+        .map(|(model, _)| model)
+        .unwrap_or(exact_model)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn json_text_len(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(json_text_len).sum(),
+        Value::Object(map) => map.values().map(json_text_len).sum(),
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct GiminiSettings {
     #[serde(default = "default_gimini_enabled")]
@@ -1105,6 +2443,7 @@ struct GiminiSettings {
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
     #[serde(default)]
+    #[allow(dead_code)]
     alias_map: HashMap<String, String>,
     #[serde(default)]
     instances: Vec<SettingsGoogleGiminiInstanceConfig>,
@@ -1113,9 +2452,13 @@ struct GiminiSettings {
 #[derive(Debug, Clone, Deserialize)]
 struct SettingsGoogleGiminiInstanceConfig {
     #[serde(default = "default_instance_id")]
-    instance_id: String,
+    provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default = "default_provider_driver")]
+    provider_driver: String,
+    #[serde(default, alias = "api_key", alias = "apiKey")]
+    api_token: String,
     #[serde(default = "default_base_url")]
     base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -1139,11 +2482,15 @@ fn default_gimini_enabled() -> bool {
 }
 
 fn default_instance_id() -> String {
-    "google-gimini-default".to_string()
+    "google-gemini-default".to_string()
 }
 
 fn default_provider_type() -> String {
-    "google-gimini".to_string()
+    "cloud_api".to_string()
+}
+
+fn default_provider_driver() -> String {
+    "google-gemini".to_string()
 }
 
 fn default_base_url() -> String {
@@ -1163,7 +2510,157 @@ fn default_features() -> Vec<String> {
 
 fn is_text2image_model_name(model: &str) -> bool {
     let lowered = model.trim().to_ascii_lowercase();
-    lowered.contains("image") || lowered.contains("nano-banana")
+    lowered.contains("image") || lowered.contains("nano-banana") || lowered.contains("imagen")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GiminiModelKind {
+    Llm,
+    Image,
+    Embedding,
+    Tts,
+    Music,
+    Video,
+}
+
+fn strip_gimini_model_prefix(name: &str) -> &str {
+    name.strip_prefix("models/")
+        .or_else(|| name.strip_prefix("tunedModels/"))
+        .unwrap_or(name)
+}
+
+/// 在一份模型列表里识别 `gemini-X.Y-...` 形态的版本前缀，找到全局最大 (X,Y)，
+/// 把所有更老主版本族的条目都丢掉。无版本前缀的条目（例如 `lyria-002` /
+/// `gemini-embedding-001` / 不以 `gemini-` 开头的命名）原样保留——它们没有
+/// 跟谁竞争。
+///
+/// 设计目的：Google 弃用模型时是整个主版本族（2.0 family）一起对新用户停服，
+/// 但 alias（`gemini-2.0-flash` / `gemini-2.0-flash-lite`）仍然出现在
+/// `/v1beta/models` 列表里给老用户兼容；只看名字看不出 deprecation。
+/// 这里直接相信 Google 的命名约定：同时给出 N.M 和 N.M+1 时，N.M 已经是过气
+/// 的版本族，不应再被路由选中。
+fn keep_only_max_gemini_version(models: &mut Vec<String>) {
+    let mut max_version: Option<(u32, u32)> = None;
+    for name in models.iter() {
+        if let Some(v) = parse_gemini_major_minor(name) {
+            max_version = Some(match max_version {
+                Some(prev) if prev >= v => prev,
+                _ => v,
+            });
+        }
+    }
+    let Some(max) = max_version else { return };
+    models.retain(|name| match parse_gemini_major_minor(name) {
+        Some(v) => v >= max,
+        None => true,
+    });
+}
+
+/// 解析 `gemini-X.Y-...` 形态的主.次版本号。识别要求：
+/// - 必须以 `gemini-` 开头（其它命名族——`lyria-*` / `veo-*` / `text-embedding-*`
+///   ——不参与版本竞争，函数返回 None 让 caller 原样保留）。
+/// - 紧跟的 token 必须能解析成 `<u32>.<u32>` 形式（`2.5` / `1.5` / `3.0`）。
+fn parse_gemini_major_minor(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("gemini-")?;
+    let version_token = rest.split('-').next()?;
+    let mut nums = version_token.splitn(2, '.');
+    let major: u32 = nums.next()?.parse().ok()?;
+    let minor: u32 = nums.next()?.parse().ok()?;
+    if nums.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
+}
+
+/// 若同一 bucket 里既有 alias `X` 又有它的数字后缀版本 `X-NNN`（NNN 是 2~4 位
+/// 数字），就只保留 alias、把版本快照剔除。Google `/v1beta/models` 同时返回这两
+/// 种命名，alias 通常生命周期更长，先停的是版本快照（`gemini-2.0-flash-001` /
+/// `gemini-2.0-flash-lite-001` 这种）。
+///
+/// 注意：只有在同一份模型列表里 alias **本身**也存在时才剔除版本号；如果只剩
+/// 版本号变体（比如 `gemini-embedding-001` 没 alias 兄弟），照样保留——它就是
+/// 这个模型在 Google 那边唯一的命名。
+fn prefer_alias_over_versioned(models: &mut Vec<String>) {
+    let aliases: HashSet<String> = models
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    models.retain(|name| {
+        let Some(alias_part) = strip_numeric_version_suffix(name) else {
+            return true;
+        };
+        let alias_key = alias_part.to_ascii_lowercase();
+        // 自己的小写形式肯定也在集合里，alias 必须是另一个不同的条目
+        let alias_exists = aliases.contains(&alias_key) && alias_key != name.to_ascii_lowercase();
+        !alias_exists
+    });
+}
+
+/// 识别 `<base>-<digits>` 命名（如 `gemini-2.0-flash-001`），返回去掉 `-<digits>`
+/// 之后的 `<base>`。识别规则约束 2~4 位纯数字尾巴，避免误吃 `gpt-4o` 这种本身
+/// 名字里就带数字的情况。
+fn strip_numeric_version_suffix(name: &str) -> Option<&str> {
+    let bytes = name.as_bytes();
+    let mut digits = 0usize;
+    while digits < bytes.len() && bytes[bytes.len() - 1 - digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if !(2..=4).contains(&digits) {
+        return None;
+    }
+    let split_at = bytes.len() - digits;
+    if split_at == 0 || bytes[split_at - 1] != b'-' {
+        return None;
+    }
+    Some(&name[..split_at - 1])
+}
+
+/// Google `/v1beta/models` 仍会列出已经下线的模型（比如 `gemini-2.0-flash-001`
+/// 对新用户已不可用），但运行期才会以 `fatal: ... is no longer available to
+/// new users` 的形式报出来。Provider 刷新模型列表本身就是为了"只保留能用的"，
+/// 所以这里在写 inventory 之前就基于 displayName / description 上的 deprecation
+/// 关键词把它们筛掉。匹配是大小写无关的子串匹配。
+///
+/// 这只是描述文字层面的过滤；如果 Google 哪天没在文案里写明就停服，最终还是要
+/// 由运行期 health 反馈再降级一次（属于另外一条独立的链路）。
+fn is_deprecated_gimini_entry(id: &str, display_name: &str, description: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "deprecat",   // deprecated / deprecation
+        "discontinu", // discontinued / discontinuation
+        "no longer",  // "no longer available", "no longer supported"
+        "retired",
+        "(legacy)", // 用 "(legacy)" 而非裸 "legacy"，避免误伤 "Gemini Legacy Workshop" 这种命名
+        "sunset",   // "sunset on ..."
+        "end of life",
+        "end-of-life",
+    ];
+    let haystack = format!("{} {} {}", id, display_name, description).to_ascii_lowercase();
+    SIGNALS.iter().any(|signal| haystack.contains(signal))
+}
+
+fn classify_gimini_model(id: &str, methods: &HashSet<String>) -> Option<GiminiModelKind> {
+    let lowered = id.to_ascii_lowercase();
+
+    if lowered.contains("embedding") || methods.contains("embedcontent") {
+        return Some(GiminiModelKind::Embedding);
+    }
+    if lowered.contains("tts") {
+        return Some(GiminiModelKind::Tts);
+    }
+    if lowered.contains("lyria") {
+        return Some(GiminiModelKind::Music);
+    }
+    if lowered.contains("veo") {
+        return Some(GiminiModelKind::Video);
+    }
+    if is_text2image_model_name(id) {
+        return Some(GiminiModelKind::Image);
+    }
+    if lowered.starts_with("gemini") && (methods.contains("generatecontent") || methods.is_empty())
+    {
+        return Some(GiminiModelKind::Llm);
+    }
+    None
 }
 
 fn normalize_model_list(models: Vec<String>) -> Vec<String> {
@@ -1193,8 +2690,9 @@ fn parse_csv_list(value: &str) -> Vec<String> {
 
 fn parse_gimini_settings(settings: &Value) -> Result<Option<GiminiSettings>> {
     let raw = settings
-        .get("gimini")
-        .or_else(|| settings.get("gemini"))
+        .get("gemini")
+        .or_else(|| settings.get("google_gemini"))
+        .or_else(|| settings.get("gimini"))
         .or_else(|| settings.get("google_gimini"))
         .or_else(|| settings.get("google"));
     let Some(raw_settings) = raw else {
@@ -1213,11 +2711,29 @@ fn parse_gimini_settings(settings: &Value) -> Result<Option<GiminiSettings>> {
     Ok(Some(gimini_settings))
 }
 
+fn normalize_legacy_gemini_instance_name(value: String) -> String {
+    if value == "google-gimini-default" {
+        "google-gemini-default".to_string()
+    } else {
+        value
+    }
+}
+
+fn normalize_legacy_gemini_driver(value: String) -> String {
+    if value == "google-gimini" {
+        "google-gemini".to_string()
+    } else {
+        value
+    }
+}
+
 fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiInstanceConfig>> {
     let raw_instances = if settings.instances.is_empty() {
         vec![SettingsGoogleGiminiInstanceConfig {
-            instance_id: default_instance_id(),
+            provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            provider_driver: default_provider_driver(),
+            api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
             models: vec![],
@@ -1240,7 +2756,7 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
         if models.is_empty() {
             return Err(anyhow!(
                 "gimini instance {} has no models configured",
-                raw_instance.instance_id
+                raw_instance.provider_instance_name
             ));
         }
 
@@ -1274,8 +2790,16 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
         };
 
         instances.push(GoogleGiminiInstanceConfig {
-            instance_id: raw_instance.instance_id,
+            provider_instance_name: normalize_legacy_gemini_instance_name(
+                raw_instance.provider_instance_name,
+            ),
             provider_type: raw_instance.provider_type,
+            provider_driver: normalize_legacy_gemini_driver(raw_instance.provider_driver),
+            api_token: if raw_instance.api_token.trim().is_empty() {
+                settings.api_token.clone()
+            } else {
+                raw_instance.api_token
+            },
             base_url: raw_instance.base_url,
             timeout_ms: raw_instance.timeout_ms,
             models,
@@ -1290,6 +2814,7 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
     Ok(instances)
 }
 
+#[cfg(test)]
 fn register_default_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -1303,14 +2828,14 @@ fn register_default_aliases(
             continue;
         }
         center.model_catalog().set_mapping(
-            Capability::LlmRouter,
+            Capability::Llm,
             model.as_str(),
             provider_type,
             model.as_str(),
         );
 
         center.model_catalog().set_mapping(
-            Capability::LlmRouter,
+            Capability::Llm,
             format!("llm.{}", model),
             provider_type,
             model.as_str(),
@@ -1318,14 +2843,9 @@ fn register_default_aliases(
     }
 
     if let Some(default_model) = default_model.filter(|model| !is_text2image_model_name(model)) {
-        for alias in [
-            "llm.default",
-            "llm.chat.default",
-            "llm.plan.default",
-            "llm.code.default",
-        ] {
+        for alias in ["llm.default", "llm.plan.default", "llm.code.default"] {
             center.model_catalog().set_mapping(
-                Capability::LlmRouter,
+                Capability::Llm,
                 alias,
                 provider_type,
                 default_model,
@@ -1335,7 +2855,7 @@ fn register_default_aliases(
 
     for model in image_models.iter() {
         center.model_catalog().set_mapping(
-            Capability::Text2Image,
+            Capability::Image,
             model.as_str(),
             provider_type,
             model.as_str(),
@@ -1344,9 +2864,10 @@ fn register_default_aliases(
             format!("text2image.{}", model),
             format!("t2i.{}", model),
             format!("image.{}", model),
+            format!("image.txt2img.{}", model),
         ] {
             center.model_catalog().set_mapping(
-                Capability::Text2Image,
+                Capability::Image,
                 alias,
                 provider_type,
                 model.as_str(),
@@ -1359,11 +2880,12 @@ fn register_default_aliases(
             "text2image.default",
             "t2i.default",
             "image.default",
+            "image.txt2img.default",
             "text2image.nano_banana",
             "t2i.nano_banana",
         ] {
             center.model_catalog().set_mapping(
-                Capability::Text2Image,
+                Capability::Image,
                 alias,
                 provider_type,
                 default_image_model,
@@ -1372,6 +2894,7 @@ fn register_default_aliases(
     }
 }
 
+#[cfg(test)]
 fn register_custom_aliases(
     center: &AIComputeCenter,
     provider_type: &str,
@@ -1383,9 +2906,9 @@ fn register_custom_aliases(
             || normalized_alias.starts_with("t2i.")
             || normalized_alias.starts_with("image.")
         {
-            Capability::Text2Image
+            Capability::Image
         } else {
-            Capability::LlmRouter
+            Capability::Llm
         };
         center.model_catalog().set_mapping(
             capability,
@@ -1404,47 +2927,35 @@ pub fn register_google_gimini_providers(
         info!("aicc google gimini provider is disabled (gimini settings missing or disabled)");
         return Ok(0);
     };
-    if gimini_settings.api_token.trim().is_empty() {
-        return Err(anyhow!(
-            "gimini.api_token (or api_key) is required when gimini provider is enabled"
-        ));
-    }
-
     let instances = build_gimini_instances(&gimini_settings)?;
-    let mut prepared = Vec::<(GoogleGiminiInstanceConfig, Arc<dyn Provider>)>::new();
+    let mut prepared = Vec::<(GoogleGiminiInstanceConfig, Arc<GoogleGiminiProvider>)>::new();
     for config in instances.iter() {
-        let provider =
-            GoogleGiminiProvider::new(config.clone(), gimini_settings.api_token.clone())?;
-        prepared.push((config.clone(), Arc::new(provider)));
+        if config.api_token.trim().is_empty() {
+            return Err(anyhow!(
+                "gimini instance {} api_token (or api_key) is required",
+                config.provider_instance_name
+            ));
+        }
+        let provider = Arc::new(GoogleGiminiProvider::new(
+            config.clone(),
+            config.api_token.clone(),
+        )?);
+        provider.clone().start_inventory_refresh();
+        prepared.push((config.clone(), provider));
     }
 
     for (config, provider) in prepared.into_iter() {
-        center.registry().add_provider(provider);
-
-        register_default_aliases(
-            center,
-            config.provider_type.as_str(),
-            &config.models,
-            config.default_model.as_deref(),
-            &config.image_models,
-            config.default_image_model.as_deref(),
-        );
-
-        register_custom_aliases(
-            center,
-            config.provider_type.as_str(),
-            &gimini_settings.alias_map,
-        );
-        register_custom_aliases(center, config.provider_type.as_str(), &config.alias_map);
-
+        let inventory = center.registry().add_provider(provider);
         info!(
-            "registered google gimini instance id={} provider_type={} base_url={} models={:?} image_models={:?}",
-            config.instance_id,
-            config.provider_type,
-            config.base_url,
-            config.models,
-            config.image_models
+            "registered google gimini base_url={} inventory={:?}",
+            config.base_url, inventory
         );
+        center
+            .model_registry()
+            .write()
+            .map_err(|_| anyhow!("model registry lock poisoned"))?
+            .apply_inventory(inventory)
+            .map_err(|err| anyhow!("failed to apply gimini inventory: {}", err))?;
     }
 
     Ok(instances.len())
@@ -1457,9 +2968,9 @@ mod tests {
     use buckyos_api::{AiPayload, ModelSpec, Requirements};
     use serde_json::json;
 
-    fn build_text2image_request(options: Option<Value>) -> CompleteRequest {
-        CompleteRequest::new(
-            Capability::Text2Image,
+    fn build_text2image_request(options: Option<Value>) -> AiMethodRequest {
+        AiMethodRequest::new(
+            Capability::Image,
             ModelSpec::new("text2image.default".to_string(), None),
             Requirements::default(),
             AiPayload::new(
@@ -1475,14 +2986,220 @@ mod tests {
     }
 
     #[test]
+    fn parse_gemini_major_minor_recognizes_canonical_shape() {
+        assert_eq!(parse_gemini_major_minor("gemini-2.5-flash"), Some((2, 5)));
+        assert_eq!(
+            parse_gemini_major_minor("gemini-2.5-flash-image-preview"),
+            Some((2, 5))
+        );
+        assert_eq!(
+            parse_gemini_major_minor("gemini-2.5-computer-use-preview-10-2025"),
+            Some((2, 5))
+        );
+        assert_eq!(
+            parse_gemini_major_minor("gemini-2.0-flash-lite"),
+            Some((2, 0))
+        );
+        assert_eq!(parse_gemini_major_minor("gemini-1.5-pro"), Some((1, 5)));
+        // 不带 family 的纯版本号也认（比较少见但合理）
+        assert_eq!(parse_gemini_major_minor("gemini-3.0"), Some((3, 0)));
+        // 没 X.Y 形式 → None（让 caller 原样保留）
+        assert_eq!(parse_gemini_major_minor("gemini-embedding-001"), None);
+        assert_eq!(parse_gemini_major_minor("gemini-pro-vision"), None);
+        assert_eq!(parse_gemini_major_minor("gemini-2-flash"), None);
+        // 不是 gemini- 开头的
+        assert_eq!(parse_gemini_major_minor("lyria-002"), None);
+        assert_eq!(parse_gemini_major_minor("veo-3.1-generate-preview"), None);
+        assert_eq!(parse_gemini_major_minor("text-embedding-004"), None);
+        // 三段版本 (2.5.1) 不识别——Google 没有这种命名，避免误判
+        assert_eq!(parse_gemini_major_minor("gemini-2.5.1-flash"), None);
+    }
+
+    #[test]
+    fn keep_only_max_gemini_version_drops_older_families() {
+        let mut models = vec![
+            "gemini-1.5-flash".to_string(),
+            "gemini-1.5-pro".to_string(),
+            "gemini-2.0-flash".to_string(),
+            "gemini-2.0-flash-lite".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-flash-lite".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.5-computer-use-preview-10-2025".to_string(),
+            // 没 X.Y 版本号的非 gemini 命名 → 原样保留
+            "gemini-embedding-001".to_string(),
+            "lyria-002".to_string(),
+            "veo-3.1-generate-preview".to_string(),
+        ];
+        keep_only_max_gemini_version(&mut models);
+        assert_eq!(
+            models,
+            vec![
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-flash-lite".to_string(),
+                "gemini-2.5-pro".to_string(),
+                "gemini-2.5-computer-use-preview-10-2025".to_string(),
+                "gemini-embedding-001".to_string(),
+                "lyria-002".to_string(),
+                "veo-3.1-generate-preview".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_only_max_gemini_version_no_op_without_versioned_models() {
+        // 全部都没 gemini-X.Y 版本号 → 不动
+        let mut models = vec![
+            "lyria-002".to_string(),
+            "veo-3.1-generate-preview".to_string(),
+            "gemini-embedding-001".to_string(),
+        ];
+        keep_only_max_gemini_version(&mut models);
+        assert_eq!(
+            models,
+            vec![
+                "lyria-002".to_string(),
+                "veo-3.1-generate-preview".to_string(),
+                "gemini-embedding-001".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_only_max_gemini_version_picks_higher_minor() {
+        // 同主版本不同次版本 → 留次版本最高的
+        let mut models = vec![
+            "gemini-2.0-flash".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.10-flash".to_string(), // 假设未来真出现
+        ];
+        keep_only_max_gemini_version(&mut models);
+        assert_eq!(models, vec!["gemini-2.10-flash".to_string()]);
+    }
+
+    #[test]
+    fn strip_numeric_version_suffix_matches_only_short_digit_tails() {
+        assert_eq!(
+            strip_numeric_version_suffix("gemini-2.0-flash-001"),
+            Some("gemini-2.0-flash")
+        );
+        assert_eq!(
+            strip_numeric_version_suffix("gemini-2.5-flash-002"),
+            Some("gemini-2.5-flash")
+        );
+        // 4 位也算（保险一点，比如 -1234）
+        assert_eq!(
+            strip_numeric_version_suffix("gemini-x-1234"),
+            Some("gemini-x")
+        );
+        // 1 位太短，可能是模型自带后缀，不算版本号
+        assert_eq!(strip_numeric_version_suffix("gpt-4"), None);
+        // 5 位以上不算（避免误吃像 claude-3-7-sonnet-20250219 这种 datestamp）
+        assert_eq!(
+            strip_numeric_version_suffix("claude-3-7-sonnet-20250219"),
+            None
+        );
+        // 没有 `-` 边界
+        assert_eq!(strip_numeric_version_suffix("gpt4o"), None);
+        // 名字本身是纯数字
+        assert_eq!(strip_numeric_version_suffix("123"), None);
+    }
+
+    #[test]
+    fn prefer_alias_over_versioned_drops_version_when_alias_present() {
+        let mut models = vec![
+            "gemini-2.0-flash".to_string(),
+            "gemini-2.0-flash-001".to_string(),
+            "gemini-2.0-flash-lite".to_string(),
+            "gemini-2.0-flash-lite-001".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-flash-002".to_string(),
+            "gemini-2.5-pro".to_string(),
+            // 没 alias 兄弟，要保留
+            "gemini-embedding-001".to_string(),
+            // claude-style datestamp（8 位）不被识别为版本号，原样保留
+            "claude-3-7-sonnet-20250219".to_string(),
+        ];
+        prefer_alias_over_versioned(&mut models);
+        assert_eq!(
+            models,
+            vec![
+                "gemini-2.0-flash".to_string(),
+                "gemini-2.0-flash-lite".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-pro".to_string(),
+                "gemini-embedding-001".to_string(),
+                "claude-3-7-sonnet-20250219".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefer_alias_over_versioned_keeps_lonely_versioned() {
+        // 只有版本快照、没有 alias 兄弟 → 保留
+        let mut models = vec![
+            "text-embedding-004".to_string(),
+            "veo-3.1-generate-preview".to_string(),
+        ];
+        prefer_alias_over_versioned(&mut models);
+        assert_eq!(
+            models,
+            vec![
+                "text-embedding-004".to_string(),
+                "veo-3.1-generate-preview".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn deprecated_gimini_entries_are_filtered() {
+        // 描述里出现 deprecation 信号 → 必须过滤
+        assert!(is_deprecated_gimini_entry(
+            "gemini-2.0-flash-001",
+            "Gemini 2.0 Flash (Discontinued)",
+            "Stable version of Gemini 2.0 Flash."
+        ));
+        assert!(is_deprecated_gimini_entry(
+            "gemini-1.5-pro-002",
+            "Gemini 1.5 Pro",
+            "This model is deprecated. Please migrate to gemini-2.5-pro."
+        ));
+        assert!(is_deprecated_gimini_entry(
+            "gemini-1.0-pro",
+            "Gemini 1.0 Pro",
+            "Legacy: gemini-1.0-pro is no longer available to new users.",
+        ));
+        assert!(is_deprecated_gimini_entry(
+            "gemini-2.0-flash-lite",
+            "Gemini 2.0 Flash-Lite",
+            "Will be retired on 2026-01-01."
+        ));
+
+        // 健康的当前模型不能误伤
+        assert!(!is_deprecated_gimini_entry(
+            "gemini-2.5-flash",
+            "Gemini 2.5 Flash",
+            "Fast and versatile multimodal model."
+        ));
+        assert!(!is_deprecated_gimini_entry(
+            "gemini-2.5-pro",
+            "Gemini 2.5 Pro",
+            "Most capable Gemini model for complex reasoning tasks."
+        ));
+    }
+
+    #[test]
     fn build_gimini_instances_infers_image_models() {
         let settings = GiminiSettings {
             enabled: true,
             api_token: "token".to_string(),
             alias_map: HashMap::new(),
             instances: vec![SettingsGoogleGiminiInstanceConfig {
-                instance_id: "gimini-1".to_string(),
-                provider_type: "google-gimini".to_string(),
+                provider_instance_name: "gimini-1".to_string(),
+                provider_type: "cloud_api".to_string(),
+                provider_driver: "google-gimini".to_string(),
+                api_token: String::new(),
                 base_url: default_base_url(),
                 timeout_ms: default_timeout_ms(),
                 models: vec![
@@ -1499,6 +3216,7 @@ mod tests {
 
         let instances = build_gimini_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].provider_driver, "google-gemini");
         assert_eq!(
             instances[0].default_model.as_deref(),
             Some("gemini-2.5-flash")
@@ -1507,6 +3225,64 @@ mod tests {
             instances[0].default_image_model.as_deref(),
             Some("gemini-2.0-flash-exp-image-generation")
         );
+    }
+
+    #[test]
+    fn build_gimini_instances_uses_gemini_default_names() {
+        let settings = GiminiSettings {
+            enabled: true,
+            api_token: "token".to_string(),
+            alias_map: HashMap::new(),
+            instances: vec![],
+        };
+
+        let instances = build_gimini_instances(&settings).expect("instances should be built");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].provider_instance_name, "google-gemini-default");
+        assert_eq!(instances[0].provider_driver, "google-gemini");
+    }
+
+    #[test]
+    fn register_gimini_inventory_exposes_stable_gemini_mounts() {
+        let center = AIComputeCenter::default();
+        let settings = json!({
+            "gemini": {
+                "enabled": true,
+                "api_token": "token",
+                "instances": [
+                    {
+                        "provider_instance_name": "google-gimini-default",
+                        "provider_type": "cloud_api",
+                        "provider_driver": "google-gimini",
+                        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                        "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
+                        "image_models": ["gemini-2.5-flash-image-preview"]
+                    }
+                ]
+            }
+        });
+
+        let count =
+            register_google_gimini_providers(&center, &settings).expect("register should work");
+        assert_eq!(count, 1);
+
+        let registry = center.model_registry().read().expect("model registry lock");
+        let flash_items = registry.default_items_for_path("llm.gemini-flash");
+        assert!(flash_items
+            .values()
+            .any(|item| { item.target == "gemini-2.5-flash@google-gemini-default" }));
+        let pro_items = registry.default_items_for_path("llm.gemini-pro");
+        assert!(pro_items
+            .values()
+            .any(|item| item.target == "gemini-2.5-pro@google-gemini-default"));
+        let legacy_items = registry.default_items_for_path("llm.gimini");
+        assert!(legacy_items.is_empty());
+        let image_items = registry.default_items_for_path("image.txt2img.gemini");
+        assert!(image_items
+            .values()
+            .any(|item| { item.target == "gemini-2.5-flash-image-preview@google-gemini-default" }));
+        let split_model_items = registry.default_items_for_path("image.img2img.gemini-2");
+        assert!(split_model_items.is_empty());
     }
 
     #[test]
@@ -1522,19 +3298,19 @@ mod tests {
                 "gemini-2.0-flash-exp-image-generation".to_string(),
             ),
         ]);
-        register_custom_aliases(&center, "google-gimini", &aliases);
+        register_custom_aliases(&center, "google-gemini", &aliases);
 
         let llm = center.model_catalog().resolve(
             "",
-            &Capability::LlmRouter,
+            &Capability::Llm,
             "llm.plan.default",
-            "google-gimini",
+            "google-gemini",
         );
         let image = center.model_catalog().resolve(
             "",
-            &Capability::Text2Image,
+            &Capability::Image,
             "text2image.nano_banana",
-            "google-gimini",
+            "google-gemini",
         );
         assert_eq!(llm.as_deref(), Some("gemini-2.5-flash"));
         assert_eq!(
@@ -1550,7 +3326,7 @@ mod tests {
         let image_models = Vec::<String>::new();
         register_default_aliases(
             &center,
-            "google-gimini",
+            "google-gemini",
             &models,
             Some("gemini-2.5-flash"),
             &image_models,
@@ -1559,15 +3335,15 @@ mod tests {
 
         let code_alias = center.model_catalog().resolve(
             "",
-            &Capability::LlmRouter,
+            &Capability::Llm,
             "llm.code.default",
-            "google-gimini",
+            "google-gemini",
         );
         let removed_alias = center.model_catalog().resolve(
             "",
-            &Capability::LlmRouter,
+            &Capability::Llm,
             "llm.json.default",
-            "google-gimini",
+            "google-gemini",
         );
 
         assert_eq!(code_alias.as_deref(), Some("gemini-2.5-flash"));

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::kRPC::Result;
 use ::kRPC::*;
 use buckyos_kit::*;
 use jsonwebtoken::{decode, DecodingKey, EncodingKey, Validation};
@@ -16,15 +17,17 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use tokio::sync::{OnceCell, RwLock};
 
 use name_client::*;
 use name_lib::*;
-use named_store::NamedStoreMgr;
+use named_store::NamedDataMgr;
 
 use crate::aicc_client::*;
 use crate::app_mgr::*;
 use crate::control_panel::*;
+use crate::kevent_client::KEventClient;
 use crate::msg_center_client::*;
 use crate::msg_queue::*;
 use crate::opendan_client::*;
@@ -33,6 +36,7 @@ use crate::scheduler_client::*;
 use crate::system_config::*;
 use crate::task_mgr::*;
 use crate::verify_hub_client::*;
+use crate::workflow_service::{WorkflowServiceClient, WORKFLOW_SERVICE_NAME};
 use crate::{
     get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, OPENDAN_SERVICE_NAME,
 };
@@ -44,6 +48,7 @@ const BUCKYOS_KRPC_TIMEOUT_SECS_ENV: &str = "BUCKYOS_KRPC_TIMEOUT_SECS";
 const BUCKYOS_KRPC_TIMEOUT_SECS_PREFIX: &str = "BUCKYOS_KRPC_TIMEOUT_SECS_";
 const BUCKYOS_HOST_GATEWAY_ENV: &str = "BUCKYOS_HOST_GATEWAY";
 const DEFAULT_DOCKER_HOST_GATEWAY: &str = "host.docker.internal";
+pub const BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV: &str = "BUCKYOS_APPCLIENT_SESSION_TOKEN";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuckyOSRuntimeType {
@@ -178,7 +183,7 @@ pub struct BuckyOSRuntime {
     pub refresh_token: Arc<RwLock<String>>,
     trust_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
     last_update_service_info_time: RwLock<u64>,
-    named_store_mgr: OnceCell<NamedStoreMgr>,
+    named_store_mgr: OnceCell<NamedDataMgr>,
     system_config_client: OnceCell<Arc<SystemConfigClient>>,
     background_task_status:
         Arc<RwLock<HashMap<RuntimeBackgroundTaskKind, RuntimeBackgroundTaskStatus>>>,
@@ -261,14 +266,15 @@ impl BuckyOSRuntime {
         *main_service_port = port;
     }
 
-    pub async fn get_named_store(&self) -> Result<NamedStoreMgr> {
-        let store_mgr: &NamedStoreMgr = self
+    pub async fn get_named_store(&self) -> Result<NamedDataMgr> {
+        let store_mgr: &NamedDataMgr = self
             .named_store_mgr
             .get_or_try_init(|| async {
                 let config_path = get_buckyos_root_dir()
                     .join("storage")
                     .join("named_store.json");
-                NamedStoreMgr::get_store_mgr(config_path.as_path())
+                let http_backend_links = HashMap::new();
+                NamedDataMgr::get_store_mgr(config_path.as_path(), &http_backend_links)
                     .await
                     .map_err(|e| {
                         RPCErrors::ReasonError(format!(
@@ -365,6 +371,36 @@ impl BuckyOSRuntime {
                 }
                 session_token_keys.push(get_session_token_env_key(self.app_id.as_str(), true));
             }
+            BuckyOSRuntimeType::AppClient => match env::var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV) {
+                Ok(session_token) => {
+                    if session_token.trim().is_empty() {
+                        warn!(
+                            "{} is set but empty, skip AppClient session token bootstrap",
+                            BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
+                        );
+                    } else {
+                        info!(
+                            "load AppClient session_token from env var success: {}",
+                            BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
+                        );
+                        let mut this_session_token = self.session_token.write().await;
+                        *this_session_token = session_token;
+                        return Ok(());
+                    }
+                }
+                Err(env::VarError::NotPresent) => {
+                    info!(
+                        "{} not set, skip AppClient session token bootstrap",
+                        BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
+                    );
+                }
+                Err(error) => {
+                    return Err(RPCErrors::ReasonError(format!(
+                        "read {} from env failed: {}",
+                        BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, error
+                    )));
+                }
+            },
             _ => {
                 info!(
                     "will not load session_token from env var for runtime_type: {:?}",
@@ -1915,17 +1951,18 @@ impl BuckyOSRuntime {
     fn resolve_local_service_host(&self) -> String {
         match self.runtime_type {
             BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
-                env::var(BUCKYOS_HOST_GATEWAY_ENV)
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| DEFAULT_DOCKER_HOST_GATEWAY.to_string())
+                let configured_host = env::var(BUCKYOS_HOST_GATEWAY_ENV).ok();
+                resolve_container_gateway_host(configured_host.as_deref())
             }
             _ => "127.0.0.1".to_string(),
         }
     }
 
-    pub async fn get_system_config_client(&self) -> Result<Arc<SystemConfigClient>> {
+    /// Compute the URL used to reach the zone's `system_config` service for
+    /// the current runtime type. Exposed so that callers (e.g. control_panel
+    /// handlers that want to forward the caller's RPC session token) can
+    /// construct a fresh `SystemConfigClient` with their own auth token.
+    pub fn get_system_config_url(&self) -> String {
         let mut url = format!(
             "http://{}:3200/kapi/system_config",
             self.resolve_local_service_host()
@@ -1948,10 +1985,23 @@ impl BuckyOSRuntime {
                     DEFAULT_NODE_GATEWAY_PORT
                 );
             }
-            _ => {
-                // keep local direct system_config url
+            BuckyOSRuntimeType::Kernel | BuckyOSRuntimeType::KernelService => {
+                // 非 OOD Kernel（ZoneGateway / 普通 Node）本机不跑 system_config 服务，
+                // 必须通过本机 cyfs-gateway 转发到 OOD。
+                if !self.is_ood() {
+                    url = format!(
+                        "http://{}:{}/kapi/system_config",
+                        self.resolve_local_service_host(),
+                        DEFAULT_NODE_GATEWAY_PORT
+                    );
+                }
             }
         }
+        url
+    }
+
+    pub async fn get_system_config_client(&self) -> Result<Arc<SystemConfigClient>> {
+        let url = self.get_system_config_url();
 
         //let url = self.get_zone_service_url("system_config",self.force_https)?;
         let session_token = self.get_session_token().await;
@@ -1976,6 +2026,15 @@ impl BuckyOSRuntime {
         let krpc_client = self.get_zone_service_krpc_client("task-manager").await?;
         let client = TaskManagerClient::new(krpc_client);
         Ok(client)
+    }
+
+    /// In-process KEvent client bound to this runtime's `app_id`. The Full
+    /// mode shares the cross-process ring buffer when available; if the ring
+    /// isn't reachable, subscriptions still work for events published in the
+    /// same process and `wait_*_kevent` helpers degrade to their sweep
+    /// fallback.
+    pub async fn get_kevent_client(&self) -> Result<KEventClient> {
+        Ok(KEventClient::new_full(self.app_id.as_str(), None))
     }
 
     pub async fn get_aicc_client(&self) -> Result<AiccClient> {
@@ -2006,6 +2065,13 @@ impl BuckyOSRuntime {
         let krpc_client = self.get_zone_service_krpc_client("scheduler").await?;
         let client = SchedulerClient::new(krpc_client);
         Ok(client)
+    }
+
+    pub async fn get_workflow_service_client(&self) -> Result<WorkflowServiceClient> {
+        let krpc_client = self
+            .get_zone_service_krpc_client(WORKFLOW_SERVICE_NAME)
+            .await?;
+        Ok(WorkflowServiceClient::new(krpc_client))
     }
 
     pub async fn get_control_panel_client(&self) -> Result<ControlPanelClient> {
@@ -2170,15 +2236,13 @@ impl BuckyOSRuntime {
             BuckyOSRuntimeType::AppClient => {
                 //通过Zone Host Name 访问Service总是可以成功的，理论上有SDK的环境不应该使用这种方式。
                 //TODO：如果约束为有SDK的环境，必然有node_gateway,那么这个分支就不必要存在
+                //
+                // kRPC `/kapi/<service>` 一律打到 zone 的裸 host —— `app_host_perfix.<zone_host>`
+                // 这种二级域名只属于 WebUI 静态资源路由，service 维度的 RPC 不走那条路径。
+                // (例：DV test 环境里 `test.buckyos.io` 有 DNS / cert，
+                // `buckycli.test.buckyos.io` 没有。)
                 let host_name = self.zone_id.to_host_name();
-                if self.app_host_perfix.len() > 0 {
-                    return Ok(format!(
-                        "{}://{}.{}/kapi/{}",
-                        schema, self.app_host_perfix, host_name, service_name
-                    ));
-                } else {
-                    return Ok(format!("{}://{}/kapi/{}", schema, host_name, service_name));
-                }
+                return Ok(format!("{}://{}/kapi/{}", schema, host_name, service_name));
             }
             BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
                 let (result_url, _is_local) = self.get_kernel_service_url(service_name).await?;
@@ -2293,6 +2357,32 @@ impl BuckyOSRuntime {
     }
 }
 
+fn resolve_container_gateway_host(configured_host: Option<&str>) -> String {
+    let host = configured_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_DOCKER_HOST_GATEWAY);
+    resolve_host_to_ipv4_literal(host).unwrap_or_else(|| host.to_string())
+}
+
+fn resolve_host_to_ipv4_literal(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
+        return Some(ipv4.to_string());
+    }
+
+    (host, 0)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr.ip() {
+            IpAddr::V4(ipv4) => Some(ipv4.to_string()),
+            IpAddr::V6(_) => None,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2400,5 +2490,17 @@ mod tests {
         assert!(data_dir.is_err());
         assert!(cache_dir.is_err());
         assert!(local_cache_dir.is_err());
+    }
+
+    #[test]
+    fn container_gateway_host_prefers_ipv4_literals() {
+        assert_eq!(
+            resolve_container_gateway_host(Some("127.0.0.1")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            resolve_container_gateway_host(Some("localhost")),
+            "127.0.0.1"
+        );
     }
 }

@@ -7,18 +7,18 @@ use buckyos_api::{
     generate_aicc_service_doc, generate_control_panel_service_doc, generate_msg_center_service_doc,
     generate_opendan_service_doc, generate_repo_service_doc, generate_scheduler_service_doc,
     generate_smb_service_doc, generate_task_manager_service_doc, generate_verify_hub_service_doc,
-    AppDoc, AppServiceSpec, AppType, GatewaySettings, GatewayShortcut, KernelServiceSpec,
-    NodeConfig, NodeState, SelectorType, ServiceExposeConfig, ServiceInfo, ServiceInstallConfig,
-    ServiceInstanceReportInfo, ServiceInstanceState, ServiceNode, ServiceState, SubPkgDesc,
-    UserContactSettings, UserSettings, UserState, UserTunnelBinding, UserType,
-    OPENDAN_SERVICE_PORT, OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID,
-    VERIFY_HUB_UNIQUE_ID,
+    generate_workflow_service_doc, AppDoc, AppServiceSpec, AppType, GatewaySettings,
+    GatewayShortcut, KernelServiceSpec, NodeConfig, NodeState, SelectorType, ServiceExposeConfig,
+    ServiceInfo, ServiceInstallConfig, ServiceInstanceReportInfo, ServiceInstanceState,
+    ServiceNode, ServiceState, SubPkgDesc, UserContactSettings, UserSettings, UserState,
+    UserTunnelBinding, UserType, OPENDAN_SERVICE_PORT, OPENDAN_SERVICE_UNIQUE_ID,
+    SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
 };
 use buckyos_api::{
     AICC_SERVICE_SERVICE_PORT, AICC_SERVICE_UNIQUE_ID, CONTROL_PANEL_SERVICE_PORT,
     CONTROL_PANEL_SERVICE_UNIQUE_ID, MSG_CENTER_SERVICE_PORT, MSG_CENTER_SERVICE_UNIQUE_ID,
     REPO_SERVICE_UNIQUE_ID, SMB_SERVICE_UNIQUE_ID, TASK_MANAGER_SERVICE_PORT,
-    TASK_MANAGER_SERVICE_UNIQUE_ID,
+    TASK_MANAGER_SERVICE_UNIQUE_ID, WORKFLOW_SERVICE_PORT, WORKFLOW_SERVICE_UNIQUE_ID,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use jsonwebtoken::jwk::Jwk;
@@ -35,11 +35,11 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 
 const DEFAULT_OOD_ID: &str = "ood1";
-const DEFAULT_SN_OPENAI_MODELS: &[&str] =
+const DEFAULT_SN_AI_PROVIDER_MODELS: &[&str] =
     &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro"];
-const DEFAULT_SN_OPENAI_IMAGE_MODELS: &[&str] = &["dall-e-3", "dall-e-2"];
-const SN_OPENAI_MODELS_API: &str = "https://sn.buckyos.ai/api/v1/ai/models";
-const SN_OPENAI_RESPONSES_API: &str = "https://sn.buckyos.ai/api/v1/ai/";
+const DEFAULT_SN_AI_PROVIDER_IMAGE_MODELS: &[&str] = &["dall-e-3", "dall-e-2"];
+const SN_AI_PROVIDER_MODELS_API: &str = "https://sn.buckyos.ai/api/v1/ai/models";
+const SN_AI_PROVIDER_RESPONSES_API: &str = "https://sn.buckyos.ai/api/v1/ai/";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AIProviderConfigSummary {
@@ -155,7 +155,7 @@ impl SystemConfigBuilder {
 
     pub async fn add_default_agents(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
         //add jarvis agent as default agent
-        // agents/jarvis/doc -> agent doc
+        // agents/buckyos_jarvis/doc -> agent doc
         let zone_did = DID::from_str(&config.zone_name)?;
         let jarvis_did = DID::new(
             zone_did.method.as_str(),
@@ -170,11 +170,13 @@ impl SystemConfigBuilder {
         let mut jarvis_doc = AgentDocument::new(jarvis_did, owner_did, jarvis_public_key_jwk);
         jarvis_doc.public_description = Some("Default built-in OpenDAN agent for BuckyOS".into());
 
-        self.insert_json("agents/jarvis/doc", &jarvis_doc)?;
-        self.entries
-            .insert("agents/jarvis/key".to_string(), jarvis_private_key_pem);
+        self.insert_json("agents/buckyos_jarvis/doc", &jarvis_doc)?;
+        self.entries.insert(
+            "agents/buckyos_jarvis/key".to_string(),
+            jarvis_private_key_pem,
+        );
 
-        let legacy_app_spec_key = format!("users/{}/apps/jarvis/spec", config.user_name);
+        let legacy_app_spec_key = format!("users/{}/apps/buckyos_jarvis/spec", config.user_name);
         if self.entries.remove(&legacy_app_spec_key).is_some() {
             warn!(
                 "removed conflicting legacy jarvis app spec at {} while installing default agent spec",
@@ -182,16 +184,16 @@ impl SystemConfigBuilder {
             );
         }
 
-        let jarvis_spec_key = format!("users/{}/agents/jarvis/spec", config.user_name);
+        let jarvis_spec_key = format!("users/{}/agents/buckyos_jarvis/spec", config.user_name);
         let jarvis_spec = build_default_jarvis_agent_spec(config)?;
         self.insert_json(&jarvis_spec_key, &jarvis_spec)?;
 
-        // agents/jarvis/settings -> agent settings,
+        // agents/buckyos_jarvis/settings -> agent settings,
         let jarvis_settings = json!({
             "enabled": true,
             "auto_start": true
         });
-        self.insert_json_if_absent("agents/jarvis/settings", &jarvis_settings)?;
+        self.insert_json_if_absent("agents/buckyos_jarvis/settings", &jarvis_settings)?;
         Ok(self)
     }
 
@@ -296,13 +298,17 @@ impl SystemConfigBuilder {
 
     pub async fn add_task_mgr(&mut self) -> Result<&mut Self> {
         let service_doc = generate_task_manager_service_doc();
-        let config = build_kernel_service_spec(
+        let mut config = build_kernel_service_spec(
             TASK_MANAGER_SERVICE_UNIQUE_ID,
             TASK_MANAGER_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        config.install_config.rdb_instances.insert(
+            buckyos_api::TASK_MANAGER_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::task_manager_default_rdb_instance_config(),
+        );
         self.insert_json("services/task-manager/spec", &config)?;
         Ok(self)
     }
@@ -322,36 +328,57 @@ impl SystemConfigBuilder {
 
     pub async fn add_aicc(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
         let service_doc = generate_aicc_service_doc();
-        let service_spec = build_kernel_service_spec(
+        let mut service_spec = build_kernel_service_spec(
             AICC_SERVICE_UNIQUE_ID,
             AICC_SERVICE_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        service_spec.install_config.rdb_instances.insert(
+            buckyos_api::AICC_USAGE_LOG_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::aicc_usage_log_default_rdb_instance_config(),
+        );
         self.insert_json("services/aicc/spec", &service_spec)?;
-        let sn_openai_models = if config.llm_router_enabled() {
-            fetch_sn_openai_models(config.user_name.as_str()).await
+        let sn_ai_provider_models = if config.llm_router_enabled() {
+            fetch_sn_ai_provider_models(config.user_name.as_str()).await
         } else {
             None
         };
-        let settings = build_aicc_settings_with_sn_models(config, sn_openai_models.as_deref());
+        let settings = build_aicc_settings_with_sn_models(config, sn_ai_provider_models.as_deref());
         self.insert_json_if_absent("services/aicc/settings", &settings)?;
         Ok(self)
     }
 
     pub async fn add_msg_center(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
         let service_doc = generate_msg_center_service_doc();
-        let service_spec = build_kernel_service_spec(
+        let mut service_spec = build_kernel_service_spec(
             MSG_CENTER_SERVICE_UNIQUE_ID,
             MSG_CENTER_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        service_spec.install_config.rdb_instances.insert(
+            buckyos_api::MSG_CENTER_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::msg_center_default_rdb_instance_config(),
+        );
         self.insert_json("services/msg-center/spec", &service_spec)?;
         let settings = build_msg_center_settings(config)?;
         self.insert_json_if_absent("services/msg-center/settings", &settings)?;
+        Ok(self)
+    }
+
+    pub async fn add_workflow(&mut self) -> Result<&mut Self> {
+        let service_doc = generate_workflow_service_doc();
+        let config = build_kernel_service_spec(
+            WORKFLOW_SERVICE_UNIQUE_ID,
+            WORKFLOW_SERVICE_PORT,
+            1,
+            service_doc,
+        )
+        .await?;
+        self.insert_json("services/workflow/spec", &config)?;
         Ok(self)
     }
 
@@ -382,8 +409,12 @@ impl SystemConfigBuilder {
 
     pub async fn add_repo_service(&mut self) -> Result<&mut Self> {
         let service_doc = generate_repo_service_doc();
-        let config =
+        let mut config =
             build_kernel_service_spec(REPO_SERVICE_UNIQUE_ID, 4000, 1, service_doc).await?;
+        config.install_config.rdb_instances.insert(
+            buckyos_api::REPO_SERVICE_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::repo_service_default_rdb_instance_config(),
+        );
         self.insert_json("services/repo-service/spec", &config)?;
 
         let settings = RepoServiceSettings {
@@ -547,7 +578,7 @@ fn default_jarvis_agent_doc(config: &StartConfigSummary) -> Value {
 
 fn build_default_jarvis_agent_spec(config: &StartConfigSummary) -> Result<AppServiceSpec> {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    const JARVIS_APP_ID: &str = "jarvis";
+    const JARVIS_APP_ID: &str = "buckyos_jarvis";
     const JARVIS_PKG_NAME: &str = "buckyos_jarvis";
 
     let owner_did = DID::from_str("did:bns:buckyos")?;
@@ -670,12 +701,14 @@ fn build_aicc_settings(config: &StartConfigSummary) -> Value {
 
 fn build_aicc_settings_with_sn_models(
     config: &StartConfigSummary,
-    sn_openai_models: Option<&[String]>,
+    sn_ai_provider_models: Option<&[String]>,
 ) -> Value {
     const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 600_000;
     let mut settings = serde_json::Map::new();
     let mut openai_alias_map = serde_json::Map::new();
     let mut openai_instances = Vec::<Value>::new();
+    let mut sn_ai_provider_alias_map = serde_json::Map::new();
+    let mut sn_ai_provider_instances = Vec::<Value>::new();
     let openai_api_token =
         trim_to_option(config.ai_provider_config.openai_api_token.as_str()).unwrap_or_default();
 
@@ -696,36 +729,31 @@ fn build_aicc_settings_with_sn_models(
     }
 
     if config.llm_router_enabled() {
-        let sn_model_settings = build_sn_openai_model_settings(sn_openai_models);
-        if !openai_alias_map.contains_key("llm.default") {
-            openai_alias_map.insert(
+        let sn_model_settings = build_sn_ai_provider_model_settings(sn_ai_provider_models);
+        if !sn_ai_provider_alias_map.contains_key("llm.default") {
+            sn_ai_provider_alias_map.insert(
                 "llm.default".to_string(),
                 json!(sn_model_settings.default_model.as_str()),
             );
         }
-        if !openai_alias_map.contains_key("llm.chat.default") {
-            openai_alias_map.insert(
-                "llm.chat.default".to_string(),
-                json!(sn_model_settings.default_model.as_str()),
-            );
-        }
-        if !openai_alias_map.contains_key("llm.plan.default") {
-            openai_alias_map.insert(
+        if !sn_ai_provider_alias_map.contains_key("llm.plan.default") {
+            sn_ai_provider_alias_map.insert(
                 "llm.plan.default".to_string(),
                 json!(sn_model_settings.plan_default_model.as_str()),
             );
         }
-        if !openai_alias_map.contains_key("llm.code.default") {
-            openai_alias_map.insert(
+        if !sn_ai_provider_alias_map.contains_key("llm.code.default") {
+            sn_ai_provider_alias_map.insert(
                 "llm.code.default".to_string(),
                 json!(sn_model_settings.default_model.as_str()),
             );
         }
 
-        openai_instances.push(json!({
-            "instance_id": "sn-openai-default",
-            "provider_type": "sn-openai",
-            "base_url": SN_OPENAI_RESPONSES_API,
+        sn_ai_provider_instances.push(json!({
+            "provider_instance_name": "sn-ai-provider-default",
+            "provider_type": "cloud_api",
+            "provider_driver": "sn-ai-provider",
+            "base_url": SN_AI_PROVIDER_RESPONSES_API,
             "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
             "models": sn_model_settings.models,
             "default_model": sn_model_settings.default_model,
@@ -744,6 +772,18 @@ fn build_aicc_settings_with_sn_models(
                 "api_token": openai_api_token,
                 "alias_map": Value::Object(openai_alias_map),
                 "instances": openai_instances
+            }),
+        );
+    }
+
+    if !sn_ai_provider_instances.is_empty() {
+        settings.insert(
+            "sn-ai-provider".to_string(),
+            json!({
+                "enabled": true,
+                "api_token": "",
+                "alias_map": Value::Object(sn_ai_provider_alias_map),
+                "instances": sn_ai_provider_instances
             }),
         );
     }
@@ -816,7 +856,7 @@ fn build_aicc_settings_with_sn_models(
 }
 
 #[derive(Debug)]
-struct SnOpenAIModelSettings {
+struct SnAIProviderModelSettings {
     models: Vec<String>,
     default_model: String,
     plan_default_model: String,
@@ -824,8 +864,10 @@ struct SnOpenAIModelSettings {
     default_image_model: String,
 }
 
-fn build_sn_openai_model_settings(sn_openai_models: Option<&[String]>) -> SnOpenAIModelSettings {
-    let mut models = sn_openai_models
+fn build_sn_ai_provider_model_settings(
+    sn_ai_provider_models: Option<&[String]>,
+) -> SnAIProviderModelSettings {
+    let mut models = sn_ai_provider_models
         .unwrap_or(&[])
         .iter()
         .map(|item| item.trim())
@@ -833,7 +875,7 @@ fn build_sn_openai_model_settings(sn_openai_models: Option<&[String]>) -> SnOpen
         .map(|item| item.to_string())
         .collect::<Vec<_>>();
     if models.is_empty() {
-        models = DEFAULT_SN_OPENAI_MODELS
+        models = DEFAULT_SN_AI_PROVIDER_MODELS
             .iter()
             .map(|item| item.to_string())
             .collect::<Vec<_>>();
@@ -850,7 +892,7 @@ fn build_sn_openai_model_settings(sn_openai_models: Option<&[String]>) -> SnOpen
         .cloned()
         .collect::<Vec<_>>();
     if image_models.is_empty() {
-        image_models = DEFAULT_SN_OPENAI_IMAGE_MODELS
+        image_models = DEFAULT_SN_AI_PROVIDER_IMAGE_MODELS
             .iter()
             .map(|item| item.to_string())
             .collect::<Vec<_>>();
@@ -859,7 +901,7 @@ fn build_sn_openai_model_settings(sn_openai_models: Option<&[String]>) -> SnOpen
         pick_preferred_model(image_models.as_slice(), &["dall-e-3", "gpt-image-1"])
             .unwrap_or_else(|| image_models[0].clone());
 
-    SnOpenAIModelSettings {
+    SnAIProviderModelSettings {
         models,
         default_model,
         plan_default_model,
@@ -885,24 +927,24 @@ fn is_image_model(model_id: &str) -> bool {
         || value.contains("vision")
 }
 
-async fn fetch_sn_openai_models(user_name: &str) -> Option<Vec<String>> {
-    match fetch_sn_openai_models_impl(user_name).await {
+async fn fetch_sn_ai_provider_models(user_name: &str) -> Option<Vec<String>> {
+    match fetch_sn_ai_provider_models_impl(user_name).await {
         Ok(models) => Some(models),
         Err(err) => {
             warn!(
-                "fetch sn-openai models from {} failed: {}",
-                SN_OPENAI_MODELS_API, err
+                "fetch sn-ai-provider models from {} failed: {}",
+                SN_AI_PROVIDER_MODELS_API, err
             );
             None
         }
     }
 }
 
-async fn fetch_sn_openai_models_impl(user_name: &str) -> Result<Vec<String>> {
+async fn fetch_sn_ai_provider_models_impl(user_name: &str) -> Result<Vec<String>> {
     let token = build_device_jwt_token_for_sn(user_name)?;
     let client = Client::new();
     let response = client
-        .get(SN_OPENAI_MODELS_API)
+        .get(SN_AI_PROVIDER_MODELS_API)
         .bearer_auth(token)
         .send()
         .await
@@ -915,7 +957,10 @@ async fn fetch_sn_openai_models_impl(user_name: &str) -> Result<Vec<String>> {
         .text()
         .await
         .map_err(|err| anyhow!("failed to read models response body: {}", err))?;
-    info!("sn-openai models endpoint raw response: {}", response_text);
+    info!(
+        "sn-ai-provider models endpoint raw response: {}",
+        response_text
+    );
     let body: Value = serde_json::from_str(response_text.as_str())
         .map_err(|err| anyhow!("invalid models response json: {}", err))?;
     let models = extract_model_ids_from_response(&body);
@@ -923,7 +968,11 @@ async fn fetch_sn_openai_models_impl(user_name: &str) -> Result<Vec<String>> {
         return Err(anyhow!("models response does not contain model ids"));
     }
 
-    info!("fetched {} sn-openai models: {:?}", models.len(), models);
+    info!(
+        "fetched {} sn-ai-provider models: {:?}",
+        models.len(),
+        models
+    );
     Ok(models)
 }
 
@@ -1034,6 +1083,7 @@ fn build_msg_center_settings(config: &StartConfigSummary) -> Result<Value> {
         "telegram_tunnel": {
             "enabled": true,
             "tunnel_did": tunnel_did,
+            "tunnel_id": "tg-main",
             "supports_ingress": true,
             "supports_egress": true,
             "gateway": {
@@ -1332,24 +1382,31 @@ mod tests {
 
         let settings = build_aicc_settings(&summary);
 
-        assert_eq!(settings["openai"]["enabled"], true);
+        assert_eq!(settings["sn-ai-provider"]["enabled"], true);
         assert_eq!(
-            settings["openai"]["instances"][0]["instance_id"],
-            "sn-openai-default"
+            settings["sn-ai-provider"]["instances"][0]["provider_instance_name"],
+            "sn-ai-provider-default"
         );
         assert_eq!(
-            settings["openai"]["instances"][0]["provider_type"],
-            "sn-openai"
+            settings["sn-ai-provider"]["instances"][0]["provider_type"],
+            "cloud_api"
         );
         assert_eq!(
-            settings["openai"]["instances"][0]["base_url"],
+            settings["sn-ai-provider"]["instances"][0]["provider_driver"],
+            "sn-ai-provider"
+        );
+        assert_eq!(
+            settings["sn-ai-provider"]["instances"][0]["base_url"],
             "https://sn.buckyos.ai/api/v1/ai/"
         );
         assert_eq!(
-            settings["openai"]["instances"][0]["auth_mode"],
+            settings["sn-ai-provider"]["instances"][0]["auth_mode"],
             "device_jwt"
         );
-        assert_eq!(settings["openai"]["alias_map"]["llm.plan.default"], "gpt-5.4");
+        assert_eq!(
+            settings["sn-ai-provider"]["alias_map"]["llm.plan.default"],
+            "gpt-5.4"
+        );
     }
 
     #[test]
@@ -1372,10 +1429,10 @@ mod tests {
         let settings = build_aicc_settings(&summary);
 
         assert_eq!(summary.llm_router_enabled(), true);
-        assert_eq!(settings["openai"]["enabled"], true);
+        assert_eq!(settings["sn-ai-provider"]["enabled"], true);
         assert_eq!(
-            settings["openai"]["instances"][0]["instance_id"],
-            "sn-openai-default"
+            settings["sn-ai-provider"]["instances"][0]["provider_instance_name"],
+            "sn-ai-provider-default"
         );
     }
 
@@ -1419,11 +1476,11 @@ mod tests {
         let settings = build_aicc_settings_with_sn_models(&summary, Some(sn_models.as_slice()));
 
         assert_eq!(
-            settings["openai"]["instances"][0]["models"],
+            settings["sn-ai-provider"]["instances"][0]["models"],
             json!(["gpt-5", "gpt-5-mini", "gpt-image-1"])
         );
         assert_eq!(
-            settings["openai"]["instances"][0]["default_image_model"],
+            settings["sn-ai-provider"]["instances"][0]["default_image_model"],
             "gpt-image-1"
         );
     }
@@ -1513,7 +1570,7 @@ mod tests {
         assert_eq!(spec.user_id, "alice");
         assert_eq!(spec.app_doc.get_app_type(), buckyos_api::AppType::Agent);
         assert_eq!(spec.app_doc.show_name, "Jarvis");
-        assert_eq!(spec.app_doc.name, "jarvis");
+        assert_eq!(spec.app_doc.name, "buckyos_jarvis");
         assert_eq!(
             spec.app_doc.install_config_tips.service_ports.get("www"),
             Some(&OPENDAN_SERVICE_PORT)
@@ -1550,13 +1607,13 @@ mod tests {
 
         let entries = builder.build();
         let spec = entries
-            .get("users/alice/agents/jarvis/spec")
+            .get("users/alice/agents/buckyos_jarvis/spec")
             .expect("jarvis spec should exist");
         let spec: buckyos_api::AppServiceSpec =
             serde_json::from_str(spec).expect("parse jarvis spec");
 
         assert_eq!(spec.user_id, "alice");
-        assert_eq!(spec.app_doc.name, "jarvis");
+        assert_eq!(spec.app_doc.name, "buckyos_jarvis");
         assert_eq!(
             spec.app_doc.install_config_tips.service_ports.get("www"),
             Some(&OPENDAN_SERVICE_PORT)
@@ -1588,15 +1645,15 @@ mod tests {
 
         let mut entries = HashMap::new();
         entries.insert(
-            "users/alice/apps/jarvis/spec".to_string(),
+            "users/alice/apps/buckyos_jarvis/spec".to_string(),
             json!({
                 "app_doc": {
-                    "name": "jarvis",
+                    "name": "buckyos_jarvis",
                     "show_name": "Jarvis",
                     "categories": ["dapp"],
                     "pkg_list": {
                         "amd64_docker_image": {
-                            "pkg_id": "jarvis#0.1.0"
+                            "pkg_id": "buckyos_jarvis#0.1.0"
                         }
                     },
                     "service_dock": {},
@@ -1630,11 +1687,11 @@ mod tests {
 
         let entries = builder.build();
         assert!(
-            !entries.contains_key("users/alice/apps/jarvis/spec"),
+            !entries.contains_key("users/alice/apps/buckyos_jarvis/spec"),
             "legacy app spec should be removed"
         );
         assert!(
-            entries.contains_key("users/alice/agents/jarvis/spec"),
+            entries.contains_key("users/alice/agents/buckyos_jarvis/spec"),
             "agent spec should exist"
         );
     }

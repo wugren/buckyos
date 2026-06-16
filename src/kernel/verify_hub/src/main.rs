@@ -24,14 +24,14 @@ const SESSION_TOKEN_EXPIRE_SECONDS: u64 = 15 * 60; // 15 minutes
                                                    // Refresh token: long-lived, used to obtain new token pairs
 const REFRESH_TOKEN_EXPIRE_SECONDS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_LOGIN_NONCE_AGE_SECONDS: u64 = 3600 * 8; // 8 hours
-use bytes::Bytes;
-use cyfs_gateway_lib::{
+use buckyos_http_server::*;
+use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
     StreamInfo,
 };
+use bytes::Bytes;
 use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
-use server_runner::*;
 
 type Result<T> = std::result::Result<T, RPCErrors>;
 
@@ -78,6 +78,7 @@ async fn generate_session_token(
     jti: u64,
     session: u64,
     duration: u64,
+    aud: Option<String>,
 ) -> Result<RPCSessionToken> {
     let now = buckyos_get_unix_timestamp();
     let exp = now + duration;
@@ -86,7 +87,7 @@ async fn generate_session_token(
         token_type: RPCSessionTokenType::Normal,
         appid: Some(appid.to_string()),
         jti: Some(jti.to_string()),
-        aud: Some(appid.to_string()),
+        aud: aud,
         sub: Some(userid.to_string()),
         token: None,
         session: Some(session),
@@ -163,6 +164,7 @@ async fn generate_token_pair(
         session_jti,
         session_id,
         SESSION_TOKEN_EXPIRE_SECONDS,
+        None,
     )
     .await?;
 
@@ -221,6 +223,70 @@ async fn load_refresh_token_from_cache(key: &str) -> Option<RPCSessionToken> {
 /// Called when a refresh token is used to ensure it cannot be reused
 async fn invalidate_refresh_token(key: &str) {
     REFRESH_TOKEN_CACHE.lock().await.remove(key);
+}
+
+async fn validate_active_refresh_token(refresh_jwt: &str) -> Result<(RPCSessionToken, String)> {
+    let jwt_payload = verify_verify_hub_jwt(refresh_jwt, None).await?;
+
+    let rpc_session_token: RPCSessionToken =
+        serde_json::from_value(jwt_payload).map_err(|error| {
+            error!(
+                "Failed to parse RPCSessionToken from JWT payload: {}",
+                error
+            );
+            RPCErrors::ReasonError("Failed to parse RPCSessionToken from JWT payload".to_string())
+        })?;
+
+    let userid = rpc_session_token
+        .sub
+        .clone()
+        .ok_or(RPCErrors::ReasonError("Missing sub".to_string()))?;
+    let appid = rpc_session_token
+        .appid
+        .clone()
+        .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
+    let session_id = rpc_session_token
+        .session
+        .ok_or(RPCErrors::ReasonError("Missing session".to_string()))?;
+    let session_key = format!("{}_{}_{}", userid, appid, session_id);
+    let refresh_jti = rpc_session_token
+        .jti
+        .clone()
+        .ok_or(RPCErrors::ReasonError("Missing jti".to_string()))?;
+
+    let cached_refresh = load_refresh_token_from_cache(session_key.as_str()).await;
+    if cached_refresh.is_none() {
+        warn!(
+            "Refresh token not found in cache for session: {}",
+            session_key
+        );
+        warn!(
+            "Refresh reuse detected (cache-miss), revoking session: {}",
+            session_key
+        );
+        revoke_session_tokens(session_key.as_str()).await;
+        return Err(RPCErrors::ReasonError(
+            "Refresh token not found or already invalidated".to_string(),
+        ));
+    }
+
+    let cached_refresh = cached_refresh.unwrap();
+    if cached_refresh.jti.as_deref() != Some(refresh_jti.as_str()) {
+        warn!(
+            "Invalid refresh token jti. Expected: {:?}, Got: {:?}",
+            cached_refresh.jti, rpc_session_token.jti
+        );
+        warn!(
+            "Refresh reuse detected (jti-mismatch), revoking session: {}",
+            session_key
+        );
+        revoke_session_tokens(session_key.as_str()).await;
+        return Err(RPCErrors::ReasonError(
+            "Invalid refresh token jti".to_string(),
+        ));
+    }
+
+    Ok((rpc_session_token, session_key))
 }
 
 async fn get_my_krpc_token() -> Result<RPCSessionToken> {
@@ -379,29 +445,48 @@ async fn load_trust_public_key_from_source(iss: &str) -> Result<DecodingKey> {
         result_key = owner_auth_key.0;
         info!("load owner public key from zone config");
     } else {
-        //load device config from system config service(not from name-lib)
         let system_config_client = get_system_config_client().await?;
         let control_panel_client = ControlPanelClient::new(system_config_client);
-        let device_config = control_panel_client.get_device_config(iss).await;
-        if device_config.is_err() {
-            warn!(
-                "load device {} config from system config service failed",
-                iss
-            );
-            return Err(RPCErrors::ReasonError(
-                "Device config not found".to_string(),
-            ));
+        match control_panel_client.get_user_config(iss).await {
+            Ok(user_config) => {
+                let owner_key = user_config.get_default_key().ok_or(RPCErrors::ReasonError(
+                    "User public key not found".to_string(),
+                ))?;
+                result_key = DecodingKey::from_jwk(&owner_key)
+                    .map_err(|err| RPCErrors::ReasonError(err.to_string()))?;
+                info!("load user public key from system config for iss={}", iss);
+            }
+            Err(RPCErrors::KeyNotExist(_)) => {
+                //load device config from system config service(not from name-lib)
+                let device_config = control_panel_client.get_device_config(iss).await;
+                if device_config.is_err() {
+                    warn!(
+                        "load user/device {} config from system config service failed",
+                        iss
+                    );
+                    return Err(RPCErrors::ReasonError(
+                        "User or device config not found".to_string(),
+                    ));
+                }
+                let device_config = device_config.unwrap();
+                let result_device_key =
+                    device_config
+                        .get_auth_key(None)
+                        .ok_or(RPCErrors::ReasonError(
+                            "Device public key not found".to_string(),
+                        ))?;
+                result_key = result_device_key.0;
+                info!("load device public key from system config for iss={}", iss);
+            }
+            Err(err) => {
+                warn!(
+                    "load user {} doc from system config service failed: {}",
+                    iss, err
+                );
+                return Err(err);
+            }
         }
-        let device_config = device_config.unwrap();
-        let result_device_key = device_config
-            .get_auth_key(None)
-            .ok_or(RPCErrors::ReasonError(
-                "Device public key not found".to_string(),
-            ))?;
-        result_key = result_device_key.0;
     }
-
-    //TODO: jwt iss by user is SUDO login, need to add new verify method for sudo login
 
     cache_trustkey(iss, result_key.clone()).await;
     Ok(result_key)
@@ -622,73 +707,20 @@ impl VerifyHubApiHandler for VerifyHubServer {
 
     async fn handle_refresh_token(&self, refresh_jwt: &str) -> Result<TokenPair> {
         gc_token_caches().await;
-
-        // Step 1: Verify the refresh token JWT
-        // Refresh token must be verified by verify-hub key
-        let jwt_payload = verify_verify_hub_jwt(refresh_jwt, None).await?;
-
-        let rpc_session_token: RPCSessionToken =
-            serde_json::from_value(jwt_payload).map_err(|error| {
-                error!(
-                    "Failed to parse RPCSessionToken from JWT payload: {}",
-                    error
-                );
-                RPCErrors::ReasonError(
-                    "Failed to parse RPCSessionToken from JWT payload".to_string(),
-                )
-            })?;
-
+        let (rpc_session_token, session_key) = validate_active_refresh_token(refresh_jwt).await?;
         let userid = rpc_session_token
             .sub
+            .clone()
             .ok_or(RPCErrors::ReasonError("Missing sub".to_string()))?;
         let appid = rpc_session_token
             .appid
+            .clone()
             .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
         let session_id = rpc_session_token
             .session
             .ok_or(RPCErrors::ReasonError("Missing session".to_string()))?;
-        let session_key = format!("{}_{}_{}", userid, appid, session_id);
-        if rpc_session_token.jti.is_none() {
-            return Err(RPCErrors::ReasonError("Missing jti".to_string()));
-        }
 
         info!("Handle refresh token request for session: {}", session_key);
-
-        // Step 4: Validate the refresh token exists in cache
-        // This ensures the refresh token hasn't been invalidated
-        let cached_refresh = load_refresh_token_from_cache(session_key.as_str()).await;
-        if cached_refresh.is_none() {
-            warn!(
-                "Refresh token not found in cache for session: {}",
-                session_key
-            );
-            warn!(
-                "Refresh reuse detected (cache-miss), revoking session: {}",
-                session_key
-            );
-            revoke_session_tokens(session_key.as_str()).await;
-            return Err(RPCErrors::ReasonError(
-                "Refresh token not found or already invalidated".to_string(),
-            ));
-        }
-
-        // Step 5: Verify the jti matches the cached refresh token
-        // This prevents replay attacks with old refresh tokens
-        let old_refresh: RPCSessionToken = cached_refresh.unwrap();
-        if old_refresh.jti != rpc_session_token.jti {
-            warn!(
-                "Invalid refresh token jti. Expected: {:?}, Got: {:?}",
-                old_refresh.jti, rpc_session_token.jti
-            );
-            warn!(
-                "Refresh reuse detected (jti-mismatch), revoking session: {}",
-                session_key
-            );
-            revoke_session_tokens(session_key.as_str()).await;
-            return Err(RPCErrors::ReasonError(
-                "Invalid refresh token jti".to_string(),
-            ));
-        }
 
         // Step 7: IMPORTANT - Invalidate the old refresh token immediately
         // This ensures the old refresh token cannot be reused (one-time use)
@@ -711,6 +743,17 @@ impl VerifyHubApiHandler for VerifyHubServer {
             session_token: token_pair.session_token,
             refresh_token: token_pair.refresh_token,
         })
+    }
+
+    async fn handle_logout(&self, refresh_jwt: &str) -> Result<bool> {
+        gc_token_caches().await;
+        let (_rpc_session_token, session_key) = validate_active_refresh_token(refresh_jwt).await?;
+
+        info!("Handle logout request for session: {}", session_key);
+        revoke_session_tokens(session_key.as_str()).await;
+        info!("Logout successful for session: {}", session_key);
+
+        Ok(true)
     }
 
     async fn handle_login_by_password(
@@ -812,13 +855,38 @@ impl VerifyHubApiHandler for VerifyHubServer {
         appid: Option<String>,
     ) -> Result<bool> {
         gc_token_caches().await;
-        let expected_audience = appid.as_deref();
         let first_dot = session_token.find('.');
         if first_dot.is_none() {
             //this is not a jwt token, use token-store to verify
             return Err(RPCErrors::InvalidToken("not a jwt token".to_string()));
         } else {
-            let _json_body = verify_verify_hub_jwt(session_token, expected_audience).await?;
+            let json_body = verify_verify_hub_jwt(session_token, None).await?;
+            let rpc_session_token: RPCSessionToken =
+                serde_json::from_value(json_body).map_err(|error| {
+                    error!(
+                        "Failed to parse RPCSessionToken from JWT payload: {}",
+                        error
+                    );
+                    RPCErrors::ReasonError(
+                        "Failed to parse RPCSessionToken from JWT payload".to_string(),
+                    )
+                })?;
+
+            if rpc_session_token.aud.as_deref() == Some(VERIFY_HUB_UNIQUE_ID) {
+                return Err(RPCErrors::InvalidToken(
+                    "refresh token cannot be used as session token".to_string(),
+                ));
+            }
+
+            if let Some(expected_appid) = appid {
+                let token_appid = rpc_session_token
+                    .appid
+                    .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
+                if token_appid != expected_appid {
+                    return Err(RPCErrors::InvalidToken("appid mismatch".to_string()));
+                }
+            }
+
             Ok(true)
         }
     }
@@ -1180,10 +1248,24 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
         println!("New session token verified successfully!");
 
         // ============================================================
-        // Test 5: Try to reuse old refresh token (should fail)
+        // Test 5: Logout using the current refresh token
+        // Expected: Logout succeeds and the refresh token becomes unusable
+        // ============================================================
+        println!("\n=== Test 5: Logout using refresh token ===");
+
+        let logout_result = handler
+            .handle_logout(new_token_pair.refresh_token.as_str())
+            .await;
+
+        assert!(logout_result.is_ok(), "Logout should succeed");
+        assert!(logout_result.unwrap(), "Logout should return true");
+        println!("Logout successful!");
+
+        // ============================================================
+        // Test 6: Reuse old refresh token from before refresh (should fail)
         // Expected: Old refresh token is invalidated, reuse should fail
         // ============================================================
-        println!("\n=== Test 5: Reuse old refresh token (should fail) ===");
+        println!("\n=== Test 6: Reuse old refresh token (should fail) ===");
 
         let reuse_result = handler
             .handle_refresh_token(token_pair.refresh_token.as_str())
@@ -1199,10 +1281,10 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
         );
 
         // ============================================================
-        // Test 6: Second refresh with new refresh token
-        // Expected: Should fail because reuse detection revokes the session
+        // Test 7: Refresh after logout with latest refresh token
+        // Expected: Should fail because logout revoked the session refresh token
         // ============================================================
-        println!("\n=== Test 6: Second refresh with new refresh token ===");
+        println!("\n=== Test 7: Refresh after logout (should fail) ===");
 
         let second_refresh_result = handler
             .handle_refresh_token(new_token_pair.refresh_token.as_str())
@@ -1210,18 +1292,18 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
 
         assert!(
             second_refresh_result.is_err(),
-            "Second refresh should fail after reuse detection"
+            "Refresh should fail after logout"
         );
         println!(
-            "Second refresh correctly rejected: {:?}",
+            "Refresh after logout correctly rejected: {:?}",
             second_refresh_result.err()
         );
 
         // ============================================================
-        // Test 7: Login with expired JWT (should fail)
+        // Test 8: Login with expired JWT (should fail)
         // Expected: Expired login JWT should be rejected
         // ============================================================
-        println!("\n=== Test 7: Login with expired JWT (should fail) ===");
+        println!("\n=== Test 8: Login with expired JWT (should fail) ===");
 
         let expired_nonce = rng.gen::<u64>();
         let expired_jwt = create_login_jwt(

@@ -1076,7 +1076,6 @@ def _prepare_common_build_root(
     rust_target: str | None = None,
     timings_dir: str | None = None,
 ) -> None:
-    python_exe = _python_executable()
     buckyos_root = target.build_root / "buckyos"
     buckycli_root = target.build_root / "buckycli"
 
@@ -1115,7 +1114,11 @@ def _prepare_common_build_root(
         dry_run=dry_run,
     )
     _ensure_executable(buckyos_root / "bin" / "stop_osx.sh", dry_run=dry_run)
-    _run_checked([python_exe, "make_config.py", "release", f"--rootfs={buckyos_root}"], cwd=SRC_DIR, dry_run=dry_run)
+    _run_checked(
+        ["deno", "task", "make_config", "release", "--rootfs", str(buckyos_root)],
+        cwd=SRC_DIR,
+        dry_run=dry_run,
+    )
 
     _stage_desktop_app(
         target,

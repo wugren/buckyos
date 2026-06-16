@@ -1,0 +1,549 @@
+use async_trait::async_trait;
+use buckyos_api::{
+    is_global_eventid, is_global_pattern, match_event_patterns, normalize_patterns,
+    validate_event_data_size, validate_eventid, validate_pattern, Event, KEventDaemonRequest,
+    KEventDaemonResponse, KEventError, KEventResult, SharedKEventRingBuffer,
+};
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::time::{timeout, Instant};
+
+pub const DEFAULT_DAEMON_READER_CAPACITY: usize = 1024;
+
+#[async_trait]
+pub trait KEventPeerPublisher: Send + Sync {
+    async fn broadcast(&self, event: &Event) -> KEventResult<()>;
+}
+
+#[derive(Clone)]
+pub struct KEventService {
+    source_node: String,
+    reader_capacity: usize,
+    readers: Arc<RwLock<HashMap<String, Arc<ServiceReaderState>>>>,
+    peers: Arc<RwLock<Vec<Arc<dyn KEventPeerPublisher>>>>,
+    shared_ring: Arc<RwLock<Option<Arc<SharedKEventRingBuffer>>>>,
+}
+
+struct ServiceReaderState {
+    patterns: StdRwLock<Vec<String>>,
+    queue: Mutex<VecDeque<Event>>,
+    notify: Notify,
+    capacity: usize,
+}
+
+impl ServiceReaderState {
+    fn new(patterns: Vec<String>, capacity: usize) -> Self {
+        Self {
+            patterns: StdRwLock::new(patterns),
+            queue: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            capacity,
+        }
+    }
+
+    fn matches(&self, eventid: &str) -> bool {
+        let patterns = self.patterns.read().expect("patterns lock poisoned");
+        match_event_patterns(&patterns, eventid)
+    }
+
+    async fn push(&self, event: Event) {
+        let mut queue = self.queue.lock().await;
+        if queue.len() >= self.capacity {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+        drop(queue);
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> Option<Event> {
+        let mut queue = self.queue.lock().await;
+        queue.pop_front()
+    }
+}
+
+impl KEventService {
+    pub fn new(source_node: impl Into<String>) -> Self {
+        Self::new_with_capacity(source_node, DEFAULT_DAEMON_READER_CAPACITY)
+    }
+
+    pub fn new_with_capacity(source_node: impl Into<String>, reader_capacity: usize) -> Self {
+        Self {
+            source_node: source_node.into(),
+            reader_capacity: reader_capacity.max(1),
+            readers: Arc::new(RwLock::new(HashMap::new())),
+            peers: Arc::new(RwLock::new(Vec::new())),
+            shared_ring: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn source_node(&self) -> &str {
+        &self.source_node
+    }
+
+    pub async fn add_peer_publisher(&self, peer: Arc<dyn KEventPeerPublisher>) {
+        self.peers.write().await.push(peer);
+    }
+
+    pub async fn set_shared_ring(&self, shared_ring: Arc<SharedKEventRingBuffer>) {
+        *self.shared_ring.write().await = Some(shared_ring);
+    }
+
+    pub async fn register_reader(
+        &self,
+        reader_id: &str,
+        patterns: Vec<String>,
+    ) -> KEventResult<()> {
+        if reader_id.is_empty() {
+            return Err(KEventError::InvalidPattern(
+                "reader_id must not be empty".to_string(),
+            ));
+        }
+        if patterns.is_empty() {
+            return Err(KEventError::InvalidPattern(
+                "patterns must not be empty".to_string(),
+            ));
+        }
+        for pattern in &patterns {
+            validate_pattern(pattern)?;
+            if !is_global_pattern(pattern) {
+                return Err(KEventError::InvalidPattern(
+                    "daemon only supports global patterns".to_string(),
+                ));
+            }
+        }
+
+        let normalized = normalize_patterns(patterns);
+        let mut readers = self.readers.write().await;
+        if let Some(existing) = readers.get(reader_id) {
+            // Preserve queue / notify across re-register; just swap patterns.
+            *existing.patterns.write().expect("patterns lock poisoned") = normalized;
+        } else {
+            readers.insert(
+                reader_id.to_string(),
+                Arc::new(ServiceReaderState::new(normalized, self.reader_capacity)),
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn unregister_reader(&self, reader_id: &str) {
+        self.readers.write().await.remove(reader_id);
+    }
+
+    pub async fn update_reader(
+        &self,
+        reader_id: &str,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> KEventResult<()> {
+        if reader_id.is_empty() {
+            return Err(KEventError::InvalidPattern(
+                "reader_id must not be empty".to_string(),
+            ));
+        }
+        for pattern in add.iter().chain(remove.iter()) {
+            validate_pattern(pattern)?;
+            if !is_global_pattern(pattern) {
+                return Err(KEventError::InvalidPattern(
+                    "daemon only supports global patterns".to_string(),
+                ));
+            }
+        }
+
+        let reader = {
+            let readers = self.readers.read().await;
+            readers.get(reader_id).cloned()
+        };
+        let Some(reader) = reader else {
+            return Err(KEventError::ReaderClosed(reader_id.to_string()));
+        };
+
+        let mut patterns = reader.patterns.write().expect("patterns lock poisoned");
+        let mut next: Vec<String> = patterns
+            .iter()
+            .filter(|p| !remove.iter().any(|r| r == *p))
+            .cloned()
+            .collect();
+        if !add.is_empty() {
+            next.extend(add);
+            next = normalize_patterns(next);
+        }
+        if next.is_empty() {
+            return Err(KEventError::InvalidPattern(
+                "reader must keep at least one pattern".to_string(),
+            ));
+        }
+        *patterns = next;
+        Ok(())
+    }
+
+    pub async fn publish_local_global(&self, eventid: &str, data: Value) -> KEventResult<()> {
+        if !is_global_eventid(eventid) {
+            return Err(KEventError::InvalidEventId(
+                "daemon only accepts global eventid".to_string(),
+            ));
+        }
+        validate_eventid(eventid)?;
+        validate_event_data_size(&data)?;
+
+        let event = Event {
+            eventid: eventid.to_string(),
+            source_node: self.source_node.clone(),
+            source_pid: std::process::id(),
+            ingress_node: Some(self.source_node.clone()),
+            timestamp: now_millis(),
+            data,
+        };
+        // Mirror to shared ring so other local processes (full-mode SDK
+        // readers that mmap the region) observe daemon-originated events
+        // via the same fast path as peer/http-originated events.
+        self.mirror_to_shared_ring(&event).await?;
+        self.distribute(&event).await;
+        if should_broadcast_to_peers(&event, &self.source_node) {
+            self.broadcast_to_peers(&event).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn publish_http_global(&self, eventid: &str, data: Value) -> KEventResult<()> {
+        let event = Event {
+            eventid: eventid.to_string(),
+            source_node: self.source_node.clone(),
+            source_pid: std::process::id(),
+            ingress_node: Some(self.source_node.clone()),
+            timestamp: now_millis(),
+            data,
+        };
+        self.accept_external_global(event).await
+    }
+
+    pub async fn publish_external_global(&self, mut event: Event) -> KEventResult<()> {
+        if !is_global_eventid(&event.eventid) {
+            return Err(KEventError::InvalidEventId(
+                "daemon only accepts global eventid".to_string(),
+            ));
+        }
+        validate_eventid(&event.eventid)?;
+        validate_event_data_size(&event.data)?;
+        if event.ingress_node.is_none() {
+            event.ingress_node = Some(self.source_node.clone());
+        }
+        self.distribute(&event).await;
+        if should_broadcast_to_peers(&event, &self.source_node) {
+            self.broadcast_to_peers(&event).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn accept_external_global(&self, mut event: Event) -> KEventResult<()> {
+        if !is_global_eventid(&event.eventid) {
+            return Err(KEventError::InvalidEventId(
+                "daemon only accepts global eventid".to_string(),
+            ));
+        }
+        validate_eventid(&event.eventid)?;
+        validate_event_data_size(&event.data)?;
+        event.ingress_node = Some(self.source_node.clone());
+        self.mirror_to_shared_ring(&event).await?;
+        self.distribute(&event).await;
+        if should_broadcast_to_peers(&event, &self.source_node) {
+            self.broadcast_to_peers(&event).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn publish_from_peer(&self, mut event: Event) -> KEventResult<()> {
+        if !is_global_eventid(&event.eventid) {
+            return Err(KEventError::InvalidEventId(
+                "peer event must be global eventid".to_string(),
+            ));
+        }
+        validate_eventid(&event.eventid)?;
+        validate_event_data_size(&event.data)?;
+        if event.ingress_node.is_none() {
+            event.ingress_node = Some(event.source_node.clone());
+        }
+        self.mirror_to_shared_ring(&event).await?;
+        self.distribute(&event).await;
+        Ok(())
+    }
+
+    pub async fn pull_event(
+        &self,
+        reader_id: &str,
+        timeout_ms: Option<u64>,
+    ) -> KEventResult<Option<Event>> {
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            let reader = {
+                let readers = self.readers.read().await;
+                readers.get(reader_id).cloned()
+            };
+
+            let Some(reader) = reader else {
+                return Ok(None);
+            };
+
+            if let Some(event) = reader.pop().await {
+                return Ok(Some(event));
+            }
+
+            if timeout_ms == Some(0) {
+                return Ok(None);
+            }
+
+            match deadline {
+                None => {
+                    reader.notify.notified().await;
+                }
+                Some(deadline_at) => {
+                    let now = Instant::now();
+                    if now >= deadline_at {
+                        return Ok(None);
+                    }
+                    let remain = deadline_at - now;
+                    if timeout(remain, reader.notify.notified()).await.is_err() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn handle_protocol_request(&self, req: KEventDaemonRequest) -> KEventDaemonResponse {
+        match req {
+            KEventDaemonRequest::RegisterReader {
+                reader_id,
+                patterns,
+            } => match self.register_reader(&reader_id, patterns).await {
+                Ok(_) => KEventDaemonResponse::Ok { event: None },
+                Err(err) => err_to_response(err),
+            },
+            KEventDaemonRequest::UnregisterReader { reader_id } => {
+                self.unregister_reader(&reader_id).await;
+                KEventDaemonResponse::Ok { event: None }
+            }
+            KEventDaemonRequest::UpdateReader {
+                reader_id,
+                add,
+                remove,
+            } => match self.update_reader(&reader_id, add, remove).await {
+                Ok(_) => KEventDaemonResponse::Ok { event: None },
+                Err(err) => err_to_response(err),
+            },
+            KEventDaemonRequest::PublishGlobal { event } => {
+                match self.accept_external_global(event).await {
+                    Ok(_) => KEventDaemonResponse::Ok { event: None },
+                    Err(err) => err_to_response(err),
+                }
+            }
+            KEventDaemonRequest::PullEvent {
+                reader_id,
+                timeout_ms,
+            } => match self.pull_event(&reader_id, timeout_ms).await {
+                Ok(event) => KEventDaemonResponse::Ok { event },
+                Err(err) => err_to_response(err),
+            },
+        }
+    }
+
+    async fn distribute(&self, event: &Event) {
+        let snapshot: Vec<Arc<ServiceReaderState>> =
+            self.readers.read().await.values().cloned().collect();
+        for reader in snapshot {
+            if reader.matches(&event.eventid) {
+                reader.push(event.clone()).await;
+            }
+        }
+    }
+
+    async fn broadcast_to_peers(&self, event: &Event) -> KEventResult<()> {
+        let peers = self.peers.read().await.clone();
+        let mut last_error: Option<KEventError> = None;
+        for peer in peers {
+            if let Err(err) = peer.broadcast(event).await {
+                last_error = Some(err);
+            }
+        }
+        match last_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    async fn mirror_to_shared_ring(&self, event: &Event) -> KEventResult<()> {
+        let shared_ring = self.shared_ring.read().await.clone();
+        let Some(shared_ring) = shared_ring else {
+            return Ok(());
+        };
+        shared_ring
+            .publish_event(event)
+            .map_err(KEventError::Internal)
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn err_to_response(err: KEventError) -> KEventDaemonResponse {
+    KEventDaemonResponse::Err {
+        code: err.code().to_string(),
+        message: err.to_string(),
+    }
+}
+
+fn should_broadcast_to_peers(event: &Event, local_node: &str) -> bool {
+    match &event.ingress_node {
+        Some(ingress_node) => ingress_node == local_node,
+        None => true,
+    }
+}
+
+pub fn protocol_ok() -> Value {
+    json!({ "status": "ok" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    fn init_test_ringbuffer_path() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let path = std::env::temp_dir().join(format!(
+                "kevent_service_ringbuffer_test_{}.shm",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            std::env::set_var("BUCKYOS_KEVENT_RINGBUFFER_PATH", &path);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_daemon_register_publish_pull() {
+        let service = KEventService::new("node_a");
+        service
+            .register_reader("r1", vec!["/taskmgr/**".to_string()])
+            .await
+            .unwrap();
+        service
+            .publish_local_global("/taskmgr/new/task_001", json!({"ok": true}))
+            .await
+            .unwrap();
+        let event = service.pull_event("r1", Some(100)).await.unwrap();
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().eventid, "/taskmgr/new/task_001");
+    }
+
+    #[tokio::test]
+    async fn test_protocol_request() {
+        let service = KEventService::new("node_a");
+        let resp = service
+            .handle_protocol_request(KEventDaemonRequest::RegisterReader {
+                reader_id: "r1".to_string(),
+                patterns: vec!["/system/**".to_string()],
+            })
+            .await;
+        assert!(matches!(resp, KEventDaemonResponse::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_update_reader_preserves_queue_and_changes_routing() {
+        let service = KEventService::new("node_a");
+        service
+            .register_reader("r1", vec!["/sys/node/online".to_string()])
+            .await
+            .unwrap();
+
+        // Publish an event matched by the original pattern; do NOT pull.
+        service
+            .publish_local_global("/sys/node/online", json!({"a": 1}))
+            .await
+            .unwrap();
+
+        // Add a broader pattern; the finer one should be swallowed by the
+        // daemon's normalize_patterns step.
+        service
+            .update_reader("r1", vec!["/sys/**".to_string()], vec![])
+            .await
+            .unwrap();
+
+        // Queued event must survive the patterns swap.
+        let ev = service.pull_event("r1", Some(20)).await.unwrap().unwrap();
+        assert_eq!(ev.eventid, "/sys/node/online");
+
+        // New events covered by the broader pattern now flow through.
+        service
+            .publish_local_global("/sys/foo/bar", json!({"a": 2}))
+            .await
+            .unwrap();
+        let ev = service.pull_event("r1", Some(50)).await.unwrap().unwrap();
+        assert_eq!(ev.eventid, "/sys/foo/bar");
+
+        // Remove the only remaining pattern → must error and not corrupt state.
+        let err = service
+            .update_reader("r1", vec![], vec!["/sys/**".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KEventError::InvalidPattern(_)));
+
+        // Reader should still route /sys/** events.
+        service
+            .publish_local_global("/sys/baz", json!({"a": 3}))
+            .await
+            .unwrap();
+        let ev = service.pull_event("r1", Some(50)).await.unwrap().unwrap();
+        assert_eq!(ev.eventid, "/sys/baz");
+    }
+
+    #[tokio::test]
+    async fn test_update_reader_unknown_id() {
+        let service = KEventService::new("node_a");
+        let err = service
+            .update_reader("ghost", vec!["/sys/**".to_string()], vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KEventError::ReaderClosed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_accept_external_global_mirrors_to_shared_ring() {
+        init_test_ringbuffer_path();
+        let consumer = SharedKEventRingBuffer::open().unwrap();
+        consumer.prime_cursors();
+
+        let service = KEventService::new("node_a");
+        service
+            .set_shared_ring(Arc::new(SharedKEventRingBuffer::open().unwrap()))
+            .await;
+
+        service
+            .accept_external_global(Event {
+                eventid: "/system/node/online".to_string(),
+                source_node: "light_client".to_string(),
+                source_pid: 7,
+                ingress_node: Some("light_client".to_string()),
+                timestamp: 1,
+                data: json!({ "ok": true }),
+            })
+            .await
+            .unwrap();
+
+        let events = consumer.drain_events::<Event>(8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ingress_node.as_deref(), Some("node_a"));
+        assert_eq!(events[0].source_node, "light_client");
+    }
+}

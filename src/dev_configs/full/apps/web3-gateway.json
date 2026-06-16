@@ -12,7 +12,7 @@
       "echo 'MAKE sure you already build the linux version of cyfs-gateway (result store in web3-gateway/)'"
     ],
     "build_all": [
-        "uv run ./make_config.py sn_server --sn_ip {{sn.ip}}"
+      "deno task make_sn_configs --rootfs /opt/web3-gateway --sn_ip {{sn.ip}}"
     ],
     "update":[
       "echo 'update web3-gateway'"

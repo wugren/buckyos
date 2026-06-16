@@ -1,5 +1,6 @@
 use ::kRPC::*;
 use async_trait::async_trait;
+use log::warn;
 use name_lib::DID;
 use ndn_lib::ObjId;
 
@@ -11,13 +12,142 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::rdb_mgr::{RdbBackend, RdbInstanceConfig};
 use crate::{AppDoc, AppType, SelectorType};
+use std::collections::HashMap;
 
 pub const TASK_MANAGER_SERVICE_UNIQUE_ID: &str = "task-manager";
 pub const TASK_MANAGER_SERVICE_NAME: &str = "task-manager";
 pub const TASK_MANAGER_SERVICE_PORT: u16 = 3380;
 
+/// Logical name of the task-manager rdb instance. Used by both the scheduler
+/// (when it writes the service's `install_config`) and the task-manager itself
+/// (when it calls `get_rdb_instance`).
+pub const TASK_MANAGER_RDB_INSTANCE_ID: &str = "task-mgr-main";
+/// Version of the task table schema. Bump whenever the DDL below changes in a
+/// way that is not trivially re-idempotent, so the scheduler can detect drift.
+pub const TASK_MANAGER_RDB_SCHEMA_VERSION: u64 = 5;
+
+/// Sqlite DDL for the task-manager database. `CREATE TABLE IF NOT EXISTS` so
+/// the migration is safe to re-run on every process start.
+pub const TASK_MANAGER_RDB_SCHEMA_SQLITE: &str = r#"
+CREATE TABLE IF NOT EXISTS task (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    task_type       TEXT NOT NULL,
+    runner          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL,
+    progress        REAL NOT NULL,
+    total_items     INTEGER NOT NULL DEFAULT 0,
+    completed_items INTEGER NOT NULL DEFAULT 0,
+    error_message   TEXT,
+    data            TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    user_id         TEXT NOT NULL DEFAULT '',
+    app_id          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    parent_id       INTEGER,
+    root_id         TEXT NOT NULL DEFAULT '',
+    permissions     TEXT,
+    message         TEXT,
+    FOREIGN KEY(parent_id) REFERENCES task(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
+CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runner_status ON task(runner, status);
+
+CREATE TABLE IF NOT EXISTS task_note (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    note_type       TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL DEFAULT '',
+    data            TEXT,
+    author_user_id  TEXT NOT NULL DEFAULT '',
+    author_app_id   TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES task(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_note_task_created ON task_note(task_id, created_at ASC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_task_note_author_created ON task_note(author_user_id, author_app_id, created_at DESC);
+"#;
+
+/// Postgres DDL for the task-manager database. Same logical schema as the
+/// sqlite variant; id uses BIGSERIAL so Postgres assigns it automatically.
+pub const TASK_MANAGER_RDB_SCHEMA_POSTGRES: &str = r#"
+CREATE TABLE IF NOT EXISTS task (
+    id              BIGSERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    task_type       TEXT NOT NULL,
+    runner          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL,
+    progress        REAL NOT NULL,
+    total_items     BIGINT NOT NULL DEFAULT 0,
+    completed_items BIGINT NOT NULL DEFAULT 0,
+    error_message   TEXT,
+    data            TEXT,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL,
+    user_id         TEXT NOT NULL DEFAULT '',
+    app_id          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    parent_id       BIGINT REFERENCES task(id) ON DELETE CASCADE,
+    root_id         TEXT NOT NULL DEFAULT '',
+    permissions     TEXT,
+    message         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_root_status ON task(root_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_parent ON task(parent_id);
+CREATE INDEX IF NOT EXISTS idx_task_app_created ON task(app_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_session_created ON task(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_status_created ON task(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_type_created ON task(task_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runner_status ON task(runner, status);
+
+CREATE TABLE IF NOT EXISTS task_note (
+    id              BIGSERIAL PRIMARY KEY,
+    task_id         BIGINT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+    note_type       TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL DEFAULT '',
+    data            TEXT,
+    author_user_id  TEXT NOT NULL DEFAULT '',
+    author_app_id   TEXT NOT NULL DEFAULT '',
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_note_task_created ON task_note(task_id, created_at ASC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_task_note_author_created ON task_note(author_user_id, author_app_id, created_at DESC);
+"#;
+
+/// Default rdb-instance config for the task-manager service. The scheduler
+/// drops this into `install_config.rdb_instances` when bootstrapping the
+/// service so `get_rdb_instance` can find it later.
+pub fn task_manager_default_rdb_instance_config() -> RdbInstanceConfig {
+    let mut schema = HashMap::new();
+    schema.insert(
+        RdbBackend::Sqlite,
+        TASK_MANAGER_RDB_SCHEMA_SQLITE.to_string(),
+    );
+    schema.insert(
+        RdbBackend::Postgres,
+        TASK_MANAGER_RDB_SCHEMA_POSTGRES.to_string(),
+    );
+    RdbInstanceConfig {
+        backend: RdbBackend::Sqlite,
+        version: TASK_MANAGER_RDB_SCHEMA_VERSION,
+        schema,
+        // Empty -> rdb_mgr generates `sqlite://$appdata/main.db` at resolve time.
+        connection: String::new(),
+    }
+}
+
 pub type TaskId = i64;
+pub type TaskNoteId = i64;
 
 pub fn generate_task_manager_service_doc() -> AppDoc {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -112,10 +242,12 @@ pub struct Task {
     pub id: i64,
     pub user_id: String,
     pub app_id: String,
+    pub session_id: String,
     pub parent_id: Option<i64>,
     pub root_id: String,
     pub name: String,
     pub task_type: String,
+    pub runner: String,
     pub status: TaskStatus,
     pub progress: f32,
     pub message: Option<String>,
@@ -125,11 +257,26 @@ pub struct Task {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNote {
+    pub id: TaskNoteId,
+    pub task_id: TaskId,
+    pub note_type: String,
+    pub content: String,
+    pub data: Value,
+    pub author_user_id: String,
+    pub author_app_id: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CreateTaskOptions {
     pub permissions: Option<TaskPermissions>,
     pub parent_id: Option<i64>,
     pub root_id: Option<String>,
+    pub session_id: Option<String>,
+    pub runner: Option<String>,
     pub priority: Option<u8>,
 }
 
@@ -145,7 +292,9 @@ impl CreateTaskOptions {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TaskFilter {
     pub app_id: Option<String>,
+    pub session_id: Option<String>,
     pub task_type: Option<String>,
+    pub runner: Option<String>,
     pub status: Option<TaskStatus>,
     pub parent_id: Option<i64>,
     pub root_id: Option<String>,
@@ -186,9 +335,22 @@ pub struct ListTasksResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTaskNoteResult {
+    pub note_id: TaskNoteId,
+    pub note: TaskNote,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTaskNotesResult {
+    pub notes: Vec<TaskNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskManagerCreateTaskReq {
     pub name: String,
     pub task_type: String,
+    #[serde(default)]
+    pub runner: String,
     #[serde(default)]
     pub data: Option<Value>,
     #[serde(default)]
@@ -204,6 +366,8 @@ pub struct TaskManagerCreateTaskReq {
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub app_name: Option<String>,
 }
 
@@ -211,6 +375,7 @@ impl TaskManagerCreateTaskReq {
     pub fn new(
         name: String,
         task_type: String,
+        runner: String,
         data: Option<Value>,
         permissions: Option<TaskPermissions>,
         parent_id: Option<i64>,
@@ -218,6 +383,7 @@ impl TaskManagerCreateTaskReq {
         priority: Option<u8>,
         user_id: String,
         app_id: String,
+        session_id: Option<String>,
     ) -> Self {
         let app_name = if app_id.is_empty() {
             None
@@ -227,6 +393,7 @@ impl TaskManagerCreateTaskReq {
         Self {
             name,
             task_type,
+            runner,
             data,
             permissions,
             parent_id,
@@ -234,6 +401,7 @@ impl TaskManagerCreateTaskReq {
             priority,
             user_id,
             app_id,
+            session_id,
             app_name,
         }
     }
@@ -259,11 +427,15 @@ pub struct TaskManagerCreateDownloadTaskReq {
     #[serde(default)]
     pub root_id: Option<String>,
     #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
     pub priority: Option<u8>,
     #[serde(default)]
     pub user_id: String,
     #[serde(default)]
     pub app_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub app_name: Option<String>,
 }
@@ -276,9 +448,11 @@ impl TaskManagerCreateDownloadTaskReq {
         parent_id: Option<i64>,
         permissions: Option<TaskPermissions>,
         root_id: Option<String>,
+        runner: Option<String>,
         priority: Option<u8>,
         user_id: String,
         app_id: String,
+        session_id: Option<String>,
     ) -> Self {
         let app_name = if app_id.is_empty() {
             None
@@ -292,9 +466,11 @@ impl TaskManagerCreateDownloadTaskReq {
             parent_id,
             permissions,
             root_id,
+            runner,
             priority,
             user_id,
             app_id,
+            session_id,
             app_name,
         }
     }
@@ -327,11 +503,90 @@ impl TaskManagerGetTaskReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskManagerAddTaskNoteReq {
+    pub task_id: i64,
+    #[serde(default)]
+    pub note_type: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub data: Option<Value>,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_app_id: Option<String>,
+}
+
+impl TaskManagerAddTaskNoteReq {
+    pub fn new(
+        task_id: i64,
+        note_type: Option<String>,
+        content: String,
+        data: Option<Value>,
+        source_user_id: Option<String>,
+        source_app_id: Option<String>,
+    ) -> Self {
+        Self {
+            task_id,
+            note_type,
+            content,
+            data,
+            source_user_id,
+            source_app_id,
+        }
+    }
+
+    pub fn from_json(value: Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TaskManagerAddTaskNoteReq: {}",
+                e
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskManagerListTaskNotesReq {
+    pub task_id: i64,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_app_id: Option<String>,
+}
+
+impl TaskManagerListTaskNotesReq {
+    pub fn new(
+        task_id: i64,
+        source_user_id: Option<String>,
+        source_app_id: Option<String>,
+    ) -> Self {
+        Self {
+            task_id,
+            source_user_id,
+            source_app_id,
+        }
+    }
+
+    pub fn from_json(value: Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TaskManagerListTaskNotesReq: {}",
+                e
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskManagerListTasksReq {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub task_type: Option<String>,
+    #[serde(default)]
+    pub runner: Option<String>,
     #[serde(default)]
     pub status: Option<TaskStatus>,
     #[serde(default)]
@@ -352,7 +607,9 @@ impl TaskManagerListTasksReq {
     ) -> Self {
         Self {
             app_id: filter.app_id,
+            session_id: filter.session_id,
             task_type: filter.task_type,
+            runner: filter.runner,
             status: filter.status,
             parent_id: filter.parent_id,
             root_id: filter.root_id,
@@ -373,6 +630,8 @@ pub struct TaskManagerListTasksByTimeRangeReq {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub task_type: Option<String>,
     #[serde(default)]
     pub source_user_id: Option<String>,
@@ -385,6 +644,7 @@ pub struct TaskManagerListTasksByTimeRangeReq {
 impl TaskManagerListTasksByTimeRangeReq {
     pub fn new(
         app_id: Option<String>,
+        session_id: Option<String>,
         task_type: Option<String>,
         source_user_id: Option<String>,
         source_app_id: Option<String>,
@@ -392,6 +652,7 @@ impl TaskManagerListTasksByTimeRangeReq {
     ) -> Self {
         Self {
             app_id,
+            session_id,
             task_type,
             source_user_id,
             source_app_id,
@@ -586,6 +847,43 @@ impl TaskManagerDeleteTaskReq {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskManagerDeleteTasksBySessionReq {
+    pub session_id: String,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_app_id: Option<String>,
+}
+
+impl TaskManagerDeleteTasksBySessionReq {
+    pub fn new(
+        session_id: String,
+        source_user_id: Option<String>,
+        source_app_id: Option<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            source_user_id,
+            source_app_id,
+        }
+    }
+
+    pub fn from_json(value: Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TaskManagerDeleteTasksBySessionReq: {}",
+                e
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteTasksResult {
+    pub deleted_count: u64,
+}
+
 pub enum TaskManagerClient {
     InProcess(Box<dyn TaskManagerHandler>),
     KRPC(Box<kRPC>),
@@ -634,6 +932,7 @@ impl TaskManagerClient {
                 let req = TaskManagerCreateTaskReq::new(
                     name.to_string(),
                     task_type.to_string(),
+                    opts.runner.unwrap_or_default(),
                     data,
                     opts.permissions,
                     opts.parent_id,
@@ -641,6 +940,7 @@ impl TaskManagerClient {
                     opts.priority,
                     user_id.to_string(),
                     app_id.to_string(),
+                    opts.session_id,
                 );
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
@@ -697,9 +997,11 @@ impl TaskManagerClient {
                     opts.parent_id,
                     opts.permissions,
                     opts.root_id,
+                    opts.runner,
                     opts.priority,
                     user_id.to_string(),
                     app_id.to_string(),
+                    opts.session_id,
                 );
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
@@ -745,6 +1047,102 @@ impl TaskManagerClient {
         }
     }
 
+    pub async fn add_task_note(
+        &self,
+        task_id: i64,
+        note_type: Option<&str>,
+        content: &str,
+        data: Option<Value>,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+    ) -> Result<TaskNote> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_add_task_note(
+                        task_id,
+                        note_type,
+                        content,
+                        data,
+                        source_user_id,
+                        source_app_id,
+                        ctx,
+                    )
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = TaskManagerAddTaskNoteReq::new(
+                    task_id,
+                    note_type.map(|value| value.to_string()),
+                    content.to_string(),
+                    data,
+                    source_user_id.map(|value| value.to_string()),
+                    source_app_id.map(|value| value.to_string()),
+                );
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+                let result = client.call("add_task_note", req_json).await?;
+                let response =
+                    serde_json::from_value::<AddTaskNoteResult>(result).map_err(|e| {
+                        RPCErrors::ParserResponseError(format!(
+                            "Expected AddTaskNoteResult response: {}",
+                            e
+                        ))
+                    })?;
+                Ok(response.note)
+            }
+        }
+    }
+
+    pub async fn list_task_notes(
+        &self,
+        task_id: i64,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+    ) -> Result<Vec<TaskNote>> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_list_task_notes(task_id, source_user_id, source_app_id, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = TaskManagerListTaskNotesReq::new(
+                    task_id,
+                    source_user_id.map(|value| value.to_string()),
+                    source_app_id.map(|value| value.to_string()),
+                );
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+                let result = client.call("list_task_notes", req_json).await?;
+
+                if let Ok(response) = serde_json::from_value::<ListTaskNotesResult>(result.clone())
+                {
+                    return Ok(response.notes);
+                }
+
+                if let Some(notes_value) = result.get("notes") {
+                    return serde_json::from_value::<Vec<TaskNote>>(notes_value.clone()).map_err(
+                        |e| {
+                            RPCErrors::ParserResponseError(format!(
+                                "Failed to parse task notes: {}",
+                                e
+                            ))
+                        },
+                    );
+                }
+
+                Err(RPCErrors::ParserResponseError(
+                    "Expected notes in response".to_string(),
+                ))
+            }
+        }
+    }
+
     pub async fn wait_for_task_end(&self, id: i64) -> Result<TaskStatus> {
         const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
         self.wait_for_task_end_with_interval(id, DEFAULT_POLL_INTERVAL)
@@ -769,6 +1167,86 @@ impl TaskManagerClient {
             }
 
             tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// KEvent-accelerated wait for a task to reach a terminal state.
+    ///
+    /// kevent is treated as an *acceleration* channel only, never as the
+    /// source of truth:
+    /// - subscribes `/task_mgr/{id}` then immediately calls `get_task` once
+    ///   to cover the window where the terminal event was published before
+    ///   the subscription was registered;
+    /// - on each kevent wake-up *or* poll timeout, re-reads `get_task` and
+    ///   only trusts that read (event payloads are not inspected);
+    /// - the first timeout is short (`FIRST_SWEEP_INTERVAL`) so we still
+    ///   make progress when kevent is wedged; once kevent has proven
+    ///   reachable (or the first sweep didn't find a terminal state), we
+    ///   relax to `STEADY_SWEEP_INTERVAL` and rely on kevent for liveness
+    ///   with the slow sweep as a backstop.
+    ///
+    /// If we can't subscribe at all (no runtime / kevent unavailable), we
+    /// fall back to the pure-polling variant — slower, but still correct.
+    pub async fn wait_for_task_end_kevent(&self, id: i64) -> Result<Task> {
+        const FIRST_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+        const STEADY_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+        // EventReader holds only a Weak ref to its KEventClient's inner — we
+        // must keep the client alive for the lifetime of the wait.
+        let kevent: Option<(
+            crate::kevent_client::KEventClient,
+            crate::kevent_client::EventReader,
+        )> = match crate::get_buckyos_api_runtime() {
+            Ok(runtime) => match runtime.get_kevent_client().await {
+                Ok(client) => match client
+                    .create_event_reader(vec![format!("/task_mgr/{}", id)])
+                    .await
+                {
+                    Ok(reader) => Some((client, reader)),
+                    Err(err) => {
+                        warn!(
+                            "wait_for_task_end_kevent: subscribe failed (task_id={}): {}; \
+                                 falling back to polling sweep",
+                            id, err
+                        );
+                        None
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        "wait_for_task_end_kevent: get_kevent_client failed (task_id={}): {}; \
+                             falling back to polling sweep",
+                        id, err
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        // Authoritative first read — closes the subscribe race.
+        let task = self.get_task(id).await?;
+        if task.status.is_terminal() {
+            return Ok(task);
+        }
+
+        let Some((_client, reader)) = kevent else {
+            // No kevent channel; degrade to plain polling at the first-sweep cadence.
+            self.wait_for_task_end_with_interval(id, FIRST_SWEEP_INTERVAL)
+                .await?;
+            return self.get_task(id).await;
+        };
+
+        let mut interval = FIRST_SWEEP_INTERVAL;
+        loop {
+            // Both event-arrival and timeout lead to the same authoritative
+            // re-read; kevent payload is intentionally ignored.
+            let _ = reader.pull_event(Some(interval.as_millis() as u64)).await;
+            let task = self.get_task(id).await?;
+            if task.status.is_terminal() {
+                return Ok(task);
+            }
+            interval = STEADY_SWEEP_INTERVAL;
         }
     }
 
@@ -822,6 +1300,7 @@ impl TaskManagerClient {
     pub async fn list_tasks_by_time_range(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
         source_user_id: Option<&str>,
         source_app_id: Option<&str>,
@@ -833,6 +1312,7 @@ impl TaskManagerClient {
                 let result = handler
                     .handle_list_tasks_by_time_range(
                         app_id,
+                        session_id,
                         task_type,
                         source_user_id,
                         source_app_id,
@@ -845,6 +1325,7 @@ impl TaskManagerClient {
             Self::KRPC(client) => {
                 let req = TaskManagerListTasksByTimeRangeReq::new(
                     app_id.map(|value| value.to_string()),
+                    session_id.map(|value| value.to_string()),
                     task_type.map(|value| value.to_string()),
                     source_user_id.map(|value| value.to_string()),
                     source_app_id.map(|value| value.to_string()),
@@ -1044,6 +1525,41 @@ impl TaskManagerClient {
         }
     }
 
+    pub async fn delete_tasks_by_session(
+        &self,
+        session_id: &str,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+    ) -> Result<u64> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_delete_tasks_by_session(session_id, source_user_id, source_app_id, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = TaskManagerDeleteTasksBySessionReq::new(
+                    session_id.to_string(),
+                    source_user_id.map(|value| value.to_string()),
+                    source_app_id.map(|value| value.to_string()),
+                );
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+                let result = client.call("delete_tasks_by_session", req_json).await?;
+                let response =
+                    serde_json::from_value::<DeleteTasksResult>(result).map_err(|e| {
+                        RPCErrors::ParserResponseError(format!(
+                            "Expected DeleteTasksResult response: {}",
+                            e
+                        ))
+                    })?;
+                Ok(response.deleted_count)
+            }
+        }
+    }
+
     pub async fn pause_task(&self, id: i64) -> Result<()> {
         self.update_task_status(id, TaskStatus::Paused).await
     }
@@ -1142,6 +1658,25 @@ pub trait TaskManagerHandler: Send + Sync {
 
     async fn handle_get_task(&self, id: i64, ctx: RPCContext) -> Result<Task>;
 
+    async fn handle_add_task_note(
+        &self,
+        task_id: i64,
+        note_type: Option<&str>,
+        content: &str,
+        data: Option<Value>,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<TaskNote>;
+
+    async fn handle_list_task_notes(
+        &self,
+        task_id: i64,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<Vec<TaskNote>>;
+
     async fn handle_list_tasks(
         &self,
         filter: TaskFilter,
@@ -1154,6 +1689,7 @@ pub trait TaskManagerHandler: Send + Sync {
     async fn handle_list_tasks_by_time_range(
         &self,
         app_id: Option<&str>,
+        session_id: Option<&str>,
         task_type: Option<&str>,
         source_user_id: Option<&str>,
         source_app_id: Option<&str>,
@@ -1200,6 +1736,19 @@ pub trait TaskManagerHandler: Send + Sync {
     async fn handle_cancel_task(&self, id: i64, recursive: bool, ctx: RPCContext) -> Result<()>;
 
     async fn handle_delete_task(&self, id: i64, ctx: RPCContext) -> Result<()>;
+
+    async fn handle_delete_tasks_by_session(
+        &self,
+        session_id: &str,
+        source_user_id: Option<&str>,
+        source_app_id: Option<&str>,
+        ctx: RPCContext,
+    ) -> Result<u64> {
+        let _ = (session_id, source_user_id, source_app_id, ctx);
+        Err(RPCErrors::ReasonError(
+            "delete_tasks_by_session not implemented".to_string(),
+        ))
+    }
 }
 
 pub struct TaskManagerServerHandler<T: TaskManagerHandler>(pub T);
@@ -1227,9 +1776,11 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions,
                     parent_id,
                     root_id,
+                    runner,
                     priority,
                     user_id,
                     app_id,
+                    session_id,
                     app_name,
                 } = create_req;
                 let resolved_app_id = if app_id.is_empty() {
@@ -1241,6 +1792,8 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions,
                     parent_id,
                     root_id,
+                    session_id,
+                    runner: Some(runner),
                     priority,
                 };
                 let task = self
@@ -1266,6 +1819,8 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     permissions: create_req.permissions,
                     parent_id: create_req.parent_id,
                     root_id: create_req.root_id,
+                    session_id: create_req.session_id,
+                    runner: create_req.runner,
                     priority: create_req.priority,
                 };
                 let task_id = self
@@ -1288,11 +1843,45 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let task = self.0.handle_get_task(get_req.id, ctx).await?;
                 RPCResult::Success(json!(GetTaskResult { task }))
             }
+            "add_task_note" => {
+                let note_req = TaskManagerAddTaskNoteReq::from_json(req.params)?;
+                let note = self
+                    .0
+                    .handle_add_task_note(
+                        note_req.task_id,
+                        note_req.note_type.as_deref(),
+                        note_req.content.as_str(),
+                        note_req.data,
+                        note_req.source_user_id.as_deref(),
+                        note_req.source_app_id.as_deref(),
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(AddTaskNoteResult {
+                    note_id: note.id,
+                    note
+                }))
+            }
+            "list_task_notes" => {
+                let note_req = TaskManagerListTaskNotesReq::from_json(req.params)?;
+                let notes = self
+                    .0
+                    .handle_list_task_notes(
+                        note_req.task_id,
+                        note_req.source_user_id.as_deref(),
+                        note_req.source_app_id.as_deref(),
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(ListTaskNotesResult { notes }))
+            }
             "list_tasks" => {
                 let list_req = TaskManagerListTasksReq::from_json(req.params)?;
                 let TaskManagerListTasksReq {
                     app_id,
+                    session_id,
                     task_type,
+                    runner,
                     status,
                     parent_id,
                     root_id,
@@ -1301,7 +1890,9 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 } = list_req;
                 let filter = TaskFilter {
                     app_id,
+                    session_id,
                     task_type,
+                    runner,
                     status,
                     parent_id,
                     root_id,
@@ -1321,6 +1912,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let list_req = TaskManagerListTasksByTimeRangeReq::from_json(req.params)?;
                 let TaskManagerListTasksByTimeRangeReq {
                     app_id,
+                    session_id,
                     task_type,
                     source_user_id,
                     source_app_id,
@@ -1332,6 +1924,7 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                     .0
                     .handle_list_tasks_by_time_range(
                         app_id.as_deref(),
+                        session_id.as_deref(),
                         task_type.as_deref(),
                         source_user_id.as_deref(),
                         source_app_id.as_deref(),
@@ -1410,6 +2003,19 @@ impl<T: TaskManagerHandler> RPCHandler for TaskManagerServerHandler<T> {
                 let delete_req = TaskManagerDeleteTaskReq::from_json(req.params)?;
                 let result = self.0.handle_delete_task(delete_req.id, ctx).await?;
                 RPCResult::Success(json!(result))
+            }
+            "delete_tasks_by_session" => {
+                let delete_req = TaskManagerDeleteTasksBySessionReq::from_json(req.params)?;
+                let deleted_count = self
+                    .0
+                    .handle_delete_tasks_by_session(
+                        delete_req.session_id.as_str(),
+                        delete_req.source_user_id.as_deref(),
+                        delete_req.source_app_id.as_deref(),
+                        ctx,
+                    )
+                    .await?;
+                RPCResult::Success(json!(DeleteTasksResult { deleted_count }))
             }
             _ => return Err(RPCErrors::UnknownMethod(req.method.clone())),
         };

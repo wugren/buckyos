@@ -1,4 +1,4 @@
-use crate::PermissionRequest;
+use crate::{PermissionRequest, RdbInstanceConfig};
 use ::kRPC::*;
 use name_lib::DID;
 use ndn_lib::ObjId;
@@ -89,6 +89,8 @@ pub struct ServiceInstallConfigTips {
     pub start_param: Option<String>,
     #[serde(flatten)]
     pub custom_config: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub rdb_instances: HashMap<String, RdbInstanceConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -128,6 +130,8 @@ pub struct SubPkgList {
     pub aarch64_apple_app: Option<SubPkgDesc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amd64_apple_app: Option<SubPkgDesc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<SubPkgDesc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web: Option<SubPkgDesc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,6 +216,7 @@ impl SubPkgList {
             "aarch64_win_app" => self.aarch64_win_app.as_ref(),
             "aarch64_apple_app" => self.aarch64_apple_app.as_ref(),
             "amd64_apple_app" => self.amd64_apple_app.as_ref(),
+            "script" => self.script.as_ref(),
             "web" => self.web.as_ref(),
             "agent" => self.agent.as_ref(),
             "agent_skills" => self.agent_skills.as_ref(),
@@ -626,6 +631,11 @@ impl AppDocBuilder {
 
     pub fn aarch64_linux_app(mut self, desc: SubPkgDesc) -> Self {
         self.pkg_list.aarch64_linux_app = Some(desc);
+        self
+    }
+
+    pub fn script_pkg(mut self, desc: SubPkgDesc) -> Self {
+        self.pkg_list.script = Some(desc);
         self
     }
 

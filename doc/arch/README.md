@@ -20,6 +20,8 @@
 
 1) 总览与差异点
 - `01_overview.md`
+- `认识BNS.md`
+- `BNS 去中心的名字系统.md`
 
 2) 启动与激活（Secure Boot / ZoneBootConfig / OOD 连接）
 - `02_boot_and_activation.md`

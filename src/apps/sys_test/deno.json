@@ -1,0 +1,10 @@
+{
+  "lock": false,
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-env main.ts",
+    "build": "pnpm build"
+  },
+  "imports": {
+    "@std/http": "jsr:@std/http@^1"
+  }
+}

@@ -15,6 +15,9 @@ modules:
   scheduler:
     type: rust
     name: scheduler
+  workflow:
+    type: rust
+    name: workflow
   task_manager:
     type: rust
     name: task-manager
@@ -49,14 +52,18 @@ modules:
   agent_tool:
     type: rust
     name: agent_tool
-  control_panel_web:
+  # control_panel_web:
+  #   type: web
+  #   name: control_panel
+  #   src_dir: frame/control_panel/web/
+  desktop:
     type: web
-    name: control_panel
-    src_dir: frame/control_panel/web/
+    name: desktop
+    src_dir: frame/desktop/  
   buckyos_systest:
     type: web
-    name: sys_test
-    src_dir: apps/sys_test/
+    name: buckyos_systest
+    src_dir: apps/sys_test
 
 apps:
   buckyos:
@@ -75,8 +82,9 @@ apps:
       scheduler: bin/scheduler/
       task_manager: bin/task-manager/
       kmsg: bin/kmsg/
+      workflow: bin/workflow/
       control_panel: bin/control-panel/
-      control_panel_web: bin/control-panel/web/
+      #control_panel_web: bin/control-panel/web/
       smb_service: bin/smb-service/
       repo_service: bin/repo-service/
       buckycli: bin/buckycli/
@@ -88,12 +96,13 @@ apps:
       agent_tool: bin/opendan/
       scheduler-etc: etc/scheduler/
       boot-gateway-config: etc/boot_gateway.yaml
+      devenv.json: etc/devenv.json
       util.py: bin/util.py
       stop.py: bin/stop.py
       stop.ps1: bin/stop.ps1
       stop_osx.sh: bin/stop_osx.sh
       buckyos_jarvis: bin/buckyos_jarvis/
-
+      desktop: bin/control-panel/web/
 
     # 数据路径，install_data 的时候如果目标存在，则不会复制，否则从rootfs复制到目标(覆盖安装逻辑)
     data_paths: 
@@ -106,6 +115,7 @@ apps:
     - data/               # cyfs://$zone_id/ 映射根: home/, srv/, var/, cache/ 均在此下
     - storage/            # 内核基础设施持久化存储 (chunks, named_store, dRDB)
     - local/              # host-node-local 服务数据
+    - security/           # 身份私钥、keyref、signer descriptor 等敏感材料
     - logs/
 
     # 清理路径，uninstall的时候会删除（无需配置:上面所有的modules item都会自动删除)
@@ -114,6 +124,7 @@ apps:
     - data/var/           # 服务运行数据
     - data/cache/         # 服务缓存数据
     - local/              # 服务本地数据
+    - security/           # 身份私钥、keyref、signer descriptor 等敏感材料
     - logs/
     - etc/                # 系统配置 (删除前自动执行身份备份)
 

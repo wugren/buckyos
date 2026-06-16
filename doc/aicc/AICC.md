@@ -22,6 +22,8 @@
 > * AICC **不重新设计**系统已有的：RPC 框架（krpc）、任务生命周期管理（TaskMgr）、事件/日志队列（MsgQueue）。
 > * AICC 只需要：在长任务场景下**生成/关联 task_id**，并将进度与输出写入系统既有的任务事件通道（具体格式/存储/订阅语义以系统组件为准）。
 
+> **breaking change 基线（2026-05-30）**：AICC 对外接口已拆成控制面 / 数据面 / Helper 三层 —— `route.resolve`（逻辑模型名 → 确定精确模型 + provider options + trace）、typed inference（`chat.completions.create` / `images.generate`，只接受 `exact_model`、不隐式 fallback）、`helper.llm_chat` / `helper.text_to_image`（组合层）。本文中描述的 all-in-one `complete` 方法、`ModelSpec.alias` 等是 **legacy / helper 兼容层** 语义，最新协议以 `doc/aicc/aicc_api设计.md` 和 `doc/aicc/aicc_router.md` 为准。
+
 ---
 
 ## 2. 总体架构与数据流
@@ -96,20 +98,23 @@ pub enum Capability {
     Video2Text,
 }
 
-/// 高层特性声明（如 plan/json_output/vision/asr 等）
+/// 高层特性声明（如 plan/json_output/web_search/vision/asr 等）
 pub type Feature = String;
 
 pub mod features {
     pub const PLAN: &str = "plan";
     pub const TOOL_CALLING: &str = "tool_calling";
     pub const JSON_OUTPUT: &str = "json_output";
+    pub const WEB_SEARCH: &str = "web_search";
     pub const VISION: &str = "vision";
     pub const ASR: &str = "asr";
     pub const VIDEO_UNDERSTAND: &str = "video_understand";
 }
 ```
 
-Router 会用 `must_features` 做硬过滤（例如 “要做 Plan” 必须选择声明支持 `plan` 的实例）。
+Router 会用结构化能力门限（逻辑模型定义的 `min_line`，见 `aicc_router.md` §6.7）做硬过滤。能力真相源是 `ProviderInventory.models[].capabilities`（由 driver metadata resolver 产出）；`Feature` / `must_features` 只是旧请求的兼容表达，不再是 inventory 真相源，新逻辑不再依赖 `ProviderInstance.features` 判定能力。
+
+> 注意：早期实现里 `llm.chat` 默认补 `web_search`、unknown model 乐观声明能力的做法已废弃。现在 unknown model 走 conservative fallback，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`，只能由 driver metadata 显式声明。
 
 ---
 
@@ -137,6 +142,8 @@ AICC 侧的硬性原则：
 
 ### 3.3 模型抽象名（Model Alias）与 ModelCatalog
 
+> legacy / helper 层概念。新分层中，逻辑模型名只出现在 `route.resolve` 的 `logical_model`，确定的精确模型名（`<provider_model_id>[:variant]@<provider_instance_name>`）只出现在数据面 `exact_model`。下面的 `ModelSpec.alias`（含 `@` 视为 exact、否则视为 logical path）保留给 legacy all-in-one 调用。
+
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelSpec {
@@ -163,12 +170,14 @@ pub struct ModelSpec {
 
 > 这里不讨论 krpc 的通用机制与 JSON 传输细节，只描述 **AICC 的方法语义与字段含义**。
 
-AICC 对外最核心的方法通常是：
+AICC 对外最核心的方法是控制面 `route.resolve` 与数据面 typed inference（`chat.completions.create` / `images.generate`），外加 `helper.*` 组合层；详见 `doc/aicc/aicc_api设计.md`。`cancel` 仍按下文语义工作。
+
+下面的 `complete` 请求/响应是 **legacy all-in-one** 形态（现以 `helper.llm_chat` 等 helper 方法承载），保留作为语义参考：
 
 * `complete`：发起一次 AI 计算（短任务直接返回结果；长任务返回 task_id）
 * `cancel`：best-effort 取消指定 task（是否可取消由系统任务机制与 provider 能力决定）
 
-### 4.1 complete 请求/响应（语义）
+### 4.1 complete 请求/响应（legacy 语义）
 
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]

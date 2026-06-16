@@ -12,17 +12,12 @@ use std::sync::Arc;
 fn openai_provider(base_url: String, timeout_ms: u64) -> OpenAIProvider {
     OpenAIProvider::new(
         OpenAIInstanceConfig {
-            instance_id: "openai-test".to_string(),
-            provider_type: "openai".to_string(),
+            provider_instance_name: "openai-test".to_string(),
+            provider_type: "cloud_api".to_string(),
+            api_token: "token".to_string(),
             base_url,
             auth_mode: "bearer".to_string(),
             timeout_ms,
-            models: vec!["gpt-4o-mini".to_string()],
-            default_model: Some("gpt-4o-mini".to_string()),
-            image_models: vec!["dall-e-3".to_string()],
-            default_image_model: Some("dall-e-3".to_string()),
-            features: vec!["plan".to_string()],
-            alias_map: HashMap::new(),
         },
         "token",
     )
@@ -32,8 +27,10 @@ fn openai_provider(base_url: String, timeout_ms: u64) -> OpenAIProvider {
 fn gimini_provider(base_url: String, timeout_ms: u64) -> GoogleGiminiProvider {
     GoogleGiminiProvider::new(
         GoogleGiminiInstanceConfig {
-            instance_id: "gimini-test".to_string(),
-            provider_type: "google-gimini".to_string(),
+            provider_instance_name: "gimini-test".to_string(),
+            provider_type: "cloud_api".to_string(),
+            provider_driver: "google-gemini".to_string(),
+            api_token: "token".to_string(),
             base_url,
             timeout_ms,
             models: vec!["gemini-2.5-flash".to_string()],
@@ -51,8 +48,10 @@ fn gimini_provider(base_url: String, timeout_ms: u64) -> GoogleGiminiProvider {
 fn claude_provider(base_url: String, timeout_ms: u64) -> ClaudeProvider {
     ClaudeProvider::new(
         ClaudeInstanceConfig {
-            instance_id: "claude-test".to_string(),
-            provider_type: "claude".to_string(),
+            provider_instance_name: "claude-test".to_string(),
+            provider_type: "cloud_api".to_string(),
+            provider_driver: "claude".to_string(),
+            api_token: "token".to_string(),
             base_url,
             timeout_ms,
             models: vec!["claude-3-7-sonnet-20250219".to_string()],
@@ -91,7 +90,7 @@ async fn adapter_openai_01_http_200_success() {
         .expect("openai 200 should succeed");
     match result {
         ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.text.as_deref(), Some("ok"));
+            assert_eq!(summary.text_content(), "ok");
             assert_eq!(summary.usage.as_ref().and_then(|u| u.total_tokens), Some(2));
         }
         _ => panic!("expected immediate summary"),
@@ -252,7 +251,7 @@ async fn adapter_gimini_01_http_200_success() {
         .expect("gimini 200 should succeed");
     match result {
         ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.text.as_deref(), Some("ok"));
+            assert_eq!(summary.text_content(), "ok");
             assert_eq!(summary.usage.as_ref().and_then(|u| u.total_tokens), Some(2));
         }
         _ => panic!("expected immediate summary"),
@@ -313,7 +312,7 @@ async fn adapter_claude_01_http_200_success() {
         .expect("claude 200 should succeed");
     match result {
         ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.text.as_deref(), Some("ok"));
+            assert_eq!(summary.text_content(), "ok");
             assert_eq!(summary.usage.as_ref().and_then(|u| u.input_tokens), Some(1));
             assert_eq!(
                 summary.usage.as_ref().and_then(|u| u.output_tokens),
@@ -514,7 +513,7 @@ async fn proto_t2i_01_prompt_from_text() {
     }])
     .await;
     let provider = openai_provider(base_url, 500);
-    let mut req = base_request_for(Capability::Text2Image, "text2image.default");
+    let mut req = base_request_for(Capability::Image, "text2image.default");
     req.payload.text = Some("draw a cat".to_string());
     req.payload.messages = vec![];
     req.payload.options = Some(serde_json::json!({"size":"1024x1024"}));
@@ -529,8 +528,8 @@ async fn proto_t2i_01_prompt_from_text() {
         .expect("text prompt should succeed");
     match res {
         aicc::ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.artifacts.len(), 1);
-            match &summary.artifacts[0].resource {
+            assert_eq!(summary.artifacts().len(), 1);
+            match &summary.artifacts()[0].resource {
                 buckyos_api::ResourceRef::Url { url, .. } => {
                     assert_eq!(url, "https://example.com/a.png");
                 }
@@ -556,7 +555,7 @@ async fn proto_t2i_04_artifact_url_format() {
     }])
     .await;
     let provider = openai_provider(base_url, 500);
-    let mut req = base_request_for(Capability::Text2Image, "text2image.default");
+    let mut req = base_request_for(Capability::Image, "text2image.default");
     req.payload.text = Some("draw a cat".to_string());
     let res = provider
         .start(
@@ -569,8 +568,8 @@ async fn proto_t2i_04_artifact_url_format() {
         .expect("should succeed");
     match res {
         aicc::ProviderStartResult::Immediate(summary) => {
-            assert!(!summary.artifacts.is_empty(), "assert failed in proto_t2i_04_artifact_url_format: condition is false; check preconditions and expected branch outcome.");
-            if let buckyos_api::ResourceRef::Url { url, .. } = &summary.artifacts[0].resource {
+            assert!(!summary.artifacts().is_empty(), "assert failed in proto_t2i_04_artifact_url_format: condition is false; check preconditions and expected branch outcome.");
+            if let buckyos_api::ResourceRef::Url { url, .. } = &summary.artifacts()[0].resource {
                 assert!(url.starts_with("https://"), "assert failed in proto_t2i_04_artifact_url_format: condition is false; check preconditions and expected branch outcome.");
             } else {
                 panic!("expected url artifact");
@@ -595,7 +594,7 @@ async fn proto_t2i_03_prompt_from_options() {
     }])
     .await;
     let provider = openai_provider(base_url, 500);
-    let mut req = base_request_for(Capability::Text2Image, "text2image.default");
+    let mut req = base_request_for(Capability::Image, "text2image.default");
     req.payload.text = None;
     req.payload.options = Some(serde_json::json!({"prompt":"draw from options"}));
     let res = provider
@@ -609,8 +608,8 @@ async fn proto_t2i_03_prompt_from_options() {
         .expect("options prompt should succeed");
     match res {
         aicc::ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.artifacts.len(), 1);
-            match &summary.artifacts[0].resource {
+            assert_eq!(summary.artifacts().len(), 1);
+            match &summary.artifacts()[0].resource {
                 buckyos_api::ResourceRef::Url { url, .. } => {
                     assert_eq!(url, "https://example.com/a.png");
                 }
@@ -636,11 +635,11 @@ async fn proto_t2i_02_prompt_from_messages() {
     }])
     .await;
     let provider = openai_provider(base_url, 500);
-    let mut req = base_request_for(Capability::Text2Image, "text2image.default");
+    let mut req = base_request_for(Capability::Image, "text2image.default");
     req.payload.text = None;
-    req.payload.messages = vec![buckyos_api::AiMessage::new(
-        "user".to_string(),
-        "draw from message".to_string(),
+    req.payload.messages = vec![buckyos_api::AiMessage::text(
+        buckyos_api::AiRole::User,
+        "draw from message",
     )];
     let res = provider
         .start(
@@ -653,8 +652,8 @@ async fn proto_t2i_02_prompt_from_messages() {
         .expect("message prompt should succeed");
     match res {
         aicc::ProviderStartResult::Immediate(summary) => {
-            assert_eq!(summary.artifacts.len(), 1);
-            match &summary.artifacts[0].resource {
+            assert_eq!(summary.artifacts().len(), 1);
+            match &summary.artifacts()[0].resource {
                 buckyos_api::ResourceRef::Url { url, .. } => {
                     assert_eq!(url, "https://example.com/a.png");
                 }
