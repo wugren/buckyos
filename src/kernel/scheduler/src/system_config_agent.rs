@@ -1174,18 +1174,9 @@ pub(crate) async fn update_node_gateway_config(
                     "zone_tls": {
                         "bind": "0.0.0.0:443",
                         "protocol": "tls",
-                        "certs": [
-                            {
-                                "domain": wildcard_zone_domain,
-                                "acme_type": "dns-01",
-                                "dns_provider": "sn-dns"
-                            },
-                            {
-                                "domain": zone_hostname
-                            },
-                            {
-                                "domain": "*"
-                            }
+                        "hosts": [
+                            wildcard_zone_domain,
+                            zone_hostname
                         ],
                         "hook_point": {
                             "main": {
@@ -2525,7 +2516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_node_gateway_config_keeps_acme_and_zone_tls() {
+    async fn test_update_node_gateway_config_keeps_acme_and_zone_tls_hosts() {
         let mut input_system_config = HashMap::new();
         let mut zone_config = create_test_zone_config();
         zone_config.sn = Some("sn.test.buckyos.io".to_string());
@@ -2551,6 +2542,11 @@ mod tests {
             "https://sn.test.buckyos.io/kapi/sn"
         );
         assert_eq!(gateway_config["stacks"]["zone_tls"]["bind"], "0.0.0.0:443");
+        assert_eq!(
+            gateway_config["stacks"]["zone_tls"]["hosts"],
+            json!(["*.test.buckyos.io", "test.buckyos.io"])
+        );
+        assert!(gateway_config["stacks"]["zone_tls"]["certs"].is_null());
         assert_eq!(
             gateway_config["stacks"]["zone_tls"]["hook_point"]["main"]["blocks"]["default"]
                 ["block"],

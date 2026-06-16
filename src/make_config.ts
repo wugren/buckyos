@@ -23,10 +23,10 @@ import * as os from "node:os";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
+  createCertFromCa,
   createNodeConfigs,
   createUserEnv,
   ensureCa,
-  createCertFromCa,
 } from "buckyos/provision";
 
 // ============================================================================
@@ -302,6 +302,7 @@ async function generateTls(
   caName: string,
   etcDir: string,
   caDir: string,
+  writePostGateway: boolean,
 ): Promise<void> {
   await ensureCa(caDir, caName);
   const { certPath, keyPath } = await createCertFromCa(caDir, zoneId, etcDir, [
@@ -322,6 +323,11 @@ async function generateTls(
     path.join(etcDir, "ca_key.pem"),
   );
   console.log(`tls certs generated under ${etcDir}`);
+
+  if (!writePostGateway) {
+    writeText(path.join(etcDir, "post_gateway.yaml"), "--- {}\n");
+    return;
+  }
 
   const postGatewayConfig = `
 stacks:
@@ -363,6 +369,7 @@ async function makeIdentityFiles(
     params.ca_name,
     ensureDir(path.join(targetDir, "etc")),
     caDir,
+    params.sn_base_host.trim().length === 0,
   );
 }
 
