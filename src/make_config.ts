@@ -23,7 +23,7 @@ import * as os from "node:os";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
-  createCertFromCa,
+  createIdentityCertFromCa,
   createNodeConfigs,
   createUserEnv,
   ensureCa,
@@ -77,6 +77,20 @@ function writeText(filePath: string, content: string): void {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, content);
   console.log(`write content ${filePath}`);
+}
+
+function removeIfExists(filePath: string): void {
+  if (fs.existsSync(filePath)) {
+    fs.rmSync(filePath);
+    console.log(`remove ${filePath}`);
+  }
+}
+
+function requireFiles(filePaths: string[]): void {
+  const missing = filePaths.filter((filePath) => !fs.existsSync(filePath));
+  if (missing.length > 0) {
+    throw new Error(`missing generated files: ${missing.join(", ")}`);
+  }
 }
 
 // ============================================================================
@@ -300,18 +314,44 @@ function copyIdentityOutputs(
 async function generateTls(
   zoneId: string,
   caName: string,
-  etcDir: string,
+  targetDir: string,
   caDir: string,
   writePostGateway: boolean,
 ): Promise<void> {
-  await ensureCa(caDir, caName);
-  const { certPath, keyPath } = await createCertFromCa(caDir, zoneId, etcDir, [
-    zoneId,
-    `*.${zoneId}`,
-  ]);
+  const etcDir = ensureDir(path.join(targetDir, "etc"));
+  const publicRoot = ensureDir(path.join(targetDir, "local", "identity"));
+  const securityRoot = ensureDir(path.join(targetDir, "security"));
+  const roots = {
+    publicRoot,
+    securityRoot,
+    buckyosRoot: targetDir,
+  };
 
-  fs.renameSync(certPath, path.join(etcDir, "zone_cert.cert"));
-  fs.renameSync(keyPath, path.join(etcDir, "zone_cert_key.pem"));
+  await ensureCa(caDir, caName);
+  const exactCert = await createIdentityCertFromCa(caDir, zoneId, roots, {
+    usage: "server",
+    hostnames: [zoneId],
+  });
+  const wildcardCert = await createIdentityCertFromCa(
+    caDir,
+    `*.${zoneId}`,
+    roots,
+    {
+      usage: "server",
+      hostnames: [`*.${zoneId}`],
+      uriSans: [],
+    },
+  );
+  requireFiles([
+    exactCert.fullchainPath,
+    exactCert.keyPath,
+    exactCert.metadataPath,
+    wildcardCert.fullchainPath,
+    wildcardCert.keyPath,
+    wildcardCert.metadataPath,
+  ]);
+  removeIfExists(path.join(etcDir, "zone_cert.cert"));
+  removeIfExists(path.join(etcDir, "zone_cert_key.pem"));
 
   // Keep CA for trust
   copyIfExists(
@@ -322,7 +362,7 @@ async function generateTls(
     path.join(caDir, `${caName}_ca_key.pem`),
     path.join(etcDir, "ca_key.pem"),
   );
-  console.log(`tls certs generated under ${etcDir}`);
+  console.log(`tls identity certs generated under ${publicRoot}`);
 
   if (!writePostGateway) {
     writeText(path.join(etcDir, "post_gateway.yaml"), "--- {}\n");
@@ -334,13 +374,12 @@ stacks:
   zone_gateway_https:
     bind: 0.0.0.0:443
     protocol: tls
-    certs:
-      - domain: "${zoneId}"
-        cert_path: ./zone_cert.cert
-        key_path: ./zone_cert_key.pem
-      - domain: "*.${zoneId}"
-        cert_path: ./zone_cert.cert
-        key_path: ./zone_cert_key.pem
+    hosts:
+      - "${zoneId}"
+      - "*.${zoneId}"
+    identity_manager:
+      public_root_path: ../local/identity
+      security_root_path: ../security
     hook_point:
       main:
         id: main
@@ -365,9 +404,9 @@ async function makeIdentityFiles(
   copyIdentityOutputs(userDir, nodeDir, targetDir, params.zone_id);
 
   await generateTls(
-    didHostToRealHost(params.zone_id, params.web3_bridge),
+    params.zone_id,
     params.ca_name,
-    ensureDir(path.join(targetDir, "etc")),
+    targetDir,
     caDir,
     params.sn_base_host.trim().length === 0,
   );
