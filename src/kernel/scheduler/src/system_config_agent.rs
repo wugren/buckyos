@@ -1168,7 +1168,19 @@ pub(crate) async fn update_node_gateway_config(
                             "key_path": "./node_private_key.pem",
                             "device_config_path": "./node_device_config.json"
                         }
-                    }
+                    },
+                    "hosts": [
+                        {
+                            "host": wildcard_zone_domain.clone(),
+                            "challenge_type": "dns-01",
+                            "dns_provider": "sn-dns"
+                        },
+                        {
+                            "host": zone_hostname.clone(),
+                            "challenge_type": "dns-01",
+                            "dns_provider": "sn-dns"
+                        }
+                    ]
                 },
                 "stacks": {
                     "zone_tls": {
@@ -2540,6 +2552,21 @@ mod tests {
         assert_eq!(
             gateway_config["acme"]["dns_providers"]["sn-dns"]["sn"],
             "https://sn.test.buckyos.io/kapi/sn"
+        );
+        assert_eq!(
+            gateway_config["acme"]["hosts"],
+            json!([
+                {
+                    "host": "*.test.buckyos.io",
+                    "challenge_type": "dns-01",
+                    "dns_provider": "sn-dns"
+                },
+                {
+                    "host": "test.buckyos.io",
+                    "challenge_type": "dns-01",
+                    "dns_provider": "sn-dns"
+                }
+            ])
         );
         assert_eq!(gateway_config["stacks"]["zone_tls"]["bind"], "0.0.0.0:443");
         assert_eq!(

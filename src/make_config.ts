@@ -216,6 +216,23 @@ export function didHostToRealHost(didHost: string, web3Bridge: string): string {
   return didHost;
 }
 
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function getZoneHostNames(zoneId: string, web3Bridge: string): string[] {
+  return uniqueStrings([zoneId, didHostToRealHost(zoneId, web3Bridge)]);
+}
+
 function makeGlobalEnvConfig(
   targetDir: string,
   web3Bns: string,
@@ -313,6 +330,7 @@ function copyIdentityOutputs(
 
 async function generateTls(
   zoneId: string,
+  web3Bridge: string,
   caName: string,
   targetDir: string,
   caDir: string,
@@ -328,28 +346,34 @@ async function generateTls(
   };
 
   await ensureCa(caDir, caName);
-  const exactCert = await createIdentityCertFromCa(caDir, zoneId, roots, {
-    usage: "server",
-    hostnames: [zoneId],
-  });
-  const wildcardCert = await createIdentityCertFromCa(
-    caDir,
-    `*.${zoneId}`,
-    roots,
-    {
+  const certPaths: string[] = [];
+  const zoneHosts = getZoneHostNames(zoneId, web3Bridge);
+  for (const host of zoneHosts) {
+    const exactCert = await createIdentityCertFromCa(caDir, host, roots, {
       usage: "server",
-      hostnames: [`*.${zoneId}`],
-      uriSans: [],
-    },
-  );
-  requireFiles([
-    exactCert.fullchainPath,
-    exactCert.keyPath,
-    exactCert.metadataPath,
-    wildcardCert.fullchainPath,
-    wildcardCert.keyPath,
-    wildcardCert.metadataPath,
-  ]);
+      hostnames: [host],
+    });
+    const wildcardHost = `*.${host}`;
+    const wildcardCert = await createIdentityCertFromCa(
+      caDir,
+      wildcardHost,
+      roots,
+      {
+        usage: "server",
+        hostnames: [wildcardHost],
+        uriSans: [],
+      },
+    );
+    certPaths.push(
+      exactCert.fullchainPath,
+      exactCert.keyPath,
+      exactCert.metadataPath,
+      wildcardCert.fullchainPath,
+      wildcardCert.keyPath,
+      wildcardCert.metadataPath,
+    );
+  }
+  requireFiles(certPaths);
   removeIfExists(path.join(etcDir, "zone_cert.cert"));
   removeIfExists(path.join(etcDir, "zone_cert_key.pem"));
 
@@ -369,14 +393,14 @@ async function generateTls(
     return;
   }
 
+  const gatewayHosts = zoneHosts.flatMap((host) => [host, `*.${host}`]);
   const postGatewayConfig = `
 stacks:
   zone_gateway_https:
     bind: 0.0.0.0:443
     protocol: tls
     hosts:
-      - "${zoneId}"
-      - "*.${zoneId}"
+${gatewayHosts.map((host) => `      - "${host}"`).join("\n")}
     identity_manager:
       public_root_path: ../local/identity
       security_root_path: ../security
@@ -405,6 +429,7 @@ async function makeIdentityFiles(
 
   await generateTls(
     params.zone_id,
+    params.web3_bridge,
     params.ca_name,
     targetDir,
     caDir,
