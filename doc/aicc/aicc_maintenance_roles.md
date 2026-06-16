@@ -23,13 +23,13 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 随版本内置 driver metadata：`openai`、`claude`、`gemini`、`fal`、`minimax`。
-- Provider adapter 可从厂商 `/models` 获取模型 ID，再由 metadata resolver 转成 AICC `ProviderInventory` / `ModelMetadata`。
-- metadata 覆盖链已存在：builtin、`remote_cache` 文件、local override、system-config override。
-- metadata resolver 已支持 exact rule、pattern rule、defaults、conservative fallback、`api_types`、`logical_mounts`、`capabilities`、estimated cost / latency 和 variant 展开。
-- 默认逻辑目录、`logical_mounts`、能力过滤、exact model、variant、fallback、route trace 已存在。
-- `sn-ai-provider` 入口代码已存在，默认指向官方 SN 地址。
-- `models.list` 可查看当前 Provider inventory、逻辑目录定义和系统 routing settings。
+- 随版本内置 driver metadata：当前文件在 `src/frame/aicc/driver_metadata/` 下，包括 `openai.json`、`claude.json`、`gemini.json`、`fal.json`、`minimax.json`。如果只是补充某个已知厂商模型的 `api_types`、`capabilities`、`logical_mounts`、估算价格或默认延迟，通常修改这些 JSON。
+- Provider adapter 可从厂商 `/models` 获取模型 ID，再由 metadata resolver 转成 AICC `ProviderInventory` / `ModelMetadata`。对应代码主要在 `src/frame/aicc/src/openai.rs`、`src/frame/aicc/src/claude.rs`、`src/frame/aicc/src/gimini.rs`、`src/frame/aicc/src/fal.rs`、`src/frame/aicc/src/minimax.rs`，公共数据结构在 `src/frame/aicc/src/model_types.rs`。
+- metadata 覆盖链已存在：内置 metadata 来自 `src/frame/aicc/driver_metadata/*.json`；运行时远端缓存、用户本地覆盖和 system-config 覆盖分别读取 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/remote_cache/<driver>.json`、`$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json`、`$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json`。
+- metadata resolver 已支持 exact rule、pattern rule、defaults、conservative fallback、`api_types`、`logical_mounts`、`capabilities`、estimated cost / latency 和 variant 展开。实现入口在 `src/frame/aicc/src/metadata_resolver.rs`，将结果写入 registry 的逻辑在 `src/frame/aicc/src/model_registry.rs`。
+- 默认逻辑目录、`logical_mounts`、能力过滤、exact model、variant、fallback、route trace 已存在。路由和调度相关实现主要在 `src/frame/aicc/src/aicc.rs`、`src/frame/aicc/src/model_router.rs`、`src/frame/aicc/src/model_scheduler.rs`、`src/frame/aicc/src/model_session.rs`。
+- `sn-ai-provider` 入口代码已存在，默认指向官方 SN 地址。实现文件是 `src/frame/aicc/src/sn_ai_provider.rs`，OpenAI-compatible 的请求与 inventory 复用 `src/frame/aicc/src/openai.rs`。
+- `models.list` 可查看当前 Provider inventory、逻辑目录定义和系统 routing settings；`reload_settings` 可让配置变更生效。这两个 KRPC 入口在 `src/frame/aicc/src/main.rs`。
 
 #### 规划中 / 未完全实现
 
@@ -56,14 +56,14 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 随版本发布 Provider adapter。
-- 随版本发布 builtin driver metadata 和默认逻辑目录基线。
-- 已支持控制面 / 数据面 / helper 分层：`route.resolve`、typed inference、`helper.*`。
-- 已支持 content-block 形态的 `AiMessage`。
-- 已支持 exact model 和 logical model 的分层语义。
-- 已支持 request 级 `session_overlay`；AICC 不维护 per-session route state。
-- 已支持 system_config 中的 `services/aicc/settings.routing_config`。
-- 已支持 `reload_settings` 重建 Provider registry 和 ModelRegistry。
+- 随版本发布 Provider adapter。新增或修改直连厂商协议时，主要修改 `src/frame/aicc/src/<provider>.rs`；新增 provider module 还需要检查 `src/frame/aicc/src/main.rs` 中的注册逻辑，并参考 `doc/aicc/how_to_add_provider.md`。
+- 随版本发布 builtin driver metadata 和默认逻辑目录基线。维护位置是 `src/frame/aicc/driver_metadata/*.json`；如果变更影响 AICC metadata schema，需要同步 `doc/aicc/driver_metadata_schema.md` 和 `src/frame/aicc/src/model_types.rs`。
+- 已支持控制面 / 数据面 / helper 分层：`route.resolve`、typed inference、`helper.*`。协议说明集中在 `doc/aicc/aicc_api设计.md`、`doc/aicc/krpc_aicc_calling_guide.md`，服务端入口在 `src/frame/aicc/src/main.rs`。
+- 已支持 content-block 形态的 `AiMessage`。类型定义在 `src/frame/aicc/src/model_types.rs`，各 Provider 的协议转换逻辑分散在对应 adapter 文件中，例如 `src/frame/aicc/src/openai.rs`、`src/frame/aicc/src/claude.rs`。
+- 已支持 exact model 和 logical model 的分层语义。路由解析在 `src/frame/aicc/src/model_router.rs` 和 `src/frame/aicc/src/aicc.rs`，逻辑目录来源包括 driver metadata 的 `logical_mounts` 和 system_config 中的 `routing_config`。
+- 已支持 request 级 `session_overlay`；AICC 不维护 per-session route state。调用文档在 `doc/aicc/krpc_aicc_calling_guide.md`，请求侧合并和路由执行在 `src/frame/aicc/src/aicc.rs`。
+- 已支持 system_config 中的 `services/aicc/settings.routing_config`。写入和 reload 的操作说明在 `doc/aicc/update_aicc_settings_via_system_config.md`，读取与应用逻辑在 `src/frame/aicc/src/aicc.rs`。
+- 已支持 `reload_settings` 重建 Provider registry 和 ModelRegistry。KRPC handler 在 `src/frame/aicc/src/main.rs`，registry 更新逻辑在 `src/frame/aicc/src/model_registry.rs`。
 
 #### 规划中 / 未完全实现
 
@@ -82,9 +82,9 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现 / 当前原则
 
-- 普通用户 API Key 不应由 BuckyOS 官方云端保存。
-- AICC usage log 不是最终财务账本；最终账务应由对应服务商或官方 SN 服务端负责。
-- `local_only` / `local_inference` 的安全判断不能只信 Provider inventory 自声明。
+- 普通用户 API Key 不应由 BuckyOS 官方云端保存。当前可用配置入口是用户 Zone 的 system_config，主要写入 `services/aicc/settings`；操作说明见 `doc/aicc/update_aicc_settings_via_system_config.md`。
+- AICC usage log 不是最终财务账本；最终账务应由对应服务商或官方 SN 服务端负责。AICC 本地 usage log 相关说明在 `doc/aicc/aicc_usage_log_db_requirements.md`，本地实现入口是 `src/frame/aicc/src/aicc_usage_log_db.rs`。
+- `local_only` / `local_inference` 的安全判断不能只信 Provider inventory 自声明。相关字段定义在 `src/frame/aicc/src/model_types.rs`，路由侧使用时应由可信 system_config 或本地管理员策略确认，不能只根据远端 Provider 返回值放行。
 
 #### 规划中 / 未完全实现
 
@@ -103,10 +103,10 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 可以直接使用 BuckyOS 的 Provider settings、metadata override、`routing_config`。
-- 可以跟随 BuckyOS 发布的 Provider adapter、builtin metadata、默认逻辑目录。
-- 可以用 `reload_settings` 和 `models.list` 验证配置生效。
-- 可以使用 AICC 已有 route trace、Provider inventory、health / quota 字段进行诊断。
+- 可以直接使用 BuckyOS 的 Provider settings、metadata override、`routing_config`。持久配置写在用户 Zone 的 system_config `services/aicc/settings`，系统级路由写在 `services/aicc/settings.routing_config`；运行时 metadata 覆盖文件放在 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json` 或 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json`。
+- 可以跟随 BuckyOS 发布的 Provider adapter、builtin metadata、默认逻辑目录。随版本维护的 adapter 在 `src/frame/aicc/src/<provider>.rs`，内置 metadata 在 `src/frame/aicc/driver_metadata/*.json`，逻辑目录最终由 `src/frame/aicc/src/model_registry.rs` 汇总。
+- 可以用 `reload_settings` 和 `models.list` 验证配置生效。KRPC handler 在 `src/frame/aicc/src/main.rs`；调用方式见 `doc/aicc/update_aicc_settings_via_system_config.md` 和 `doc/aicc/krpc_aicc_calling_guide.md`。
+- 可以使用 AICC 已有 route trace、Provider inventory、health / quota 字段进行诊断。字段定义在 `src/frame/aicc/src/model_types.rs`，路由结果生成在 `src/frame/aicc/src/aicc.rs`；命令行侧已有 `src/tools/buckyos-agent/commands/ai_provider.ts` 和 `src/tools/buckyos-agent/commands/ai_quota.ts` 作为管理入口。
 
 #### 规划中 / 未完全实现
 
@@ -122,11 +122,11 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 服务商可以配置自建 Provider instance 和自己的 `base_url`。
-- 服务商可以提供 OpenAI-compatible 自营 Provider。
-- 服务商可以放置自己的 remote/local metadata 文件。
-- 服务商可以通过 system-config 管理系统级路由配置。
-- 服务商可以复用 `sn-ai-provider` 类似模式，为自己的云端 Provider 提供统一入口。
+- 服务商可以配置自建 Provider instance 和自己的 `base_url`。当前可用入口是 system_config `services/aicc/settings` 中的 provider settings，字段和写入流程见 `doc/aicc/update_aicc_settings_via_system_config.md`。
+- 服务商可以提供 OpenAI-compatible 自营 Provider。只要协议兼容，可复用 `src/frame/aicc/src/openai.rs` 的 `/models`、chat completion 和 cost estimate 路径；不兼容时需要新增或修改 `src/frame/aicc/src/<provider>.rs`。
+- 服务商可以放置自己的 remote/local metadata 文件。文件路径分别是 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/remote_cache/<driver>.json`、`$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json`、`$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json`；解析逻辑在 `src/frame/aicc/src/metadata_resolver.rs`。
+- 服务商可以通过 system-config 管理系统级路由配置。持久化 key 是 `services/aicc/settings.routing_config`，生效逻辑在 `src/frame/aicc/src/aicc.rs` 的 routing config 应用流程中。
+- 服务商可以复用 `sn-ai-provider` 类似模式，为自己的云端 Provider 提供统一入口。当前官方入口实现是 `src/frame/aicc/src/sn_ai_provider.rs`，它复用 OpenAI-compatible adapter 并增加 `device_jwt` 等授权字段。
 
 #### 规划中 / 未完全实现
 
@@ -148,9 +148,9 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现 / 当前原则
 
-- 用户自带 API Key 默认不应上传给 BuckyOS 官方云端。
-- 服务商可以在自己的产品中实现托管 Key，但这必须作为明确商业托管能力处理。
-- 服务商不能把不可信远程代理标成 `local_inference`。
+- 用户自带 API Key 默认不应上传给 BuckyOS 官方云端。当前机制是写入用户自己的 system_config `services/aicc/settings`，由本 Zone 内 AICC service 读取。
+- 服务商可以在自己的产品中实现托管 Key，但这必须作为明确商业托管能力处理。AICC 开源侧只提供 provider settings / `base_url` / adapter 接入点，不提供默认云端 Key 托管。
+- 服务商不能把不可信远程代理标成 `local_inference`。`provider_type`、privacy、health、quota 等字段定义在 `src/frame/aicc/src/model_types.rs`，实际是否可信应由服务商自己的可信配置或本地 system_config 决定。
 
 #### 规划中 / 未完全实现
 
@@ -169,11 +169,11 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 用户可以在自己的 system_config / AICC settings 中配置 API Key、`base_url`、Provider instance。
-- 可以配置 `provider_driver`、`provider_type`、启用或禁用 Provider。
-- 可以配置 OpenAI-compatible endpoint。
-- `sn-ai-provider` 支持 `device_jwt` 这类非普通 API Key 的授权模式。
-- 变更后可以调用 `reload_settings` 生效。
+- 用户可以在自己的 system_config / AICC settings 中配置 API Key、`base_url`、Provider instance。配置 key 是 `services/aicc/settings`，写入和验证流程见 `doc/aicc/update_aicc_settings_via_system_config.md`。
+- 可以配置 `provider_driver`、`provider_type`、启用或禁用 Provider。这些字段由 `src/frame/aicc/src/aicc.rs` 读取并注册到 Provider registry，类型定义在 `src/frame/aicc/src/model_types.rs`。
+- 可以配置 OpenAI-compatible endpoint。实际请求和 `/models` 拉取逻辑复用 `src/frame/aicc/src/openai.rs`，用户主要维护 `base_url`、API Key 和 models 配置。
+- `sn-ai-provider` 支持 `device_jwt` 这类非普通 API Key 的授权模式。实现位置是 `src/frame/aicc/src/sn_ai_provider.rs`。
+- 变更后可以调用 `reload_settings` 生效，并用 `models.list` 查看当前 inventory。两个入口的 handler 在 `src/frame/aicc/src/main.rs`。
 
 #### 规划中 / 未完全实现
 
@@ -191,11 +191,11 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 用户可以配置系统级 `routing_config`：权重、禁用或偏好 Provider、`global_exact_model_weights`、`policy`、`logical_tree`、`logical_definitions`。
-- 可以使用 exact model 临时指定新模型。
-- 可以添加 local metadata override 或 system-config override。
-- 可以通过 request `session_overlay` 做单次或应用侧临时路由偏好。
-- 可以用 `models.list` 验证当前 inventory、exact model 和 `logical_mounts`。
+- 用户可以配置系统级 `routing_config`：权重、禁用或偏好 Provider、`global_exact_model_weights`、`policy`、`logical_tree`、`logical_definitions`。持久化位置是 system_config `services/aicc/settings.routing_config`，说明见 `doc/aicc/update_aicc_settings_via_system_config.md` 和 `doc/aicc/aicc_router.md`。
+- 可以使用 exact model 临时指定新模型，形式通常是 `model@provider-instance`。exact / logical model 的解析在 `src/frame/aicc/src/model_router.rs` 和 `src/frame/aicc/src/aicc.rs`。
+- 可以添加 local metadata override 或 system-config override。文件路径是 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json` 和 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json`，schema 见 `doc/aicc/driver_metadata_schema.md`。
+- 可以通过 request `session_overlay` 做单次或应用侧临时路由偏好。请求格式见 `doc/aicc/krpc_aicc_calling_guide.md`，AICC 侧合并逻辑在 `src/frame/aicc/src/aicc.rs`。
+- 可以用 `models.list` 验证当前 inventory、exact model 和 `logical_mounts`。入口在 `src/frame/aicc/src/main.rs`，registry 结果来自 `src/frame/aicc/src/model_registry.rs`。
 
 #### 规划中 / 未完全实现
 
@@ -215,12 +215,12 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 用户可以添加 OpenAI-compatible Provider：配置 `base_url`、API Key、`provider_driver`、`provider_type`、models。
-- Provider adapter 可从 `/models` 拉取模型 ID，并通过 metadata resolver 归一化。
-- 如果新模型协议兼容，用户可以把模型 ID 加入 Provider `models`。
-- 用户可以直接用 `new-model@provider-instance` 作为 exact model。
-- 用户可以写 local metadata override，补充 `api_types`、`capabilities`、`logical_mounts`。
-- 用户可以在 `routing_config` 中临时把 exact model 挂到 `llm.chat`、`llm.code`、`llm.plan` 等目录。
+- 用户可以添加 OpenAI-compatible Provider：在 system_config `services/aicc/settings` 中配置 `base_url`、API Key、`provider_driver`、`provider_type`、models；具体字段和刷新方式见 `doc/aicc/update_aicc_settings_via_system_config.md`。
+- Provider adapter 可从 `/models` 拉取模型 ID，并通过 metadata resolver 归一化。OpenAI-compatible 路径在 `src/frame/aicc/src/openai.rs`，metadata 归一化在 `src/frame/aicc/src/metadata_resolver.rs`。
+- 如果新模型协议兼容，用户可以把模型 ID 加入 Provider `models`；如果 Provider `/models` 能返回该模型，也可以让 adapter 自动发现 ID，再通过 metadata override 补足能力信息。
+- 用户可以直接用 `new-model@provider-instance` 作为 exact model。路由解析和 fallback 在 `src/frame/aicc/src/model_router.rs`、`src/frame/aicc/src/aicc.rs`。
+- 用户可以写 local metadata override，补充 `api_types`、`capabilities`、`logical_mounts`。本地文件放在 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json`，格式见 `doc/aicc/driver_metadata_schema.md`。
+- 用户可以在 `routing_config` 中临时把 exact model 挂到 `llm.chat`、`llm.code`、`llm.plan` 等目录。持久配置写 `services/aicc/settings.routing_config`，临时单次偏好走 request `session_overlay`。
 
 #### 规划中 / 未完全实现
 
@@ -242,7 +242,7 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 无。当前通常是 BuckyOS 通过已有厂商协议或 OpenAI-compatible 协议主动适配模型服务商。
+- 无。当前通常是 BuckyOS 通过已有厂商协议或 OpenAI-compatible 协议主动适配模型服务商；代码入口在 `src/frame/aicc/src/openai.rs`、`src/frame/aicc/src/claude.rs`、`src/frame/aicc/src/gimini.rs`、`src/frame/aicc/src/fal.rs`、`src/frame/aicc/src/minimax.rs`，不是模型服务商主动提供 BuckyOS 专用接口。
 
 #### 规划中 / 未完全实现
 
@@ -258,7 +258,7 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 无。当前主要由 BuckyOS 项目方、服务商或用户侧 metadata override 维护。
+- 无。当前主要由 BuckyOS 项目方维护 `src/frame/aicc/driver_metadata/*.json`，或由服务商 / 用户在 `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json`、`$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json` 做覆盖；模型服务商没有已实现的主动维护通道。
 
 #### 规划中 / 未完全实现
 
@@ -275,7 +275,7 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 
 #### 已实现
 
-- 无针对 BuckyOS 的模型服务商主动支持机制。
+- 无针对 BuckyOS 的模型服务商主动支持机制。AICC 当前能承接的字段定义在 `src/frame/aicc/src/model_types.rs`，但真实成本、额度、健康度主要仍由 BuckyOS adapter、本地配置或服务商自建网关转换后提供。
 
 #### 规划中 / 未完全实现
 
@@ -287,4 +287,3 @@ BuckyOS 项目方维护公共协议、默认能力基线、默认路由体系，
 - 提供 BuckyOS 原生 quota、billing、health、route trace 扩展。
 - 提供包月、免费额度、超额价格、缓存价格、阶梯价格等可供调度器使用的信息。
 - 提供 BuckyOS 官方认证 Provider 插件。
-
