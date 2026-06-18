@@ -1,6 +1,6 @@
 # AICC 新 API 与模型体系升级 TODO
 
-本文档基于 `notepads/aicc-new-api.md` 的分层设计，并按当前仓库实现修订。目标不是从零设计，而是在已有第一版实现上收敛边界：把“逻辑模型路由”和“物理模型推理”真正拆开，同时继续推进模型 metadata、逻辑模型名、auto-mount 与 session profile overlay。
+本文档基于 `doc/aicc/aicc-new-api.md` 的分层设计，并按当前仓库实现修订。目标不是从零设计，而是在已有第一版实现上收敛边界：把“逻辑模型路由”和“物理模型推理”真正拆开，同时继续推进模型 metadata、逻辑模型名、auto-mount 与 session profile overlay。
 
 ## 进度复核（2026-05-30，按实际代码核对）
 

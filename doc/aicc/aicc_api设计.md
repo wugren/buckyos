@@ -8,8 +8,8 @@
 - `doc/aicc/aicc 逻辑模型目录.md`
 - `doc/aicc/aicc_router.md`
 - `doc/aicc/driver_metadata_schema.md`
-- `doc/aicc/krpc_aicc_calling_guide.md`
-- `doc/aicc/update_aicc_settings_via_system_config.md`
+- `doc/aicc/maintenance/krpc_aicc_calling_guide.md`
+- `doc/aicc/maintenance/update_aicc_settings_via_system_config.md`
 
 本文定义 AICC 面向调用方、Provider Adapter、Router、Control Panel 和 Agent Runtime 的标准 API 设计。目标是覆盖 `aicc 逻辑模型目录.md` 中规划的所有已知 AI 调用方法。
 

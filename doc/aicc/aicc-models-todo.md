@@ -1,6 +1,6 @@
 # AICC Models Manager 后续 TODO
 
-来源：`notepads/aicc-models-mgr.md`  
+来源：`doc/aicc/aicc-models-mgr.md`  
 状态：Draft  
 范围：AICC Models Manager、模型目录、模型路由、Provider inventory、driver metadata、Desktop 展示与配置入口。
 
@@ -45,7 +45,7 @@
     - 方案 A：provider weight 只影响同一最高优先级集合内 scheduler。
     - 方案 B：provider weight 也参与最高优先级集合筛选。
   - 推荐先保持方案 A，并在文档中明确。
-  - 已实现：保持方案 A，并在 `notepads/aicc-models-mgr.md` 的权重语义和候选集合筛选段落中明确。
+  - 已实现：保持方案 A，并在 `doc/aicc/aicc-models-mgr.md` 的权重语义和候选集合筛选段落中明确。
 
 - [x] 补充 `models.list` / Desktop route trace 展示。
   - 当前 Desktop 类型已经能接收 `provider_weights`，但 UI 未提供显式编辑和解释。
@@ -222,7 +222,7 @@
       }
     }
     ```
-  - 已实现：`doc/aicc/krpc_aicc_calling_guide.md` 增加 request 级 `session_config_patch.provider_weights` 示例。
+  - 已实现：`doc/aicc/maintenance/krpc_aicc_calling_guide.md` 增加 request 级 `session_config_patch.provider_weights` 示例。
 
 ## 6. P1：成本语义拆分
 

@@ -15,7 +15,7 @@ gen_image "A precise product photo of a matte black desk lamp." result.png
 
 - `src/kernel/buckyos-api/src/aicc_client.rs`
 - `doc/aicc/aicc_api设计.md`
-- `doc/aicc/krpc_aicc_calling_guide.md`
+- `doc/aicc/maintenance/krpc_aicc_calling_guide.md`
 
 ---
 
