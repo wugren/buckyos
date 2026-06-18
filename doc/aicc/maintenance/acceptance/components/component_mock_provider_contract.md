@@ -1,8 +1,8 @@
-# AICC Mock Provider 契约组件
+﻿# AICC Mock Provider 契约组件
 
 定义 Mock Provider 的通用原则、行为控制、配置样例和 HTTP 接口契约。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. Mock Provider 契约
 

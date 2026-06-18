@@ -2,7 +2,7 @@
 
 定义固定资源、ResourceRef 输入、artifact 输出、fixture manifest、digest/media type 校验和资源生成约束。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. 测试数据与资源 Fixture
 

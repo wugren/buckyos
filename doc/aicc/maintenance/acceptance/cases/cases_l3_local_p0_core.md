@@ -2,7 +2,7 @@
 
 定义本地 kRPC P0 闭环，包括 settings reload、Mock Provider、models.list、llm.chat、resource、task、usage、trace 和错误分类。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. 异常路径
 

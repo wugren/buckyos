@@ -2,7 +2,7 @@
 
 定义 fal 和媒体能力 Provider 的 image/audio/video 真实 gateway workflow、artifact、task、usage、trace 和 partial 判定。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. Method 验收清单
 

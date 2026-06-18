@@ -2,7 +2,7 @@
 
 定义 L4 api_type × method × logical_path × Provider × model 五维矩阵、attempt、not_applicable/skipped/partial 和真实模型判定。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. Provider 协议覆盖
 

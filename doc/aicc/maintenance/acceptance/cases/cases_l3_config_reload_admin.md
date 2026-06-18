@@ -2,7 +2,7 @@
 
 定义 system_config 写入、reload_settings、models.list、provider 管理、usage/quota 查询和非法配置回滚。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. 配置与重载验收
 

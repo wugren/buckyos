@@ -1,8 +1,8 @@
-# AICC Provider 协议覆盖组件
+﻿# AICC Provider 协议覆盖组件
 
 定义 OpenAI、Claude、Google Gemini、OpenAI-compatible / OpenRouter、fal、SN AI Provider 的协议覆盖要求和 L4 五维矩阵。
 
-本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
+本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准。
 
 ## 1. Provider 协议覆盖
 
