@@ -354,7 +354,7 @@ review 后进入实现阶段时，建议至少验证：
 
 可能联动：
 
-- `doc/aicc/how_to_add_provider.md`：新增 provider 指南需要从 alias 注册改成 inventory 声明。
+- `doc/aicc/maintenance/how_to_add_provider.md`：新增 provider 指南需要从 alias 注册改成 inventory 声明。
 - `doc/aicc/AICC.md`：旧 `ModelCatalog` alias 设计需要改为新版 inventory + logical tree。
 - `src/frame/aicc/tests/*`：大量测试仍基于 `ModelCatalog` 和 string provider_type，需要直接迁移。
 - `src/frame/desktop/src/app/ai-center/*`：如果 UI 展示 provider type、models、health，后续应对接 inventory/metadata。

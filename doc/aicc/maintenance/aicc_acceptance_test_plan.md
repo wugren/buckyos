@@ -27,12 +27,14 @@
 - `doc/aicc/aicc 逻辑模型目录.md`
 - `doc/aicc/aicc_requirements.md`
 - `doc/aicc/aicc_provider_plan.md`
-- `doc/aicc/krpc_aicc_calling_guide.md`
-- `doc/aicc/update_aicc_settings_via_system_config.md`
+- `doc/aicc/maintenance/krpc_aicc_calling_guide.md`
+- `doc/aicc/maintenance/update_aicc_settings_via_system_config.md`
 - `doc/aicc/aicc_usage_log_db_requirements.md`
-- `doc/aicc/how_to_add_provider.md`
+- `doc/aicc/maintenance/how_to_add_provider.md`
 - `doc/aicc/driver_metadata_schema.md`
-- `doc/aicc/aicc_maintenance_roles.md`
+- `doc/aicc/maintenance/aicc_maintenance_roles.md`
+
+`doc/aicc/maintenance/` 下的文档只作为维护场景和当前实现参考；验收目标必须回到根目录需求、设计、协议和 schema 文档确认，不能由维护参考单独派生新的设计约束。
 
 关键协议约束：
 
@@ -127,11 +129,11 @@
 | `aicc_api设计.md` control method | `control_method_*` | L1/L2/L3 |
 | AICC 服务管理 method | `provider_admin_*`、`models_list_*`、`quota_query_*`、`usage_query_*` | L2/L3/L4 |
 | `aicc_usage_log_db_requirements.md` usage event | `usage_log_*` | L1/L3 |
-| `update_aicc_settings_via_system_config.md` reload | `settings_reload_*` | L3/L4 |
-| `aicc_maintenance_roles.md` 统一更新验收流程 | `maintenance_update_*` | L3/L4 |
-| `aicc_maintenance_roles.md` 模型事实 / 运营策略分离 | `maintenance_metadata_*`、`maintenance_policy_*` | L3/L4 |
-| `aicc_maintenance_roles.md` 服务商 / 用户配置覆盖 | `maintenance_provider_settings_*`、`maintenance_routing_config_*` | L3/L4 |
-| `aicc_maintenance_roles.md` 回滚验收 | `maintenance_rollback_*` | L3/L4 |
+| `maintenance/update_aicc_settings_via_system_config.md` reload | `settings_reload_*` | L3/L4 |
+| `maintenance/aicc_maintenance_roles.md` 统一更新验收流程 | `maintenance_update_*` | L3/L4 |
+| `maintenance/aicc_maintenance_roles.md` 模型事实 / 运营策略分离 | `maintenance_metadata_*`、`maintenance_policy_*` | L3/L4 |
+| `maintenance/aicc_maintenance_roles.md` 服务商 / 用户配置覆盖 | `maintenance_provider_settings_*`、`maintenance_routing_config_*` | L3/L4 |
+| `maintenance/aicc_maintenance_roles.md` 回滚验收 | `maintenance_rollback_*` | L3/L4 |
 
 ## 7. Method 验收清单
 
@@ -759,7 +761,7 @@ usage_output_tokens = 3
 
 ### 23.1 新模型维护更新验收
 
-当验收目标来自 `aicc_maintenance_roles.md` 中的新模型、新 Provider、新逻辑目录挂载、metadata、运营策略或 routing 维护动作时，除满足常规发布标准外，还必须执行本节闭环。
+当验收目标来自 `maintenance/aicc_maintenance_roles.md` 中的新模型、新 Provider、新逻辑目录挂载、metadata、运营策略或 routing 维护动作时，除满足常规发布标准外，还必须执行本节闭环。
 
 维护更新类型：
 
@@ -1146,11 +1148,11 @@ Mock 阶段必须保证执行环境确定：
 - `doc/aicc/aicc_api设计.md`
 - `doc/aicc/aicc_router.md`
 - `doc/aicc/aicc 逻辑模型目录.md`
-- `doc/aicc/krpc_aicc_calling_guide.md`
-- `doc/aicc/update_aicc_settings_via_system_config.md`
+- `doc/aicc/maintenance/krpc_aicc_calling_guide.md`
+- `doc/aicc/maintenance/update_aicc_settings_via_system_config.md`
 - `doc/aicc/aicc_provider_plan.md`
 - `doc/aicc/aicc_usage_log_db_requirements.md`
-- `doc/aicc/aicc_maintenance_roles.md`
+- `doc/aicc/maintenance/aicc_maintenance_roles.md`
 - `src/kernel/buckyos-api/src/aicc_client.rs`
 - `src/frame/aicc/src`
 - `test/aicc_test`
