@@ -14,8 +14,9 @@
 6. 路由、Provider、协议、任务、权限、预算、资源、配置等异常路径。
 7. 低成本、确定性 Mock 模型前期测试，以及真实模型的 gateway 验收。
 8. gateway 发布强覆盖验收必须覆盖 `openai`、`fal`、`google-gemini`、`claude`、`openrouter`、`sn-ai-provider` 六类 Provider；其中 `sn-ai-provider` 不需要普通 API key。普通开发验收可按缺失 key 将真实 Provider 用例标记为 skipped。
-9. gateway 真实模型验收按 Provider 与其支持模型的笛卡尔积生成用例，每个用例执行一条复杂 workflow。
-10. 新模型、新 Provider、新逻辑目录挂载、metadata / 运营策略 / routing 更新的维护验收闭环，覆盖测试环境相关用例、测试环境全量用例、发布环境相关用例、发布环境全量用例，以及必要的回滚验证。
+9. gateway 真实模型验收必须按 `api_type × method × 标准逻辑目录路径 × Provider × model` 的笛卡尔积生成用例；`api_type` 以代码中 canonical `ApiType` 枚举为准，标准逻辑目录路径以当前生效 `LocalLogicalTreeConfig.logical_definitions`、`SessionConfig.logical_tree` 全部可寻址节点和 `models.list` 暴露的逻辑目录为准，Provider 与 model 以实际 inventory 中可观察到的可用模型为准。
+10. 每个矩阵用例必须同时覆盖逻辑模型和实际物理模型两种调用方式：先用逻辑目录路径执行 `route.resolve` 并断言选中的 `selected_exact_model`，再用该精确模型名执行 typed inference 或 legacy method，报告中必须保留 requested logical path 与 exact model 的对应关系。
+11. 新模型、新 Provider、新逻辑目录挂载、metadata / 运营策略 / routing 更新的维护验收闭环，覆盖测试环境相关用例、测试环境全量用例、发布环境相关用例、发布环境全量用例，以及必要的回滚验证。
 
 ## 2. 设计依据
 
@@ -53,7 +54,7 @@
 | L1 白盒单测 | AICC 内部模块 | `src/frame/aicc/tests`；如需测试非 `pub` 程序块，可嵌入对应实现文件 | Rust Mock Provider | `cargo test -p aicc` | 精细覆盖路由、调度、协议转换、任务、usage log、异常分支 |
 | L2 AiccClient 黑盒 | `AiccClient` | `src/kernel/buckyos-api/tests/aicc_client_test.rs` | In-process Mock AICC server | `cargo test -p buckyos-api --test aicc_client_test` | 验证 SDK client 的 request/response、错误、任务接口语义 |
 | L3 本地 kRPC 黑盒 | `/kapi/aicc` | `test/aicc_test` | TypeScript Mock Provider | 启动本机 BuckyOS + AICC 后运行 TS 用例 | 验证真实服务进程、配置重载、kRPC、task-manager、资源链路 |
-| L4 Gateway 验收 | gateway 远程访问 | `test/aicc_test` | 真实模型 | `buckyos-devkit` 临时 group + 自动 runner | 验证真实部署链路；覆盖 Provider × 支持模型的笛卡尔积；每个用例执行一条复杂 workflow |
+| L4 Gateway 验收 | gateway 远程访问 | `test/aicc_test` | 真实模型 | `buckyos-devkit` 临时 group + 自动 runner | 验证真实部署链路；覆盖 `api_type × method × 标准逻辑目录路径 × Provider × model` 的笛卡尔积；每个用例同时验证逻辑模型路由和精确物理模型调用 |
 
 分层原则：
 
@@ -90,7 +91,8 @@
 | 资源 | `ResourceRef::Url`、`Base64`、`NamedObject`、FileObject meta、artifact 输出、大批量 embedding artifact | L1/L3/L4 |
 | Streaming | Provider-native streaming 转最终 summary；中间态写 task data；AICC response 只返回 `succeeded` 或 `running` | L1/L3/L4 |
 | Usage log | 成功调用写一条 durable event；幂等不重复写；缺 usage 视为 provider protocol error；按 1d/7d/provider/model 查询 | L1/L3 |
-| 配置 | system_config 写入、全量/局部更新、`reload_settings`、`models.list` 生效验证 | L3/L4 |
+| 控制与管理 method | `cancel`、`reload_settings` / `service.reload_settings`、`models.list` / `service.models.list`、`usage.query`、`quota.query`、`provider.list`、`provider.health`、`provider.validate`、`provider.add`、`provider.delete`、`provider.refresh_models` | L1/L2/L3/L4 |
+| 配置 | system_config 写入、全量/局部更新、Provider validate/add/delete/refresh、`reload_settings`、`models.list` 生效验证 | L3/L4 |
 | 维护更新 | 模型事实基线、运营策略、`remote_cache` / 本地 override、随版本内置缓存、provider settings、routing_config、相关用例筛选、发布后复验、事实配置回滚、策略配置回滚 | L3/L4 |
 | 安全 | `local_only` 硬过滤、`proxy_unknown` 非本地、trace 脱敏、密钥不入日志、跨租户隔离 | L1/L3/L4 |
 
@@ -121,6 +123,9 @@
 | R-021 用户友好 trace summary | `trace_user_summary_*` | L1/L3/L4 |
 | `aicc_api设计.md` ResourceRef | `resource_ref_*` | L1/L3 |
 | `aicc_api设计.md` idempotency | `idempotency_*` | L1/L2/L3 |
+| `aicc_api设计.md` method / api_type 命名 | `method_api_type_canonical_*` | L1/L2/L3 |
+| `aicc_api设计.md` control method | `control_method_*` | L1/L2/L3 |
+| AICC 服务管理 method | `provider_admin_*`、`models_list_*`、`quota_query_*`、`usage_query_*` | L2/L3/L4 |
 | `aicc_usage_log_db_requirements.md` usage event | `usage_log_*` | L1/L3 |
 | `update_aicc_settings_via_system_config.md` reload | `settings_reload_*` | L3/L4 |
 | `aicc_maintenance_roles.md` 统一更新验收流程 | `maintenance_update_*` | L3/L4 |
@@ -129,6 +134,14 @@
 | `aicc_maintenance_roles.md` 回滚验收 | `maintenance_rollback_*` | L3/L4 |
 
 ## 7. Method 验收清单
+
+本节同时覆盖标准 AI 推理 method、分层 API method 和控制/管理 method。`method` 是 kRPC schema discriminator；`api_type` 只用于 `route.resolve`、Provider inventory 和逻辑目录过滤。
+
+当前实现里的 canonical `ApiType` 序列化值以代码枚举为准：LLM 为 `llm`，不是 `llm.chat`；chat 的真实调用 method 仍是 `llm.chat`。验收用例必须同时验证：
+
+- `route.resolve(api_type="llm")` 可路由到支持 chat 的模型。
+- `route.resolve(api_type="llm.chat")` 的行为必须与当前协议约定一致：若实现尚未接受该别名，应返回稳定、可判断的错误，并在报告中标注为命名兼容缺口。
+- `embedding.multilingual`、`embedding.code` 当前不是正式 `ApiType` 枚举项；如文档或 inventory 中出现，应作为 capability / logical mount / metadata 标签处理，不能当作已支持的标准 `api_type` 误判为缺测。
 
 ### 7.1 LLM
 
@@ -188,6 +201,24 @@
 - action array response。
 - 不允许无 sandbox / environment 上下文的真实执行。
 
+### 7.6 Control / Management
+
+| Method | 必测输入 | 必测输出 | 异常 |
+|---|---|---|---|
+| `cancel` | `task_id`、tenant/session 上下文 | accepted / rejected、原 task 状态可观察、task data / event 记录 cancel 语义 | unknown task、跨 tenant cancel、provider 不支持取消、已完成任务重复取消 |
+| `reload_settings` | 空 params 或兼容旧调用 | reload 结果、Provider registry / ModelRegistry 重建摘要 | settings 非法、凭据缺失、保留上一版可用配置 |
+| `service.reload_settings` | 同 `reload_settings` | 同 `reload_settings` | 同 `reload_settings` |
+| `models.list` | 空 params、可选诊断过滤参数 | Provider inventory、exact model、`api_types`、`logical_mounts`、逻辑目录、legacy aliases、health 摘要 | registry 为空、敏感字段泄露、损坏 metadata 不应导致服务不可诊断 |
+| `service.models.list` | 同 `models.list` | 同 `models.list` | 同 `models.list` |
+| `usage.query` | 时间窗口、provider/model/method/api_type 过滤 | 聚合 usage、明细数量、成本/usage 字段、空结果 | 非法时间窗口、无权限、重复幂等记录不应重复计费 |
+| `quota.query` | capability / method、tenant/session 上下文 | 剩余额度、预算状态、限制来源 | 未配置 quota、跨 tenant 查询、非法 method |
+| `provider.list` | 可选 provider/type/driver 过滤 | Provider 列表、inventory 摘要、health、capability、pricing 脱敏视图 | 无权限、凭据泄露、Provider 状态异常仍可诊断 |
+| `provider.health` | provider instance / driver | health 状态、最近错误摘要、latency / quota / availability | Provider 不存在、health 过期、敏感错误未脱敏 |
+| `provider.validate` | provider settings 草案、base_url、auth mode、模型声明 | schema 校验结果、可连接性 / mock 可达性、脱敏诊断 | 凭据缺失、base_url 非法、未知 driver、不得写入 system_config |
+| `provider.add` | provider settings、tenant/session 上下文 | system_config 写入、reload 后 `models.list` 可见、审计记录 | 重名冲突、无权限、schema 非法、写入失败回滚 |
+| `provider.delete` | provider instance name、tenant/session 上下文 | system_config 删除、reload 后候选消失、相关 routing 诊断 | 删除不存在、仍被 policy 锁定引用、无权限 |
+| `provider.refresh_models` | provider instance / driver、刷新策略 | inventory 更新、metadata resolver 生效、`models.list` 反映新 revision | Provider 不可达、返回损坏 metadata、刷新失败不破坏旧 inventory |
+
 ## 8. Provider 协议覆盖
 
 | Provider | 输入格式 | 输出格式 | Streaming / 异步 | Mock 重点 |
@@ -208,27 +239,46 @@ P0 Provider 最小集合按 `aicc_provider_plan.md`：
 
 OpenRouter 在 Mock 和 Provider adapter 单测中仍可作为 P1 optional provider；在 L4 gateway 发布强覆盖验收中纳入 Provider 覆盖矩阵，用于验证 OpenAI-compatible 长尾模型、成本 fallback 和兼容性。普通开发验收缺少 OpenRouter key 时应 skipped，不阻塞 P0。
 
-### 8.1 L4 真实 Provider 与模型矩阵
+### 8.1 L4 真实 Provider、逻辑目录与物理模型矩阵
 
-L4 不再按“每 Provider 一条用例”收敛，而是由 runner 在测试开始时读取当前临时 group 中的 `models.list` / Provider inventory，生成以下矩阵：
+L4 不再按“每 Provider 一条用例”或“Provider × model 一条用例”收敛，而是由 runner 在测试开始时读取当前临时 group 中的 `models.list` / Provider inventory / 逻辑目录配置，生成完整覆盖矩阵：
 
 ```text
 case_set = {
-  provider in [openai, fal, google-gemini, claude, openrouter, sn-ai-provider]
+  api_type in canonical ApiType
+} x {
+  method in methods_supporting(api_type)
+} x {
+  logical_path in standard_logical_paths where logical_path.api_type == api_type
+} x {
+  provider in enabled_official_providers
 } x {
   model in provider.supported_models
+    where model.api_types contains api_type
+      and model is mounted to logical_path or admitted by logical_path min_line
 }
 ```
 
+矩阵来源：
+
+1. `canonical ApiType` 以 `src/frame/aicc/src/model_types.rs` 中的 `ApiType` 序列化值为准。当前 `llm` 是 canonical api_type，`llm.chat` 是 method；`vision.ocr`、`vision.caption`、`vision.detect`、`vision.segment` 是 api_type，但其标准逻辑目录路径在内置树中是 `image.ocr`、`image.caption`、`image.detect`、`image.segment`。
+2. `methods_supporting(api_type)` 以本文件 §7 Method 验收清单和 `aicc_api设计.md` 为准。一个 api_type 可以对应多个 method，例如 `llm` 需要覆盖 `route.resolve`、`chat.completions.create`、`helper.llm_chat`、`llm.chat`、`llm.completion` 中适用的调用形态。
+3. `standard_logical_paths` 以当前运行版本加载的 `LocalLogicalTreeConfig.logical_definitions`、`SessionConfig.logical_tree` 全部可寻址节点和 `models.list` 暴露的逻辑目录为准；该配置默认来自 `build_builtin_local_logical_tree_config()`，并可被 system_config 中的官方 routing 配置叠加。runner 必须把最终生效的标准逻辑目录路径写入报告，并标明每个路径的来源、继承到的 api_type、items、fallback 和 admission 结果。
+4. `enabled_official_providers` 发布强覆盖默认至少包含 `openai`、`fal`、`google-gemini`、`claude`、`openrouter`、`sn-ai-provider`；如果官方配置或本次发布基线新增 Provider driver，必须自动纳入矩阵或在报告中标记为未覆盖缺口。
+5. `supported_models` 以 AICC 实际注册并可被 `models.list` 观察到的模型为准，包含精确模型名、provider instance、`api_types`、`logical_mounts`、capabilities、health 和 pricing 摘要。
+
 矩阵生成规则：
 
-1. `supported_models` 以 AICC 实际注册并可被 `models.list` 观察到的模型为准，包含精确模型名和其支持的 `api_types`。
-2. 同一个 Provider 下同一个物理模型如果支持多个 `api_types`，runner 应选择能覆盖该模型主要能力的复杂 workflow；必要时一个模型可拆成 `llm` / `media` / `embedding` 等子用例，但报告必须仍能按 Provider × model 聚合。
-3. Provider 已启用但没有任何可用模型时，生成一个 `skipped` 诊断用例，原因记为 `provider_has_no_models`。
-4. `sn-ai-provider` 不需要普通 API key；如果临时 group 的 `settings.sn-ai-provider` 没有注册成功，应判为环境或配置失败，而不是 key 缺失。
-5. `openai`、`fal`、`google-gemini`、`claude`、`openrouter` 缺少对应 API key 时，该 Provider 的全部真实模型用例标记为 `skipped`，并在报告中按 Provider 汇总；发布强覆盖模式可在 preflight 直接失败。
-6. 每个真实模型用例最多执行 3 次 attempt：首次失败后只重跑同一个 Provider × model × workflow 用例 2 次；任意一次 attempt 成功则该用例最终为 `passed`。
-7. attempt 失败原因必须全部保留在报告中，最终成功的用例也要记录之前失败 attempt 的 `failure_class`、错误码和耗时，便于分析不稳定性。
+1. runner 必须先生成 `api_type × method × logical_path × provider × model` 的候选矩阵，再按模型实际能力、逻辑目录 `min_line`、`disable_line`、`mount_mode`、health、quota、policy 和 key 可用性决定 `planned` / `skipped` / `not_applicable`。
+2. `skipped` 只用于环境缺失或凭据缺失；模型不支持该 api_type、未挂载到该逻辑目录或不满足 `min_line` 时，应记录为 `not_applicable`，不能混入 skipped 通过率。
+3. 每个 `planned` 用例必须执行两段验证：逻辑模型段用 `logical_path` 发起路由或 helper/legacy 调用，断言 route trace 中的 `requested_model_type=logical`、`resolved_logical_path`、`selected_exact_model` 和 provider；物理模型段使用同一个 `selected_exact_model` 或矩阵中的 exact model 发起 typed inference / exact model 调用，断言 `requested_model_type=exact`、不发生隐式 fallback、usage 和 trace 正确。
+4. 如果某个 method 只允许 exact model，例如 typed inference，逻辑模型段必须拆成 `route.resolve(logical_path)`，再把结果传给该 method；如果某个 legacy/helper method 接受逻辑模型名，则必须直接用逻辑路径调用一次。
+5. 同一个 Provider 下同一个物理模型如果支持多个 `api_types`，不得只用一条“代表性 workflow”替代全部 api_type 覆盖；可以把昂贵能力合并到同一 workflow 中执行，但报告必须保留每个 `api_type × method × logical_path × provider × model` 维度的覆盖状态。
+6. Provider 已启用但没有任何可用模型时，生成一个 `skipped` 诊断用例，原因记为 `provider_has_no_models`。
+7. `sn-ai-provider` 不需要普通 API key；如果临时 group 的 `settings.sn-ai-provider` 没有注册成功，应判为环境或配置失败，而不是 key 缺失。
+8. `openai`、`fal`、`google-gemini`、`claude`、`openrouter` 缺少对应 API key 时，该 Provider 的全部真实模型用例标记为 `skipped`，并在报告中按 Provider 汇总；发布强覆盖模式可在 preflight 直接失败。
+9. 每个真实模型用例最多执行 3 次 attempt：首次失败后只重跑同一个 `api_type × method × logical_path × Provider × model` 用例 2 次；任意一次 attempt 成功则该用例最终为 `passed`。
+10. attempt 失败原因必须全部保留在报告中，最终成功的用例也要记录之前失败 attempt 的 `failure_class`、错误码和耗时，便于分析不稳定性。
 
 ## 9. Mock Provider 契约
 
@@ -308,6 +358,8 @@ Mock 行为可通过 request `payload.options.mock_behavior`、测试专用 head
 | 任务 | cancel unknown task、cancel forbidden、provider 不支持取消、异步任务最终失败 |
 | 幂等 | 重复 key 命中 running/succeeded/failed/cancelled；相同 key 不同 body 返回 conflict |
 | 配置 | settings schema 非法、凭据缺失、reload 后 provider 数量为 0、inventory 为空 |
+| 管理 | provider validate/add/delete/refresh 无权限、重名、损坏 metadata、删除被引用 Provider、`models.list` / `provider.list` 敏感字段泄露 |
+| 命名 | `route.resolve.api_type` 与正式 `ApiType` 枚举不一致、历史别名行为不稳定、inventory 中出现非正式 api_type |
 | 安全 | 跨 tenant 查询/取消拒绝，trace/log 不包含 token、prompt 原文、原始文件内容 |
 
 错误验收要求：
@@ -339,6 +391,10 @@ system_config 写入 settings
 4. 修改 `provider_type` 为 `local_inference` / `cloud_api` / `proxy_unknown`，验证 `local_only` 过滤。
 5. 全量覆盖 settings 和局部更新 settings 都能生效。
 6. settings 非法时 reload 失败，不破坏上一版可用配置。
+7. `provider.validate` 只做校验和脱敏诊断，不写入 system_config。
+8. `provider.add` 写入后 reload，`models.list` / `provider.list` / `provider.health` 可见，且路由可命中新增 Provider。
+9. `provider.refresh_models` 更新 inventory revision 后，`models.list` 中 exact model、`api_types`、`logical_mounts` 和 metadata resolver 结果同步变化。
+10. `provider.delete` 后 reload，候选和 provider list 中删除目标消失；若仍被 locked policy 引用，必须返回明确错误或诊断。
 
 ## 13. Usage Log 验收
 
@@ -377,9 +433,9 @@ system_config 写入 settings
 
 真实模型成本受控：
 
-- 每个真实 Provider 按其支持模型展开用例；每个 Provider × model 用例执行一条复杂 workflow。
-- 每条 workflow 尽量覆盖该 Provider / model 最有代表性的能力。
-- 首次失败后只重跑同一个 Provider × model × workflow 用例，最多累计 3 次 attempt。
+- 每个真实 Provider 按 `api_type × method × 标准逻辑目录路径 × Provider × model` 展开用例；每个 planned 用例必须覆盖逻辑模型路径和精确物理模型路径。
+- 每条 workflow 可以承载多个矩阵用例以控制成本，但报告必须逐项标记每个矩阵坐标的覆盖结果，不能用“代表性 workflow”替代未执行维度。
+- 首次失败后只重跑同一个 `api_type × method × logical_path × Provider × model` 用例，最多累计 3 次 attempt。
 - 任意 attempt 成功则该用例成功，所有 attempt 摘要都写入报告。
 - 不断言自然语言全文，只断言协议事实。
 - 未配置 API key 或 Provider 未启用时用例标记为 `skipped`，不算失败。
@@ -388,13 +444,15 @@ system_config 写入 settings
 
 每条真实模型 workflow 至少断言：
 
-1. response schema 正确。
-2. task 状态闭环。
-3. artifact 可读取。
-4. usage 存在。
-5. route trace 存在。
-6. 错误被分类。
-7. 成本调用次数受控。
+1. 矩阵坐标中的 `api_type`、`method`、`logical_path`、`provider`、`exact_model` 被写入报告。
+2. 逻辑模型段 route trace 正确，包含 `requested_model_type=logical`、`resolved_logical_path`、`selected_exact_model` 和 provider。
+3. 物理模型段 response schema 正确，并确认 exact model 调用不发生隐式 fallback。
+4. task 状态闭环。
+5. artifact 可读取。
+6. usage 存在。
+7. route trace 存在且能关联逻辑段与物理段。
+8. 错误被分类。
+9. 成本调用次数受控。
 
 建议 workflow：
 
@@ -437,7 +495,7 @@ test/aicc_test/run_acceptance.{ts|py}
 7. 执行本地 kRPC TS 用例。
 8. 如 TOML 配置启用 gateway 且 `managed_by_devkit=true`，则通过 `buckyos-devkit` 创建临时 group；当前已有 `aicc_remote_runner.ts` 主要面向既有 gateway。
 9. 从宿主机经 gateway 登录临时 group，并写入真实 Provider settings。
-10. 调用 `models.list` 生成 Provider × model 矩阵。
+10. 调用 `models.list` 并读取最终生效逻辑目录，生成 `api_type × method × logical_path × Provider × model` 矩阵。
 11. 执行真实模型 workflow；失败 case 最多累计 3 次 attempt。
 12. 生成报告。
 13. 清理本次 runner 创建的临时 group。
@@ -564,7 +622,7 @@ test/aicc_test/reports/acceptance/<run_id>/
 - gateway 链路、鉴权、配置读取、报告生成必须稳定。
 - 被测环境必须由 `buckyos-devkit` 临时 group 启动，宿主机 runner 作为客户端通过 gateway 访问。
 - 发布强覆盖 Provider 矩阵必须包含 `openai`、`fal`、`google-gemini`、`claude`、`openrouter`、`sn-ai-provider`；普通开发验收可因缺 key skipped，但必须在报告中明确。
-- 用例覆盖必须按 Provider × 支持模型的笛卡尔积生成；每个用例执行一条复杂 workflow。
+- 用例覆盖必须按 `api_type × method × 标准逻辑目录路径 × Provider × model` 的笛卡尔积生成；每个 planned 用例必须覆盖逻辑模型路由和精确物理模型调用。
 - 每个失败用例必须额外重试 2 次，累计最多 3 次；任意一次成功则最终判定为成功。
 - 真实模型内容不要求固定，但协议、任务状态、错误分类、trace、usage 记录必须可判定。
 - 真实模型失败不能吞掉原因，必须进入报告。
@@ -578,7 +636,7 @@ test/aicc_test/reports/acceptance/<run_id>/
 |---|---|---|
 | M0 | L1 白盒单测 + L2 AiccClient 黑盒测试 | Rust Mock Provider 可用；`cargo test -p aicc` 和 `cargo test -p buckyos-api --test aicc_client_test` 的 P0 用例 100% 通过 |
 | M1 | L3 本地 kRPC + TypeScript Mock Provider | 本机 BuckyOS + AICC 启动后，可通过 TS Mock Provider 或现有 smoke 扩展完成配置重载、`models.list`、各类 method、task、usage、trace 和异常路径测试 |
-| M2 | L4 gateway + 真实模型验收 | runner 能连接既有 gateway；发布强覆盖阶段再要求能用 `buckyos-devkit` 启动临时 group，经 gateway 执行 Provider × model 矩阵 workflow，报告可区分 passed / failed / skipped / partial；真实模型失败原因和重试 attempt 可追踪 |
+| M2 | L4 gateway + 真实模型验收 | runner 能连接既有 gateway；发布强覆盖阶段再要求能用 `buckyos-devkit` 启动临时 group，经 gateway 执行 `api_type × method × logical_path × Provider × model` 矩阵 workflow，报告可区分 passed / failed / skipped / not_applicable / partial；真实模型失败原因和重试 attempt 可追踪 |
 
 里程碑边界：
 
@@ -776,6 +834,8 @@ usage_output_tokens = 3
 | `l1_resource_ref_*` | P0 | `url`、`base64`、`named_object`、FileObject meta 推导 |
 | `l1_task_lifecycle_*` | P0 | immediate、async running、final succeeded、failed、cancel |
 | `l1_usage_log_*` | P0 | 成功写 usage、幂等去重、缺 usage 报错、查询聚合 |
+| `l1_method_api_type_canonical_*` | P0 | `method` 与 `api_type` 边界、`llm` vs `llm.chat`、非正式 api_type 拒绝或降级诊断 |
+| `l1_control_method_*` | P0 | cancel、reload、models list、usage/quota/provider 查询的 schema 和权限边界 |
 | `l1_security_*` | P0 | `local_only`、`proxy_unknown`、locked policy、trace 脱敏 |
 | `l1_concurrency_*` | P1 | session patch 并发、幂等并发、异步任务并发完成 |
 
@@ -788,6 +848,7 @@ usage_output_tokens = 3
 | `l2_client_idempotency_*` | P0 | running / succeeded / failed / conflict 语义 |
 | `l2_client_async_task_*` | P0 | running response、event_ref、最终 task 查询 |
 | `l2_client_cancel_*` | P0 | cancel 成功、unknown task、forbidden |
+| `l2_client_control_method_*` | P0 | reload、models list、usage/quota/provider 查询响应解析和错误映射 |
 | `l2_client_resource_ref_*` | P1 | client 侧 `ResourceRef` JSON tag 和反序列化 |
 | `l2_client_error_mapping_*` | P0 | kRPC error 与 AICC task failed error 的边界 |
 
@@ -796,6 +857,9 @@ usage_output_tokens = 3
 | 用例族 | 优先级 | 覆盖点 |
 |---|---|---|
 | `l3_settings_reload_mock_*` | P0 | system_config 写入 Mock settings、reload、models.list |
+| `l3_provider_admin_*` | P0 | provider.validate/add/delete/refresh_models 的 system_config 写入、reload 和回滚语义 |
+| `l3_models_list_*` | P0 | `models.list` / `service.models.list` inventory、逻辑目录、health、legacy aliases 脱敏诊断 |
+| `l3_quota_query_*` | P1 | `quota.query` 按 tenant、capability、method 返回预算状态和拒绝路径 |
 | `l3_krpc_llm_chat_*` | P0 | 纯文本、多模态 content part、tool call、JSON schema |
 | `l3_krpc_resource_*` | P0 | `url`、`base64`、`named_object` 输入和 artifact 输出 |
 | `l3_krpc_stream_*` | P0 | Mock streaming chunks、task data progress、final summary |
@@ -908,8 +972,8 @@ pnpm run acceptance:all -- \
 4. 使用 `buckyos-devkit` 创建并启动 L4 临时 group，通过 gateway 访问该 group。
 5. 将传入的 4 个 key 写入临时 group 的 AICC settings；`sn-ai-provider` 不需要普通 API key。
 6. 对 `openrouter`，runner 优先读取配置文件或临时 group settings 中的 `openrouter` key；如果发布验收要求强覆盖但缺 key，应在 preflight 阶段失败。普通开发验收可将 openrouter 矩阵标记为 `skipped`。
-7. 动态读取 `models.list`，生成 Provider × model 矩阵。
-8. 每个矩阵用例执行复杂 workflow，失败后最多额外执行 2 次。
+7. 动态读取 `models.list` 和最终生效逻辑目录，生成 `api_type × method × logical_path × Provider × model` 矩阵。
+8. 每个 planned 矩阵用例执行逻辑模型段与精确物理模型段验证，失败后最多额外执行 2 次。
 9. 输出 `summary.md`、`summary.json` 和脱敏后的 attempt 明细。
 10. 清理 runner 新建的临时 group。
 
@@ -945,7 +1009,7 @@ timeout_ms = 300000
 max_attempts_per_case = 3
 allow_real_model_calls = false
 fail_on_partial = false
-matrix_mode = "provider_model_cartesian"
+matrix_mode = "full_cartesian"
 providers = ["openai", "fal", "google-gemini", "claude", "openrouter", "sn-ai-provider"]
 
 [providers.openai]
@@ -979,7 +1043,8 @@ requires_api_key = false
 配置规则：
 
 - `allow_real_model_calls` 默认为 `false`。只有显式设为 `true` 才允许发起真实模型调用。
-- `matrix_mode=provider_model_cartesian` 时，runner 必须按 Provider × 该 Provider 支持模型生成 L4 用例。
+- `matrix_mode=full_cartesian` 时，runner 必须按 `api_type × method × 标准逻辑目录路径 × Provider × model` 生成 L4 用例。
+- 兼容旧配置 `matrix_mode=provider_model_cartesian` 时，runner 必须在报告中标记为降级模式，并明确列出未覆盖的 `api_type`、`method`、`logical_path` 维度；发布强覆盖不得使用该降级模式。
 - `max_attempts_per_case` 默认为 `3`；只有首轮失败的用例才继续执行第 2 / 第 3 次 attempt。
 - Provider `enabled=true` 但缺 key 时，用例标记 `skipped`；发布强覆盖模式下，缺 key 可在 preflight 直接失败。
 - `google-gemini` 对应 AICC 配置中的 `settings.gemini` / `settings.google_gemini` 兼容入口，生效的 `provider_driver` 应归一为 `google-gemini`。
@@ -998,7 +1063,7 @@ L4 runner 应把被测环境视为一次性资源，推荐流程：
 4. 使用 group template 生成临时 group 配置，最小建议为 `SN + alice-ood1`；需要多 Provider 节点或 gateway 冗余时再扩展节点。
 5. 执行 `create_vms` / `install` / `start`，并等待 gateway、system-config、verify-hub、scheduler、task-manager、AICC 全部可访问。
 6. 宿主机 runner 通过 gateway 登录并获取测试 token，后续所有 L4 调用都经 gateway 访问 `/kapi/aicc` 和相关 task / artifact 接口。
-7. 写入真实 Provider settings，触发 `reload_settings`，调用 `models.list` 生成 Provider × model 矩阵。
+7. 写入真实 Provider settings，触发 `reload_settings`，调用 `models.list` 并读取最终生效逻辑目录，生成 `api_type × method × logical_path × Provider × model` 矩阵。
 8. 运行 L4 矩阵用例并收集报告。
 9. 默认执行 `stop` / `clean_vms` 清理临时 group；除非显式 `keep_on_failure=true`，失败环境也必须清理。
 
@@ -1038,7 +1103,7 @@ L4 runner 应把被测环境视为一次性资源，推荐流程：
 
 真实模型重试判定：
 
-1. 重试粒度是单个 Provider × model × workflow 用例，不得扩大到整个 Provider 或整个测试批次。
+1. 重试粒度是单个 `api_type × method × logical_path × Provider × model` 用例，不得扩大到整个 Provider 或整个测试批次。
 2. 第 1 次 attempt 失败后，runner 应立即重跑同一用例；第 2 次仍失败时再重跑第 3 次。
 3. 任意 attempt 满足通过断言，则该 case 最终状态为 `passed`，并在报告中标注 `passed_after_attempt=N`。
 4. 三次 attempt 全部失败时，该 case 最终状态为 `failed`，主失败原因取最后一次 attempt，同时保留全部 attempt 明细。
@@ -1064,7 +1129,7 @@ Mock 阶段必须保证执行环境确定：
 | 风险 | 影响 | 处理策略 |
 |---|---|---|
 | 真实模型输出不稳定 | gateway 用例误报 | 只断言协议事实，不断言自然语言全文 |
-| 真实模型费用失控 | 成本风险 | `allow_real_model_calls=false` 默认值、按 Provider × model 生成前先输出预计用例数；失败用例最多 3 次 attempt；报告统计真实调用次数和估算成本 |
+| 真实模型费用失控 | 成本风险 | `allow_real_model_calls=false` 默认值、按五维矩阵生成前先输出 planned / skipped / not_applicable 数量和预计调用次数；失败用例最多 3 次 attempt；报告统计真实调用次数和估算成本 |
 | L4 临时环境残留 | 占用本机资源、污染后续测试 | group 名带 `run_id`，默认 `cleanup_on_exit=true`；只清理 runner 创建的 group；清理失败写 warning |
 | VM 多节点构造慢 | 发布验收耗时长 | 先构造空白 VM，再 clone 出所需节点；只在需要 gateway / SN / 多节点路径时扩展节点数 |
 | Mock 与真实 Provider 差异过大 | Mock 通过但真实失败 | Mock 按 Provider 原生协议构造请求/响应，不只 mock AICC 内部 trait |
@@ -1141,12 +1206,15 @@ json_schema = "assertions/llm_chat_summary.schema.json"
 no_sensitive_log = true
 
 [[cases]]
-case_id = "l4_gateway_openai_${model_slug}_complex_workflow"
+case_id = "l4_gateway_${api_type_slug}_${method_slug}_${logical_slug}_${provider}_${model_slug}"
 layer = "L4"
 priority = "P2"
-method = "workflow"
+api_type = "${api_type}"
+method = "${method}"
+logical_path = "${logical_path}"
 provider = "openai"
 model = "${exact_model}"
+matrix_source = "models.list"
 timeout_ms = 300000
 requires = ["gateway", "real_model", "api_key:openai"]
 max_attempts = 3
@@ -1178,13 +1246,15 @@ expect_trace = true
 | `case_id` | 稳定用例 ID，进入报告后不随意变更 |
 | `layer` | `L1`、`L2`、`L3`、`L4` |
 | `priority` | `P0`、`P1`、`P2` |
+| `api_type` | canonical `ApiType` 序列化值，例如 `llm`、`vision.ocr`、`image.txt2img` |
 | `method` | AICC method 或 `workflow` |
+| `logical_path` | 标准逻辑目录路径，例如 `llm.plan`、`image.ocr`；不得用 `vision.ocr` 代替 `image.ocr` |
 | `model_alias` | 请求模型名，可为逻辑模型或精确模型 |
 | `provider` | 期望命中的 Provider；路由类用例可为空 |
 | `provider_driver` | Provider driver 名，例如 `openai`、`google-gemini`、`claude` |
 | `scenario` | Mock 行为场景 |
 | `update_type` | 维护更新类型，例如 `metadata`、`policy`、`routing`、`provider_settings`、`adapter_release`、`rollback` |
-| `api_types` | 本用例覆盖的 AICC method / API type 列表 |
+| `api_types` | 本用例覆盖的 AICC method / API type 列表；L4 矩阵用例必须同时填写单值 `api_type` |
 | `logical_catalogs` | 本用例覆盖的逻辑目录列表 |
 | `tags` | 可检索标签；维护更新类用例至少包含 `update:*`、`provider:*`、`model:*`、`api_type:*` 或 `logical:*` 中适用项 |
 | `requires` | 前置能力；缺失时用例 `skipped` |
@@ -1195,6 +1265,9 @@ expect_trace = true
 | `max_attempts` | L4 单 case 最大 attempt 数；真实模型默认 3 |
 | `matrix_source` | L4 动态矩阵来源，推荐 `models.list` |
 | `model_slug` | 由精确模型名归一化得到的稳定用例 ID 片段 |
+| `logical_slug` | 由逻辑目录路径归一化得到的稳定用例 ID 片段 |
+| `logical_attempt` | 报告字段：逻辑模型段 attempt 摘要，包含 requested logical path、route trace、selected exact model |
+| `exact_attempt` | 报告字段：物理模型段 attempt 摘要，包含 exact model、provider、usage、trace 和 no-fallback 断言 |
 
 Runner 要求：
 
@@ -1202,7 +1275,7 @@ Runner 要求：
 - `requires` 不满足时标记 `skipped`，并记录 `skip_reason`。
 - 同一 manifest 内 `case_id` 必须唯一。
 - 报告中的 case 顺序应与 manifest 顺序一致，便于人工阅读。
-- L4 动态矩阵用例可以由模板 case 展开；展开后的 `case_id` 必须唯一，并保留 `provider`、`model`、`api_types`、`matrix_source`。
+- L4 动态矩阵用例可以由模板 case 展开；展开后的 `case_id` 必须唯一，并保留 `api_type`、`method`、`logical_path`、`provider`、`model`、`matrix_source`。
 - L4 attempt 明细必须挂在同一个 case 下，不能展开成多个独立 case 影响通过率统计。
 - 维护更新类用例必须支持按 `update_type`、`provider_driver`、`provider`、`model`、`api_types`、`logical_catalogs` 和 `tags` 筛选；报告中应能单独汇总本次更新相关用例与全量回归用例。
 
@@ -1332,7 +1405,7 @@ Fixture 要求：
 9. 如果是 L4，确认 `allow_real_model_calls=true`，否则跳过真实调用。
 10. 如果是 L4，确认 `buckyos-devkit`、Multipass 和临时 group template 可用。
 11. 如果是 L4，创建或 clone 临时 group VM，启动后通过 gateway 完成登录和 `/kapi/aicc` 连通性检查。
-12. 如果是 L4，调用 `models.list` 生成 Provider × model 矩阵，并在真正执行前把矩阵摘要写入报告。
+12. 如果是 L4，调用 `models.list` 并读取最终生效逻辑目录，生成 `api_type × method × logical_path × Provider × model` 矩阵，并在真正执行前把矩阵摘要写入报告。
 
 执行后应做 cleanup：
 
@@ -1395,7 +1468,7 @@ Fixture 要求：
 | 7 | 对齐 Rust Mock Provider 与 TS Mock scenario 契约 | `src/frame/aicc/tests`、`test/aicc_test` |
 | 8 | 增加 Provider-specific protocol P0 用例 | `src/frame/aicc/tests` |
 | 9 | 增加 gateway TOML、`buckyos-devkit` 临时 group 管理和真实模型 workflow | `test/aicc_test` |
-| 10 | 增加 Provider × model 矩阵生成、失败 case 三次 attempt 和 attempt 报告 | `test/aicc_test` |
+| 10 | 增加五维矩阵生成、失败 case 三次 attempt 和 attempt 报告 | `test/aicc_test` |
 | 11 | 接入脱敏扫描和发布验收报告 | `test/aicc_test` |
 
 每个任务完成后至少应能回答：
@@ -1487,25 +1560,33 @@ Fixture 要求：
 
 ## Summary
 
-| Layer | Passed | Failed | Skipped | Partial | Duration |
-|---|---:|---:|---:|---:|---:|
-| L1 | 18 | 0 | 0 | 0 | 42s |
-| L2 | 3 | 0 | 0 | 0 | 8s |
-| L3 | 10 | 1 | 1 | 0 | 3m41s |
-| L4 | 18 | 1 | 5 | 1 | 41m12s |
+| Layer | Passed | Failed | Skipped | Not Applicable | Partial | Duration |
+|---|---:|---:|---:|---:|---:|---:|
+| L1 | 18 | 0 | 0 | 0 | 0 | 42s |
+| L2 | 3 | 0 | 0 | 0 | 0 | 8s |
+| L3 | 10 | 1 | 1 | 0 | 0 | 3m41s |
+| L4 | 72 | 1 | 30 | 184 | 1 | 41m12s |
 
-Total: 49 passed, 2 failed, 6 skipped, 1 partial.
+Total: 103 passed, 2 failed, 31 skipped, 184 not_applicable, 1 partial.
 
 ## L4 Matrix
 
-| Provider | Models | Passed | Failed | Skipped | Partial | Attempts |
-|---|---:|---:|---:|---:|---:|---:|
-| openai | 4 | 4 | 0 | 0 | 0 | 5 |
-| claude | 3 | 3 | 0 | 0 | 0 | 3 |
-| google-gemini | 4 | 3 | 1 | 0 | 0 | 7 |
-| fal | 4 | 4 | 0 | 0 | 0 | 4 |
-| openrouter | 5 | 0 | 0 | 5 | 0 | 0 |
-| sn-ai-provider | 3 | 3 | 0 | 0 | 0 | 3 |
+| Provider | Api Types | Logical Paths | Models | Planned | Passed | Failed | Skipped | Not Applicable | Partial | Attempts |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| openai | 7 | 14 | 8 | 36 | 36 | 0 | 0 | 76 | 0 | 40 |
+| claude | 2 | 7 | 3 | 12 | 12 | 0 | 0 | 30 | 0 | 12 |
+| google-gemini | 6 | 12 | 5 | 20 | 19 | 1 | 0 | 40 | 0 | 25 |
+| fal | 5 | 5 | 4 | 12 | 12 | 0 | 0 | 8 | 0 | 12 |
+| openrouter | 1 | 6 | 5 | 0 | 0 | 0 | 30 | 0 | 0 | 0 |
+| sn-ai-provider | 1 | 6 | 3 | 9 | 9 | 0 | 0 | 9 | 0 | 9 |
+
+## L4 Matrix Detail
+
+| Case | Api Type | Method | Logical Path | Provider | Exact Model | Logical Result | Exact Result | Attempts |
+|---|---|---|---|---|---|---|---|---:|
+| l4_gateway_llm_llm_chat_llm_plan_openai_gpt_5_5_pro | llm | llm.chat | llm.plan | openai | gpt-5.5-pro@openai | passed | passed | 1 |
+| l4_gateway_vision_ocr_vision_ocr_image_ocr_google_florence_2 | vision.ocr | vision.ocr | image.ocr | google-gemini | florence-2@google | failed | not_run | 3 |
+| l4_gateway_image_upscale_image_upscale_image_upscale_fal_esrgan | image.upscale | image.upscale | image.upscale | fal | esrgan@fal | passed | passed | 1 |
 
 ## Failed Cases
 
@@ -1529,6 +1610,13 @@ Total: 49 passed, 2 failed, 6 skipped, 1 partial.
 | l4_gateway_openai_* | allow_real_model_calls=false |
 | l4_gateway_claude_* | missing api_key:claude |
 | l4_gateway_openrouter_* | missing api_key:openrouter |
+
+## Not Applicable Cases
+
+| Dimension | Count | Reason |
+|---|---:|---|
+| vision.* × openrouter LLM models | 30 | model api_types do not contain vision api_type |
+| image.upscale × openai text models | 8 | model not mounted to logical path and not admitted by min_line |
 
 ## Cost
 
@@ -1560,7 +1648,7 @@ Total: 49 passed, 2 failed, 6 skipped, 1 partial.
 - `summary.json` 面向 CI、脚本和后续分析。
 - 失败用例必须提供 trace id、task id、failure class 和脱敏输入输出目录。
 - skipped 不能只显示数量，必须显示原因。
-- L4 报告必须显示真实模型调用次数、attempt 次数、Provider × model 覆盖矩阵和估算成本。
+- L4 报告必须显示真实模型调用次数、attempt 次数、`api_type × method × logical_path × Provider × model` 覆盖矩阵、not_applicable/skipped 原因和估算成本。
 - L4 报告必须显示临时 group 是否已清理；如未清理，必须显示保留原因和手工清理命令。
 
 ## 41. 第一阶段明确不做
