@@ -1,10 +1,42 @@
-﻿# AICC 维护更新验收用例
+# AICC CI、发布门槛与性能组件
 
-定义新增模型、新 Provider、新逻辑目录、metadata、routing、运营策略和回滚的维护更新验收闭环。
+定义 CI 与手工边界、阶段性门槛、发布验收、性能并发最低要求、文档联动和评审清单。
 
 本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
 
-## 1. 发布验收标准
+## 1. CI 与手工验收边界
+
+| 范围 | 执行环境 | 是否阻塞合入 |
+|---|---|---|
+| L1 `cargo test -p aicc` | CI / 本地 | 是 |
+| L2 `cargo test -p buckyos-api --test aicc_client_test` | CI / 本地 | 是 |
+| L3 本地 kRPC + Mock Provider | CI 或 nightly；本地可手工 | P0 阶段应阻塞 |
+| L4 gateway + 真实模型 | nightly / 手工 | 不阻塞普通合入，阻塞发布验收 |
+
+真实模型 key 缺失时，L4 用例必须 `skipped`，不能算失败。
+
+## 2. 阶段性验收门槛
+
+### 2.1 Mock 阶段
+
+- L1/L2/L3 P0 必须 100% 通过。
+- 不允许访问真实模型。
+- 测试执行环境必须可重复，失败必须可复现。
+- usage、task、trace、resource、routing 的核心断言必须稳定。
+- 报告必须能定位失败原因。
+
+### 2.2 Gateway 阶段
+
+- gateway 链路、鉴权、配置读取、报告生成必须稳定。
+- 被测环境必须由 `buckyos-devkit` 临时 group 启动，宿主机 runner 作为客户端通过 gateway 访问。
+- 发布强覆盖 Provider 矩阵必须包含 `openai`、`fal`、`google-gemini`、`claude`、`openrouter`、`sn-ai-provider`；普通开发验收可因缺 key skipped，但必须在报告中明确。
+- 用例覆盖必须按 `api_type × method × 标准逻辑目录路径 × Provider × model` 的笛卡尔积生成；每个 planned 用例必须覆盖逻辑模型路由和精确物理模型调用。
+- 每个失败用例必须额外重试 2 次，累计最多 3 次；任意一次成功则最终判定为成功。
+- 真实模型内容不要求固定，但协议、任务状态、错误分类、trace、usage 记录必须可判定。
+- 真实模型失败不能吞掉原因，必须进入报告。
+- 测试完成后必须清理临时 group；如果清理失败，报告记录 `cleanup_failed` warning。
+
+## 3. 发布验收标准
 
 发布前建议满足以下硬指标：
 
@@ -20,7 +52,7 @@
 10. 所有 failed / partial 用例都有明确失败原因、错误码或 Provider 摘要。
 11. runner 创建的临时 group 已清理，或报告中明确记录保留原因和清理命令。
 
-### 1.1 新模型维护更新验收
+### 3.1 新模型维护更新验收
 
 当验收目标来自 `maintenance/aicc_maintenance_roles.md` 中的新模型、新 Provider、新逻辑目录挂载、metadata、运营策略或 routing 维护动作时，除满足常规发布标准外，还必须执行本节闭环。
 
@@ -52,7 +84,30 @@
 - 产品用户通过 system_config、local metadata override 或 `session_overlay` 做临时接入时，验收只要求配置生效、可回滚和安全边界正确；不要求修改公共基线。
 - 模型服务商主动提供 BuckyOS metadata / inventory / cost / quota / health 信息目前按畅想处理；如接入试点，应作为服务商或第三方 Provider 包验收，不作为 P0 默认要求。
 
-## 2. 文档联动要求
+## 4. 性能与并发最低要求
+
+性能和并发不作为第一阶段的主要目标，但需要设置最低验收线，避免破坏基础可用性。
+
+| 项目 | 最低要求 | 主要层级 |
+|---|---|---|
+| 路由解析耗时 | Mock 环境下单次普通路由不应成为主要耗时瓶颈；建议记录 p50 / p95，不先设置硬阈值 | L1/L3 |
+| 并发 request overlay 路由 | 多个请求携带不同 `session_overlay` 时互不污染，无共享 session 状态 | L1 |
+| 幂等重试 | 并发重复提交同一 `idempotency_key` 不得重复执行 Provider，不得重复写 usage | L1/L3 |
+| usage 写入 | 多个异步任务并发完成时，usage event 不串任务、不重复、不丢失 | L1/L3 |
+| artifact 输出 | 并发生成 artifact 时 ObjectId、meta、task result 不串 | L3 |
+| failover | 多候选并发失败时，trace 能区分每次 attempt，不污染其它 request | L1/L3 |
+| task 状态 | 多个异步任务并发运行和完成时，状态、event_ref、最终 result 对应正确 | L1/L3 |
+
+并发测试建议：
+
+1. 多个 request 携带不同 overlay 并发 route resolve。
+2. 多个 request 携带相同 overlay 并发 route resolve。
+3. 同一 idempotency key 并发提交相同 request。
+4. 同一 idempotency key 并发提交不同 request。
+5. 多个异步 Mock video/audio/image task 并发完成。
+6. Provider 先失败后 failover 的请求与普通成功请求并发执行。
+
+## 5. 文档联动要求
 
 后续实现测试或修改 AICC 协议时，需要同步检查：
 
@@ -80,115 +135,19 @@
 8. 修改 task data / event 中 AICC 字段。
 9. 修改 metadata、运营策略、`remote_cache`、provider settings、routing_config 或回滚流程。
 
-## 3. 用例 Manifest 约定
+## 6. 评审清单
 
-为便于统一 runner 执行和生成报告，建议把 L3/L4 用例声明为 manifest。Rust L1/L2 可以不强制使用 manifest，但报告中的 case metadata 应与 manifest 字段保持一致。
+新增或修改 AICC 验收用例时，评审应检查：
 
-推荐文件：
-
-```text
-test/aicc_test/cases/
-  local_mock_cases.toml
-  gateway_cases.toml
-```
-
-Manifest 样例：
-
-```toml
-[[cases]]
-case_id = "l3_krpc_llm_chat_json_schema_success"
-layer = "L3"
-priority = "P0"
-method = "llm.chat"
-model_alias = "llm.plan"
-provider = "openai-mock-1"
-scenario = "success"
-timeout_ms = 30000
-requires = ["mock_provider", "aicc_service", "task_manager"]
-fixtures = []
-expect_status = "succeeded"
-expect_artifacts = false
-expect_usage = true
-expect_trace = true
-
-[cases.input]
-template = "llm_chat_json_schema.json"
-
-[cases.assertions]
-json_schema = "assertions/llm_chat_summary.schema.json"
-no_sensitive_log = true
-
-[[cases]]
-case_id = "l4_gateway_${api_type_slug}_${method_slug}_${logical_slug}_${provider}_${model_slug}"
-layer = "L4"
-priority = "P2"
-api_type = "${api_type}"
-method = "${method}"
-logical_path = "${logical_path}"
-provider = "openai"
-model = "${exact_model}"
-matrix_source = "models.list"
-timeout_ms = 300000
-requires = ["gateway", "real_model", "api_key:openai"]
-max_attempts = 3
-expect_status = "partial_or_passed"
-expect_usage = true
-expect_trace = true
-
-[[cases]]
-case_id = "l3_maintenance_metadata_openai_gpt_5_mini_logical_llm_chat"
-layer = "L3"
-priority = "P1"
-method = "maintenance.update"
-provider = "openai-mock-1"
-model = "gpt-5-mini@openai-mock-1"
-update_type = "metadata"
-api_types = ["llm.chat"]
-logical_catalogs = ["llm.chat"]
-tags = ["update:metadata", "provider:openai", "model:gpt-5-mini", "api_type:llm.chat", "logical:llm.chat"]
-requires = ["mock_provider", "aicc_service", "settings_reload"]
-expect_status = "succeeded"
-expect_usage = false
-expect_trace = true
-```
-
-字段说明：
-
-| 字段 | 说明 |
-|---|---|
-| `case_id` | 稳定用例 ID，进入报告后不随意变更 |
-| `layer` | `L1`、`L2`、`L3`、`L4` |
-| `priority` | `P0`、`P1`、`P2` |
-| `api_type` | canonical `ApiType` 序列化值，例如 `llm`、`vision.ocr`、`image.txt2img` |
-| `method` | AICC method 或 `workflow` |
-| `logical_path` | 标准逻辑目录路径，例如 `llm.plan`、`image.ocr`；不得用 `vision.ocr` 代替 `image.ocr` |
-| `model_alias` | 请求模型名，可为逻辑模型或精确模型 |
-| `provider` | 期望命中的 Provider；路由类用例可为空 |
-| `provider_driver` | Provider driver 名，例如 `openai`、`google-gemini`、`claude` |
-| `scenario` | Mock 行为场景 |
-| `update_type` | 维护更新类型，例如 `metadata`、`policy`、`routing`、`provider_settings`、`adapter_release`、`rollback` |
-| `api_types` | 本用例覆盖的 AICC method / API type 列表；L4 矩阵用例必须同时填写单值 `api_type` |
-| `logical_catalogs` | 本用例覆盖的逻辑目录列表 |
-| `tags` | 可检索标签；维护更新类用例至少包含 `update:*`、`provider:*`、`model:*`、`api_type:*` 或 `logical:*` 中适用项 |
-| `requires` | 前置能力；缺失时用例 `skipped` |
-| `fixtures` | 所需 fixture 列表 |
-| `expect_status` | `succeeded`、`running`、`failed`、`partial_or_passed` |
-| `expect_usage` | 是否必须存在 usage |
-| `expect_trace` | 是否必须存在 route trace |
-| `max_attempts` | L4 单 case 最大 attempt 数；真实模型默认 3 |
-| `matrix_source` | L4 动态矩阵来源，推荐 `models.list` |
-| `model_slug` | 由精确模型名归一化得到的稳定用例 ID 片段 |
-| `logical_slug` | 由逻辑目录路径归一化得到的稳定用例 ID 片段 |
-| `logical_attempt` | 报告字段：逻辑模型段 attempt 摘要，包含 requested logical path、route trace、selected exact model |
-| `exact_attempt` | 报告字段：物理模型段 attempt 摘要，包含 exact model、provider、usage、trace 和 no-fallback 断言 |
-
-Runner 要求：
-
-- manifest 解析失败应直接终止，不能静默跳过。
-- `requires` 不满足时标记 `skipped`，并记录 `skip_reason`。
-- 同一 manifest 内 `case_id` 必须唯一。
-- 报告中的 case 顺序应与 manifest 顺序一致，便于人工阅读。
-- L4 动态矩阵用例可以由模板 case 展开；展开后的 `case_id` 必须唯一，并保留 `api_type`、`method`、`logical_path`、`provider`、`model`、`matrix_source`。
-- L4 attempt 明细必须挂在同一个 case 下，不能展开成多个独立 case 影响通过率统计。
-- 维护更新类用例必须支持按 `update_type`、`provider_driver`、`provider`、`model`、`api_types`、`logical_catalogs` 和 `tags` 筛选；报告中应能单独汇总本次更新相关用例与全量回归用例。
-
+1. case id 是否符合命名规范。
+2. 是否标明 layer、priority、method、provider、scenario。
+3. 是否可以稳定复现。
+4. 是否避免真实模型默认调用。
+5. 是否有明确断言，而不是只检查“不报错”。
+6. 是否覆盖成功和至少一个失败路径。
+7. 是否检查 usage、trace、task 或 artifact 中与该用例相关的关键字段。
+8. 是否避免记录密钥、token、原始 prompt 和原始文件内容。
+9. 是否在失败时输出足够诊断信息。
+10. 是否更新需求追踪矩阵或 manifest。
+11. 是否需要同步更新 `doc/aicc` 其它协议文档。
+12. 是否会引入新的依赖；如需要，应先单独确认。

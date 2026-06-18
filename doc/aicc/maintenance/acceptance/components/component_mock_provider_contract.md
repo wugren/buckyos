@@ -1,6 +1,6 @@
-﻿# AICC TS Mock Provider 组件 Part 1
+# AICC Mock Provider 契约组件
 
-实现 TypeScript Mock Provider 管理接口和 OpenAI-like 最小接口，覆盖 L3 P0 所需的基础协议路径。
+定义 Mock Provider 的通用原则、行为控制、配置样例和 HTTP 接口契约。
 
 本文档是拆分后的自包含验收任务文档。实现或评审本任务时，以本文档和 README 中列出的依赖文档为准，不需要回查总方案。
 
@@ -176,4 +176,3 @@ Mock Provider 需要提供测试管理接口：
 | `POST` | `/fal-ai/video-upscaler` | `video.upscale` |
 | `GET` | `/queue/requests/{request_id}/status` | 异步状态 |
 | `GET` | `/queue/requests/{request_id}` | 异步结果 |
-
