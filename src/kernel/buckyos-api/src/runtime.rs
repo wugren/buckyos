@@ -54,7 +54,7 @@ pub const BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV: &str = "BUCKYOS_APPCLIENT_SESSION
 pub enum BuckyOSRuntimeType {
     AppClient,     //运行在所有设备上，通常不在容器里（唯一可能加载user private key的类型)
     AppService,    //R3 运行在Node上，指定用户，可能在容器里
-    FrameService,  //R2 运行在Node上，通常在容器里
+    FrameService,  //R2 运行在Node上，通常在容器里（未启用）
     KernelService, //R1 由node-daemon启动的的系统基础服务
     Kernel,        //R0,node-daemon和cyfs-gateway使用，可以单独启动的组件
 }

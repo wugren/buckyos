@@ -47,6 +47,9 @@
 9) 常见踩坑与工程建议
 - `09_pitfalls.md`
 
+10) 用户生命周期与权限：创建/删除用户、用户类型权限差异、系统 vs App 职责
+- `10_user_lifecycle_and_permissions.md`
+
 
 ## 术语与端口（当前实现的关键常量）
 - system-config 服务主端口：`3200`（见 `src/kernel/sys_config_service/src/main.rs`）

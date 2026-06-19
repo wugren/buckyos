@@ -406,7 +406,7 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
         "auth_mode".to_string(),
         Value::String(
             if provider_type == "sn_router" {
-                "device_jwt"
+                "runtime_session"
             } else {
                 "bearer"
             }

@@ -13,19 +13,17 @@ use crate::openai_protocol::{
     apply_provider_model_defaults, merge_options, merge_requirements_response_format,
     merge_tool_calls, strip_incompatible_sampling_options,
 };
-use ::kRPC::{RPCSessionToken, RPCSessionTokenType};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use buckyos_api::{
-    ai_methods, features, value_to_object_map, AiArtifact, AiContent, AiCost, AiMessage,
-    AiMethodRequest, AiResponse, AiRole, AiToolCall, AiToolResultContent, AiUsage, Capability,
-    ResourceRef,
+    ai_methods, features, get_buckyos_api_runtime, value_to_object_map, AiArtifact, AiContent,
+    AiCost, AiMessage, AiMethodRequest, AiResponse, AiRole, AiToolCall, AiToolResultContent,
+    AiUsage, Capability, ResourceRef,
 };
-use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
+use buckyos_kit::buckyos_get_unix_timestamp;
 use log::{error, info, warn};
-use name_lib::load_private_key;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -33,7 +31,6 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time;
@@ -51,8 +48,8 @@ const DEFAULT_OPENAI_PROVIDER_DRIVER: &str = "openai";
 const SN_AI_PROVIDER_DRIVER: &str = "sn-ai-provider";
 const DEFAULT_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_AUTH_MODE: &str = "bearer";
+const RUNTIME_SESSION_AUTH_MODE: &str = "runtime_session";
 const DEVICE_JWT_AUTH_MODE: &str = "device_jwt";
-const DEFAULT_DEVICE_AUTH_APP_ID: &str = "aicc";
 const OPENAI_TOOL_TYPE_WEB_SEARCH: &str = "web_search_preview";
 const OPENAI_IMAGE_OPTION_ALLOWLIST: &[&str] = &[
     "background",
@@ -111,7 +108,7 @@ pub struct OpenAIProvider {
 #[derive(Debug, Clone)]
 enum OpenAIAuthMode {
     Bearer(String),
-    DeviceJwt,
+    RuntimeSession,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,7 +211,7 @@ impl OpenAIProvider {
 
     async fn refresh_inventory_once(&self) -> Result<ProviderInventory> {
         let endpoint = self.models_endpoint();
-        let token = self.build_inventory_auth_token()?;
+        let token = self.build_inventory_auth_token().await?;
         let response = self
             .client
             .get(endpoint.as_str())
@@ -446,119 +443,74 @@ impl OpenAIProvider {
             return Ok(OpenAIAuthMode::Bearer(token));
         }
 
-        if mode == DEVICE_JWT_AUTH_MODE {
-            return Ok(OpenAIAuthMode::DeviceJwt);
+        if mode == RUNTIME_SESSION_AUTH_MODE || mode == DEVICE_JWT_AUTH_MODE {
+            if mode == DEVICE_JWT_AUTH_MODE {
+                warn!(
+                    "openai auth_mode '{}' is deprecated for aicc; using '{}' without loading device private key",
+                    DEVICE_JWT_AUTH_MODE, RUNTIME_SESSION_AUTH_MODE
+                );
+            }
+            return Ok(OpenAIAuthMode::RuntimeSession);
         }
 
         Err(anyhow!(
             "unsupported openai auth_mode '{}', expected '{}' or '{}'",
             auth_mode,
             DEFAULT_AUTH_MODE,
-            DEVICE_JWT_AUTH_MODE
+            RUNTIME_SESSION_AUTH_MODE
         ))
     }
 
-    fn build_inventory_auth_token(&self) -> Result<String> {
+    async fn build_inventory_auth_token(&self) -> Result<String> {
         match &self.auth_mode {
             OpenAIAuthMode::Bearer(token) => Ok(token.clone()),
-            OpenAIAuthMode::DeviceJwt => {
-                let private_key_path = Self::resolve_private_key_path();
-                let private_key = load_private_key(private_key_path.as_path()).map_err(|err| {
+            OpenAIAuthMode::RuntimeSession => {
+                let runtime = get_buckyos_api_runtime().map_err(|err| {
                     anyhow!(
-                        "openai device_jwt inventory auth failed to load private key '{}': {}",
-                        private_key_path.display(),
+                        "openai runtime_session inventory auth requires runtime: {}",
                         err
                     )
                 })?;
-                let now = buckyos_get_unix_timestamp();
-                let subject = Self::read_default_device_subject();
-                let claims = RPCSessionToken {
-                    token_type: RPCSessionTokenType::JWT,
-                    token: None,
-                    aud: None,
-                    exp: Some(now + 60 * 15),
-                    iss: Some(subject.clone()),
-                    jti: None,
-                    session: None,
-                    sub: Some(subject),
-                    appid: Some(DEFAULT_DEVICE_AUTH_APP_ID.to_string()),
-                    extra: HashMap::new(),
-                };
-                claims
-                    .generate_jwt(None, &private_key)
-                    .map_err(|err| anyhow!("openai device_jwt inventory auth failed: {}", err))
-            }
-        }
-    }
-
-    fn read_default_device_subject() -> String {
-        let device_cfg_path = get_buckyos_system_etc_dir().join("node_device_config.json");
-        let content = std::fs::read_to_string(device_cfg_path.as_path());
-        if let Ok(content) = content {
-            if let Ok(json_value) = serde_json::from_str::<Value>(content.as_str()) {
-                if let Some(name) = json_value
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    return name.to_string();
+                let token = runtime.get_session_token().await;
+                if token.trim().is_empty() {
+                    return Err(anyhow!(
+                        "openai runtime_session inventory auth requires non-empty runtime session token"
+                    ));
                 }
+                Ok(token)
             }
         }
-        "ood1".to_string()
     }
 
-    fn resolve_device_subject(ctx: &crate::aicc::InvokeCtx) -> String {
-        let subject = ctx.tenant_id.trim();
-        if !subject.is_empty() && subject != "anonymous" {
-            return subject.to_string();
-        }
-        Self::read_default_device_subject()
-    }
-
-    fn resolve_device_appid(ctx: &crate::aicc::InvokeCtx) -> String {
-        ctx.caller_app_id
-            .as_ref()
-            .map(|appid| appid.trim().to_string())
-            .filter(|appid| !appid.is_empty())
-            .unwrap_or_else(|| DEFAULT_DEVICE_AUTH_APP_ID.to_string())
-    }
-
-    fn resolve_private_key_path() -> PathBuf {
-        get_buckyos_system_etc_dir().join("node_private_key.pem")
-    }
-
-    fn build_auth_token(&self, ctx: &crate::aicc::InvokeCtx) -> Result<String, ProviderError> {
+    async fn build_auth_token(
+        &self,
+        ctx: &crate::aicc::InvokeCtx,
+    ) -> Result<String, ProviderError> {
         match &self.auth_mode {
             OpenAIAuthMode::Bearer(token) => Ok(token.clone()),
-            OpenAIAuthMode::DeviceJwt => {
-                let private_key_path = Self::resolve_private_key_path();
-                let private_key = load_private_key(private_key_path.as_path()).map_err(|err| {
+            OpenAIAuthMode::RuntimeSession => {
+                if let Some(token) = ctx
+                    .session_token
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                {
+                    return Ok(token.to_string());
+                }
+
+                let runtime = get_buckyos_api_runtime().map_err(|err| {
                     ProviderError::fatal(format!(
-                        "openai device_jwt auth failed to load private key '{}': {}",
-                        private_key_path.display(),
+                        "openai runtime_session auth requires runtime: {}",
                         err
                     ))
                 })?;
-                let now = buckyos_get_unix_timestamp();
-                let claims = RPCSessionToken {
-                    token_type: RPCSessionTokenType::JWT,
-                    token: None,
-                    aud: None,
-                    exp: Some(now + 60 * 15),
-                    // SN expects issuer to be device name, while subject/appid are caller identity.
-                    iss: Some(Self::read_default_device_subject()),
-                    jti: None,
-                    session: None,
-                    sub: Some(Self::resolve_device_subject(ctx)),
-                    appid: Some(Self::resolve_device_appid(ctx)),
-                    extra: HashMap::new(),
-                };
-                let jwt = claims.generate_jwt(None, &private_key).map_err(|err| {
-                    ProviderError::fatal(format!("openai device_jwt auth failed: {}", err))
-                })?;
-                Ok(jwt)
+                let token = runtime.get_session_token().await;
+                if token.trim().is_empty() {
+                    return Err(ProviderError::fatal(
+                        "openai runtime_session auth requires non-empty session token".to_string(),
+                    ));
+                }
+                Ok(token)
             }
         }
     }
@@ -2101,7 +2053,7 @@ impl OpenAIProvider {
         url: &str,
         request_obj: &Map<String, Value>,
     ) -> Result<(StatusCode, Value, u64), ProviderError> {
-        let auth_token = self.build_auth_token(ctx)?;
+        let auth_token = self.build_auth_token(ctx).await?;
         let started_at = std::time::Instant::now();
         let response = self
             .client
@@ -2223,7 +2175,7 @@ impl OpenAIProvider {
         url: &str,
         request_obj: &Map<String, Value>,
     ) -> Result<(StatusCode, Vec<u8>, String, u64), ProviderError> {
-        let auth_token = self.build_auth_token(ctx)?;
+        let auth_token = self.build_auth_token(ctx).await?;
         let started_at = std::time::Instant::now();
         let response = self
             .client
@@ -2333,7 +2285,7 @@ impl OpenAIProvider {
         }
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-        let auth_token = self.build_auth_token(ctx)?;
+        let auth_token = self.build_auth_token(ctx).await?;
         let started_at = std::time::Instant::now();
         let response = self
             .client
@@ -4197,7 +4149,7 @@ data: [DONE]
     }
 
     #[test]
-    fn build_openai_instances_allows_device_jwt_without_static_auth_fields() {
+    fn build_openai_instances_allows_runtime_session_without_static_auth_fields() {
         let settings = OpenAISettings {
             enabled: true,
             api_token: String::new(),
@@ -4206,14 +4158,14 @@ data: [DONE]
                 provider_type: "cloud_api".to_string(),
                 api_token: String::new(),
                 base_url: "https://sn.buckyos.ai/v1".to_string(),
-                auth_mode: DEVICE_JWT_AUTH_MODE.to_string(),
+                auth_mode: RUNTIME_SESSION_AUTH_MODE.to_string(),
                 timeout_ms: default_timeout_ms(),
             }],
         };
 
         let instances = build_openai_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].auth_mode, DEVICE_JWT_AUTH_MODE);
+        assert_eq!(instances[0].auth_mode, RUNTIME_SESSION_AUTH_MODE);
     }
 
     #[test]

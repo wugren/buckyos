@@ -99,7 +99,7 @@
 | Google Gemini | `generateContent`、多模态 parts、embedding、image/video/audio | candidates、function_call、safety、media outputs | streamGenerateContent / 长任务 operation | parts 映射、safety block、multimodal embedding space、video operation |
 | OpenAI-compatible / OpenRouter | Chat completions 或 responses-like | OpenAI-like，但字段可能缺失或扩展 | SSE 兼容差异 | 兼容字段缺失、模型名映射、provider-specific error |
 | fal | 图片/音频/视频工具型任务 | artifact URL / operation status | 异步 submit + poll | upscale、bg_remove、audio.enhance、video.upscale、operation timeout |
-| SN AI Provider | AICC `settings.sn-ai-provider`，经 SN 转发到兼容模型服务 | OpenAI-like 或 SN 归一响应 | 由 SN AI Provider 能力决定 | 无普通 API key 参数、`device_jwt` / SN 链路可达性、provider instance 命名、usage / trace / free credit 归因 |
+| SN AI Provider | AICC `settings.sn-ai-provider`，经 SN 转发到兼容模型服务 | OpenAI-like 或 SN 归一响应 | 由 SN AI Provider 能力决定 | 无普通 API key 参数、`runtime_session` / SN 链路可达性、provider instance 命名、usage / trace / free credit 归因 |
 
 P0 Provider 最小集合按 `aicc_provider_plan.md`：
 

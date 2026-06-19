@@ -760,7 +760,7 @@ fn build_aicc_settings_with_sn_models(
             "image_models": sn_model_settings.image_models,
             "default_image_model": sn_model_settings.default_image_model,
             "features": ["plan", "json_output", "tool_calling", "web_search"],
-            "auth_mode": "device_jwt"
+            "auth_mode": "runtime_session"
         }));
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
         );
         assert_eq!(
             settings["sn-ai-provider"]["instances"][0]["auth_mode"],
-            "device_jwt"
+            "runtime_session"
         );
         assert_eq!(
             settings["sn-ai-provider"]["alias_map"]["llm.plan.default"],

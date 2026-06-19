@@ -9,7 +9,7 @@ use std::sync::Arc;
 const SN_AI_PROVIDER_SETTINGS_KEY: &str = "sn-ai-provider";
 const DEFAULT_SN_AI_PROVIDER_BASE_URL: &str = "https://sn.buckyos.ai/api/v1/ai/";
 const DEFAULT_SN_AI_PROVIDER_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_AUTH_MODE: &str = "device_jwt";
+const DEFAULT_AUTH_MODE: &str = "runtime_session";
 
 #[derive(Debug, Deserialize, Default)]
 struct SnAIProviderSettings {
@@ -152,7 +152,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn build_sn_ai_provider_instances_allows_device_jwt_without_api_token() {
+    fn build_sn_ai_provider_instances_allows_runtime_session_without_api_token() {
         let settings = SnAIProviderSettings {
             enabled: true,
             api_token: String::new(),
@@ -161,14 +161,14 @@ mod tests {
                 provider_type: "cloud_api".to_string(),
                 api_token: String::new(),
                 base_url: "https://sn.buckyos.ai/api/v1/ai/".to_string(),
-                auth_mode: "device_jwt".to_string(),
+                auth_mode: "runtime_session".to_string(),
                 timeout_ms: default_timeout_ms(),
             }],
         };
 
         let instances = build_sn_ai_provider_instances(&settings).expect("instances");
         assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].auth_mode, "device_jwt");
+        assert_eq!(instances[0].auth_mode, "runtime_session");
         assert_eq!(instances[0].provider_instance_name, "sn-ai-provider-1");
     }
 
