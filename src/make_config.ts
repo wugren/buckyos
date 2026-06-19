@@ -20,6 +20,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { Buffer } from "node:buffer";
+import { createPrivateKey, sign } from "node:crypto";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
@@ -27,6 +29,7 @@ import {
   createNodeConfigs,
   createUserEnv,
   ensureCa,
+  IdentityRoots,
 } from "buckyos/provision";
 
 // ============================================================================
@@ -91,6 +94,106 @@ function requireFiles(filePaths: string[]): void {
   if (missing.length > 0) {
     throw new Error(`missing generated files: ${missing.join(", ")}`);
   }
+}
+
+function readJsonObject(filePath: string): Record<string, unknown> {
+  const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`invalid json object: ${filePath}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireString(
+  value: Record<string, unknown>,
+  key: string,
+  source: string,
+): string {
+  const field = value[key];
+  if (typeof field !== "string" || field.trim().length === 0) {
+    throw new Error(`${source} missing string field: ${key}`);
+  }
+  return field;
+}
+
+function requireObject(
+  value: Record<string, unknown>,
+  key: string,
+  source: string,
+): Record<string, unknown> {
+  const field = value[key];
+  if (!field || typeof field !== "object" || Array.isArray(field)) {
+    throw new Error(`${source} missing object field: ${key}`);
+  }
+  return field as Record<string, unknown>;
+}
+
+function parseDid(did: string): { method: string; id: string } {
+  const parts = did.split(":");
+  if (parts.length < 3 || parts[0] !== "did" || !parts[1]) {
+    throw new Error(`invalid DID: ${did}`);
+  }
+  return { method: parts[1], id: parts.slice(2).join(":") };
+}
+
+function didRawHostName(did: string): string {
+  const { method, id } = parseDid(did);
+  const realId = id.split(":")[0];
+  return method === "web" ? realId : `${realId}.${method}.did`;
+}
+
+function buildDeviceDid(deviceName: string, zoneDid: string): string {
+  const { method, id } = parseDid(zoneDid);
+  const zoneName = method === "web"
+    ? didRawHostName(zoneDid)
+    : id.split(":")[0] || id;
+  if (!zoneName.trim()) {
+    throw new Error(`zone DID ${zoneDid} has empty host/name`);
+  }
+  return `did:${method}:${deviceName}.${zoneName}`;
+}
+
+function bindDeviceConfigDid(
+  deviceConfig: Record<string, unknown>,
+  deviceDid: string,
+): Record<string, unknown> {
+  const rebound = structuredClone(deviceConfig);
+  rebound.id = deviceDid;
+  const methods = rebound.verificationMethod;
+  if (!Array.isArray(methods)) {
+    throw new Error("device config verificationMethod is missing");
+  }
+  for (const method of methods) {
+    if (!method || typeof method !== "object" || Array.isArray(method)) {
+      throw new Error("device config verificationMethod item is not object");
+    }
+    (method as Record<string, unknown>).controller = deviceDid;
+  }
+  return rebound;
+}
+
+function base64UrlEncodeBytes(value: Uint8Array): string {
+  return Buffer.from(value).toString("base64").replaceAll("+", "-")
+    .replaceAll("/", "_").replace(/=+$/g, "");
+}
+
+function base64UrlEncodeString(value: string): string {
+  return base64UrlEncodeBytes(Buffer.from(value, "utf8"));
+}
+
+function signJwtEdDSA(
+  payload: Record<string, unknown>,
+  privateKeyPem: string,
+): string {
+  const header = base64UrlEncodeString(JSON.stringify({ alg: "EdDSA" }));
+  const body = base64UrlEncodeString(JSON.stringify(payload));
+  const signingInput = `${header}.${body}`;
+  const signature = sign(
+    null,
+    Buffer.from(signingInput, "utf8"),
+    createPrivateKey(privateKeyPem),
+  );
+  return `${signingInput}.${base64UrlEncodeBytes(signature)}`;
 }
 
 // ============================================================================
@@ -295,6 +398,111 @@ export async function buildUserEnv(
 // identity files + TLS
 // ============================================================================
 
+const NODE_IDENTITY_SCHEMA_V2 = "buckyos.node_identity.v2";
+const DEVICE_DOC_JWT_FILE_NAME = "device_doc.jwt";
+const DEVICE_MINI_DOC_JWT_FILE_NAME = "device_mini_doc.jwt";
+
+interface LocalDeviceIdentityFiles {
+  deviceDocJwt: string;
+  deviceDid: string;
+}
+
+function writeLocalDeviceIdentityFiles(
+  userDir: string,
+  nodeDir: string,
+  targetDir: string,
+): LocalDeviceIdentityFiles {
+  const oldNodeIdentityPath = path.join(nodeDir, "node_identity.json");
+  const oldNodeIdentity = readJsonObject(oldNodeIdentityPath);
+  const oldDeviceConfigPath = path.join(nodeDir, "node_device_config.json");
+  const oldDeviceConfig = readJsonObject(oldDeviceConfigPath);
+  const zoneDid = requireString(
+    oldNodeIdentity,
+    "zone_did",
+    oldNodeIdentityPath,
+  );
+  const ownerDid = requireString(
+    oldNodeIdentity,
+    "owner_did",
+    oldNodeIdentityPath,
+  );
+  const ownerPublicKey = requireObject(
+    oldNodeIdentity,
+    "owner_public_key",
+    oldNodeIdentityPath,
+  );
+  const deviceName = requireString(
+    oldDeviceConfig,
+    "name",
+    oldDeviceConfigPath,
+  );
+  const deviceDid = buildDeviceDid(deviceName, zoneDid);
+  const deviceConfig = bindDeviceConfigDid(oldDeviceConfig, deviceDid);
+  const ownerPrivateKeyPem = fs.readFileSync(
+    path.join(userDir, "user_private_key.pem"),
+    "utf8",
+  );
+  const devicePrivateKeyPem = fs.readFileSync(
+    path.join(nodeDir, "node_private_key.pem"),
+    "utf8",
+  );
+  const deviceDocJwt = signJwtEdDSA(deviceConfig, ownerPrivateKeyPem);
+  const deviceMiniDocJwt = requireString(
+    oldNodeIdentity,
+    "device_mini_doc_jwt",
+    oldNodeIdentityPath,
+  );
+  const zoneIat = typeof oldNodeIdentity.zone_iat === "number"
+    ? oldNodeIdentity.zone_iat
+    : 0;
+
+  const roots = new IdentityRoots(
+    path.join(targetDir, "local", "identity"),
+    path.join(targetDir, "security"),
+  );
+  const publicDir = roots.publicDir(deviceDid);
+  const securityDir = roots.securityDir(deviceDid);
+  const didJsonPath = roots.publicFile(
+    deviceDid,
+    "authentication",
+    "did-json",
+  );
+  const privateKeyPath = roots.securityFile(
+    deviceDid,
+    "authentication",
+    "private",
+  );
+
+  const etcDir = ensureDir(path.join(targetDir, "etc"));
+  ensureDir(publicDir);
+  ensureDir(securityDir);
+  writeJson(path.join(etcDir, "node_identity.json"), {
+    schema: NODE_IDENTITY_SCHEMA_V2,
+    zone_did: zoneDid,
+    owner_did: ownerDid,
+    owner_public_key: ownerPublicKey,
+    device_name: deviceName,
+    device_did: deviceDid,
+    zone_iat: zoneIat,
+  });
+  writeJson(didJsonPath, deviceConfig);
+  writeText(path.join(publicDir, DEVICE_DOC_JWT_FILE_NAME), deviceDocJwt);
+  writeText(
+    path.join(publicDir, DEVICE_MINI_DOC_JWT_FILE_NAME),
+    deviceMiniDocJwt,
+  );
+  writeText(privateKeyPath, devicePrivateKeyPem);
+  requireFiles([
+    path.join(etcDir, "node_identity.json"),
+    didJsonPath,
+    path.join(publicDir, DEVICE_DOC_JWT_FILE_NAME),
+    path.join(publicDir, DEVICE_MINI_DOC_JWT_FILE_NAME),
+    privateKeyPath,
+  ]);
+
+  return { deviceDocJwt, deviceDid };
+}
+
 function copyIdentityOutputs(
   userDir: string,
   nodeDir: string,
@@ -307,16 +515,20 @@ function copyIdentityOutputs(
     path.join(userDir, `${zoneId}.zone.json`),
     path.join(etcDir, `${zoneId}.zone.json`),
   );
-  for (
-    const name of [
-      "start_config.json",
-      "node_identity.json",
-      "node_private_key.pem",
-      "node_device_config.json",
-    ]
-  ) {
-    copyIfExists(path.join(nodeDir, name), path.join(etcDir, name));
-  }
+  const localIdentity = writeLocalDeviceIdentityFiles(
+    userDir,
+    nodeDir,
+    targetDir,
+  );
+
+  const startConfigPath = path.join(nodeDir, "start_config.json");
+  const startConfig = readJsonObject(startConfigPath);
+  startConfig.ood_jwt = localIdentity.deviceDocJwt;
+  delete startConfig.device_private_key;
+  delete startConfig.device_public_key;
+  writeJson(path.join(etcDir, "start_config.json"), startConfig);
+  removeIfExists(path.join(etcDir, "node_private_key.pem"));
+  removeIfExists(path.join(etcDir, "node_device_config.json"));
 
   const buckycliDir = ensureDir(path.join(etcDir, ".buckycli"));
   for (const name of ["user_config.json", "user_private_key.pem"]) {
@@ -325,6 +537,9 @@ function copyIdentityOutputs(
   copyIfExists(
     path.join(userDir, `${zoneId}.zone.json`),
     path.join(buckycliDir, "zone_config.json"),
+  );
+  console.log(
+    `device identity ${localIdentity.deviceDid} copied to local identity roots`,
   );
 }
 
