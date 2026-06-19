@@ -14,6 +14,7 @@ use buckyos_api::{
     UserTunnelBinding, UserType, OPENDAN_SERVICE_PORT, OPENDAN_SERVICE_UNIQUE_ID,
     SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
 };
+use buckyos_api::{load_local_device_private_key, load_local_node_identity_config};
 use buckyos_api::{
     AICC_SERVICE_SERVICE_PORT, AICC_SERVICE_UNIQUE_ID, CONTROL_PANEL_SERVICE_PORT,
     CONTROL_PANEL_SERVICE_UNIQUE_ID, MSG_CENTER_SERVICE_PORT, MSG_CENTER_SERVICE_UNIQUE_ID,
@@ -24,8 +25,8 @@ use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use jsonwebtoken::jwk::Jwk;
 use log::{debug, info, warn};
 use name_lib::{
-    generate_ed25519_key_pair, load_private_key, AgentDocument, OwnerConfig, VerifyHubInfo,
-    ZoneBootConfig, ZoneConfig, DID,
+    generate_ed25519_key_pair, AgentDocument, OwnerConfig, VerifyHubInfo, ZoneBootConfig,
+    ZoneConfig, DID,
 };
 use package_lib::PackageId;
 use reqwest::Client;
@@ -977,15 +978,12 @@ async fn fetch_sn_ai_provider_models_impl(user_name: &str) -> Result<Vec<String>
 }
 
 fn build_device_jwt_token_for_sn(user_name: &str) -> Result<String> {
-    let device_name = read_default_device_subject();
-    let private_key_path = get_buckyos_system_etc_dir().join("node_private_key.pem");
-    let private_key = load_private_key(private_key_path.as_path()).map_err(|err| {
-        anyhow!(
-            "failed to load device private key '{}': {}",
-            private_key_path.display(),
-            err
-        )
-    })?;
+    let node_identity_path = get_buckyos_system_etc_dir().join("node_identity.json");
+    let node_identity = load_local_node_identity_config(node_identity_path.as_path())
+        .map_err(|err| anyhow!("failed to load node identity: {}", err))?;
+    let device_name = node_identity.device_name.clone();
+    let private_key = load_local_device_private_key(&node_identity.device_did)
+        .map_err(|err| anyhow!("failed to load device private key: {}", err))?;
     let now = buckyos_get_unix_timestamp();
     let claims = RPCSessionToken {
         token_type: RPCSessionTokenType::JWT,
@@ -1005,19 +1003,9 @@ fn build_device_jwt_token_for_sn(user_name: &str) -> Result<String> {
 }
 
 fn read_default_device_subject() -> String {
-    let device_cfg_path = get_buckyos_system_etc_dir().join("node_device_config.json");
-    let content = std::fs::read_to_string(device_cfg_path.as_path());
-    if let Ok(content) = content {
-        if let Ok(json_value) = serde_json::from_str::<Value>(content.as_str()) {
-            if let Some(name) = json_value
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return name.to_string();
-            }
-        }
+    let node_identity_path = get_buckyos_system_etc_dir().join("node_identity.json");
+    if let Ok(node_identity) = load_local_node_identity_config(node_identity_path.as_path()) {
+        return node_identity.device_name;
     }
     DEFAULT_OOD_ID.to_string()
 }

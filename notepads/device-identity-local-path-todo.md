@@ -57,7 +57,7 @@ $BUCKYOS_ROOT/security/ood1.example.com/
 - `device_doc.jwt` 和 `device_mini_doc.jwt` 是公开信息，按 DID 路径放入 public identity root。
 - `did.json` 保存 decoded DeviceConfig DID document。里面已包含公钥，不需要额外保存 device public key。
 - 设备私钥放在 security root，对应 usage 建议使用 `authentication`。
-- `authentication.keyref.json` 必须生成，`mode=file` 时指向同目录的 `authentication.private.pem`。
+- `authentication.keyref.json` 不能生成，物理文件和keyref二选1
 
 `node_identity.json` 建议保留字段：
 
@@ -73,7 +73,7 @@ $BUCKYOS_ROOT/security/ood1.example.com/
 }
 ```
 
-是否保留 `owner_public_key`：启动早期仍需要用它验证 zone boot / device doc，除非同时完成从 boot/config 或 owner DID document 取 owner key 的启动前置逻辑。
+保留 `owner_public_key`：启动早期仍需要用它验证 zone boot / device doc，除非同时完成从 boot/config 或 owner DID document 取 owner key 的启动前置逻辑。
 
 ## TODO
 

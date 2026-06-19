@@ -1150,6 +1150,7 @@ pub(crate) async fn update_node_gateway_config(
 ) -> Result<HashMap<String, KVAction>> {
     let zone_config = get_zone_config(input_system_config)?;
     let web_app_servers = build_web_app_servers(input_system_config)?;
+    let device_list = get_device_list(input_system_config)?;
     let mut result = HashMap::new();
 
     for node_id in need_update_gateway_node_list.iter() {
@@ -1157,6 +1158,11 @@ pub(crate) async fn update_node_gateway_config(
 
         if let Some(sn_host) = zone_config.sn.as_ref() {
             info!("SN enabled, add acme/tls stack for node {}", node_id);
+            let device_info = device_list
+                .get(node_id)
+                .ok_or_else(|| anyhow::anyhow!("device info {} not found", node_id))?;
+            let identity_paths = buckyos_api::device_identity_paths(&device_info.device_doc.id)
+                .map_err(|err| anyhow::anyhow!("build device identity paths failed: {}", err))?;
             let sn_url = format!("https://{}/kapi/sn", sn_host);
             let zone_hostname = zone_config.id.to_host_name();
             let wildcard_zone_domain = format!("*.{}", zone_hostname);
@@ -1165,8 +1171,8 @@ pub(crate) async fn update_node_gateway_config(
                     "dns_providers": {
                         "sn-dns": {
                             "sn": sn_url,
-                            "key_path": "./node_private_key.pem",
-                            "device_config_path": "./node_device_config.json"
+                            "key_path": identity_paths.authentication_private_key.display().to_string(),
+                            "device_config_path": identity_paths.did_json.display().to_string()
                         }
                     },
                     "hosts": [
@@ -1562,10 +1568,14 @@ mod tests {
     fn create_test_device_info(name: &str, rtcp_port: Option<u32>) -> DeviceInfo {
         let (_, public_key_jwk) = generate_ed25519_key_pair();
         let public_key_jwk: Jwk = serde_json::from_value(public_key_jwk).unwrap();
-        let pkx = get_x_from_jwk(&public_key_jwk).unwrap();
-        let mut device = DeviceConfig::new(name, pkx);
+        let zone_did = DID::new("web", "test.buckyos.io");
+        let device_did = buckyos_api::build_device_did(name, &zone_did).unwrap();
+        let mut device =
+            buckyos_api::new_device_config_by_jwk_with_did(name, public_key_jwk, &device_did)
+                .unwrap();
         device.rtcp_port = rtcp_port;
         device.owner = DID::new("bns", "owner");
+        device.zone_did = Some(zone_did);
         DeviceInfo::from_device_doc(&device)
     }
 
@@ -2532,9 +2542,14 @@ mod tests {
         let mut input_system_config = HashMap::new();
         let mut zone_config = create_test_zone_config();
         zone_config.sn = Some("sn.test.buckyos.io".to_string());
+        let device_ood1 = create_test_device_info("ood1", None);
         input_system_config.insert(
             "boot/config".to_string(),
             serde_json::to_string(&zone_config).unwrap(),
+        );
+        input_system_config.insert(
+            "devices/ood1/info".to_string(),
+            serde_json::to_string(&device_ood1).unwrap(),
         );
 
         let mut nodes = HashSet::new();
@@ -2552,6 +2567,19 @@ mod tests {
         assert_eq!(
             gateway_config["acme"]["dns_providers"]["sn-dns"]["sn"],
             "https://sn.test.buckyos.io/kapi/sn"
+        );
+        let expected_identity_paths =
+            buckyos_api::device_identity_paths(&device_ood1.device_doc.id).unwrap();
+        assert_eq!(
+            gateway_config["acme"]["dns_providers"]["sn-dns"]["key_path"],
+            expected_identity_paths
+                .authentication_private_key
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            gateway_config["acme"]["dns_providers"]["sn-dns"]["device_config_path"],
+            expected_identity_paths.did_json.display().to_string()
         );
         assert_eq!(
             gateway_config["acme"]["hosts"],

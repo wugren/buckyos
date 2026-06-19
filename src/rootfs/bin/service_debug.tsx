@@ -259,6 +259,32 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+async function findDeviceIdentityDir(buckyosRoot: string, deviceDid: string): Promise<string> {
+  const identityRoot = joinPath(buckyosRoot, 'local', 'identity')
+  for await (const entry of Deno.readDir(identityRoot)) {
+    if (!entry.isDirectory) {
+      continue
+    }
+    const dir = joinPath(identityRoot, entry.name)
+    const didJsonPath = joinPath(dir, 'did.json')
+    const didJson = await readJsonFile(didJsonPath).catch(() => null)
+    if (didJson && getNestedString(didJson, ['id']) === deviceDid) {
+      return dir
+    }
+  }
+  throw new Error(`device identity dir not found for ${deviceDid}`)
+}
+
+async function loadDevicePrivateKeyPem(buckyosRoot: string, identityDir: string): Promise<string> {
+  const dirName = identityDir.split('/').filter(Boolean).pop()
+  if (!dirName) {
+    throw new Error(`invalid identity dir: ${identityDir}`)
+  }
+  const securityDir = joinPath(buckyosRoot, 'security', dirName)
+  const privateKeyPath = joinPath(securityDir, 'authentication.private.pem')
+  return await Deno.readTextFile(privateKeyPath)
+}
+
 async function readJsonFile(path: string): Promise<JsonObject> {
   const raw = await Deno.readTextFile(path)
   return JSON.parse(raw) as JsonObject
@@ -660,20 +686,20 @@ async function buildLaunchContext(options: StartupOptions) {
   const buckyosRoot = getBuckyosRoot()
   const etcDir = joinPath(buckyosRoot, 'etc')
   const nodeIdentityPath = joinPath(etcDir, 'node_identity.json')
-  const nodePrivateKeyPath = joinPath(etcDir, 'node_private_key.pem')
-  const nodeDeviceConfigPath = joinPath(etcDir, 'node_device_config.json')
 
   const nodeIdentity = await readJsonFile(nodeIdentityPath)
-  const nodeDeviceConfig = await readJsonFile(nodeDeviceConfigPath)
-  const nodePrivateKeyPem = await Deno.readTextFile(nodePrivateKeyPath)
-  const deviceConfig = decodeJwtPayload<JsonObject>(
-    getNestedString(nodeIdentity, ['device_doc_jwt']) || '',
-  )
+  const deviceDid = getNestedString(nodeIdentity, ['device_did']) || ''
+  if (!deviceDid) {
+    throw new Error('device_did not found in node_identity.json')
+  }
+  const identityDir = await findDeviceIdentityDir(buckyosRoot, deviceDid)
+  const deviceConfig = await readJsonFile(joinPath(identityDir, 'did.json'))
+  const nodePrivateKeyPem = await loadDevicePrivateKeyPem(buckyosRoot, identityDir)
   const deviceName =
-    getNestedString(nodeDeviceConfig, ['name']) ||
+    getNestedString(nodeIdentity, ['device_name']) ||
     getNestedString(deviceConfig, ['name'])
   if (!deviceName) {
-    throw new Error('device name not found in node_device_config.json/device_doc_jwt')
+    throw new Error('device name not found in node_identity.json/did.json')
   }
 
   const nodeId = options.nodeId || deviceName

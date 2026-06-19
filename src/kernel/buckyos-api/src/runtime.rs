@@ -38,7 +38,8 @@ use crate::task_mgr::*;
 use crate::verify_hub_client::*;
 use crate::workflow_service::{WorkflowServiceClient, WORKFLOW_SERVICE_NAME};
 use crate::{
-    get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, OPENDAN_SERVICE_NAME,
+    get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, load_local_device_config,
+    load_local_device_private_key, load_local_node_identity_config, OPENDAN_SERVICE_NAME,
 };
 
 const DEFAULT_NODE_GATEWAY_PORT: u16 = 3180;
@@ -560,35 +561,20 @@ impl BuckyOSRuntime {
         );
 
         let node_identity_file = config_root_dir.join("node_identity.json");
-        let device_private_key_file = config_root_dir.join("node_private_key.pem");
 
         let node_identity_config =
-            NodeIdentityConfig::load_node_identity_config(&node_identity_file).map_err(|e| {
+            load_local_node_identity_config(&node_identity_file).map_err(|e| {
                 error!("Failed to load node identity config: {}", e);
                 RPCErrors::ReasonError(format!("Failed to load node identity config: {}", e))
             });
 
         if node_identity_config.is_ok() {
             let node_identity_config = node_identity_config.unwrap();
-            let device_config =
-                decode_jwt_claim_without_verify(node_identity_config.device_doc_jwt.as_str())
-                    .map_err(|e| {
-                        error!("Failed to decode device config: {}", e);
-                        RPCErrors::ReasonError(format!("Failed to decode device config: {}", e))
-                    })?;
-
-            let devcie_config = serde_json::from_value::<DeviceConfig>(device_config);
-            if devcie_config.is_err() {
-                error!(
-                    "Failed to parse device config: {}",
-                    devcie_config.err().unwrap()
-                );
-                return Err(RPCErrors::ReasonError(format!(
-                    "Failed to parse device config from jwt: {}",
-                    node_identity_config.device_doc_jwt.as_str()
-                )));
-            }
-            let device_config = devcie_config.unwrap();
+            let (_, device_config) = load_local_device_config(&node_identity_config, false)
+                .map_err(|e| {
+                    error!("Failed to load local device config: {}", e);
+                    RPCErrors::ReasonError(format!("Failed to load local device config: {}", e))
+                })?;
             self.device_config = Some(device_config);
             let zone_did = node_identity_config.zone_did.clone();
             self.zone_id = zone_did.clone();
@@ -597,17 +583,6 @@ impl BuckyOSRuntime {
                 return Err(RPCErrors::ReasonError(
                     "node_identity_config is not set".to_string(),
                 ));
-            }
-        }
-
-        if self.runtime_type == BuckyOSRuntimeType::AppClient
-            || self.runtime_type == BuckyOSRuntimeType::Kernel
-        {
-            let private_key = load_private_key(&device_private_key_file);
-            if private_key.is_ok() {
-                self.device_private_key = Some(private_key.unwrap());
-            } else {
-                self.device_private_key = None;
             }
         }
 
@@ -654,6 +629,19 @@ impl BuckyOSRuntime {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn load_device_private_key(&mut self) -> Result<()> {
+        let device_did = self
+            .device_config
+            .as_ref()
+            .map(|config| config.id.clone())
+            .ok_or_else(|| RPCErrors::ReasonError("device_config is not set".to_string()))?;
+        let private_key = load_local_device_private_key(&device_did).map_err(|err| {
+            RPCErrors::ReasonError(format!("load device private key failed: {}", err))
+        })?;
+        self.device_private_key = Some(private_key);
         Ok(())
     }
 
@@ -1110,7 +1098,7 @@ impl BuckyOSRuntime {
         }
 
         Err(RPCErrors::ReasonError(
-            "Missing local private key for login".to_string(),
+            "Missing local private key for login; call load_device_private_key() only for components that require device signing".to_string(),
         ))
     }
 
@@ -1318,7 +1306,7 @@ impl BuckyOSRuntime {
 
                 if session_token.is_empty() {
                     return Err(RPCErrors::ReasonError(
-                        "session_token is empty!".to_string(),
+                        "session_token is empty; runtime will not implicitly load the device private key".to_string(),
                     ));
                 }
                 drop(session_token);

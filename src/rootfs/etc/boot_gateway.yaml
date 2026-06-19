@@ -28,8 +28,8 @@ stacks:
   node_rtcp:
     protocol: rtcp
     bind: 0.0.0.0:2980
-    key_path: ./node_private_key.pem
-    device_config_path: ./node_device_config.json
+    key_path: "__BUCKYOS_DEVICE_AUTH_PRIVATE_KEY__"
+    device_config_path: "__BUCKYOS_DEVICE_DID_JSON__"
     keep_tunnel: []
     hook_point:
       main:

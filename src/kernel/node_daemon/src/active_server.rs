@@ -214,6 +214,15 @@ impl ActiveServer {
             device_did.to_string(),
             device_name
         );
+        let expected_device_did =
+            build_device_did(device_name.as_str(), &zone_did).map_err(RPCErrors::ReasonError)?;
+        if device_did != expected_device_did {
+            return Err(RPCErrors::ParseRequestError(format!(
+                "device DID {} does not match expected DID {}",
+                device_did.to_string(),
+                expected_device_did.to_string()
+            )));
+        }
 
         // Verify the JWT signatures with owner public key
         let owner_decoding_key = DecodingKey::from_jwk(&owner_public_key).map_err(|e| {
@@ -228,7 +237,7 @@ impl ActiveServer {
                 RPCErrors::ParseRequestError(format!("Failed to verify device_doc_jwt: {}", e))
             })?;
 
-        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|e| {
                 warn!("Invalid device private key: {}", e);
                 RPCErrors::ReasonError("Invalid device private key".to_string())
@@ -347,36 +356,25 @@ impl ActiveServer {
             info!("verify zone boot config success");
         }
 
-        // Write device private key
         let write_dir = get_buckyos_system_etc_dir();
-        let device_private_key_file = write_dir.join("node_private_key.pem");
-        tokio::fs::write(device_private_key_file, device_private_key.as_bytes())
-            .await
-            .map_err(|e| {
-                RPCErrors::ReasonError(format!("Failed to write device private key: {}", e))
-            })?;
-
-        // Write device identity
-        let zone_did = DID::from_str(zone_name)
-            .map_err(|_| RPCErrors::ReasonError("Invalid zone name".to_string()))?;
         let owner_did = DID::from_str(&user_name).unwrap_or_else(|_| DID::new("bns", &user_name));
-        let node_identity = NodeIdentityConfig {
-            zone_did: zone_did.clone(),
-            owner_public_key: owner_public_key,
-            owner_did: owner_did,
-            device_doc_jwt: device_doc_jwt.to_string(),
-            zone_iat: (buckyos_get_unix_timestamp() as u32 - 3600),
-            device_mini_doc_jwt: device_mini_doc_jwt.to_string(),
-        };
-        let device_identity_file = write_dir.join("node_identity.json");
-        let device_identity_str = serde_json::to_string(&node_identity).map_err(|e| {
-            RPCErrors::ReasonError(format!("Failed to serialize node identity: {}", e))
-        })?;
-        tokio::fs::write(device_identity_file, device_identity_str.as_bytes())
-            .await
-            .map_err(|_| {
-                RPCErrors::ReasonError("Failed to write node_identity.json".to_string())
-            })?;
+        let node_identity = LocalNodeIdentityConfig::new(
+            zone_did.clone(),
+            owner_did,
+            owner_public_key.clone(),
+            device_name.clone(),
+            device_did.clone(),
+            buckyos_get_unix_timestamp() as u32 - 3600,
+        );
+        save_local_device_identity(
+            write_dir.as_path(),
+            &node_identity,
+            &device_config,
+            device_doc_jwt,
+            device_mini_doc_jwt,
+            device_private_key,
+        )
+        .map_err(RPCErrors::ReasonError)?;
 
         // Write start config (minimal, only essential params)
         let mut real_start_params = req.params.clone();
@@ -393,18 +391,6 @@ impl ActiveServer {
         tokio::fs::write(start_params_file, start_params_str.as_bytes())
             .await
             .map_err(|_| RPCErrors::ReasonError("Failed to write start params".to_string()))?;
-
-        //write node_device_config.json
-        let node_device_config_file = write_dir.join("node_device_config.json");
-        let node_device_config_json_str = serde_json::to_string(&device_config).unwrap();
-        tokio::fs::write(
-            node_device_config_file,
-            node_device_config_json_str.as_bytes(),
-        )
-        .await
-        .map_err(|_| {
-            RPCErrors::ReasonError("Failed to write node_device_config.json".to_string())
-        })?;
 
         let zone_boot_doc = match EncodedDocument::from_str(boot_config_jwt.to_string()) {
             Ok(doc) => doc,
@@ -424,7 +410,7 @@ impl ActiveServer {
         })?;
         Self::update_zone_boot_cache(&zone_did, &zone_boot_config).await;
 
-        info!("ActiveByWallet Write Active files [node_private_key.pem,node_identity.json,start_config.json,node_device_config.json] success");
+        info!("ActiveByWallet wrote device identity files to node_identity.json, identity root and security root");
 
         tokio::task::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -490,10 +476,8 @@ impl ActiveServer {
             }
         }
 
-        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid device private key".to_string()))?;
-        let device_did = get_device_did_from_ed25519_jwk(&device_public_key)
-            .map_err(|_| RPCErrors::ReasonError("Invalid device public key".to_string()))?;
         let device_public_jwk: Jwk = serde_json::from_value(device_public_key.clone())
             .map_err(|_| RPCErrors::ReasonError("Invalid device public key format".to_string()))?;
 
@@ -515,7 +499,10 @@ impl ActiveServer {
             }
         }
 
-        let mut device_config = DeviceConfig::new_by_jwk("ood1", device_public_jwk);
+        let device_did = build_device_did("ood1", &zone_did).map_err(RPCErrors::ReasonError)?;
+        let mut device_config =
+            new_device_config_by_jwk_with_did("ood1", device_public_jwk, &device_did)
+                .map_err(RPCErrors::ReasonError)?;
         device_config.net_id = net_id;
         device_config.ddns_sn_url = ddns_sn_url;
         device_config.support_container = is_support_container;
@@ -632,10 +619,8 @@ impl ActiveServer {
 
         let owner_private_key_pem = EncodingKey::from_ed_pem(owner_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid owner private key".to_string()))?;
-        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid device private key".to_string()))?;
-        let device_did = get_device_did_from_ed25519_jwk(&device_public_key)
-            .map_err(|_| RPCErrors::ReasonError("Invalid device public key".to_string()))?;
         let device_public_jwk: Jwk = serde_json::from_value(device_public_key.clone()).unwrap();
 
         //let device_ip:Option<IpAddr> = None;
@@ -656,7 +641,10 @@ impl ActiveServer {
             is_support_container = support_container.unwrap().as_str().unwrap() == "true";
         }
         //create device doc ,and sign it with owner private key
-        let mut device_config = DeviceConfig::new_by_jwk("ood1", device_public_jwk);
+        let device_did = build_device_did("ood1", &zone_did).map_err(RPCErrors::ReasonError)?;
+        let mut device_config =
+            new_device_config_by_jwk_with_did("ood1", device_public_jwk, &device_did)
+                .map_err(RPCErrors::ReasonError)?;
         device_config.net_id = net_id;
         device_config.ddns_sn_url = ddns_sn_url;
         device_config.support_container = is_support_container;
@@ -739,33 +727,28 @@ impl ActiveServer {
         //TODO: call resolve_did to check self domain config is correct?
         //  check in ui is more smoothly
 
-        //write device private key
         let write_dir = get_buckyos_system_etc_dir();
-        let device_private_key_file = write_dir.join("node_private_key.pem");
-        tokio::fs::write(device_private_key_file, device_private_key.as_bytes())
-            .await
-            .unwrap();
         let owner_public_key: Jwk = serde_json::from_value(owner_public_key.clone()).unwrap();
-
-        //write device idenity，
 
         let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
         let device_mini_doc_jwt = device_mini_config.to_jwt(&owner_private_key_pem).unwrap();
-        let node_identity = NodeIdentityConfig {
-            zone_did: zone_did.clone(),
-            owner_public_key: owner_public_key, //TODO:how to update owner's public key? (update owner's did-doc)
-            owner_did: DID::new("bns", user_name.as_str()),
-            device_doc_jwt: device_doc_jwt.to_string(),
-            zone_iat: (buckyos_get_unix_timestamp() as u32 - 3600),
-            device_mini_doc_jwt: device_mini_doc_jwt.to_string(),
-        };
-        let device_identity_file = write_dir.join("node_identity.json");
-        let device_identity_str = serde_json::to_string(&node_identity).unwrap();
-        tokio::fs::write(device_identity_file, device_identity_str.as_bytes())
-            .await
-            .map_err(|_| {
-                RPCErrors::ReasonError("Failed to write node_identity.json".to_string())
-            })?;
+        let node_identity = LocalNodeIdentityConfig::new(
+            zone_did.clone(),
+            DID::new("bns", user_name.as_str()),
+            owner_public_key,
+            device_config.name.clone(),
+            device_did.clone(),
+            buckyos_get_unix_timestamp() as u32 - 3600,
+        );
+        save_local_device_identity(
+            write_dir.as_path(),
+            &node_identity,
+            &device_config,
+            device_doc_jwt.to_string().as_str(),
+            device_mini_doc_jwt.as_str(),
+            device_private_key,
+        )
+        .map_err(RPCErrors::ReasonError)?;
 
         //write start config ,TODO
         let mut real_start_parms = req.params.clone();
@@ -780,15 +763,6 @@ impl ActiveServer {
         tokio::fs::write(start_params_file, start_params_str.as_bytes())
             .await
             .map_err(|_| RPCErrors::ReasonError("Failed to write start params".to_string()))?;
-
-        //write node_device_config.json
-        let device_config_file = write_dir.join("node_device_config.json");
-        let device_config_json_str = serde_json::to_string(&device_config).unwrap();
-        tokio::fs::write(device_config_file, device_config_json_str.as_bytes())
-            .await
-            .map_err(|_| {
-                RPCErrors::ReasonError("Failed to write node_device_config.json".to_string())
-            })?;
 
         let ood = if let Some(net_id) = device_config.net_id.as_ref() {
             if net_id != "nat" {
@@ -822,7 +796,7 @@ impl ActiveServer {
         };
         Self::update_zone_boot_cache(&zone_did, &zone_boot_config).await;
 
-        info!("DoAction Write Active files [node_private_key.pem,node_identity.json,start_config.json,node_device_config.json] success");
+        info!("DoAction wrote device identity files to node_identity.json, identity root and security root");
 
         tokio::task::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

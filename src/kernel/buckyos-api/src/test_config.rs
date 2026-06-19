@@ -3,10 +3,11 @@ use buckyos_kit::buckyos_get_unix_timestamp;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{DecodingKey, EncodingKey};
+use name_client::IdentityRoots;
 use name_lib::{
     generate_ed25519_key_pair, get_x_from_jwk, DIDDocumentTrait, DeviceConfig, DeviceInfo,
-    DeviceMiniConfig, DeviceNodeType, EncodedDocument, NodeIdentityConfig, OODDescriptionString,
-    OwnerConfig, ZoneBootConfig, ZoneConfig, DID,
+    DeviceMiniConfig, DeviceNodeType, EncodedDocument, OODDescriptionString, OwnerConfig,
+    ZoneBootConfig, ZoneConfig, DID,
 };
 use package_lib::PackageId;
 use rusqlite::{params, Connection};
@@ -19,9 +20,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    AppDoc, LocalAppInstanceConfig, ServiceInstallConfig, ServiceInstanceState,
-    MSG_CENTER_SERVICE_UNIQUE_ID, OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID,
-    SMB_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID, WORKFLOW_SERVICE_UNIQUE_ID,
+    build_device_did, device_identity_paths_for_roots, new_device_config_by_jwk_with_did,
+    save_local_device_identity_for_roots, AppDoc, LocalAppInstanceConfig, LocalNodeIdentityConfig,
+    ServiceInstallConfig, ServiceInstanceState, MSG_CENTER_SERVICE_UNIQUE_ID,
+    OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID, SMB_SERVICE_UNIQUE_ID,
+    VERIFY_HUB_UNIQUE_ID, WORKFLOW_SERVICE_UNIQUE_ID,
 };
 
 // ============================================================================
@@ -407,6 +410,13 @@ fn get_jwk(x: &str) -> jsonwebtoken::jwk::Jwk {
     .unwrap()
 }
 
+fn test_identity_roots(root_dir: &Path) -> IdentityRoots {
+    IdentityRoots::new(
+        root_dir.join("local").join("identity"),
+        root_dir.join("security"),
+    )
+}
+
 pub fn gen_kernel_service_docs() -> HashMap<DID, EncodedDocument> {
     let mut docs = HashMap::new();
     let verify_hub_doc = crate::generate_verify_hub_service_doc();
@@ -653,14 +663,15 @@ impl<'a> UserEnvScope<'a> {
 
         // 2. Create device configuration and JWT
         let device_jwk = get_jwk(&device_key_pair.public_key_x);
-        let mut device_config = DeviceConfig::new_by_jwk(ood.name.as_str(), device_jwk.clone());
+        let device_did = build_device_did(ood.name.as_str(), &self.zone_did).unwrap();
+        let mut device_config =
+            new_device_config_by_jwk_with_did(ood.name.as_str(), device_jwk.clone(), &device_did)
+                .unwrap();
         device_config.support_container = true;
         device_config.net_id = ood.net_id.clone();
         device_config.owner = self.did.clone();
         device_config.zone_did = Some(self.zone_did.clone());
         device_config.ddns_sn_url = ddns_sn_url;
-        let node_dir = self.user_dir.join(ood.name.as_str());
-        write_json(&node_dir.join("node_device_config.json"), &device_config);
 
         println!(
             "{} device config: {}",
@@ -689,18 +700,16 @@ impl<'a> UserEnvScope<'a> {
         let full_device_name = format!("{}.{}", self.username, device_name);
         let device_key_pair = TestKeys::get_key_pair_by_id(&full_device_name).unwrap();
         let node_dir = self.user_dir.join(device_name);
-        // 1. Write device private key
-        write_file(
-            &node_dir.join("node_private_key.pem"),
-            device_key_pair.private_key_pem.as_str(),
-        );
 
-        // 2. Create device configuration and JWT
         let device_jwk = get_jwk(&device_key_pair.public_key_x);
-        //load device_config from file
-        let device_config_path = node_dir.join("node_device_config.json");
-        let device_config: DeviceConfig =
-            serde_json::from_str(&fs::read_to_string(&device_config_path).unwrap()).unwrap();
+        let device_did = build_device_did(device_name, &self.zone_did).unwrap();
+        let mut device_config =
+            new_device_config_by_jwk_with_did(device_name, device_jwk.clone(), &device_did)
+                .unwrap();
+        device_config.support_container = true;
+        device_config.net_id = net_id.clone();
+        device_config.owner = self.did.clone();
+        device_config.zone_did = Some(self.zone_did.clone());
 
         println!(
             "input net_id: {:?},device_config.net_id: {:?}",
@@ -724,18 +733,26 @@ impl<'a> UserEnvScope<'a> {
             device_mini_jwt.to_string().as_str(),
         );
 
-        // 3. Create node identity configuration
-        let identity_config = NodeIdentityConfig {
-            zone_did: self.zone_did.clone(),
-            owner_public_key: get_jwk(&self.key_pair.public_key_x),
-            owner_did: self.did.clone(),
-            device_doc_jwt: device_jwt.to_string(),
-            zone_iat: self.builder.now as u32,
-            device_mini_doc_jwt: device_mini_jwt.to_string(),
-        };
-        write_json(&node_dir.join("node_identity.json"), &identity_config);
+        let identity_config = LocalNodeIdentityConfig::new(
+            self.zone_did.clone(),
+            self.did.clone(),
+            get_jwk(&self.key_pair.public_key_x),
+            device_name.to_string(),
+            device_did,
+            self.builder.now as u32,
+        );
+        let roots = test_identity_roots(&node_dir);
+        save_local_device_identity_for_roots(
+            &node_dir,
+            &roots,
+            &identity_config,
+            &device_config,
+            device_jwt.to_string().as_str(),
+            device_mini_jwt.to_string().as_str(),
+            device_key_pair.private_key_pem.as_str(),
+        )
+        .unwrap();
 
-        // 4. Create startup configuration (only for OOD nodes)
         if device_name.starts_with("ood") {
             let start_config = json!({
                 "admin_password_hash": ADMIN_PASSWORD_HASH,
@@ -1033,18 +1050,21 @@ pub async fn register_device_to_sn(
         ));
     }
 
-    // Read node_identity.json to get device DID
-    let node_identity: NodeIdentityConfig = serde_json::from_str(
+    let node_identity: LocalNodeIdentityConfig = serde_json::from_str(
         &std::fs::read_to_string(&node_identity_path)
             .map_err(|e| format!("Failed to read node_identity.json: {}", e))?,
     )
     .map_err(|e| format!("Failed to parse node_identity.json: {}", e))?;
 
     let username = node_identity.owner_did.id;
+    let roots = test_identity_roots(&device_dir);
+    let identity_paths = device_identity_paths_for_roots(&roots, &node_identity.device_did)
+        .map_err(|e| format!("Failed to build device identity paths: {}", e))?;
 
-    // Extract device DID from device_doc_jwt
-    let device_doc_jwt = node_identity.device_doc_jwt.clone();
-    let device_mini_doc_jwt = node_identity.device_mini_doc_jwt.clone();
+    let device_doc_jwt = fs::read_to_string(identity_paths.device_doc_jwt.as_path())
+        .map_err(|e| format!("Failed to read device_doc.jwt: {}", e))?;
+    let device_mini_doc_jwt = fs::read_to_string(identity_paths.device_mini_doc_jwt.as_path())
+        .map_err(|e| format!("Failed to read device_mini_doc.jwt: {}", e))?;
     let encoded_doc = EncodedDocument::from_str(device_doc_jwt.clone())
         .map_err(|e| format!("Failed to create EncodedDocument: {}", e))?;
     let device_doc = DeviceConfig::decode(
@@ -1056,7 +1076,6 @@ pub async fn register_device_to_sn(
     )
     .map_err(|e| format!("Failed to decode device_doc_jwt: {}", e))?;
 
-    // Get device DID from device config id field
     let device_did = device_doc.id.clone();
 
     let ood_desc = {
@@ -1516,7 +1535,9 @@ mod tests {
         let zone_did = DID::new("web", "test.buckyos.io");
         // Create device configuration
         let device_jwk = get_jwk(&device_keys.public_key_x);
-        let mut device_config = DeviceConfig::new_by_jwk("ood1", device_jwk.clone());
+        let device_did = build_device_did("ood1", &zone_did).unwrap();
+        let mut device_config =
+            new_device_config_by_jwk_with_did("ood1", device_jwk.clone(), &device_did).unwrap();
         device_config.support_container = true;
         device_config.owner = DID::new("bns", "devtest");
         device_config.zone_did = Some(zone_did.clone());
@@ -1528,19 +1549,25 @@ mod tests {
         let ood: OODDescriptionString = "ood1".to_string().parse().unwrap();
         let zone_txt_record = scope.create_zone_boot_config_jwt(None, ood, 2980);
 
-        // Create node identity configuration
-        let node_identity_config = NodeIdentityConfig {
-            zone_did: zone_did.clone(),
-            owner_public_key: get_jwk(&owner_keys.public_key_x),
-            owner_did: DID::new("bns", "devtest"),
-            device_doc_jwt: device_jwt.to_string(),
-            device_mini_doc_jwt: device_mini_doc_jwt.to_string(),
-            zone_iat: builder.now() as u32,
-        };
-        write_json(
-            &builder.root_dir().join("node_identity.json"),
-            &node_identity_config,
+        let node_identity_config = LocalNodeIdentityConfig::new(
+            zone_did.clone(),
+            DID::new("bns", "devtest"),
+            get_jwk(&owner_keys.public_key_x),
+            "ood1".to_string(),
+            device_did,
+            builder.now() as u32,
         );
+        let roots = test_identity_roots(builder.root_dir());
+        save_local_device_identity_for_roots(
+            builder.root_dir(),
+            &roots,
+            &node_identity_config,
+            &device_config,
+            device_jwt.to_string().as_str(),
+            device_mini_doc_jwt.to_string().as_str(),
+            device_keys.private_key_pem.as_str(),
+        )
+        .unwrap();
 
         // Create startup configuration
         let start_config = json!({

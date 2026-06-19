@@ -5,6 +5,7 @@ use log::{info, warn};
 
 mod content_mgr_client;
 mod control_panel;
+mod device_identity;
 mod group_mgr;
 mod msg_center_client;
 pub mod msg_queue;
@@ -47,6 +48,7 @@ pub use cyfs_gateway_api::{
     SnGetDeviceInfoReq, SnHandler, SnRegisterDeviceReq, SnServerHandler, SnSetUserDidDocumentReq,
     SnUpdateDeviceInfoReq,
 };
+pub use device_identity::*;
 pub use group_mgr::*;
 pub use msg_center_client::*;
 pub use repo_client::*;

@@ -63,7 +63,9 @@ enum NodeDaemonErrors {
 
 type Result<T> = std::result::Result<T, NodeDaemonErrors>;
 
-async fn looking_zone_boot_config(node_identity: &NodeIdentityConfig) -> Result<ZoneBootConfig> {
+async fn looking_zone_boot_config(
+    node_identity: &LocalNodeIdentityConfig,
+) -> Result<ZoneBootConfig> {
     //If local files exist, priority loads local files
     let etc_dir = get_buckyos_system_etc_dir();
     let json_config_path = etc_dir.join(format!(
@@ -845,6 +847,63 @@ async fn wait_sysmte_config_sync() -> std::result::Result<(), String> {
     return Ok(());
 }
 
+fn write_boot_gateway_identity_paths(device_did: &DID) -> std::result::Result<(), String> {
+    let paths = device_identity_paths(device_did)?;
+    let boot_gateway_path = get_buckyos_system_etc_dir().join("boot_gateway.yaml");
+    let content = std::fs::read_to_string(boot_gateway_path.as_path()).map_err(|err| {
+        format!(
+            "read boot gateway config {} failed: {}",
+            boot_gateway_path.display(),
+            err
+        )
+    })?;
+
+    let private_key_path = paths.authentication_private_key.display().to_string();
+    let did_json_path = paths.did_json.display().to_string();
+    let mut changed = false;
+    let mut rewritten = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        if trimmed.starts_with("key_path:") {
+            rewritten.push(format!("{}key_path: \"{}\"", indent, private_key_path));
+            changed = true;
+        } else if trimmed.starts_with("device_config_path:") {
+            rewritten.push(format!(
+                "{}device_config_path: \"{}\"",
+                indent, did_json_path
+            ));
+            changed = true;
+        } else {
+            rewritten.push(line.to_string());
+        }
+    }
+
+    if !changed {
+        return Err(format!(
+            "boot gateway config {} does not contain key_path/device_config_path",
+            boot_gateway_path.display()
+        ));
+    }
+
+    let new_content = format!("{}\n", rewritten.join("\n"));
+    if new_content != content {
+        std::fs::write(boot_gateway_path.as_path(), new_content.as_bytes()).map_err(|err| {
+            format!(
+                "write boot gateway config {} failed: {}",
+                boot_gateway_path.display(),
+                err
+            )
+        })?;
+        info!(
+            "updated boot_gateway.yaml identity paths, key={}, did={}",
+            private_key_path, did_json_path
+        );
+    }
+    Ok(())
+}
+
 async fn keep_system_config_service(
     node_id: &str,
     device_doc: &DeviceConfig,
@@ -1484,7 +1543,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
 
     //load node identity config
     let node_identity_file = get_buckyos_system_etc_dir().join("node_identity.json");
-    let mut node_identity = NodeIdentityConfig::load_node_identity_config(&node_identity_file);
+    let mut node_identity = load_local_node_identity_config(&node_identity_file);
     if node_identity.is_err() {
         let desktop_task = if is_desktop {
             info!("start desktop daemon...");
@@ -1550,28 +1609,24 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
     //     }
     // }
 
-    let device_doc_json = decode_json_from_jwt_with_default_pk(
-        &node_identity.device_doc_jwt,
-        &node_identity.owner_public_key,
-    )
-    .map_err(|err| {
-        error!("decode device doc failed! {}", err);
-        return String::from("decode device doc from jwt failed!");
-    })?;
-    let device_doc: DeviceConfig = serde_json::from_value(device_doc_json).map_err(|err| {
-        error!("parse device doc failed! {}", err);
-        return String::from("parse device doc failed!");
-    })?;
+    let (device_doc_jwt, device_doc) =
+        load_local_device_config(&node_identity, true).map_err(|err| {
+            error!("load device doc from identity root failed! {}", err);
+            return String::from("load device doc from identity root failed!");
+        })?;
     info!("current node's device doc: {:?}", device_doc);
 
-    //load device private key
-    let device_private_key_file = get_buckyos_system_etc_dir().join("node_private_key.pem");
-    let device_private_key = load_private_key(&device_private_key_file).map_err(|error| {
-        error!(
-            "load device private key from node_private_key.pem failed! {}",
-            error
-        );
-        return String::from("load device private key failed!");
+    let device_private_key =
+        load_local_device_private_key(&node_identity.device_did).map_err(|error| {
+            error!(
+                "load device private key from identity root failed! {}",
+                error
+            );
+            return String::from("load device private key failed!");
+        })?;
+    write_boot_gateway_identity_paths(&node_identity.device_did).map_err(|error| {
+        error!("update boot_gateway.yaml identity paths failed! {}", error);
+        return String::from("update boot_gateway.yaml identity paths failed!");
     })?;
 
     //lookup zone config
@@ -1611,7 +1666,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
                 String::from("parse owner public key for finder failed!")
             })?;
         match NodeFinder::new_for_zone(
-            node_identity.device_doc_jwt.clone(),
+            device_doc_jwt.clone(),
             device_private_key.clone(),
             zone_boot_config.clone(),
             owner_public_key,
@@ -1644,7 +1699,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
                 String::from("parse owner public key for finder client failed!")
             })?;
         discover_oods_in_lan(
-            node_identity.device_doc_jwt.clone(),
+            device_doc_jwt.clone(),
             device_private_key.clone(),
             zone_boot_config.clone(),
             owner_public_key_for_finder,
@@ -1866,6 +1921,11 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         // 让 runtime.get_system_config_url() 走"非 OOD Kernel -> 本机 3180"分支
         // （buckyos-api/runtime.rs 的 get_system_config_url 已识别该 case）。
         runtime.force_https = false;
+        runtime.device_private_key = Some(device_private_key.clone());
+        {
+            let mut session_token = runtime.session_token.write().await;
+            *session_token = device_session_token_jwt.clone();
+        }
 
         // 重试 login。两类失败都会进入 retry：
         //  1) cyfs-gateway 还没就绪：连 127.0.0.1:3180 拒连；

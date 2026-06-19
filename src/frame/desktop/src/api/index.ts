@@ -247,7 +247,7 @@ const mockZoneOverview: ZoneOverview = {
   },
   device: {
     name: 'ood1',
-    did: 'did:dev:jocxyR8Ceskn6rjgDfDYmMQ5HXJDhw_TEyJj7sqCPZA',
+    did: 'did:bns:ood1.meteor101',
     type: 'ood',
     netId: 'nat',
   },
@@ -271,15 +271,15 @@ const mockZoneOverview: ZoneOverview = {
       modifiedAt: '',
     },
     {
-      name: 'node_device_config.json',
-      path: '/opt/buckyos/etc/node_device_config.json',
+      name: 'node_identity.json',
+      path: '/opt/buckyos/etc/node_identity.json',
       exists: true,
       sizeBytes: 1024,
       modifiedAt: '',
     },
     {
-      name: 'node_identity.json',
-      path: '/opt/buckyos/etc/node_identity.json',
+      name: 'did.json',
+      path: '/opt/buckyos/local/identity/ood1.meteor101.bns.did/did.json',
       exists: true,
       sizeBytes: 1024,
       modifiedAt: '',

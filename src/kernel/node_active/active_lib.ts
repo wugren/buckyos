@@ -70,9 +70,6 @@ export async function createInitialWizardData (initial?: Partial<ActiveWizzardDa
     }
 
     console.log("owner_public_key",owner_public_key);
-    let device_did = "did:dev:"+ device_public_key["x"];
-    console.log("device_did",device_did);
-
     let result:ActiveWizzardData = {
         gatewy_type: GatewayType.BuckyForward,
         //is_direct_connect: false,

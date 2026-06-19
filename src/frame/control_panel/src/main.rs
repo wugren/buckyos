@@ -85,11 +85,7 @@ const GATEWAY_CONFIG_FILES: [&str; 5] = [
     "user_gateway.yaml",
     "post_gateway.yaml",
 ];
-const ZONE_CONFIG_FILES: [&str; 3] = [
-    "start_config.json",
-    "node_device_config.json",
-    "node_identity.json",
-];
+const ZONE_CONFIG_FILES: [&str; 2] = ["start_config.json", "node_identity.json"];
 const CONTROL_PANEL_LOCALE_KEY: &str = "services/control_panel/settings/locale";
 
 pub(crate) fn gateway_etc_dir() -> PathBuf {

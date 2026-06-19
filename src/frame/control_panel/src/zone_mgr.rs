@@ -308,16 +308,9 @@ impl ControlPanelServer {
         let etc_dir = gateway_etc_dir();
         let start_config_path = Self::zone_config_file_path("start_config.json")
             .unwrap_or_else(|| etc_dir.join("start_config.json"));
-        let node_device_config_path = Self::zone_config_file_path("node_device_config.json")
-            .unwrap_or_else(|| etc_dir.join("node_device_config.json"));
         let node_identity_path = Self::zone_config_file_path("node_identity.json")
             .unwrap_or_else(|| etc_dir.join("node_identity.json"));
-
-        let files = vec![
-            Self::gateway_file_summary(&start_config_path),
-            Self::gateway_file_summary(&node_device_config_path),
-            Self::gateway_file_summary(&node_identity_path),
-        ];
+        let mut device_doc_path: Option<PathBuf> = None;
 
         let mut zone_name = String::new();
         let mut zone_domain = String::new();
@@ -371,47 +364,6 @@ impl ControlPanelServer {
             }
         }
 
-        if let Ok(content) = std::fs::read_to_string(&node_device_config_path) {
-            if let Ok(value) = serde_json::from_str::<Value>(content.as_str()) {
-                device_did = value
-                    .get("id")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                device_name = value
-                    .get("name")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                device_type = value
-                    .get("device_type")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if zone_did.is_empty() {
-                    zone_did = value
-                        .get("zone_did")
-                        .and_then(|item| item.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                }
-                if owner_did.is_empty() {
-                    owner_did = value
-                        .get("owner")
-                        .and_then(|item| item.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                }
-                if net_id.is_empty() {
-                    net_id = value
-                        .get("net_id")
-                        .and_then(|item| item.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                }
-            }
-        }
-
         if let Ok(content) = std::fs::read_to_string(&node_identity_path) {
             if let Ok(value) = serde_json::from_str::<Value>(content.as_str()) {
                 if zone_did.is_empty() {
@@ -428,11 +380,74 @@ impl ControlPanelServer {
                         .unwrap_or_default()
                         .to_string();
                 }
+                device_name = value
+                    .get("device_name")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                device_did = value
+                    .get("device_did")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 zone_iat = value
                     .get("zone_iat")
                     .and_then(|item| item.as_i64())
                     .unwrap_or(0);
             }
+        }
+
+        if !device_did.is_empty() {
+            if let Ok(did) = name_lib::DID::from_str(device_did.as_str()) {
+                if let Ok(paths) = buckyos_api::device_identity_paths(&did) {
+                    device_doc_path = Some(paths.did_json.clone());
+                    if let Ok(content) = std::fs::read_to_string(paths.did_json.as_path()) {
+                        if let Ok(value) = serde_json::from_str::<Value>(content.as_str()) {
+                            if device_name.is_empty() {
+                                device_name = value
+                                    .get("name")
+                                    .and_then(|item| item.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                            }
+                            device_type = value
+                                .get("device_type")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if zone_did.is_empty() {
+                                zone_did = value
+                                    .get("zone_did")
+                                    .and_then(|item| item.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                            }
+                            if owner_did.is_empty() {
+                                owner_did = value
+                                    .get("owner")
+                                    .and_then(|item| item.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                            }
+                            if net_id.is_empty() {
+                                net_id = value
+                                    .get("net_id")
+                                    .and_then(|item| item.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut files = vec![
+            Self::gateway_file_summary(&start_config_path),
+            Self::gateway_file_summary(&node_identity_path),
+        ];
+        if let Some(path) = device_doc_path.as_ref() {
+            files.push(Self::gateway_file_summary(path));
         }
 
         if zone_name.is_empty() {
@@ -447,12 +462,10 @@ impl ControlPanelServer {
             notes.push("zone name not found in start_config.json or zone_did".to_string());
         }
         if zone_did.is_empty() {
-            notes.push(
-                "zone_did not found in node_device_config.json/node_identity.json".to_string(),
-            );
+            notes.push("zone_did not found in node_identity.json/did.json".to_string());
         }
         if device_name.is_empty() {
-            notes.push("device name not found in node_device_config.json".to_string());
+            notes.push("device name not found in node_identity.json/did.json".to_string());
         }
 
         let mut dig_errors: Vec<String> = Vec::new();
