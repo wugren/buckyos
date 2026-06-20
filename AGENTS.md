@@ -1,5 +1,7 @@
 # AGENTS
 
+当前版本beta 2.2 是一个breaking change,任何修改都不用考虑向前兼容。
+
 ## BuckyOS 开发常用命令
 
 **注意下面脚本都推荐在src目录下运行**

@@ -15,6 +15,7 @@ pub const CONTROL_PANEL_SERVICE_PORT: u16 = 4020;
 #[serde(try_from = "String", into = "String")]
 pub enum UserState {
     Active,
+    Pending,
     Suspended(String), //suspend reason
     Deleted,           //delete reason
     Banned(String),    //ban reason
@@ -28,6 +29,7 @@ impl TryFrom<String> for UserState {
         let reason = split_result.get(1).unwrap_or(&"");
         match state_str {
             "active" => Ok(UserState::Active),
+            "pending" => Ok(UserState::Pending),
             "suspended" => Ok(UserState::Suspended(reason.to_string())),
             "deleted" => Ok(UserState::Deleted),
             "banned" => Ok(UserState::Banned(reason.to_string())),
@@ -40,6 +42,7 @@ impl From<UserState> for String {
     fn from(value: UserState) -> Self {
         match value {
             UserState::Active => "active".to_string(),
+            UserState::Pending => "pending".to_string(),
             UserState::Suspended(reason) => format!("suspended:{}", reason),
             UserState::Deleted => "deleted".to_string(),
             UserState::Banned(reason) => format!("banned:{}", reason),
@@ -65,6 +68,10 @@ pub struct UserTunnelBinding {
     pub display_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<u64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub meta: HashMap<String, String>,
 }
@@ -83,8 +90,30 @@ pub struct UserContactSettings {
     pub bindings: Vec<UserTunnelBinding>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UserProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
 //did:bns:$user_id user_id is-> UserSettings
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserSettings {
     pub user_id: String,
     //rename to type
@@ -96,6 +125,10 @@ pub struct UserSettings {
     pub res_pool_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<UserContactSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UserProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_password_change: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

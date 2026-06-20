@@ -15,7 +15,7 @@ use crate::service::*;
 use crate::zone_route_builder::{build_forward_plan, DidIpHint, NodeGatewayRouteCandidate};
 use buckyos_api::{
     get_buckyos_api_runtime, AppServiceSpec, KernelServiceSpec, NodeConfig,
-    ServiceInstanceReportInfo, ServiceState, UserSettings, UserType as ApiUserType,
+    ServiceInstanceReportInfo, ServiceState, UserSettings, UserState, UserType as ApiUserType,
     ZoneGatewaySettings, CONTROL_PANEL_SERVICE_PORT,
 };
 use buckyos_kit::*;
@@ -183,6 +183,9 @@ pub fn create_scheduler_by_system_config(
                             error!("UserSettings serde_json::from_str failed: {:?}", e);
                             e
                         })?;
+                    if !matches!(user_settings.state, UserState::Active) {
+                        continue;
+                    }
                     let user_item = UserItem {
                         userid: user_id.to_string(),
                         res_pool_id: None,
@@ -1247,6 +1250,7 @@ async fn update_rbac(
         if user_id == "root" {
             continue;
         }
+        rbac_policy.push_str(&format!("\ng, {}, zone_users", user_id));
         match user_item.user_type {
             crate::scheduler::UserType::Admin => {
                 rbac_policy.push_str(&format!("\ng, {}, admin", user_id));

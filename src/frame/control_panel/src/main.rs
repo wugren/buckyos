@@ -991,6 +991,25 @@ impl RPCHandler for ControlPanelServer {
                 self.handle_user_update_contact(req, principal.as_ref())
                     .await
             }
+            "user.profile.get" => self.handle_user_profile_get(req, principal.as_ref()).await,
+            "user.profile.set" => self.handle_user_profile_set(req, principal.as_ref()).await,
+            "user.set_msg_tunnel" => {
+                self.handle_user_set_msg_tunnel(req, principal.as_ref())
+                    .await
+            }
+            "user.remove_msg_tunnel" => {
+                self.handle_user_remove_msg_tunnel(req, principal.as_ref())
+                    .await
+            }
+            "user.invite.create" => {
+                self.handle_user_invite_create(req, principal.as_ref())
+                    .await
+            }
+            "user.invite.get" => self.handle_user_invite_get(req, principal.as_ref()).await,
+            "user.invite.accept" => {
+                self.handle_user_invite_accept(req, principal.as_ref())
+                    .await
+            }
             "user.delete" => self.handle_user_delete(req, principal.as_ref()).await,
 
             "user.change_password" => {
@@ -1002,6 +1021,11 @@ impl RPCHandler for ControlPanelServer {
 
             "agent.list" => self.handle_agent_list(req, principal.as_ref()).await,
             "agent.get" => self.handle_agent_get(req, principal.as_ref()).await,
+            "agent.create" => self.handle_agent_create(req, principal.as_ref()).await,
+            "agent.update" => self.handle_agent_update(req, principal.as_ref()).await,
+            "agent.delete" => self.handle_agent_delete(req, principal.as_ref()).await,
+            "agent.profile.get" => self.handle_agent_profile_get(req, principal.as_ref()).await,
+            "agent.profile.set" => self.handle_agent_profile_set(req, principal.as_ref()).await,
             "agent.set_msg_tunnel" => {
                 self.handle_agent_set_msg_tunnel(req, principal.as_ref())
                     .await

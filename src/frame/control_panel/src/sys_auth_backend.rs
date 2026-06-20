@@ -1,7 +1,7 @@
 use crate::{gateway_etc_dir, ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult, RPCSessionToken};
 use buckyos_api::{
-    get_buckyos_api_runtime, LoginByPasswordResponse, UserInfo, UserSettings, UserState, UserType,
+    get_buckyos_api_runtime, LoginByPasswordResponse, UserInfo, UserSettings, UserState,
 };
 use buckyos_http_server::{server_err, ServerError, ServerErrorCode, ServerResult, StreamInfo};
 use buckyos_kit::buckyos_get_unix_timestamp;
@@ -266,10 +266,7 @@ impl ControlPanelServer {
                 let user_info = self
                     .lookup_user_info_by_session_token(token_pair.session_token.as_str())
                     .await
-                    .unwrap_or_else(|error| {
-                        warn!("sso_refresh user lookup fallback: {}", error);
-                        Self::fallback_user_info(token_pair.session_token.as_str())
-                    });
+                    .map_err(Self::rpc_to_server_error)?;
                 let mut response = http::Response::builder()
                     .status(http::StatusCode::OK)
                     .header(http::header::CONTENT_TYPE, "application/json")
@@ -433,31 +430,13 @@ impl ControlPanelServer {
             .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
         let user_settings: UserSettings = serde_json::from_str(user_info.value.as_str())
             .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
-        Ok(user_settings.to_user_info())
-    }
-
-    fn fallback_user_info(session_token: &str) -> UserInfo {
-        match RPCSessionToken::from_string(session_token) {
-            Ok(parsed) => {
-                let username = parsed
-                    .sub
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "unknown".to_string());
-                UserInfo {
-                    show_name: username.clone(),
-                    user_id: username,
-                    state: UserState::Active,
-                    user_type: UserType::Root,
-                }
-            }
-            Err(_) => UserInfo {
-                show_name: "unknown".to_string(),
-                user_id: "unknown".to_string(),
-                state: UserState::Active,
-                user_type: UserType::Root,
-            },
+        if !matches!(user_settings.state, UserState::Active) {
+            return Err(RPCErrors::InvalidToken(format!(
+                "user '{}' is not active",
+                username
+            )));
         }
+        Ok(user_settings.to_user_info())
     }
 
     async fn store_pending_sso_login(&self, nonce: u64, pending: PendingSsoLogin) {
@@ -753,7 +732,13 @@ impl ControlPanelServer {
     fn is_public_rpc_method(method: &str) -> bool {
         matches!(
             method,
-            "auth.login" | "auth.refresh" | "auth.verify" | "auth.logout" | "auth.issue_sso_token"
+            "auth.login"
+                | "auth.refresh"
+                | "auth.verify"
+                | "auth.logout"
+                | "auth.issue_sso_token"
+                | "user.invite.get"
+                | "user.invite.accept"
         )
     }
 
@@ -916,11 +901,34 @@ impl ControlPanelServer {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| RPCErrors::InvalidToken("session token missing subject".to_string()))?;
-        let owner_did = DID::new("bns", &username).to_string();
+        let runtime = get_buckyos_api_runtime()?;
+        let system_config_client = runtime.get_system_config_client().await?;
+        let settings_path = format!("users/{}/settings", username);
+        let settings_val = system_config_client
+            .get(&settings_path)
+            .await
+            .map_err(|error| {
+                RPCErrors::InvalidToken(format!("failed to load user settings: {}", error))
+            })?;
+        let user_settings: UserSettings = serde_json::from_str(settings_val.value.as_str())
+            .map_err(|error| {
+                RPCErrors::InvalidToken(format!("failed to parse user settings: {}", error))
+            })?;
+        if !matches!(user_settings.state, UserState::Active) {
+            return Err(RPCErrors::InvalidToken(format!(
+                "user '{}' is not active",
+                username
+            )));
+        }
+        let owner_did = user_settings
+            .contact
+            .as_ref()
+            .and_then(|contact| contact.did.clone())
+            .unwrap_or_else(|| DID::new("bns", &username).to_string());
 
         Ok(Some(RpcAuthPrincipal {
             username,
-            user_type: UserType::Root,
+            user_type: user_settings.user_type,
             owner_did,
         }))
     }

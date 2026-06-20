@@ -13,6 +13,7 @@ export type UserType = 'admin' | 'user' | 'root' | 'limited' | 'guest'
  */
 export type UserStateString =
   | 'active'
+  | 'pending'
   | 'deleted'
   | `suspended:${string}`
   | `banned:${string}`
@@ -24,6 +25,8 @@ export interface UserTunnelBinding {
   account_id: string
   display_id?: string | null
   tunnel_id?: string | null
+  status?: string | null
+  last_sync_at?: number | null
   meta?: Record<string, string>
 }
 
@@ -38,6 +41,18 @@ export interface UserContactSettings {
   groups?: string[]
   tags?: string[]
   bindings?: UserTunnelBinding[]
+}
+
+export interface UserProfile {
+  display_name?: string | null
+  avatar_url?: string | null
+  title?: string | null
+  bio?: string | null
+  location?: string | null
+  website?: string | null
+  email?: string | null
+  phone?: string | null
+  extra?: Record<string, unknown>
 }
 
 /** Minimal user listing entry as returned by `user.list`. */
@@ -60,6 +75,8 @@ export interface UserDetail {
   user_type: UserType | string
   state: UserStateString
   res_pool_id: string
+  profile?: UserProfile | Record<string, unknown> | null
+  allow_password_change?: boolean
   /** Only present if caller is the user themselves or an admin. */
   contact?: UserContactSettings
   /** Optional DID document loaded from `users/{uid}/doc`. */
@@ -70,6 +87,40 @@ export interface SimpleOkResponse {
   ok: boolean
   user_id?: string
   [key: string]: unknown
+}
+
+export interface UserProfileResponse {
+  user_id: string
+  profile: UserProfile | Record<string, unknown>
+  local_profile?: UserProfile | null
+  did_profile?: Record<string, unknown> | null
+}
+
+export interface UserInviteRecord {
+  invite_id: string
+  created_by: string
+  created_at: number
+  expires_at?: number | null
+  state: 'pending' | 'accepted' | string
+  target_user_id?: string | null
+  target_did?: string | null
+  show_name?: string | null
+  default_user_type: UserType | string
+  groups?: string[]
+  app_ids?: string[]
+  accepted_at?: number | null
+  accepted_user_id?: string | null
+}
+
+export interface UserInviteResponse {
+  invite: UserInviteRecord
+  expired?: boolean
+  zone_did?: string
+  zone_host?: string
+  invite_url?: string
+  ok?: boolean
+  user_id?: string
+  state?: UserStateString
 }
 
 /** Agent listing entry as returned by `agent.list`. */
@@ -88,6 +139,7 @@ export interface AgentDetail {
   agent_id: string
   /** Optional settings block merged in from `agents/{agent_id}/settings`. */
   settings?: Record<string, unknown>
+  runtime?: Record<string, unknown>
   [key: string]: unknown
 }
 
@@ -97,6 +149,13 @@ export interface AgentTunnelBindingResponse {
   platform: string
   total_bindings?: number
   remaining_bindings?: number
+}
+
+export interface AgentProfileResponse {
+  agent_id: string
+  profile: Record<string, unknown>
+  local_profile?: Record<string, unknown> | null
+  did_profile?: Record<string, unknown> | null
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +183,7 @@ export const createUser = async (input: {
   passwordHash: string
   showName?: string
   userType?: Exclude<UserType, 'root'>
+  allowPasswordChange?: boolean
 }): Promise<{ data: SimpleOkResponse | null; error: unknown }> => {
   const params: Record<string, unknown> = {
     user_id: input.userId,
@@ -131,6 +191,9 @@ export const createUser = async (input: {
   }
   if (input.showName !== undefined) params.show_name = input.showName
   if (input.userType !== undefined) params.user_type = input.userType
+  if (input.allowPasswordChange !== undefined) {
+    params.allow_password_change = input.allowPasswordChange
+  }
   return callRpc<SimpleOkResponse>('user.create', params)
 }
 
@@ -172,6 +235,142 @@ export const updateUserContact = async (input: {
     'user.update_contact',
     params,
   )
+}
+
+export const fetchUserProfile = async (
+  userId?: string,
+): Promise<{ data: UserProfileResponse | null; error: unknown }> => {
+  const params: Record<string, unknown> = {}
+  if (userId) params.user_id = userId
+  return callRpc<UserProfileResponse>('user.profile.get', params)
+}
+
+export const setUserProfile = async (input: {
+  userId?: string
+  profile?: UserProfile
+  displayName?: string
+  avatarUrl?: string
+  title?: string
+  bio?: string
+  location?: string
+  website?: string
+  email?: string
+  phone?: string
+  extra?: Record<string, unknown>
+}): Promise<{ data: (SimpleOkResponse & { profile?: UserProfile }) | null; error: unknown }> => {
+  const params: Record<string, unknown> = {}
+  if (input.userId) params.user_id = input.userId
+  if (input.profile !== undefined) params.profile = input.profile
+  if (input.displayName !== undefined) params.display_name = input.displayName
+  if (input.avatarUrl !== undefined) params.avatar_url = input.avatarUrl
+  if (input.title !== undefined) params.title = input.title
+  if (input.bio !== undefined) params.bio = input.bio
+  if (input.location !== undefined) params.location = input.location
+  if (input.website !== undefined) params.website = input.website
+  if (input.email !== undefined) params.email = input.email
+  if (input.phone !== undefined) params.phone = input.phone
+  if (input.extra !== undefined) params.extra = input.extra
+  return callRpc<SimpleOkResponse & { profile?: UserProfile }>('user.profile.set', params)
+}
+
+export const setUserMsgTunnel = async (input: {
+  userId?: string
+  platform: string
+  accountId: string
+  displayId?: string
+  tunnelId?: string
+  status?: string
+  lastSyncAt?: number
+  meta?: Record<string, string>
+}): Promise<{
+  data: (SimpleOkResponse & {
+    platform?: string
+    total_bindings?: number
+    contact?: UserContactSettings
+  }) | null
+  error: unknown
+}> => {
+  const params: Record<string, unknown> = {
+    platform: input.platform,
+    account_id: input.accountId,
+  }
+  if (input.userId) params.user_id = input.userId
+  if (input.displayId !== undefined) params.display_id = input.displayId
+  if (input.tunnelId !== undefined) params.tunnel_id = input.tunnelId
+  if (input.status !== undefined) params.status = input.status
+  if (input.lastSyncAt !== undefined) params.last_sync_at = input.lastSyncAt
+  if (input.meta !== undefined) params.meta = input.meta
+  return callRpc<
+    SimpleOkResponse & {
+      platform?: string
+      total_bindings?: number
+      contact?: UserContactSettings
+    }
+  >('user.set_msg_tunnel', params)
+}
+
+export const removeUserMsgTunnel = async (input: {
+  userId?: string
+  platform: string
+}): Promise<{
+  data: (SimpleOkResponse & {
+    platform?: string
+    remaining_bindings?: number
+    contact?: UserContactSettings
+  }) | null
+  error: unknown
+}> => {
+  const params: Record<string, unknown> = { platform: input.platform }
+  if (input.userId) params.user_id = input.userId
+  return callRpc<
+    SimpleOkResponse & {
+      platform?: string
+      remaining_bindings?: number
+      contact?: UserContactSettings
+    }
+  >('user.remove_msg_tunnel', params)
+}
+
+export const createUserInvite = async (input: {
+  inviteId?: string
+  userId?: string
+  targetDid?: string
+  showName?: string
+  userType?: Exclude<UserType, 'root'>
+  expiresAt?: number
+  ttlSecs?: number
+  groups?: string[]
+  appIds?: string[]
+}): Promise<{ data: UserInviteResponse | null; error: unknown }> => {
+  const params: Record<string, unknown> = {}
+  if (input.inviteId !== undefined) params.invite_id = input.inviteId
+  if (input.userId !== undefined) params.user_id = input.userId
+  if (input.targetDid !== undefined) params.target_did = input.targetDid
+  if (input.showName !== undefined) params.show_name = input.showName
+  if (input.userType !== undefined) params.user_type = input.userType
+  if (input.expiresAt !== undefined) params.expires_at = input.expiresAt
+  if (input.ttlSecs !== undefined) params.ttl_secs = input.ttlSecs
+  if (input.groups !== undefined) params.groups = input.groups
+  if (input.appIds !== undefined) params.app_ids = input.appIds
+  return callRpc<UserInviteResponse>('user.invite.create', params)
+}
+
+export const fetchUserInvite = async (
+  inviteId: string,
+): Promise<{ data: UserInviteResponse | null; error: unknown }> =>
+  callRpc<UserInviteResponse>('user.invite.get', { invite_id: inviteId })
+
+export const acceptUserInvite = async (input: {
+  inviteId: string
+  ownerConfig: Record<string, unknown> | string
+  passwordHash?: string
+}): Promise<{ data: UserInviteResponse | null; error: unknown }> => {
+  const params: Record<string, unknown> = {
+    invite_id: input.inviteId,
+    owner_config: input.ownerConfig,
+  }
+  if (input.passwordHash !== undefined) params.password_hash = input.passwordHash
+  return callRpc<UserInviteResponse>('user.invite.accept', params)
 }
 
 /** Soft-delete a user (state → `deleted`). Admin-only; cannot delete root or self. */
@@ -222,11 +421,74 @@ export const fetchAgentList = async (): Promise<{
   error: unknown
 }> => callRpc<AgentsListResponse>('agent.list', {})
 
+export const fetchAgentListWithRuntime = async (): Promise<{
+  data: AgentsListResponse | null
+  error: unknown
+}> => callRpc<AgentsListResponse>('agent.list', { include_runtime: true })
+
 /** Get the full detail for a single agent (doc + optional settings). */
 export const fetchAgentDetail = async (
   agentId: string,
 ): Promise<{ data: AgentDetail | null; error: unknown }> =>
   callRpc<AgentDetail>('agent.get', { agent_id: agentId })
+
+export const createAgent = async (input: {
+  agentId: string
+  displayName?: string
+  ownerUserId?: string
+  agentDid?: string
+  description?: string
+  profile?: Record<string, unknown>
+  settings?: Record<string, unknown>
+}): Promise<{ data: (SimpleOkResponse & AgentDetail) | null; error: unknown }> => {
+  const params: Record<string, unknown> = { agent_id: input.agentId }
+  if (input.displayName !== undefined) params.display_name = input.displayName
+  if (input.ownerUserId !== undefined) params.owner_user_id = input.ownerUserId
+  if (input.agentDid !== undefined) params.agent_did = input.agentDid
+  if (input.description !== undefined) params.description = input.description
+  if (input.profile !== undefined) params.profile = input.profile
+  if (input.settings !== undefined) params.settings = input.settings
+  return callRpc<SimpleOkResponse & AgentDetail>('agent.create', params)
+}
+
+export const updateAgent = async (input: {
+  agentId: string
+  displayName?: string
+  description?: string
+  state?: string
+  profile?: Record<string, unknown>
+  settings?: Record<string, unknown>
+}): Promise<{ data: (SimpleOkResponse & { settings?: Record<string, unknown> }) | null; error: unknown }> => {
+  const params: Record<string, unknown> = { agent_id: input.agentId }
+  if (input.displayName !== undefined) params.display_name = input.displayName
+  if (input.description !== undefined) params.description = input.description
+  if (input.state !== undefined) params.state = input.state
+  if (input.profile !== undefined) params.profile = input.profile
+  if (input.settings !== undefined) params.settings = input.settings
+  return callRpc<SimpleOkResponse & { settings?: Record<string, unknown> }>(
+    'agent.update',
+    params,
+  )
+}
+
+export const deleteAgent = async (
+  agentId: string,
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> =>
+  callRpc<SimpleOkResponse>('agent.delete', { agent_id: agentId })
+
+export const fetchAgentProfile = async (
+  agentId: string,
+): Promise<{ data: AgentProfileResponse | null; error: unknown }> =>
+  callRpc<AgentProfileResponse>('agent.profile.get', { agent_id: agentId })
+
+export const setAgentProfile = async (input: {
+  agentId: string
+  profile: Record<string, unknown>
+}): Promise<{ data: (SimpleOkResponse & { profile?: Record<string, unknown> }) | null; error: unknown }> =>
+  callRpc<SimpleOkResponse & { profile?: Record<string, unknown> }>('agent.profile.set', {
+    agent_id: input.agentId,
+    profile: input.profile,
+  })
 
 /**
  * Set (add or replace) a message-tunnel binding for an agent. Admin-only.
@@ -239,6 +501,8 @@ export const setAgentMsgTunnel = async (input: {
   accountId: string
   displayId?: string
   tunnelId?: string
+  status?: string
+  lastSyncAt?: number
   meta?: Record<string, string>
 }): Promise<{ data: AgentTunnelBindingResponse | null; error: unknown }> => {
   const params: Record<string, unknown> = {
@@ -248,6 +512,8 @@ export const setAgentMsgTunnel = async (input: {
   }
   if (input.displayId !== undefined) params.display_id = input.displayId
   if (input.tunnelId !== undefined) params.tunnel_id = input.tunnelId
+  if (input.status !== undefined) params.status = input.status
+  if (input.lastSyncAt !== undefined) params.last_sync_at = input.lastSyncAt
   if (input.meta !== undefined) params.meta = input.meta
   return callRpc<AgentTunnelBindingResponse>('agent.set_msg_tunnel', params)
 }

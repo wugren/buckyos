@@ -120,6 +120,8 @@ impl SystemConfigBuilder {
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             contact: None,
+            profile: None,
+            allow_password_change: None,
         };
         self.insert_json_if_absent("users/root/settings", &root_settings)?;
 
@@ -132,6 +134,8 @@ impl SystemConfigBuilder {
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             contact: admin_contact,
+            profile: None,
+            allow_password_change: None,
         };
         self.insert_json_if_absent(&admin_key, &admin_settings)?;
         self.append_policy(&format!("g, {}, admin", config.user_name));
@@ -691,6 +695,8 @@ fn build_zone_user_contact_settings(
             account_id: normalized_account_id,
             display_id: Some(account_id),
             tunnel_id: Some(tunnel_id),
+            status: None,
+            last_sync_at: None,
             meta: HashMap::new(),
         }],
     }))
