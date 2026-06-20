@@ -1,15 +1,30 @@
 /* ── Self (current user) detail page ── */
 
 import { Chip } from '@mui/material'
-import { useSelf } from '../../hooks/use-users-agents-store'
+import { useSelf, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 import { HeaderSection } from '../sections/HeaderSection'
-import { BindingsSection } from '../sections/BindingsSection'
+import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'
 import { DIDDocumentSection } from '../sections/DIDDocumentSection'
 import { SecuritySection } from '../sections/SecuritySection'
 
 export function SelfDetailPage() {
   const self = useSelf()
+  const store = useUsersAgentsStore()
+
+  const handleAvatarEdit = () => {
+    const nextUrl = window.prompt('Avatar image URL:', self.avatarUrl ?? '')
+    if (nextUrl !== null) {
+      store.updateSelfAvatar(nextUrl.trim() || undefined)
+    }
+  }
+
+  const handleBioEdit = () => {
+    const nextBio = window.prompt('Bio:', self.bio ?? '')
+    if (nextBio !== null) {
+      store.updateSelfBio(nextBio.trim())
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -20,6 +35,9 @@ export function SelfDetailPage() {
         did={self.did}
         subtitle={self.bio}
         isOnline
+        previewUrl={`/profile/${encodeURIComponent(self.did ?? self.id)}`}
+        onAvatarEdit={handleAvatarEdit}
+        onSubtitleEdit={handleBioEdit}
         badges={
           <>
             <Chip label="Owner" size="small" color="primary" variant="outlined" />
@@ -30,18 +48,18 @@ export function SelfDetailPage() {
         }
       />
 
-      <BindingsSection entityId={self.id} bindings={self.bindings} />
+      <InfoFieldsSection title="Profile" fields={self.info} onFieldChange={store.updateSelfInfo.bind(store)} />
 
-      <InfoFieldsSection title="Profile" fields={self.info} />
+      <SocialAccountsSection entityId={self.id} accounts={self.socialAccounts} />
 
       <InfoFieldsSection title="Settings" fields={self.settings} />
-
-      <DIDDocumentSection document={self.didDocument} />
 
       <SecuritySection
         twoFactorEnabled={self.twoFactorEnabled}
         lastLogin={self.lastLogin}
       />
+
+      <DIDDocumentSection document={self.didDocument} />
     </div>
   )
 }

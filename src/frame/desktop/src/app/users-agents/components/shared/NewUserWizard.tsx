@@ -104,7 +104,7 @@ export function NewUserWizard({ onClose, onCreated }: NewUserWizardProps) {
       kind: 'local-user',
       displayName: data.displayName.trim(),
       did,
-      bindings: [],
+      socialAccounts: [],
       role: data.source === 'local-account' ? data.userType : data.userType,
       source: data.source,
       status: isInvite ? 'pending-invitation' : 'active',
@@ -212,7 +212,7 @@ export function NewUserWizard({ onClose, onCreated }: NewUserWizardProps) {
           <div className="space-y-3">
             <Alert severity="info">
               This creates a real user who can log in to the current Zone. Use
-              Contacts or MessageHub if you only want to add a friend.
+              My Network if you only want to add a friend or contact.
             </Alert>
             <div className="grid gap-2 sm:grid-cols-2">
               <div

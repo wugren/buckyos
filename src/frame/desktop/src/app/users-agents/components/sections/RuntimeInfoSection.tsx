@@ -9,6 +9,9 @@ interface RuntimeInfoSectionProps {
     memoryUsage: string
     cpuUsage: string
     lastActive: string
+    runningTasks: number
+    queuedTasks: number
+    healthStatus: 'healthy' | 'busy' | 'degraded' | 'offline'
     uiSessions: number
     workSessions: number
     workspaces: number
@@ -37,18 +40,24 @@ export function RuntimeInfoSection({ runtime, status }: RuntimeInfoSectionProps)
 
       <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
         <MetricCard
-          label="Status"
+          label="Health"
           tone={status === 'running' ? 'success' : status === 'error' ? 'warning' : 'neutral'}
-          value={status}
+          value={runtime.healthStatus}
         />
+        <MetricCard label="Running Tasks" tone="accent" value={String(runtime.runningTasks)} />
+        <MetricCard label="Queued Tasks" tone="warning" value={String(runtime.queuedTasks)} />
         <MetricCard label="Uptime" tone="accent" value={runtime.uptime} />
         <MetricCard label="CPU" tone="neutral" value={runtime.cpuUsage} />
         <MetricCard label="Memory" tone="neutral" value={runtime.memoryUsage} />
-        <MetricCard label="UI Sessions" tone="accent" value={String(runtime.uiSessions)} />
-        <MetricCard label="Workspaces" tone="accent" value={String(runtime.workspaces)} />
       </div>
 
       <div className="mt-3 space-y-1.5">
+        <div className="flex items-baseline gap-3">
+          <span className="text-[12px] font-medium w-28 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+            Service status
+          </span>
+          <span className="text-sm" style={{ color: 'var(--cp-text)' }}>{status}</span>
+        </div>
         <div className="flex items-baseline gap-3">
           <span className="text-[12px] font-medium w-28 shrink-0" style={{ color: 'var(--cp-muted)' }}>
             Work sessions

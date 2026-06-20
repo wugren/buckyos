@@ -3,7 +3,7 @@
 import { Chip } from '@mui/material'
 import { useAgent } from '../../hooks/use-users-agents-store'
 import { HeaderSection } from '../sections/HeaderSection'
-import { BindingsSection } from '../sections/BindingsSection'
+import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'
 import { DIDDocumentSection } from '../sections/DIDDocumentSection'
 import { RuntimeInfoSection } from '../sections/RuntimeInfoSection'
@@ -18,7 +18,8 @@ export function AgentDetailPage() {
         kind="agent"
         avatarUrl={agent.avatarUrl}
         did={agent.did}
-        subtitle={`${agent.agentType} · v${agent.version}`}
+        subtitle={`${agent.agentType} · Owner ${agent.settings.owner} · v${agent.version}`}
+        previewUrl={`/profile/${encodeURIComponent(agent.did ?? agent.id)}`}
         badges={
           <>
             {agent.capabilities.map((cap) => (
@@ -28,13 +29,23 @@ export function AgentDetailPage() {
         }
       />
 
-      <BindingsSection entityId={agent.id} bindings={agent.bindings} />
+      <RuntimeInfoSection runtime={agent.runtime} status={agent.status} />
 
       <InfoFieldsSection title="Profile" fields={agent.info} />
 
+      <SocialAccountsSection entityId={agent.id} accounts={agent.socialAccounts} />
+
       <InfoFieldsSection title="Settings" fields={agent.settings} />
 
-      <RuntimeInfoSection runtime={agent.runtime} status={agent.status} />
+      <InfoFieldsSection
+        title="Security & Account"
+        editable={false}
+        fields={{
+          owner: agent.settings.owner,
+          credential: 'Service key managed by owner',
+          permissions: agent.settings.permissions,
+        }}
+      />
 
       <DIDDocumentSection document={agent.didDocument} />
     </div>

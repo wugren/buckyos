@@ -4,7 +4,7 @@ import { Alert, Chip, Button } from '@mui/material'
 import { Link, ShieldAlert, Trash2 } from 'lucide-react'
 import type { LocalUserEntity } from '../../mock/types'
 import { HeaderSection } from '../sections/HeaderSection'
-import { BindingsSection } from '../sections/BindingsSection'
+import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'
 import { MetricCard } from '../../../../components/AppPanelPrimitives'
 import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
@@ -63,7 +63,6 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
         }
       />
 
-      {/* Quick stats */}
       <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
         <MetricCard
           label="Source"
@@ -74,8 +73,6 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
         <MetricCard label="Quota" tone="neutral" value={user.storageQuota} />
         <MetricCard label="Apps" tone="success" value={String(user.availableApps.length)} />
       </div>
-
-      <BindingsSection entityId={user.id} bindings={user.bindings} />
 
       {user.invitation && (
         <div
@@ -91,12 +88,11 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
               className="font-display text-sm font-semibold"
               style={{ color: 'var(--cp-text)' }}
             >
-              Pending BNS Binding Confirmation
+              Pending DID Confirmation
             </h3>
           </div>
           <Alert severity="warning">
-            The target user must update their BNS ownerconfig and add this Zone
-            to binded_zone_list with their own root key.
+            The target user must confirm this Zone with their own identity key before the account becomes active.
           </Alert>
           <div className="mt-3 space-y-1.5">
             {[
@@ -128,9 +124,11 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
         </div>
       )}
 
-      <InfoFieldsSection title="Profile" fields={user.profile} />
+      <InfoFieldsSection title="Profile" fields={user.profile} editable={false} />
 
-      <InfoFieldsSection title="Settings" fields={user.settings} />
+      <SocialAccountsSection entityId={user.id} accounts={user.socialAccounts} editable={false} />
+
+      <InfoFieldsSection title="Settings" fields={user.settings} editable={false} />
 
       {/* Available apps */}
       <div

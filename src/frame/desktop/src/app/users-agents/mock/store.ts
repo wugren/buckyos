@@ -9,7 +9,7 @@ import type {
   EntityGroupEntity,
   Collection,
   AnyEntity,
-  MessageTunnelBinding,
+  SocialAccount,
 } from './types'
 import {
   mockSelf,
@@ -96,7 +96,7 @@ export class UsersAgentsMockStore {
     this.contacts = [...this.contacts, ...contacts]
     const contactIds = contacts.map((contact) => contact.id)
     this.collections = this.collections.map((col) =>
-      col.type === 'friends'
+      col.type === 'contacts'
         ? {
             ...col,
             entityIds: Array.from(new Set([...col.entityIds, ...contactIds])),
@@ -158,13 +158,16 @@ export class UsersAgentsMockStore {
 
   // ── collection CRUD ──
 
-  addCollection(name: string) {
+  addCollection(name: string, description = '') {
     const col: Collection = {
       id: `col-custom-${Date.now()}`,
       name,
       type: 'custom',
+      mode: 'static',
+      description,
       sourceType: 'manual',
       isBuiltIn: false,
+      isReadOnly: false,
       entityIds: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -182,13 +185,13 @@ export class UsersAgentsMockStore {
   }
 
   removeCollection(id: string) {
-    this.collections = this.collections.filter((c) => c.id !== id)
+    this.collections = this.collections.filter((c) => c.id !== id || c.isBuiltIn)
     this.notify()
   }
 
   addToCollection(collectionId: string, entityId: string) {
     this.collections = this.collections.map((c) =>
-      c.id === collectionId && !c.entityIds.includes(entityId)
+      c.id === collectionId && !c.isReadOnly && !c.entityIds.includes(entityId)
         ? {
             ...c,
             entityIds: [...c.entityIds, entityId],
@@ -215,7 +218,7 @@ export class UsersAgentsMockStore {
   removeManyFromCollection(collectionId: string, entityIds: string[]) {
     const removeSet = new Set(entityIds)
     this.collections = this.collections.map((c) =>
-      c.id === collectionId
+      c.id === collectionId && !c.isReadOnly
         ? {
             ...c,
             entityIds: c.entityIds.filter((eid) => !removeSet.has(eid)),
@@ -226,32 +229,107 @@ export class UsersAgentsMockStore {
     this.notify()
   }
 
-  addBinding(entityId: string, binding: MessageTunnelBinding) {
+  updateSelfAvatar(avatarUrl?: string) {
+    this.self = { ...this.self, avatarUrl }
+    this.notify()
+  }
+
+  updateSelfBio(bio: string) {
+    this.self = {
+      ...this.self,
+      bio,
+      info: {
+        ...this.self.info,
+        bio,
+      },
+    }
+    this.notify()
+  }
+
+  updateSelfInfo(key: string, value: string) {
+    this.self = {
+      ...this.self,
+      displayName: key === 'displayName' ? value : this.self.displayName,
+      bio: key === 'bio' ? value : this.self.bio,
+      info: {
+        ...this.self.info,
+        [key]: value,
+      },
+    }
+    this.notify()
+  }
+
+  addSocialAccount(entityId: string, account: SocialAccount) {
     if (this.self.id === entityId) {
-      this.self = { ...this.self, bindings: [...this.self.bindings, binding] }
+      this.self = { ...this.self, socialAccounts: [...this.self.socialAccounts, account] }
       this.notify()
       return
     }
 
     if (this.agent.id === entityId) {
-      this.agent = { ...this.agent, bindings: [...this.agent.bindings, binding] }
+      this.agent = { ...this.agent, socialAccounts: [...this.agent.socialAccounts, account] }
       this.notify()
       return
     }
 
     this.localUsers = this.localUsers.map((user) =>
       user.id === entityId
-        ? { ...user, bindings: [...user.bindings, binding] }
+        ? { ...user, socialAccounts: [...user.socialAccounts, account] }
         : user,
     )
     this.contacts = this.contacts.map((contact) =>
       contact.id === entityId
-        ? { ...contact, bindings: [...contact.bindings, binding] }
+        ? { ...contact, socialAccounts: [...contact.socialAccounts, account] }
         : contact,
     )
     this.entityGroups = this.entityGroups.map((group) =>
       group.id === entityId
-        ? { ...group, bindings: [...group.bindings, binding] }
+        ? { ...group, socialAccounts: [...group.socialAccounts, account] }
+        : group,
+    )
+    this.notify()
+  }
+
+  removeSocialAccount(entityId: string, accountId: string) {
+    this.updateSocialAccounts(entityId, (accounts) => accounts.filter((account) => account.id !== accountId))
+  }
+
+  toggleSocialAccountVisibility(entityId: string, accountId: string) {
+    this.updateSocialAccounts(entityId, (accounts) =>
+      accounts.map((account) =>
+        account.id === accountId
+          ? { ...account, isPublic: !account.isPublic }
+          : account,
+      ),
+    )
+  }
+
+  private updateSocialAccounts(entityId: string, updater: (accounts: SocialAccount[]) => SocialAccount[]) {
+    if (this.self.id === entityId) {
+      this.self = { ...this.self, socialAccounts: updater(this.self.socialAccounts) }
+      this.notify()
+      return
+    }
+
+    if (this.agent.id === entityId) {
+      this.agent = { ...this.agent, socialAccounts: updater(this.agent.socialAccounts) }
+      this.notify()
+      return
+    }
+
+    this.localUsers = this.localUsers.map((user) =>
+      user.id === entityId
+        ? { ...user, socialAccounts: updater(user.socialAccounts) }
+        : user,
+    )
+    this.contacts = this.contacts.map((contact) =>
+      contact.id === entityId
+        ? { ...contact, socialAccounts: updater(contact.socialAccounts) }
+        : contact,
+    )
+    this.entityGroups = this.entityGroups.map((group) =>
+      group.id === entityId
+        ? { ...group, socialAccounts: updater(group.socialAccounts) }
         : group,
     )
     this.notify()

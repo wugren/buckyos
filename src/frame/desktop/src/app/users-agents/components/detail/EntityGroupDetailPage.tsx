@@ -4,7 +4,7 @@ import { Chip, Button } from '@mui/material'
 import { MessageSquare, Users2 } from 'lucide-react'
 import type { EntityGroupEntity } from '../../mock/types'
 import { HeaderSection } from '../sections/HeaderSection'
-import { BindingsSection } from '../sections/BindingsSection'
+import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { MetricCard } from '../../../../components/AppPanelPrimitives'
 
 interface EntityGroupDetailPageProps {
@@ -76,7 +76,7 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
         )}
       </div>
 
-      <BindingsSection entityId={group.id} bindings={group.bindings} />
+      <SocialAccountsSection entityId={group.id} accounts={group.socialAccounts} editable={false} />
 
       {/* Members preview */}
       <div

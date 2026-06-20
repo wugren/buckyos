@@ -1,16 +1,25 @@
 /* ── Key-value info fields section ── */
 
 import { Edit3 } from 'lucide-react'
-import { Button } from '@mui/material'
+import { IconButton } from '@mui/material'
 
 interface InfoFieldsSectionProps {
   title: string
   fields: Record<string, string>
   editable?: boolean
+  onFieldChange?: (key: string, value: string) => void
 }
 
-export function InfoFieldsSection({ title, fields, editable = true }: InfoFieldsSectionProps) {
+export function InfoFieldsSection({ title, fields, editable = true, onFieldChange }: InfoFieldsSectionProps) {
   const entries = Object.entries(fields)
+  const canEdit = editable && Boolean(onFieldChange)
+
+  const editField = (key: string, value: string) => {
+    const nextValue = window.prompt(key, value)
+    if (nextValue !== null) {
+      onFieldChange?.(key, nextValue.trim())
+    }
+  }
 
   return (
     <div
@@ -27,11 +36,6 @@ export function InfoFieldsSection({ title, fields, editable = true }: InfoFields
         >
           {title}
         </h3>
-        {editable && (
-          <Button size="small" startIcon={<Edit3 size={13} />} variant="text">
-            Edit
-          </Button>
-        )}
       </div>
 
       {entries.length === 0 ? (
@@ -41,9 +45,9 @@ export function InfoFieldsSection({ title, fields, editable = true }: InfoFields
       ) : (
         <div className="space-y-2">
           {entries.map(([key, value]) => (
-            <div key={key} className="flex items-baseline gap-3">
+            <div key={key} className="flex items-start gap-3">
               <span
-                className="text-[12px] font-medium capitalize shrink-0 w-24"
+                className="text-[12px] font-medium capitalize shrink-0 w-24 pt-0.5"
                 style={{ color: 'var(--cp-muted)' }}
               >
                 {key}
@@ -51,6 +55,15 @@ export function InfoFieldsSection({ title, fields, editable = true }: InfoFields
               <span className="text-sm flex-1 min-w-0 break-words" style={{ color: 'var(--cp-text)' }}>
                 {value}
               </span>
+              {canEdit && (
+                <IconButton
+                  size="small"
+                  aria-label={`Edit ${key}`}
+                  onClick={() => editField(key, value)}
+                >
+                  <Edit3 size={13} />
+                </IconButton>
+              )}
             </div>
           ))}
         </div>

@@ -5,7 +5,7 @@ import { Alert, Chip, Button } from '@mui/material'
 import { UserCheck, UserX, Trash2, FolderPlus, MessageSquare, ShieldCheck } from 'lucide-react'
 import type { ContactEntity } from '../../mock/types'
 import { HeaderSection } from '../sections/HeaderSection'
-import { BindingsSection } from '../sections/BindingsSection'
+import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { useCollections, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
 interface ContactDetailPageProps {
@@ -55,7 +55,7 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
         }
       />
 
-      <BindingsSection entityId={contact.id} bindings={contact.bindings} />
+      <SocialAccountsSection entityId={contact.id} accounts={contact.socialAccounts} />
 
       {/* Source & history */}
       <div

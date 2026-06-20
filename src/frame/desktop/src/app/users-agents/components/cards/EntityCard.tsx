@@ -17,8 +17,17 @@ const kindLabel: Record<string, string> = {
 }
 
 function getSubLabel(entity: AnyEntity) {
+  if (entity.kind === 'self') {
+    return entity.bio ?? 'Owner'
+  }
+  if (entity.kind === 'agent') {
+    return `Owner ${entity.settings.owner} · ${entity.status}`
+  }
   if (entity.kind === 'local-user') {
     return `${entity.source === 'primary-did' ? 'BNS / DID' : 'Local'} · ${entity.status}`
+  }
+  if (entity.kind === 'entity-group') {
+    return `${entity.memberCount} members · ${entity.isHostedBySelf ? 'Self-hosted' : 'Joined'}`
   }
   return `${kindLabel[entity.kind] ?? entity.kind}${entity.did ? ` · ${entity.did}` : ''}`
 }

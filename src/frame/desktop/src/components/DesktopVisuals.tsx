@@ -10,6 +10,7 @@ import {
   Home,
   LayoutGrid,
   MessageSquare,
+  Network,
   Settings,
   SlidersHorizontal,
   StickyNote,
@@ -37,6 +38,7 @@ const iconMap = {
   'task-center': ClipboardList,
   workflow: WorkflowIcon,
   'users-agents': Users,
+  'my-network': Network,
   clock: Clock3,
   notepad: StickyNote,
 }

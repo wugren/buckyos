@@ -1131,7 +1131,7 @@ export class DesktopUIStore {
         (app): app is SystemSidebarDataModel['switchApps'][number] => Boolean(app),
       )
 
-    const systemApps = ['settings', 'diagnostics', 'users-agents']
+    const systemApps = ['settings', 'diagnostics', 'users-agents', 'my-network']
       .map((appId) => toSidebarApp(appMap.get(appId)))
       .filter((app): app is SystemSidebarAppItem => Boolean(app))
 

@@ -1,6 +1,6 @@
 /* ── Collection element list (middle column in Mode B) ── */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, ToggleButton, ToggleButtonGroup } from '@mui/material'
 import { Download, Merge, Trash2 } from 'lucide-react'
 import { SearchFilterBar } from '../shared/SearchFilterBar'
@@ -12,9 +12,10 @@ interface CollectionListProps {
   collectionId: string
   selectedElementId: string | null
   onSelectElement: (id: string) => void
+  wide?: boolean
 }
 
-export function CollectionList({ collectionId, selectedElementId, onSelectElement }: CollectionListProps) {
+function CollectionListContent({ collectionId, selectedElementId, onSelectElement, wide = false }: CollectionListProps) {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'contacts' | 'groups' | 'imported'>('all')
   const [sort, setSort] = useState<'name' | 'source' | 'updated'>('name')
@@ -55,12 +56,6 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
       })
   }, [entities, filter, query, sort])
 
-  useEffect(() => {
-    setSelectedIds([])
-    setFilter('all')
-    setQuery('')
-  }, [collectionId])
-
   if (!collection) return null
 
   const selectedEntities = entities.filter((entity) => selectedIds.includes(entity.id))
@@ -84,7 +79,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           kind: 'contact',
           displayName: 'Mina.imported',
           sourceLabel: 'Mina.imported',
-          bindings: [{ id: `b-import-${Date.now()}`, platform: 'email', accountId: 'mina@example.com', displayId: 'mina@example.com', status: 'active' }],
+          socialAccounts: [{ id: `b-import-${Date.now()}`, platform: 'email', accountId: 'mina@example.com', displayId: 'mina@example.com', status: 'active', isPublic: false, canIdentify: true }],
           source: 'imported',
           isVerified: false,
           relation: 'one-way',
@@ -98,7 +93,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           kind: 'contact',
           displayName: 'Grace.imported',
           sourceLabel: 'Grace.imported',
-          bindings: [],
+          socialAccounts: [],
           source: 'imported',
           isVerified: false,
           relation: 'one-way',
@@ -121,7 +116,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
 
   return (
     <div
-      className="flex flex-col h-full w-64 shrink-0 overflow-hidden"
+      className={`flex flex-col h-full overflow-hidden ${wide ? 'w-full' : 'w-64 shrink-0'}`}
       style={{
         borderRight: '1px solid color-mix(in srgb, var(--cp-border) 60%, transparent)',
       }}
@@ -135,7 +130,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           >
             {collection.name}
           </h3>
-          {collection.type === 'friends' && (
+          {collection.type === 'contacts' && (
             <Button
               size="small"
               variant="text"
@@ -153,8 +148,13 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           className="text-[11px] mt-0.5"
           style={{ color: 'var(--cp-muted)' }}
         >
-          {entities.length} items · {collection.sourceType} · updated {new Date(collection.updatedAt).toLocaleDateString()}
+          {entities.length} items · {collection.mode} {collection.sourceType} · updated {new Date(collection.updatedAt).toLocaleDateString()}
         </div>
+        {collection.description && (
+          <div className="mt-1 text-[11px] leading-4" style={{ color: 'var(--cp-muted)' }}>
+            {collection.description}
+          </div>
+        )}
       </div>
 
       <SearchFilterBar
@@ -217,6 +217,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
               color="error"
               variant="outlined"
               startIcon={<Trash2 size={13} />}
+              disabled={collection.isReadOnly}
               onClick={() => {
                 store.removeManyFromCollection(collection.id, selectedIds)
                 setSelectedIds([])
@@ -257,7 +258,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           {importStage === 'idle' && (
             <div className="space-y-2 pt-1 text-sm" style={{ color: 'var(--cp-text)' }}>
               <p>
-                Imported contacts land in My Friends first. Existing profiles
+                Imported contacts land in Contacts first. Existing profiles
                 are not overwritten; possible duplicates are marked as merge
                 candidates.
               </p>
@@ -275,7 +276,7 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
           )}
           {importStage === 'complete' && (
             <div className="space-y-2 py-2 text-sm" style={{ color: 'var(--cp-text)' }}>
-              <p>Import complete. Two contacts were added to My Friends.</p>
+              <p>Import complete. Two contacts were added to Contacts.</p>
               <p style={{ color: 'var(--cp-muted)' }}>
                 Grace.imported is marked as a merge candidate so the user can
                 review before combining records.
@@ -318,4 +319,8 @@ export function CollectionList({ collectionId, selectedElementId, onSelectElemen
       </Dialog>
     </div>
   )
+}
+
+export function CollectionList(props: CollectionListProps) {
+  return <CollectionListContent key={props.collectionId} {...props} />
 }

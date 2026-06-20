@@ -425,7 +425,7 @@ Dead Zone 抽象**没有被整体删除**，但其作用范围已经显著收缩
 原始设计把所有 System UI 后置为“未来再定”。当前实现已落地两个最小 System UI 组件（均仍属于薄桌面层范畴）：
 
 - **顶部 StatusBar**（§27.3）：常驻顶栏，承载连接状态、主题 / 语言切换、通知托盘、时钟；移动端额外承担 App 标题栏与返回 / 最小化语义。
-- **侧滑 SystemSidebar**（§27.4）：点击左上角 Logo 唤出的抽屉，提供“回桌面”、最小化窗口切换列表、固定系统应用入口（settings / diagnostics / users-agents）。
+- **侧滑 SystemSidebar**（§27.4）：点击左上角 Logo 唤出的抽屉，提供“回桌面”、最小化窗口切换列表、固定系统应用入口（settings / diagnostics / users-agents / my-network）。
 
 底部任务区 / Recent Apps / 独立 launcher 仍未实现，留待后续版本（与 §23 一致）。
 
@@ -1165,8 +1165,8 @@ WinBox.js：窗口系统。⚠️ **未采用。** `winbox` 仍残留在 `packag
 - 顶部用户卡片（用户名 + 运行容器 + 连接状态）。
 - “回到桌面”入口。
 - **切换区（switchApps）**：来自被最小化的窗口，按 `minimizedOrder` 升序；`settings` / `diagnostics` 不进切换区。
-- **固定系统区（systemApps）**：`settings` / `diagnostics` / `users-agents`。
-- 注意：`users-agents` 既在固定区，也可能因被最小化而临时出现在切换区。
+- **固定系统区（systemApps）**：`settings` / `diagnostics` / `users-agents` / `my-network`。
+- 注意：`users-agents` / `my-network` 既在固定区，也可能因被最小化而临时出现在切换区。
 
 ### 27.5 Window Manifest 字段扩展
 
@@ -1190,4 +1190,3 @@ WinBox.js：窗口系统。⚠️ **未采用。** `winbox` 仍残留在 `packag
 - §8.1 的 `fullscreen` 显示模式、§16.2 的 fullscreen：当前仅是 manifest 能力声明，**没有独立运行态**。
 - §10.1 “不含复杂状态栏 / 系统 UI”：当前已含薄 StatusBar + SystemSidebar（见 §11.4）。
 - §16.4 窗口 ID = `APP ID + Path`：当前运行态 `WindowRecord.id` 仍为 `appId + 时间戳`，按 `appId` 复用几何信息；“APP ID + 路径”的多窗口标识尚未完全落地。
-

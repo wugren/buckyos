@@ -1,7 +1,7 @@
 /* ── Collection card for sidebar ── */
 
 import { useState } from 'react'
-import { Heart, Users2, FolderOpen, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
+import { Contact, Eye, Heart, Users2, FolderOpen, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
 import { IconButton, Menu, MenuItem, ListItemIcon, ListItemText } from '@mui/material'
 import type { Collection } from '../../mock/types'
 
@@ -14,9 +14,11 @@ interface CollectionCardProps {
 }
 
 const typeIcon = {
+  contacts: Contact,
   friends: Heart,
   groups: Users2,
   custom: FolderOpen,
+  'dynamic-view': Eye,
 }
 
 export function CollectionCard({ collection, isActive, onClick, onRename, onDelete }: CollectionCardProps) {
@@ -57,6 +59,12 @@ export function CollectionCard({ collection, isActive, onClick, onRename, onDele
             style={{ color: 'var(--cp-text)' }}
           >
             {collection.name}
+          </div>
+          <div
+            className="truncate text-[11px] capitalize"
+            style={{ color: 'var(--cp-muted)' }}
+          >
+            {collection.mode}
           </div>
         </div>
 

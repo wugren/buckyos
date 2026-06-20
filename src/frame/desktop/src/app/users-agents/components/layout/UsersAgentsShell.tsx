@@ -1,9 +1,8 @@
 /* ── Users & Agents – main shell layout ── */
 
 import { useCallback, useState } from 'react'
-import { useMediaQuery } from '@mui/material'
+import { Alert, Snackbar, useMediaQuery } from '@mui/material'
 import { Sidebar } from './Sidebar'
-import { CollectionList } from './CollectionList'
 import { MobileHomeScreen } from './MobileHomeScreen'
 import { EmptyPlaceholder } from '../detail/EmptyPlaceholder'
 import { SelfDetailPage } from '../detail/SelfDetailPage'
@@ -12,7 +11,7 @@ import { LocalUserDetailPage } from '../detail/LocalUserDetailPage'
 import { ContactDetailPage } from '../detail/ContactDetailPage'
 import { EntityGroupDetailPage } from '../detail/EntityGroupDetailPage'
 import { NewUserWizard } from '../shared/NewUserWizard'
-import { useEntity, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
+import { useEntity } from '../../hooks/use-users-agents-store'
 import { useMobileBackHandler } from '../../../../desktop/windows/MobileNavContext'
 import type { SidebarSelection } from '../../mock/types'
 
@@ -38,41 +37,22 @@ function DetailRouter({ entityId, onRemoved }: { entityId: string; onRemoved?: (
 
 export function UsersAgentsShell() {
   const [selection, setSelection] = useState<SidebarSelection | null>(null)
-  const [collectionElementId, setCollectionElementId] = useState<string | null>(null)
   const [showNewUser, setShowNewUser] = useState(false)
+  const [agentNoticeOpen, setAgentNoticeOpen] = useState(false)
   const isMobile = useMediaQuery('(max-width: 767px)')
-  const store = useUsersAgentsStore()
 
   const handleSelect = (sel: SidebarSelection) => {
     setSelection(sel)
-    setCollectionElementId(null)
     setShowNewUser(false)
   }
 
   const handleBack = useCallback(() => {
-    if (collectionElementId) {
-      setCollectionElementId(null)
-    } else {
-      setSelection(null)
-      setShowNewUser(false)
-    }
-  }, [collectionElementId])
+    setSelection(null)
+    setShowNewUser(false)
+  }, [])
 
-  const handleRenameCollection = (id: string, currentName: string) => {
-    const newName = window.prompt('Rename collection:', currentName)
-    if (newName && newName.trim() && newName !== currentName) {
-      store.renameCollection(id, newName.trim())
-    }
-  }
-
-  const handleDeleteCollection = (id: string) => {
-    if (window.confirm('Delete this collection?')) {
-      store.removeCollection(id)
-      if (selection?.kind === 'collection' && selection.collectionId === id) {
-        setSelection(null)
-        setCollectionElementId(null)
-      }
-    }
+  const handleAddAgent = () => {
+    setAgentNoticeOpen(true)
   }
 
   const handleUserCreated = (userId: string) => {
@@ -82,8 +62,20 @@ export function UsersAgentsShell() {
 
   const handleEntityRemoved = () => {
     setSelection(null)
-    setCollectionElementId(null)
   }
+
+  const agentNotice = (
+    <Snackbar
+      open={agentNoticeOpen}
+      autoHideDuration={2600}
+      onClose={() => setAgentNoticeOpen(false)}
+      anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+    >
+      <Alert severity="info" variant="filled" onClose={() => setAgentNoticeOpen(false)}>
+        Agent creation is coming soon.
+      </Alert>
+    </Snackbar>
+  )
 
   // Register back handler: any mobile sub-page that isn't the root sidebar
   const isOnSubPage = isMobile && (selection !== null || showNewUser)
@@ -94,13 +86,15 @@ export function UsersAgentsShell() {
     // level 0: full-width mobile home with badge & server cards
     if (!selection && !showNewUser) {
       return (
-        <MobileHomeScreen
-          selection={selection}
-          onSelect={handleSelect}
-          onAddUser={() => setShowNewUser(true)}
-          onRenameCollection={handleRenameCollection}
-          onDeleteCollection={handleDeleteCollection}
-        />
+        <>
+          <MobileHomeScreen
+            selection={selection}
+            onSelect={handleSelect}
+            onAddUser={() => setShowNewUser(true)}
+            onAddAgent={handleAddAgent}
+          />
+          {agentNotice}
+        </>
       )
     }
 
@@ -111,62 +105,32 @@ export function UsersAgentsShell() {
           <div className="flex-1 overflow-y-auto desktop-scrollbar px-4 py-4">
             <NewUserWizard onClose={() => setShowNewUser(false)} onCreated={handleUserCreated} />
           </div>
+          {agentNotice}
         </div>
       )
     }
-
-    // level 1 (collection): show list
-    if (selection?.kind === 'collection' && !collectionElementId) {
-      return (
-        <div className="flex flex-col h-full w-full" style={{ background: 'var(--cp-bg)' }}>
-          <div className="flex-1 overflow-hidden">
-            <CollectionList
-              collectionId={selection.collectionId}
-              selectedElementId={null}
-              onSelectElement={setCollectionElementId}
-            />
-          </div>
-        </div>
-      )
-    }
-
-    // level 2: detail
-    const detailEntityId =
-      selection?.kind === 'entity'
-        ? selection.entityId
-        : collectionElementId
 
     return (
       <div className="flex flex-col h-full w-full" style={{ background: 'var(--cp-bg)' }}>
         <main className="flex-1 overflow-y-auto desktop-scrollbar">
           <div className="px-4 pb-5 pt-3">
-            {detailEntityId ? <DetailRouter entityId={detailEntityId} onRemoved={handleEntityRemoved} /> : <EmptyPlaceholder />}
+            {selection?.kind === 'entity' ? <DetailRouter entityId={selection.entityId} onRemoved={handleEntityRemoved} /> : <EmptyPlaceholder />}
           </div>
         </main>
+        {agentNotice}
       </div>
     )
   }
 
   // ── Desktop layout ──
-  const isCollectionMode = selection?.kind === 'collection'
-
   return (
     <div className="flex h-full w-full" style={{ background: 'var(--cp-bg)' }}>
       <Sidebar
         selection={selection}
         onSelect={handleSelect}
         onAddUser={() => setShowNewUser(true)}
-        onRenameCollection={handleRenameCollection}
-        onDeleteCollection={handleDeleteCollection}
+        onAddAgent={handleAddAgent}
       />
-
-      {isCollectionMode && (
-        <CollectionList
-          collectionId={selection.collectionId}
-          selectedElementId={collectionElementId}
-          onSelectElement={setCollectionElementId}
-        />
-      )}
 
       <main className="flex-1 overflow-y-auto desktop-scrollbar min-w-0">
         <div className="px-6 py-5 max-w-3xl">
@@ -174,13 +138,12 @@ export function UsersAgentsShell() {
             <NewUserWizard onClose={() => setShowNewUser(false)} onCreated={handleUserCreated} />
           ) : selection?.kind === 'entity' ? (
             <DetailRouter entityId={selection.entityId} onRemoved={handleEntityRemoved} />
-          ) : collectionElementId ? (
-            <DetailRouter entityId={collectionElementId} onRemoved={handleEntityRemoved} />
           ) : (
             <EmptyPlaceholder />
           )}
         </div>
       </main>
+      {agentNotice}
     </div>
   )
 }

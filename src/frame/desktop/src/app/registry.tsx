@@ -7,6 +7,7 @@ import { FileBrowserAppPanel } from './filebrowser/FileBrowserAppPanel'
 import { HomeStationAppPanel } from './homestation/HomeStationAppPanel'
 import { MarketAppPanel } from './market/MarketAppPanel'
 import { MessageHubAppPanel } from './messagehub/MessageHubAppPanel'
+import { MyNetworkAppPanel } from './my-network/MyNetworkAppPanel'
 import { SettingsAppPanel } from './settings/SettingsAppPanel'
 import { StudioAppPanel } from './studio/StudioAppPanel'
 import { TaskCenterAppPanel } from './task-center/TaskCenterAppPanel'
@@ -31,6 +32,7 @@ const appLoaders = {
   files: FileBrowserAppPanel,
   codeassistant: CodeAssistantAppPanel,
   messagehub: MessageHubAppPanel,
+  'my-network': MyNetworkAppPanel,
   homestation: HomeStationAppPanel,
   'task-center': TaskCenterAppPanel,
   'users-agents': UsersAgentsAppPanel,

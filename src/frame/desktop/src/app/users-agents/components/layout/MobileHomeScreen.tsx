@@ -1,16 +1,16 @@
 /* ── Users & Agents – mobile first screen (full-width card layout) ── */
 
-import { Plus, UserPlus, Server, MessageSquare, Crown, User } from 'lucide-react'
-import { IconButton } from '@mui/material'
+import { useMemo, useState } from 'react'
+import { Bot, Search, UserPlus, Server, MessageSquare, Crown, User } from 'lucide-react'
+import { Chip, IconButton } from '@mui/material'
 import { EntityAvatar } from '../shared/EntityAvatar'
-import { CollectionCard } from '../cards/CollectionCard'
+import { SearchFilterBar } from '../shared/SearchFilterBar'
+import { filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
 import {
   useSelf,
   useAgent,
   useLocalUsers,
   useEntityGroups,
-  useCollections,
-  useUsersAgentsStore,
 } from '../../hooks/use-users-agents-store'
 import type { SidebarSelection } from '../../mock/types'
 import type { AnyEntity, LocalUserEntity, AgentEntity, SelfEntity, EntityGroupEntity } from '../../mock/types'
@@ -267,36 +267,41 @@ interface MobileHomeScreenProps {
   selection: SidebarSelection | null
   onSelect: (sel: SidebarSelection) => void
   onAddUser?: () => void
-  onRenameCollection?: (id: string, currentName: string) => void
-  onDeleteCollection?: (id: string) => void
+  onAddAgent?: () => void
 }
+
+const filters: Array<{ value: InternalEntityFilter; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'users', label: 'User' },
+  { value: 'agents', label: 'Agent' },
+  { value: 'groups', label: 'Group' },
+  { value: 'online', label: 'Online' },
+]
 
 export function MobileHomeScreen({
   selection,
   onSelect,
   onAddUser,
-  onRenameCollection,
-  onDeleteCollection,
+  onAddAgent,
 }: MobileHomeScreenProps) {
+  const [showSearch, setShowSearch] = useState(false)
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<InternalEntityFilter>('all')
   const self = useSelf()
   const agent = useAgent()
   const localUsers = useLocalUsers()
   const entityGroups = useEntityGroups()
-  const collections = useCollections()
-  const store = useUsersAgentsStore()
 
   const isEntityActive = (id: string) =>
     selection?.kind === 'entity' && selection.entityId === id
 
-  const isCollectionActive = (id: string) =>
-    selection?.kind === 'collection' && selection.collectionId === id
-
-  const handleNewCollection = () => {
-    const col = store.addCollection('New Collection')
-    onSelect({ kind: 'collection', collectionId: col.id })
-  }
-
-  const hostedGroups = entityGroups.filter((g) => g.isHostedBySelf)
+  const filteredEntities = useMemo(
+    () => filterInternalEntities(getInternalEntities(self, agent, localUsers, entityGroups), query, filter),
+    [agent, entityGroups, filter, localUsers, query, self],
+  )
+  const identityEntities = filteredEntities.filter((entity) => entity.kind !== 'entity-group')
+  const hostedGroups = filteredEntities.filter((entity) => entity.kind === 'entity-group') as EntityGroupEntity[]
+  const hasMatches = filteredEntities.length > 0
 
   return (
     <div
@@ -304,46 +309,75 @@ export function MobileHomeScreen({
       style={{ background: 'var(--cp-bg)' }}
     >
       <div className="px-4 pt-4 pb-6 space-y-5">
-        {/* ── Section: Entities (ID badge grid) ── */}
         <div>
           <div className="flex items-center justify-between mb-2.5">
             <span
               className="text-[11px] font-semibold uppercase tracking-[0.18em]"
               style={{ color: 'var(--cp-muted)' }}
             >
-              Entities
+              Internal Entities
             </span>
-            {onAddUser && (
-              <IconButton size="small" onClick={onAddUser} aria-label="Add user">
-                <UserPlus size={14} />
+            <div className="flex items-center gap-1">
+              <IconButton size="small" onClick={() => setShowSearch((value) => !value)} aria-label="Search or filter">
+                <Search size={14} />
               </IconButton>
-            )}
+              {onAddAgent && (
+                <IconButton size="small" onClick={onAddAgent} aria-label="Add Agent">
+                  <Bot size={14} />
+                </IconButton>
+              )}
+              {onAddUser && (
+                <IconButton size="small" onClick={onAddUser} aria-label="Add User">
+                  <UserPlus size={14} />
+                </IconButton>
+              )}
+            </div>
           </div>
 
-          {/* badge card grid – 3 columns, fill width */}
-          <div className="grid grid-cols-3 gap-2.5">
-            <BadgeCard
-              entity={self}
-              isActive={isEntityActive(self.id)}
-              onClick={() => onSelect({ kind: 'entity', entityId: self.id })}
-            />
-            <BadgeCard
-              entity={agent}
-              isActive={isEntityActive(agent.id)}
-              onClick={() => onSelect({ kind: 'entity', entityId: agent.id })}
-            />
-            {localUsers.map((u) => (
-              <BadgeCard
-                key={u.id}
-                entity={u}
-                isActive={isEntityActive(u.id)}
-                onClick={() => onSelect({ kind: 'entity', entityId: u.id })}
+          {(showSearch || query) && (
+            <>
+              <SearchFilterBar
+                query={query}
+                onQueryChange={setQuery}
+                placeholder="Search name, DID, role, tag, status..."
               />
-            ))}
-          </div>
+              <div className="mb-3 mt-1 flex flex-wrap gap-1">
+                {filters.map((item) => (
+                  <Chip
+                    key={item.value}
+                    label={item.label}
+                    size="small"
+                    variant={filter === item.value ? 'filled' : 'outlined'}
+                    onClick={() => setFilter(item.value)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+
+          {identityEntities.length > 0 && (
+            <div className="grid grid-cols-2 gap-2.5 min-[390px]:grid-cols-3">
+              {identityEntities.map((entity) => (
+                <BadgeCard
+                  key={entity.id}
+                  entity={entity}
+                  isActive={isEntityActive(entity.id)}
+                  onClick={() => onSelect({ kind: 'entity', entityId: entity.id })}
+                />
+              ))}
+            </div>
+          )}
+
+          {!hasMatches && (
+            <div className="rounded-[16px] px-4 py-8 text-center text-sm" style={{
+              color: 'var(--cp-muted)',
+              border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
+            }}>
+              No internal entities match.
+            </div>
+          )}
         </div>
 
-        {/* ── Section: Hosted Servers ── */}
         {hostedGroups.length > 0 && (
           <div>
             <div className="flex items-center justify-between mb-2.5">
@@ -351,7 +385,7 @@ export function MobileHomeScreen({
                 className="text-[11px] font-semibold uppercase tracking-[0.18em]"
                 style={{ color: 'var(--cp-muted)' }}
               >
-                Hosted Servers
+                Self-hosted Groups
               </span>
             </div>
 
@@ -367,42 +401,6 @@ export function MobileHomeScreen({
             </div>
           </div>
         )}
-
-        {/* divider */}
-        <div
-          style={{
-            height: 1,
-            background: 'color-mix(in srgb, var(--cp-border) 50%, transparent)',
-          }}
-        />
-
-        {/* ── Section: Collections ── */}
-        <div>
-          <div className="flex items-center justify-between mb-2.5">
-            <span
-              className="text-[11px] font-semibold uppercase tracking-[0.18em]"
-              style={{ color: 'var(--cp-muted)' }}
-            >
-              Collections
-            </span>
-            <IconButton size="small" onClick={handleNewCollection} aria-label="New collection">
-              <Plus size={14} />
-            </IconButton>
-          </div>
-
-          <div className="space-y-0.5">
-            {collections.map((col) => (
-              <CollectionCard
-                key={col.id}
-                collection={col}
-                isActive={isCollectionActive(col.id)}
-                onClick={() => onSelect({ kind: 'collection', collectionId: col.id })}
-                onRename={!col.isBuiltIn && onRenameCollection ? () => onRenameCollection(col.id, col.name) : undefined}
-                onDelete={!col.isBuiltIn && onDeleteCollection ? () => onDeleteCollection(col.id) : undefined}
-              />
-            ))}
-          </div>
-        </div>
       </div>
     </div>
   )

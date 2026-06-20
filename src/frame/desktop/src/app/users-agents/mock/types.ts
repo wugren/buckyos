@@ -6,14 +6,31 @@ import { z } from 'zod'
 
 export type EntityKind = 'self' | 'agent' | 'local-user' | 'contact' | 'entity-group'
 
-export interface MessageTunnelBinding {
+export type SocialAccountStatus = 'active' | 'pending' | 'error'
+
+export interface SocialAccount {
   id: string
-  platform: string          // e.g. 'telegram', 'email', 'wechat'
+  platform: string
   accountId: string
   displayId: string
-  status: 'active' | 'pending' | 'error'
+  status: SocialAccountStatus
+  isPublic: boolean
+  canIdentify: boolean
   lastSyncAt?: string
+  lastVerifiedAt?: string
 }
+
+export const socialAccountPlatformOptions = [
+  { id: 'github', label: 'GitHub', hint: 'Add a developer profile to the DID public page.' },
+  { id: 'x', label: 'X', hint: 'Show a public social identity.' },
+  { id: 'telegram', label: 'Telegram', hint: 'Add a messaging identity without making it public by default.' },
+  { id: 'discord', label: 'Discord', hint: 'Add a community identity.' },
+  { id: 'linkedin', label: 'LinkedIn', hint: 'Add a professional profile.' },
+  { id: 'mastodon', label: 'Mastodon', hint: 'Add a federated social profile.' },
+  { id: 'wechat', label: 'WeChat', hint: 'Add a private regional identity.' },
+  { id: 'email', label: 'Email', hint: 'Add a reachable email identity.' },
+  { id: 'phone', label: 'Phone', hint: 'Add a private recovery or identity signal.' },
+] as const
 
 export interface EntityBase {
   id: string
@@ -21,7 +38,7 @@ export interface EntityBase {
   displayName: string
   avatarUrl?: string
   did?: string
-  bindings: MessageTunnelBinding[]
+  socialAccounts: SocialAccount[]
   createdAt: string
 }
 
@@ -55,6 +72,9 @@ export interface AgentEntity extends EntityBase {
     memoryUsage: string
     cpuUsage: string
     lastActive: string
+    runningTasks: number
+    queuedTasks: number
+    healthStatus: 'healthy' | 'busy' | 'degraded' | 'offline'
     uiSessions: number
     workSessions: number
     workspaces: number
@@ -133,14 +153,18 @@ export type AnyEntity =
 
 // ── Collections ──
 
-export type CollectionType = 'friends' | 'groups' | 'custom'
+export type CollectionType = 'contacts' | 'friends' | 'groups' | 'custom' | 'dynamic-view'
+export type CollectionMode = 'static' | 'view'
 
 export interface Collection {
   id: string
   name: string
   type: CollectionType
+  mode: CollectionMode
+  description?: string
   sourceType: 'built-in' | 'manual' | 'import' | 'sync'
   isBuiltIn: boolean
+  isReadOnly: boolean
   entityIds: string[]
   createdAt: string
   updatedAt: string

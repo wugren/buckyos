@@ -290,8 +290,8 @@ export interface SystemSidebarDataModel {
 
 - `switchApps` 来自最小化窗口，按 `minimizedOrder` 升序排列。
 - 当前实现只把 `settings` 和 `diagnostics` 排除在 `switchApps` 外。
-- `systemApps` 当前固定尝试展示 `settings`、`diagnostics`、`users-agents`。
-- 也就是说，`users-agents` 既可能出现在固定系统区，也可能因为被最小化而出现在切换区；文档需要按这一真实行为记录。
+- `systemApps` 当前固定尝试展示 `settings`、`diagnostics`、`users-agents`、`my-network`。
+- 也就是说，`users-agents` / `my-network` 既可能出现在固定系统区，也可能因为被最小化而出现在切换区；文档需要按这一真实行为记录。
 
 ### 3.7 通用加载态
 
@@ -327,7 +327,7 @@ const defaultWallpaper = {
 
 ### 4.2 当前应用目录
 
-当前 `appCatalog` 共 14 个应用：
+当前 `appCatalog` 共 15 个应用：
 
 | appId | tier | 备注 |
 | --- | --- | --- |
@@ -342,6 +342,7 @@ const defaultWallpaper = {
 | `messagehub` | `system` | 移动端重定向到 `/messagehub` |
 | `homestation` | `system` | 移动端重定向到 `/homestation` |
 | `users-agents` | `system` | 固定系统应用之一 |
+| `my-network` | `system` | 独立关系网络管理应用 |
 | `task-center` | `system` | 移动端重定向到 `/taskcenter` |
 | `app-service` | `system` | `contentPadding: 'none'` |
 | `docs` | `external` | 特殊：`defaultMode: 'maximized'`、`placement: 'new-container'`、`titleBarMode: 'custom'` |
@@ -357,12 +358,12 @@ const defaultWallpaper = {
   - `ai-center` / `homestation`
   - `notepad` widget
 - 第 2 页包含：
-  - `diagnostics` / `users-agents` / `task-center` / `app-service`
+  - `diagnostics` / `users-agents` / `task-center` / `my-network` / `app-service`
 
 移动端默认布局：
 
 - 共 2 页。
-- 第 1 页包含 1 个 `clock` widget 和 14 个应用入口。
+- 第 1 页包含 1 个 `clock` widget 和 15 个应用入口。
 - 第 2 页包含 1 个 `notepad` widget。
 
 补充：

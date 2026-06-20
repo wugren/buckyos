@@ -20,7 +20,7 @@ export function EmptyPlaceholder() {
         className="font-display text-sm font-medium text-center"
         style={{ color: 'var(--cp-muted)' }}
       >
-        Select an entity or collection to view details
+        Select an internal entity to view details
       </p>
     </div>
   )
