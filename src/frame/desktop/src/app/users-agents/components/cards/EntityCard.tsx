@@ -1,7 +1,7 @@
 /* ── Entity card for sidebar ── */
 
 import { EntityAvatar } from '../shared/EntityAvatar'
-import type { AnyEntity } from '../../mock/types'
+import type { AnyEntity } from '../../datamodel/types'
 
 interface EntityCardProps {
   entity: AnyEntity

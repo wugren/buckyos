@@ -1,7 +1,7 @@
 /* ── Single-line dense list item for collection elements ── */
 
 import { EntityAvatar } from './EntityAvatar'
-import type { AnyEntity } from '../../mock/types'
+import type { AnyEntity } from '../../datamodel/types'
 import { Checkbox } from '@mui/material'
 
 interface CollectionListItemProps {

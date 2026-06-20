@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Contact, Eye, Heart, Users2, FolderOpen, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
 import { IconButton, Menu, MenuItem, ListItemIcon, ListItemText } from '@mui/material'
-import type { Collection } from '../../mock/types'
+import type { Collection } from '../../datamodel/types'
 
 interface CollectionCardProps {
   collection: Collection

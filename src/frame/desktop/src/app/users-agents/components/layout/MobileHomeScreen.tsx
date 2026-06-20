@@ -12,8 +12,8 @@ import {
   useLocalUsers,
   useEntityGroups,
 } from '../../hooks/use-users-agents-store'
-import type { SidebarSelection } from '../../mock/types'
-import type { AnyEntity, LocalUserEntity, AgentEntity, SelfEntity, EntityGroupEntity } from '../../mock/types'
+import type { SidebarSelection } from '../../datamodel/types'
+import type { AnyEntity, LocalUserEntity, AgentEntity, SelfEntity, EntityGroupEntity } from '../../datamodel/types'
 
 /* ── Role icons & colors ── */
 

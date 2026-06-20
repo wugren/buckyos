@@ -7,8 +7,8 @@ import { EntityGroupDetailPage } from '../users-agents/components/detail/EntityG
 import { CollectionList } from '../users-agents/components/layout/CollectionList'
 import { SearchFilterBar } from '../users-agents/components/shared/SearchFilterBar'
 import { UsersAgentsStoreContext, useCollections, useEntity, useUsersAgentsStore } from '../users-agents/hooks/use-users-agents-store'
-import { UsersAgentsMockStore } from '../users-agents/mock/store'
-import type { SidebarSelection } from '../users-agents/mock/types'
+import { UsersAgentsStore } from '../users-agents/datamodel/store'
+import type { SidebarSelection } from '../users-agents/datamodel/types'
 
 type CollectionCreateMode = 'manual' | 'import'
 
@@ -290,7 +290,7 @@ function MyNetworkShell() {
 }
 
 export function MyNetworkAppPanel() {
-  const [store] = useState(() => new UsersAgentsMockStore())
+  const [store] = useState(() => new UsersAgentsStore())
 
   return (
     <UsersAgentsStoreContext.Provider value={store}>

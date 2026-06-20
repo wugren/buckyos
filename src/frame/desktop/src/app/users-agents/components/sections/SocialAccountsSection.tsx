@@ -3,8 +3,8 @@
 import { useState } from 'react'
 import { AlertCircle, Check, Clock, Eye, EyeOff, Plus, Trash2 } from 'lucide-react'
 import { Button, Dialog, DialogActions, DialogContent, DialogTitle, IconButton, Switch } from '@mui/material'
-import type { SocialAccount } from '../../mock/types'
-import { socialAccountPlatformOptions } from '../../mock/types'
+import type { SocialAccount } from '../../datamodel/types'
+import { socialAccountPlatformOptions } from '../../datamodel/types'
 import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
 interface SocialAccountsSectionProps {

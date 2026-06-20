@@ -12,7 +12,7 @@ import {
   useLocalUsers,
   useEntityGroups,
 } from '../../hooks/use-users-agents-store'
-import type { SidebarSelection } from '../../mock/types'
+import type { SidebarSelection } from '../../datamodel/types'
 
 interface SidebarProps {
   selection: SidebarSelection | null

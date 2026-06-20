@@ -19,12 +19,12 @@ import {
   X,
 } from 'lucide-react'
 import { useState } from 'react'
-import type { LocalUserEntity, NewZoneUserInput } from '../../mock/types'
+import type { LocalUserEntity, NewZoneUserInput } from '../../datamodel/types'
 import {
   newZoneUserInputSchema,
   storageQuotaOptions,
   userAppOptions,
-} from '../../mock/types'
+} from '../../datamodel/types'
 import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
 interface NewUserWizardProps {

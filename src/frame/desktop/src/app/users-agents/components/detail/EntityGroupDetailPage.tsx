@@ -2,7 +2,7 @@
 
 import { Chip, Button } from '@mui/material'
 import { MessageSquare, Users2 } from 'lucide-react'
-import type { EntityGroupEntity } from '../../mock/types'
+import type { EntityGroupEntity } from '../../datamodel/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { MetricCard } from '../../../../components/AppPanelPrimitives'

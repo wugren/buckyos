@@ -2,7 +2,7 @@
 
 import { Alert, Chip, Button } from '@mui/material'
 import { Link, ShieldAlert, Trash2 } from 'lucide-react'
-import type { LocalUserEntity } from '../../mock/types'
+import type { LocalUserEntity } from '../../datamodel/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'

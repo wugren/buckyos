@@ -6,7 +6,7 @@ import { Download, Merge, Trash2 } from 'lucide-react'
 import { SearchFilterBar } from '../shared/SearchFilterBar'
 import { CollectionListItem } from '../shared/CollectionListItem'
 import { useCollection, useCollectionEntities, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
-import type { AnyEntity, ContactEntity } from '../../mock/types'
+import type { AnyEntity, ContactEntity } from '../../datamodel/types'
 
 interface CollectionListProps {
   collectionId: string

@@ -13,7 +13,7 @@ import { EntityGroupDetailPage } from '../detail/EntityGroupDetailPage'
 import { NewUserWizard } from '../shared/NewUserWizard'
 import { useEntity } from '../../hooks/use-users-agents-store'
 import { useMobileBackHandler } from '../../../../desktop/windows/MobileNavContext'
-import type { SidebarSelection } from '../../mock/types'
+import type { SidebarSelection } from '../../datamodel/types'
 
 function DetailRouter({ entityId, onRemoved }: { entityId: string; onRemoved?: () => void }) {
   const entity = useEntity(entityId)

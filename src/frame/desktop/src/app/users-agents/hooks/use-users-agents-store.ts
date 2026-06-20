@@ -1,16 +1,16 @@
 /* ── Users & Agents – store hooks ── */
 
 import { createContext, useContext, useSyncExternalStore } from 'react'
-import type { UsersAgentsMockStore } from '../mock/store'
+import type { UsersAgentsStore } from '../datamodel/store'
 import type {
   UsersAgentsSnapshot,
   AnyEntity,
   Collection,
-} from '../mock/types'
+} from '../datamodel/types'
 
-export const UsersAgentsStoreContext = createContext<UsersAgentsMockStore>(null!)
+export const UsersAgentsStoreContext = createContext<UsersAgentsStore>(null!)
 
-export function useUsersAgentsStore(): UsersAgentsMockStore {
+export function useUsersAgentsStore(): UsersAgentsStore {
   return useContext(UsersAgentsStoreContext)
 }
 

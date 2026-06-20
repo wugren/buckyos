@@ -1,7 +1,7 @@
 /* ── Entity avatar with type indicator ── */
 
 import { Bot, CircleUser, Contact, Users2 } from 'lucide-react'
-import type { EntityKind } from '../../mock/types'
+import type { EntityKind } from '../../datamodel/types'
 
 const kindIcon: Record<EntityKind, typeof Bot> = {
   self: CircleUser,

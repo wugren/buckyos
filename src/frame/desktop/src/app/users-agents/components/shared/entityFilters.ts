@@ -1,4 +1,4 @@
-import type { AgentEntity, AnyEntity, EntityGroupEntity, LocalUserEntity, SelfEntity } from '../../mock/types'
+import type { AgentEntity, AnyEntity, EntityGroupEntity, LocalUserEntity, SelfEntity } from '../../datamodel/types'
 
 export type InternalEntityFilter = 'all' | 'users' | 'agents' | 'groups' | 'online'
 

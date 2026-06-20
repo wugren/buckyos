@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Alert, Chip, Button } from '@mui/material'
 import { UserCheck, UserX, Trash2, FolderPlus, MessageSquare, ShieldCheck } from 'lucide-react'
-import type { ContactEntity } from '../../mock/types'
+import type { ContactEntity } from '../../datamodel/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { useCollections, useUsersAgentsStore } from '../../hooks/use-users-agents-store'

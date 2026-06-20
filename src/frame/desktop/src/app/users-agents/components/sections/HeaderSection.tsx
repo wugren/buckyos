@@ -3,7 +3,7 @@
 import { Copy, ExternalLink, ImagePlus, Pencil } from 'lucide-react'
 import { Button, IconButton } from '@mui/material'
 import { EntityAvatar } from '../shared/EntityAvatar'
-import type { EntityKind } from '../../mock/types'
+import type { EntityKind } from '../../datamodel/types'
 
 interface HeaderSectionProps {
   name: string
