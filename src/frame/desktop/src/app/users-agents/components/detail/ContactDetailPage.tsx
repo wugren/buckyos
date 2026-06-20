@@ -1,11 +1,12 @@
 /* ── Contact detail page ── */
 
-import { Chip, Button } from '@mui/material'
-import { UserCheck, UserX, Trash2, FolderPlus } from 'lucide-react'
+import { useState } from 'react'
+import { Alert, Chip, Button } from '@mui/material'
+import { UserCheck, UserX, Trash2, FolderPlus, MessageSquare, ShieldCheck } from 'lucide-react'
 import type { ContactEntity } from '../../mock/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { BindingsSection } from '../sections/BindingsSection'
-import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
+import { useCollections, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
 interface ContactDetailPageProps {
   contact: ContactEntity
@@ -13,7 +14,12 @@ interface ContactDetailPageProps {
 }
 
 export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps) {
+  const [showCommentFlow, setShowCommentFlow] = useState(false)
   const store = useUsersAgentsStore()
+  const collections = useCollections()
+  const memberships = collections.filter((collection) =>
+    collection.entityIds.includes(contact.id),
+  )
 
   const handleRemove = () => {
     if (window.confirm(`Remove contact "${contact.displayName}"?`)) {
@@ -34,11 +40,14 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
           <>
             <Chip
               icon={contact.isVerified ? <UserCheck size={12} /> : <UserX size={12} />}
-              label={contact.isVerified ? 'Verified (mutual)' : 'Unverified'}
+              label={contact.relation === 'mutual' ? 'Mutual DID relation' : 'One-way relation'}
               size="small"
               color={contact.isVerified ? 'success' : 'default'}
               variant="outlined"
             />
+            {contact.isMergeCandidate && (
+              <Chip label="Merge candidate" size="small" color="warning" variant="outlined" />
+            )}
             {contact.tags.map((tag) => (
               <Chip key={tag} label={tag} size="small" variant="outlined" />
             ))}
@@ -46,7 +55,7 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
         }
       />
 
-      <BindingsSection bindings={contact.bindings} />
+      <BindingsSection entityId={contact.id} bindings={contact.bindings} />
 
       {/* Source & history */}
       <div
@@ -71,6 +80,26 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
               {contact.source}
             </span>
           </div>
+          {contact.importBatch && (
+            <div className="flex items-baseline gap-3">
+              <span className="text-[12px] font-medium w-28 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+                Import batch
+              </span>
+              <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
+                {contact.importBatch}
+              </span>
+            </div>
+          )}
+          {contact.lastSyncedAt && (
+            <div className="flex items-baseline gap-3">
+              <span className="text-[12px] font-medium w-28 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+                Last synced
+              </span>
+              <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
+                {new Date(contact.lastSyncedAt).toLocaleString()}
+              </span>
+            </div>
+          )}
           <div className="flex items-baseline gap-3">
             <span className="text-[12px] font-medium w-28 shrink-0" style={{ color: 'var(--cp-muted)' }}>
               Created
@@ -89,6 +118,31 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
               </span>
             </div>
           )}
+        </div>
+      </div>
+
+      <div
+        className="rounded-[22px] px-5 py-4"
+        style={{
+          background: 'color-mix(in srgb, var(--cp-surface-2) 40%, var(--cp-surface))',
+          border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
+        }}
+      >
+        <h3
+          className="font-display text-sm font-semibold mb-3"
+          style={{ color: 'var(--cp-text)' }}
+        >
+          Collections
+        </h3>
+        <div className="flex flex-wrap gap-1.5">
+          {memberships.map((collection) => (
+            <Chip
+              key={collection.id}
+              label={collection.name}
+              size="small"
+              variant="outlined"
+            />
+          ))}
         </div>
       </div>
 
@@ -131,11 +185,56 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
           <Button size="small" variant="outlined" startIcon={<FolderPlus size={14} />}>
             Add to Collection
           </Button>
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<MessageSquare size={14} />}
+            onClick={() => setShowCommentFlow((value) => !value)}
+          >
+            Comment Login Flow
+          </Button>
           <Button size="small" color="error" variant="outlined" startIcon={<Trash2 size={14} />} onClick={handleRemove}>
             Remove
           </Button>
         </div>
       </div>
+
+      {showCommentFlow && (
+        <div
+          className="rounded-[22px] px-5 py-4"
+          style={{
+            background: 'color-mix(in srgb, var(--cp-accent-soft) 10%, var(--cp-surface))',
+            border: '1px solid color-mix(in srgb, var(--cp-accent) 20%, transparent)',
+          }}
+        >
+          <div className="mb-3 flex items-center gap-2">
+            <ShieldCheck size={16} style={{ color: 'var(--cp-accent)' }} />
+            <h3 className="font-display text-sm font-semibold" style={{ color: 'var(--cp-text)' }}>
+              HomeStation Comment Authorization
+            </h3>
+          </div>
+          <div className="space-y-2">
+            {[
+              ['Guest read', 'Public content can be read with Session Token = None.'],
+              ['DID proof', `${contact.displayName} proves a DID / BNS identity with a wallet, passkey, or their own Zone.`],
+              ['Scoped token', 'Verify Hub issues a token scoped to this Zone, HomeStation, and the comment action.'],
+              ['App policy', 'HomeStation checks contact relation, moderation, block list, and audit rules before publishing.'],
+            ].map(([title, body]) => (
+              <div key={title} className="rounded-[14px] px-3 py-2" style={{
+                background: 'color-mix(in srgb, var(--cp-surface) 78%, transparent)',
+                border: '1px solid color-mix(in srgb, var(--cp-border) 36%, transparent)',
+              }}>
+                <div className="text-sm font-medium" style={{ color: 'var(--cp-text)' }}>{title}</div>
+                <div className="mt-0.5 text-[12px] leading-5" style={{ color: 'var(--cp-muted)' }}>{body}</div>
+              </div>
+            ))}
+          </div>
+          <Alert severity="info" sx={{ mt: 2 }}>
+            Writing a comment is not the same as creating a system user.
+            Anonymous write access remains an app-level policy exception.
+          </Alert>
+        </div>
+      )}
     </div>
   )
 }

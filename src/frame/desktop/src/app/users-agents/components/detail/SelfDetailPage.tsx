@@ -30,9 +30,11 @@ export function SelfDetailPage() {
         }
       />
 
-      <BindingsSection bindings={self.bindings} />
+      <BindingsSection entityId={self.id} bindings={self.bindings} />
 
-      <InfoFieldsSection title="Public Info" fields={self.info} />
+      <InfoFieldsSection title="Profile" fields={self.info} />
+
+      <InfoFieldsSection title="Settings" fields={self.settings} />
 
       <DIDDocumentSection document={self.didDocument} />
 

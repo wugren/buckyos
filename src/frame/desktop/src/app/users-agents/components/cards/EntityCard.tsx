@@ -16,6 +16,13 @@ const kindLabel: Record<string, string> = {
   'entity-group': 'Group',
 }
 
+function getSubLabel(entity: AnyEntity) {
+  if (entity.kind === 'local-user') {
+    return `${entity.source === 'primary-did' ? 'BNS / DID' : 'Local'} · ${entity.status}`
+  }
+  return `${kindLabel[entity.kind] ?? entity.kind}${entity.did ? ` · ${entity.did}` : ''}`
+}
+
 export function EntityCard({ entity, isActive, onClick }: EntityCardProps) {
   const isOnline =
     entity.kind === 'local-user' ? entity.isOnline :
@@ -56,8 +63,7 @@ export function EntityCard({ entity, isActive, onClick }: EntityCardProps) {
           className="truncate text-[11px]"
           style={{ color: 'var(--cp-muted)' }}
         >
-          {kindLabel[entity.kind] ?? entity.kind}
-          {entity.did ? ` · ${entity.did}` : ''}
+          {getSubLabel(entity)}
         </div>
       </div>
 

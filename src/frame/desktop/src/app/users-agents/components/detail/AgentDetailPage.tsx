@@ -28,9 +28,11 @@ export function AgentDetailPage() {
         }
       />
 
-      <BindingsSection bindings={agent.bindings} />
+      <BindingsSection entityId={agent.id} bindings={agent.bindings} />
 
-      <InfoFieldsSection title="Agent Info" fields={agent.info} />
+      <InfoFieldsSection title="Profile" fields={agent.info} />
+
+      <InfoFieldsSection title="Settings" fields={agent.settings} />
 
       <RuntimeInfoSection runtime={agent.runtime} status={agent.status} />
 

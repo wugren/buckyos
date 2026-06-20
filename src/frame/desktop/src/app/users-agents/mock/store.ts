@@ -9,6 +9,7 @@ import type {
   EntityGroupEntity,
   Collection,
   AnyEntity,
+  MessageTunnelBinding,
 } from './types'
 import {
   mockSelf,
@@ -93,6 +94,16 @@ export class UsersAgentsMockStore {
 
   addContacts(contacts: ContactEntity[]) {
     this.contacts = [...this.contacts, ...contacts]
+    const contactIds = contacts.map((contact) => contact.id)
+    this.collections = this.collections.map((col) =>
+      col.type === 'friends'
+        ? {
+            ...col,
+            entityIds: Array.from(new Set([...col.entityIds, ...contactIds])),
+            updatedAt: new Date().toISOString(),
+          }
+        : col,
+    )
     this.notify()
   }
 
@@ -106,6 +117,45 @@ export class UsersAgentsMockStore {
     this.notify()
   }
 
+  mergeContacts(primaryId: string, mergedIds: string[]) {
+    const mergedSet = new Set(mergedIds.filter((id) => id !== primaryId))
+    if (mergedSet.size === 0) return
+
+    const mergedNames = this.contacts
+      .filter((contact) => mergedSet.has(contact.id))
+      .map((contact) => contact.displayName)
+
+    this.contacts = this.contacts
+      .filter((contact) => !mergedSet.has(contact.id))
+      .map((contact) =>
+        contact.id === primaryId
+          ? {
+              ...contact,
+              isMergeCandidate: false,
+              tags: Array.from(new Set([...contact.tags, 'merged'])),
+              notes: [
+                contact.notes,
+                mergedNames.length > 0
+                  ? `Merged with ${mergedNames.join(', ')}.`
+                  : undefined,
+              ].filter(Boolean).join(' '),
+            }
+          : contact,
+      )
+
+    this.collections = this.collections.map((col) => {
+      const nextIds = col.entityIds.map((id) =>
+        mergedSet.has(id) ? primaryId : id,
+      )
+      return {
+        ...col,
+        entityIds: Array.from(new Set(nextIds)),
+        updatedAt: new Date().toISOString(),
+      }
+    })
+    this.notify()
+  }
+
   // ── collection CRUD ──
 
   addCollection(name: string) {
@@ -113,9 +163,11 @@ export class UsersAgentsMockStore {
       id: `col-custom-${Date.now()}`,
       name,
       type: 'custom',
+      sourceType: 'manual',
       isBuiltIn: false,
       entityIds: [],
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     }
     this.collections = [...this.collections, col]
     this.notify()
@@ -124,7 +176,7 @@ export class UsersAgentsMockStore {
 
   renameCollection(id: string, name: string) {
     this.collections = this.collections.map((c) =>
-      c.id === id ? { ...c, name } : c,
+      c.id === id ? { ...c, name, updatedAt: new Date().toISOString() } : c,
     )
     this.notify()
   }
@@ -137,7 +189,11 @@ export class UsersAgentsMockStore {
   addToCollection(collectionId: string, entityId: string) {
     this.collections = this.collections.map((c) =>
       c.id === collectionId && !c.entityIds.includes(entityId)
-        ? { ...c, entityIds: [...c.entityIds, entityId] }
+        ? {
+            ...c,
+            entityIds: [...c.entityIds, entityId],
+            updatedAt: new Date().toISOString(),
+          }
         : c,
     )
     this.notify()
@@ -146,8 +202,57 @@ export class UsersAgentsMockStore {
   removeFromCollection(collectionId: string, entityId: string) {
     this.collections = this.collections.map((c) =>
       c.id === collectionId
-        ? { ...c, entityIds: c.entityIds.filter((eid) => eid !== entityId) }
+        ? {
+            ...c,
+            entityIds: c.entityIds.filter((eid) => eid !== entityId),
+            updatedAt: new Date().toISOString(),
+          }
         : c,
+    )
+    this.notify()
+  }
+
+  removeManyFromCollection(collectionId: string, entityIds: string[]) {
+    const removeSet = new Set(entityIds)
+    this.collections = this.collections.map((c) =>
+      c.id === collectionId
+        ? {
+            ...c,
+            entityIds: c.entityIds.filter((eid) => !removeSet.has(eid)),
+            updatedAt: new Date().toISOString(),
+          }
+        : c,
+    )
+    this.notify()
+  }
+
+  addBinding(entityId: string, binding: MessageTunnelBinding) {
+    if (this.self.id === entityId) {
+      this.self = { ...this.self, bindings: [...this.self.bindings, binding] }
+      this.notify()
+      return
+    }
+
+    if (this.agent.id === entityId) {
+      this.agent = { ...this.agent, bindings: [...this.agent.bindings, binding] }
+      this.notify()
+      return
+    }
+
+    this.localUsers = this.localUsers.map((user) =>
+      user.id === entityId
+        ? { ...user, bindings: [...user.bindings, binding] }
+        : user,
+    )
+    this.contacts = this.contacts.map((contact) =>
+      contact.id === entityId
+        ? { ...contact, bindings: [...contact.bindings, binding] }
+        : contact,
+    )
+    this.entityGroups = this.entityGroups.map((group) =>
+      group.id === entityId
+        ? { ...group, bindings: [...group.bindings, binding] }
+        : group,
     )
     this.notify()
   }

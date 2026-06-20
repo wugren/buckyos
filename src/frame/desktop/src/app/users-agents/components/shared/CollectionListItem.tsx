@@ -2,11 +2,14 @@
 
 import { EntityAvatar } from './EntityAvatar'
 import type { AnyEntity } from '../../mock/types'
+import { Checkbox } from '@mui/material'
 
 interface CollectionListItemProps {
   entity: AnyEntity
   isActive: boolean
+  isSelected?: boolean
   onClick: () => void
+  onToggleSelected?: () => void
 }
 
 function getSubtitle(entity: AnyEntity): string {
@@ -26,7 +29,13 @@ function getSubtitle(entity: AnyEntity): string {
   }
 }
 
-export function CollectionListItem({ entity, isActive, onClick }: CollectionListItemProps) {
+export function CollectionListItem({
+  entity,
+  isActive,
+  isSelected = false,
+  onClick,
+  onToggleSelected,
+}: CollectionListItemProps) {
   const subtitle = getSubtitle(entity)
   const isOnline =
     entity.kind === 'local-user' ? entity.isOnline :
@@ -47,6 +56,17 @@ export function CollectionListItem({ entity, isActive, onClick }: CollectionList
           : '2px solid transparent',
       }}
     >
+      {onToggleSelected && (
+        <span
+          onClick={(event) => {
+            event.stopPropagation()
+            onToggleSelected()
+          }}
+        >
+          <Checkbox size="small" checked={isSelected} tabIndex={-1} />
+        </span>
+      )}
+
       <EntityAvatar
         name={entity.displayName}
         kind={entity.kind}
@@ -70,6 +90,18 @@ export function CollectionListItem({ entity, isActive, onClick }: CollectionList
           style={{ color: 'var(--cp-muted)' }}
         >
           {subtitle}
+        </span>
+      )}
+
+      {entity.kind === 'contact' && entity.isMergeCandidate && (
+        <span
+          className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
+          style={{
+            background: 'color-mix(in srgb, var(--cp-warning) 16%, transparent)',
+            color: 'var(--cp-warning)',
+          }}
+        >
+          merge
         </span>
       )}
 

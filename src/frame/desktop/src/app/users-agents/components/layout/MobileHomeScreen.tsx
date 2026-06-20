@@ -19,8 +19,8 @@ import type { AnyEntity, LocalUserEntity, AgentEntity, SelfEntity, EntityGroupEn
 
 const roleConfig: Record<string, { icon: typeof Crown; label: string; color: string }> = {
   admin: { icon: Crown, label: 'Admin', color: 'var(--cp-warning)' },
-  member: { icon: User, label: 'Member', color: 'var(--cp-accent)' },
-  guest: { icon: User, label: 'Guest', color: 'var(--cp-muted)' },
+  user: { icon: User, label: 'User', color: 'var(--cp-accent)' },
+  limited: { icon: User, label: 'Limited', color: 'var(--cp-muted)' },
 }
 
 /* ── ID Badge Card (for self / local-user / agent) ── */
@@ -65,7 +65,7 @@ function BadgeCard({
   const subtitle =
     isSelf ? (entity as SelfEntity).bio ?? '' :
     isAgent ? `v${(entity as AgentEntity).version} · ${(entity as AgentEntity).status}` :
-    `${(entity as LocalUserEntity).storageUsed} / ${(entity as LocalUserEntity).storageQuota}`
+    `${(entity as LocalUserEntity).source === 'primary-did' ? 'BNS / DID' : 'Local'} · ${(entity as LocalUserEntity).status}`
 
   return (
     <button

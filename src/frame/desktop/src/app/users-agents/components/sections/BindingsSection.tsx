@@ -1,10 +1,13 @@
 /* ── Binding management section ── */
 
+import { useState } from 'react'
 import { Link2, Plus, AlertCircle, Check, Clock } from 'lucide-react'
-import { Button, IconButton } from '@mui/material'
+import { Button, Dialog, DialogActions, DialogContent, DialogTitle, IconButton } from '@mui/material'
 import type { MessageTunnelBinding } from '../../mock/types'
+import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
 interface BindingsSectionProps {
+  entityId?: string
   bindings: MessageTunnelBinding[]
 }
 
@@ -20,7 +23,22 @@ const statusColor = {
   error: 'var(--cp-danger)',
 }
 
-export function BindingsSection({ bindings }: BindingsSectionProps) {
+export function BindingsSection({ entityId, bindings }: BindingsSectionProps) {
+  const [open, setOpen] = useState(false)
+  const store = useUsersAgentsStore()
+
+  const handleAdd = (platform: string) => {
+    if (!entityId) return
+    store.addBinding(entityId, {
+      id: `binding-${platform}-${Date.now()}`,
+      platform,
+      accountId: platform === 'telegram' ? '@new_channel' : 'new@example.com',
+      displayId: platform === 'telegram' ? '@new_channel' : 'new@example.com',
+      status: 'pending',
+    })
+    setOpen(false)
+  }
+
   return (
     <div
       className="rounded-[22px] px-5 py-4"
@@ -39,7 +57,12 @@ export function BindingsSection({ bindings }: BindingsSectionProps) {
             Message Tunnel Bindings
           </h3>
         </div>
-        <Button size="small" startIcon={<Plus size={14} />} variant="text">
+        <Button
+          size="small"
+          startIcon={<Plus size={14} />}
+          variant="text"
+          onClick={() => setOpen(true)}
+        >
           Add
         </Button>
       </div>
@@ -97,6 +120,40 @@ export function BindingsSection({ bindings }: BindingsSectionProps) {
           })}
         </div>
       )}
+
+      <Dialog open={open} onClose={() => setOpen(false)} fullWidth maxWidth="xs">
+        <DialogTitle>Bind message tunnel</DialogTitle>
+        <DialogContent>
+          <div className="space-y-2 pt-1">
+            {[
+              ['telegram', 'Sync Telegram messages and contacts into MessageHub.'],
+              ['email', 'Make this entity reachable through an email identity.'],
+              ['did', 'Use a DID-native channel for internal BuckyOS messaging.'],
+            ].map(([platform, body]) => (
+              <button
+                key={platform}
+                type="button"
+                className="w-full rounded-[14px] px-3 py-2 text-left"
+                style={{
+                  background: 'color-mix(in srgb, var(--cp-surface) 80%, transparent)',
+                  border: '1px solid color-mix(in srgb, var(--cp-border) 40%, transparent)',
+                }}
+                onClick={() => handleAdd(platform)}
+              >
+                <div className="text-sm font-medium capitalize" style={{ color: 'var(--cp-text)' }}>
+                  {platform}
+                </div>
+                <div className="mt-0.5 text-[12px] leading-5" style={{ color: 'var(--cp-muted)' }}>
+                  {body}
+                </div>
+              </button>
+            ))}
+          </div>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpen(false)}>Cancel</Button>
+        </DialogActions>
+      </Dialog>
     </div>
   )
 }

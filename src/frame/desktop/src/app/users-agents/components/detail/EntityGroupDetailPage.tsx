@@ -49,7 +49,7 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
         )}
       </div>
 
-      <BindingsSection bindings={group.bindings} />
+      <BindingsSection entityId={group.id} bindings={group.bindings} />
 
       {/* Members preview */}
       <div

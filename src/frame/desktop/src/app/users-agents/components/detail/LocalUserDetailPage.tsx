@@ -1,10 +1,11 @@
 /* ── Local space user detail page ── */
 
-import { Chip, Button } from '@mui/material'
-import { Trash2 } from 'lucide-react'
+import { Alert, Chip, Button } from '@mui/material'
+import { Link, ShieldAlert, Trash2 } from 'lucide-react'
 import type { LocalUserEntity } from '../../mock/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { BindingsSection } from '../sections/BindingsSection'
+import { InfoFieldsSection } from '../sections/InfoFieldsSection'
 import { MetricCard } from '../../../../components/AppPanelPrimitives'
 import { useUsersAgentsStore } from '../../hooks/use-users-agents-store'
 
@@ -15,8 +16,14 @@ interface LocalUserDetailPageProps {
 
 const roleColor = {
   admin: 'primary' as const,
-  member: 'default' as const,
-  guest: 'secondary' as const,
+  user: 'default' as const,
+  limited: 'secondary' as const,
+}
+
+const statusColor = {
+  active: 'success' as const,
+  'pending-invitation': 'warning' as const,
+  suspended: 'error' as const,
 }
 
 export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProps) {
@@ -36,26 +43,94 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
         kind="local-user"
         avatarUrl={user.avatarUrl}
         did={user.did}
-        subtitle={`Local user · ${user.defaultGroup} group`}
+        subtitle={`${user.source === 'primary-did' ? 'Primary DID user' : 'Local account'} · ${user.defaultGroup}`}
         isOnline={user.isOnline}
         badges={
-          <Chip
-            label={user.role}
-            size="small"
-            color={roleColor[user.role]}
-            variant="outlined"
-          />
+          <>
+            <Chip
+              label={user.role}
+              size="small"
+              color={roleColor[user.role]}
+              variant="outlined"
+            />
+            <Chip
+              label={user.status.replace('-', ' ')}
+              size="small"
+              color={statusColor[user.status]}
+              variant="outlined"
+            />
+          </>
         }
       />
 
       {/* Quick stats */}
       <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
+        <MetricCard
+          label="Source"
+          tone={user.source === 'primary-did' ? 'accent' : 'neutral'}
+          value={user.source === 'primary-did' ? 'BNS / DID' : 'Local'}
+        />
         <MetricCard label="Storage used" tone="accent" value={user.storageUsed} />
         <MetricCard label="Quota" tone="neutral" value={user.storageQuota} />
         <MetricCard label="Apps" tone="success" value={String(user.availableApps.length)} />
       </div>
 
-      <BindingsSection bindings={user.bindings} />
+      <BindingsSection entityId={user.id} bindings={user.bindings} />
+
+      {user.invitation && (
+        <div
+          className="rounded-[22px] px-5 py-4"
+          style={{
+            background: 'color-mix(in srgb, var(--cp-warning) 8%, var(--cp-surface))',
+            border: '1px solid color-mix(in srgb, var(--cp-warning) 22%, transparent)',
+          }}
+        >
+          <div className="mb-3 flex items-center gap-2">
+            <ShieldAlert size={16} style={{ color: 'var(--cp-warning)' }} />
+            <h3
+              className="font-display text-sm font-semibold"
+              style={{ color: 'var(--cp-text)' }}
+            >
+              Pending BNS Binding Confirmation
+            </h3>
+          </div>
+          <Alert severity="warning">
+            The target user must update their BNS ownerconfig and add this Zone
+            to binded_zone_list with their own root key.
+          </Alert>
+          <div className="mt-3 space-y-1.5">
+            {[
+              ['Invite URL', user.invitation.inviteUrl],
+              ['Target Zone', user.invitation.targetZone],
+              ['Requested DID', user.invitation.requestedDid],
+              ['Expires', new Date(user.invitation.expiresAt).toLocaleString()],
+            ].map(([label, value]) => (
+              <div key={label} className="flex items-baseline gap-3">
+                <span className="w-28 shrink-0 text-[12px] font-medium" style={{ color: 'var(--cp-muted)' }}>
+                  {label}
+                </span>
+                <span className="min-w-0 break-all text-sm" style={{ color: 'var(--cp-text)' }}>
+                  {value}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex">
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<Link size={14} />}
+              onClick={() => navigator.clipboard.writeText(user.invitation?.inviteUrl ?? '')}
+            >
+              Copy invitation link
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <InfoFieldsSection title="Profile" fields={user.profile} />
+
+      <InfoFieldsSection title="Settings" fields={user.settings} />
 
       {/* Available apps */}
       <div
@@ -98,15 +173,33 @@ export function LocalUserDetailPage({ user, onRemoved }: LocalUserDetailPageProp
               Last active
             </span>
             <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
-              {new Date(user.lastActive).toLocaleString()}
+              {user.status === 'pending-invitation'
+                ? 'Not activated'
+                : new Date(user.lastActive).toLocaleString()}
             </span>
           </div>
           <div className="flex items-baseline gap-3">
             <span className="text-[12px] font-medium w-24 shrink-0" style={{ color: 'var(--cp-muted)' }}>
-              Created
+            Created
             </span>
             <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
               {new Date(user.createdAt).toLocaleDateString()}
+            </span>
+          </div>
+          <div className="flex items-baseline gap-3">
+            <span className="text-[12px] font-medium w-24 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+              Credential
+            </span>
+            <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
+              {user.credentialStatus.replace('-', ' ')}
+            </span>
+          </div>
+          <div className="flex items-baseline gap-3">
+            <span className="text-[12px] font-medium w-24 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+              Password
+            </span>
+            <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
+              {user.canChangePassword ? 'Change allowed' : 'Change restricted'}
             </span>
           </div>
         </div>
