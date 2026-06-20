@@ -12,8 +12,14 @@ interface EntityGroupDetailPageProps {
 }
 
 export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
+  const summaryItems = [
+    ['Members', String(group.memberCount)],
+    ['Type', group.isHostedBySelf ? 'Self-hosted' : 'Joined'],
+    ...(group.ownerName ? [['Owner', group.ownerName]] : []),
+  ]
+
   return (
-    <div className="space-y-4">
+    <div className="min-w-0 space-y-4">
       <HeaderSection
         name={group.displayName}
         kind="entity-group"
@@ -37,7 +43,28 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
         }
       />
 
-      <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
+      <div
+        className="rounded-[22px] px-4 py-3 md:hidden"
+        style={{
+          background: 'color-mix(in srgb, var(--cp-surface-2) 40%, var(--cp-surface))',
+          border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
+        }}
+      >
+        <dl className="divide-y" style={{ borderColor: 'color-mix(in srgb, var(--cp-border) 45%, transparent)' }}>
+          {summaryItems.map(([label, value]) => (
+            <div key={label} className="flex items-center justify-between gap-4 py-2 first:pt-0 last:pb-0">
+              <dt className="shrink-0 text-[11px] font-semibold uppercase tracking-[0.16em]" style={{ color: 'var(--cp-muted)' }}>
+                {label}
+              </dt>
+              <dd className="min-w-0 break-words text-right text-sm font-semibold" style={{ color: 'var(--cp-text)' }}>
+                {value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+
+      <div className="hidden gap-2 md:grid md:grid-cols-3">
         <MetricCard label="Members" tone="accent" value={String(group.memberCount)} />
         <MetricCard
           label="Type"
@@ -53,7 +80,7 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
 
       {/* Members preview */}
       <div
-        className="rounded-[22px] px-5 py-4"
+        className="min-w-0 rounded-[22px] px-5 py-4"
         style={{
           background: 'color-mix(in srgb, var(--cp-surface-2) 40%, var(--cp-surface))',
           border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
@@ -68,9 +95,18 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
             Members ({group.memberCount})
           </h3>
         </div>
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex min-w-0 flex-wrap gap-1.5">
           {group.memberIds.slice(0, 8).map((id) => (
-            <Chip key={id} label={id} size="small" variant="outlined" />
+            <span
+              key={id}
+              className="inline-flex max-w-full min-w-0 items-center rounded-full px-2.5 py-1 text-[12px] font-medium"
+              style={{
+                color: 'var(--cp-text)',
+                border: '1px solid color-mix(in srgb, var(--cp-border) 70%, transparent)',
+              }}
+            >
+              <span className="truncate">{id}</span>
+            </span>
           ))}
           {group.memberIds.length > 8 && (
             <Chip label={`+${group.memberIds.length - 8} more`} size="small" variant="outlined" />
@@ -80,7 +116,7 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
 
       {/* Group info */}
       <div
-        className="rounded-[22px] px-5 py-4"
+        className="min-w-0 rounded-[22px] px-5 py-4"
         style={{
           background: 'color-mix(in srgb, var(--cp-surface-2) 40%, var(--cp-surface))',
           border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
@@ -92,9 +128,9 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
         >
           Group Info
         </h3>
-        <div className="space-y-1.5">
-          <div className="flex items-baseline gap-3">
-            <span className="text-[12px] font-medium w-24 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+        <div className="space-y-3 md:space-y-1.5">
+          <div className="flex flex-col gap-1 md:flex-row md:items-baseline md:gap-3">
+            <span className="text-[12px] font-medium md:w-24 md:shrink-0" style={{ color: 'var(--cp-muted)' }}>
               Created
             </span>
             <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
@@ -102,11 +138,11 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
             </span>
           </div>
           {group.did && (
-            <div className="flex items-baseline gap-3">
-              <span className="text-[12px] font-medium w-24 shrink-0" style={{ color: 'var(--cp-muted)' }}>
+            <div className="flex flex-col gap-1 md:flex-row md:items-baseline md:gap-3">
+              <span className="text-[12px] font-medium md:w-24 md:shrink-0" style={{ color: 'var(--cp-muted)' }}>
                 DID
               </span>
-              <span className="text-sm" style={{ color: 'var(--cp-text)' }}>
+              <span className="min-w-0 break-all font-mono text-[12px] leading-5 md:text-sm" style={{ color: 'var(--cp-text)' }}>
                 {group.did}
               </span>
             </div>
@@ -116,7 +152,7 @@ export function EntityGroupDetailPage({ group }: EntityGroupDetailPageProps) {
 
       {group.canMessage && (
         <div className="flex">
-          <Button variant="contained" startIcon={<MessageSquare size={14} />}>
+          <Button className="w-full md:w-auto" variant="contained" startIcon={<MessageSquare size={14} />}>
             Open in MessageHub
           </Button>
         </div>
