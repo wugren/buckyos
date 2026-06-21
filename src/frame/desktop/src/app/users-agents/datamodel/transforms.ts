@@ -10,6 +10,7 @@ import type {
 import type { SelfHostGroupSummary } from '../../../api/self_host_groups.ts'
 import type {
   AgentEntity,
+  ContactEntity,
   EntityGroupEntity,
   LocalUserEntity,
   SelfEntity,
@@ -51,11 +52,28 @@ function stringArray(value: unknown): string[] {
   return text.split(',').map((item) => item.trim()).filter(Boolean)
 }
 
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'true') return true
+  if (normalized === 'false') return false
+  return undefined
+}
+
 function isoFromUnix(value: unknown): string | undefined {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+  const timestamp = numberValue(value)
+  if (timestamp === undefined || timestamp <= 0) {
     return undefined
   }
-  const millis = value > 10_000_000_000 ? value : value * 1000
+  const millis = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000
   return new Date(millis).toISOString()
 }
 
@@ -125,6 +143,33 @@ function socialAccountsFromUnknown(value: unknown): SocialAccount[] {
     }]
   })
   return toSocialAccounts(bindings)
+}
+
+function socialAccountsFromChatBindings(value: unknown): SocialAccount[] {
+  if (!Array.isArray(value)) return []
+  const bindings = value.flatMap((item): UserTunnelBinding[] => {
+    const record = asRecord(item)
+    const platform = stringValue(record.platform)
+    const accountId = stringValue(record.account_id ?? record.accountId)
+    if (!platform || !accountId) return []
+    return [{
+      platform,
+      account_id: accountId,
+      display_id: stringValue(record.display_id ?? record.displayId) ?? accountId,
+      tunnel_id: stringValue(record.tunnel_id ?? record.tunnelId),
+      status: 'active',
+      last_sync_at: numberValue(record.last_active_at ?? record.lastActiveAt),
+      meta: asRecord(record.meta) as Record<string, string>,
+    }]
+  })
+  return toSocialAccounts(bindings)
+}
+
+function chatContactSource(accessLevel: unknown): ContactEntity['source'] {
+  const normalized = String(accessLevel ?? '').toLowerCase()
+  if (normalized === 'friend') return 'manual'
+  if (normalized === 'temporary' || normalized === 'stranger') return 'discovered'
+  return 'imported'
 }
 
 function userStateBase(state: UserStateString | undefined): string {
@@ -340,20 +385,67 @@ export function toAgentEntity(
   }
 }
 
-export function toEntityGroupEntity(group: SelfHostGroupSummary): EntityGroupEntity {
+export function toContactEntity(value: unknown): ContactEntity {
+  const raw = asRecord(value)
+  const did = firstString(raw.did, raw.contact_did, raw.id)
+  const displayName = firstString(raw.name, raw.display_name, did, 'Unknown Contact') ?? 'Unknown Contact'
+  const socialAccounts = socialAccountsFromChatBindings(raw.bindings)
+  const createdAt = isoFromUnix(raw.created_at ?? raw.createdAt) ?? fallbackCreatedAt
+  const updatedAt = isoFromUnix(raw.updated_at ?? raw.updatedAt)
+  const isVerified = booleanValue(raw.is_verified ?? raw.isVerified) ?? false
+  const tags = Array.from(new Set([
+    ...stringArray(raw.groups),
+    ...stringArray(raw.tags),
+  ]))
+
   return {
-    id: `eg-${group.group_id}`,
+    id: firstString(did, raw.contact_id, raw.id, displayName) ?? displayName,
+    kind: 'contact',
+    displayName,
+    avatarUrl: firstString(raw.avatar, raw.avatar_url, raw.avatarUrl),
+    did,
+    socialAccounts,
+    source: chatContactSource(raw.access_level ?? raw.accessLevel),
+    sourceLabel: firstString(
+      socialAccounts[0]?.displayId,
+      raw.access_level,
+      raw.accessLevel,
+    ),
+    isVerified,
+    relation: isVerified ? 'mutual' : 'one-way',
+    lastSyncedAt: updatedAt,
+    tags,
+    notes: firstString(raw.note, raw.notes),
+    lastInteraction: updatedAt,
+    createdAt,
+  }
+}
+
+export function toEntityGroupEntity(group: SelfHostGroupSummary | unknown): EntityGroupEntity {
+  const raw = asRecord(group)
+  const groupDid = firstString(raw.group_did, raw.groupDid)
+  const groupId = firstString(raw.group_id, raw.groupId, groupDid, raw.id) ?? 'unknown-group'
+  const memberIds = stringArray(raw.member_entity_ids ?? raw.memberEntityIds)
+  const members = Array.isArray(raw.members) ? raw.members : []
+  const ownerName = firstString(raw.owner_name, raw.ownerName, raw.owner, raw.owner_did)
+  const createdAt =
+    firstString(raw.created_at, raw.createdAt) ??
+    isoFromUnix(raw.updated_at_ms ?? raw.updatedAtMs) ??
+    fallbackCreatedAt
+
+  return {
+    id: `eg-${groupId}`,
     kind: 'entity-group',
-    displayName: group.display_name,
-    avatarUrl: group.avatar_url,
-    did: group.group_did,
+    displayName: firstString(raw.display_name, raw.displayName, raw.name, groupDid, groupId) ?? groupId,
+    avatarUrl: firstString(raw.avatar_url, raw.avatarUrl, raw.avatar),
+    did: groupDid,
     socialAccounts: [],
-    description: group.description,
-    memberCount: group.member_count,
-    memberIds: group.member_entity_ids,
-    ownerName: group.owner_name,
-    isHostedBySelf: group.is_hosted_by_self,
-    canMessage: group.can_message,
-    createdAt: group.created_at,
+    description: firstString(raw.description),
+    memberCount: numberValue(raw.member_count ?? raw.memberCount) ?? (memberIds.length || members.length),
+    memberIds,
+    ownerName,
+    isHostedBySelf: booleanValue(raw.is_hosted_by_self ?? raw.isHostedBySelf) ?? false,
+    canMessage: booleanValue(raw.can_message ?? raw.canMessage) ?? false,
+    createdAt,
   }
 }

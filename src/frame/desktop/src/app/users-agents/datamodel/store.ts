@@ -10,24 +10,31 @@ import type {
   UsersAgentsSnapshot,
 } from './types'
 import {
+  createEmptyUsersAgentsSnapshot,
   createMockUsersAgentsSnapshot,
   fetchUsersAgentsSnapshot,
 } from './api'
+import { isMockRuntime } from '../../../runtime'
 
 export interface UsersAgentsStoreOptions {
   useMock?: boolean
+  includeNetwork?: boolean
 }
 
 const mockModeValues = new Set(['1', 'true', 'yes', 'mock'])
 
 function defaultUseMock(): boolean {
-  const value =
-    import.meta.env.VITE_USERS_AGENTS_USE_MOCK ??
-    import.meta.env.VITE_USE_MOCK
-  return mockModeValues.has(String(value ?? '').toLowerCase())
+  const value = import.meta.env.VITE_USERS_AGENTS_USE_MOCK
+  if (value !== undefined) {
+    return mockModeValues.has(String(value).toLowerCase())
+  }
+  return isMockRuntime()
 }
 
 export class UsersAgentsStore {
+  private readonly useMock: boolean
+  private readonly includeNetwork: boolean
+
   private self: SelfEntity
   private agent: AgentEntity
   private localUsers: LocalUserEntity[]
@@ -39,7 +46,11 @@ export class UsersAgentsStore {
   private listeners = new Set<() => void>()
 
   constructor(options: UsersAgentsStoreOptions = {}) {
-    const initial = createMockUsersAgentsSnapshot()
+    this.useMock = options.useMock ?? defaultUseMock()
+    this.includeNetwork = options.includeNetwork ?? false
+    const initial = this.useMock
+      ? createMockUsersAgentsSnapshot()
+      : createEmptyUsersAgentsSnapshot()
     this.self = initial.self
     this.agent = initial.agent
     this.localUsers = initial.localUsers
@@ -48,7 +59,7 @@ export class UsersAgentsStore {
     this.collections = initial.collections
     this.snapshot = this.buildSnapshot()
 
-    if (!(options.useMock ?? defaultUseMock())) {
+    if (!this.useMock) {
       void this.reload()
     }
   }
@@ -61,11 +72,19 @@ export class UsersAgentsStore {
   getSnapshot = (): UsersAgentsSnapshot => this.snapshot
 
   async reload() {
+    if (this.useMock) {
+      this.applySnapshot(createMockUsersAgentsSnapshot())
+      this.notify()
+      return
+    }
+
     try {
-      this.applySnapshot(await fetchUsersAgentsSnapshot())
+      this.applySnapshot(await fetchUsersAgentsSnapshot({
+        includeNetwork: this.includeNetwork,
+      }))
       this.notify()
     } catch (error) {
-      console.warn('Failed to load users-agents datamodel; using mock snapshot.', error)
+      console.warn('Failed to load users-agents datamodel from backend.', error)
     }
   }
 

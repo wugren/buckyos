@@ -742,12 +742,6 @@ export const downloadSystemLogs = async (
 ): Promise<{ data: SystemLogDownloadResponse | null; error: unknown }> =>
   callRpc<SystemLogDownloadResponse>('system.logs.download', params)
 
-export const fetchSysConfigTree = async (
-  key: string,
-  depth = 2,
-): Promise<{ data: SysConfigTreeResponse | null; error: unknown }> =>
-  callRpc<SysConfigTreeResponse>('sys_config.tree', { key, depth })
-
 export type ControlPanelLocale = 'en' | 'zh-CN'
 
 type ControlPanelLocaleResponse = {

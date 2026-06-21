@@ -1,9 +1,10 @@
-use crate::{ChatMessageView, ControlPanelServer, RpcAuthPrincipal};
+use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, AiMessage, AiMethodRequest, AiPayload, AiRole, BoxKind,
-    Capability, ModelSpec, Requirements, SystemConfigClient,
+    Capability, ModelSpec, MsgCenterClient, Requirements, SystemConfigClient,
 };
+use ndn_lib::MsgObjKind;
 use log::info;
 use name_lib::DID;
 use serde::Serialize;
@@ -24,6 +25,14 @@ pub(crate) struct MessageHubThreadSummaryResponse {
     pub(crate) model_alias: String,
     pub(crate) summary: String,
     pub(crate) source_message_count: usize,
+}
+
+/// Minimal transcript line extracted from a msg-center chat record, used only to
+/// build the summary prompt.
+struct ChatSummaryLine {
+    outbound: bool,
+    created_at_ms: u64,
+    content: String,
 }
 
 impl ControlPanelServer {
@@ -763,14 +772,14 @@ impl ControlPanelServer {
         left
     }
 
-    pub(crate) fn build_message_hub_summary_prompt(
+    fn build_message_hub_summary_prompt(
         peer_name: Option<&str>,
         peer_did: &str,
-        messages: &[ChatMessageView],
+        messages: &[ChatSummaryLine],
     ) -> String {
         let mut transcript = String::new();
         for message in messages.iter().rev().take(20).rev() {
-            let speaker = if message.direction == "outbound" {
+            let speaker = if message.outbound {
                 "Me"
             } else {
                 peer_name.unwrap_or(peer_did)
@@ -1095,13 +1104,27 @@ impl ControlPanelServer {
         }
     }
 
+    async fn get_msg_center_client(&self) -> Result<MsgCenterClient, RPCErrors> {
+        let runtime = get_buckyos_api_runtime()?;
+        runtime.get_msg_center_client().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("get msg-center client failed: {}", error))
+        })
+    }
+
     pub(crate) async fn handle_ai_message_hub_thread_summary(
         &self,
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_chat_principal(principal)?;
-        let owner_did = Self::parse_chat_owner_did(principal)?;
+        let principal = principal.ok_or_else(|| {
+            RPCErrors::InvalidToken("missing authenticated principal".to_string())
+        })?;
+        let owner_did = DID::from_str(principal.owner_did.as_str()).map_err(|error| {
+            RPCErrors::ReasonError(format!(
+                "invalid chat owner DID `{}`: {}",
+                principal.owner_did, error
+            ))
+        })?;
         let peer_did_raw = Self::require_param_str(&req, "peer_did")?;
         let peer_did = DID::from_str(peer_did_raw.trim()).map_err(|error| {
             RPCErrors::ParseRequestError(format!("Invalid peer_did `{}`: {}", peer_did_raw, error))
@@ -1145,7 +1168,14 @@ impl ControlPanelServer {
             .items
             .into_iter()
             .chain(outbox.items.into_iter())
-            .filter(|record| Self::chat_record_matches_peer(record, &owner_did, &peer_did))
+            .filter(|record| {
+                record.record.msg_kind == MsgObjKind::Chat
+                    && if record.record.from == owner_did {
+                        record.record.to == peer_did
+                    } else {
+                        record.record.from == peer_did
+                    }
+            })
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             left.record
@@ -1156,7 +1186,15 @@ impl ControlPanelServer {
 
         let items = records
             .iter()
-            .map(|record| Self::map_chat_message_record(record, &owner_did, peer_name.clone()))
+            .map(|record| ChatSummaryLine {
+                outbound: record.record.from == owner_did,
+                created_at_ms: record.record.created_at_ms,
+                content: record
+                    .msg
+                    .as_ref()
+                    .map(|msg| msg.content.content.clone())
+                    .unwrap_or_default(),
+            })
             .collect::<Vec<_>>();
         if items.is_empty() {
             return Err(RPCErrors::ReasonError(

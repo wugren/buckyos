@@ -28,12 +28,10 @@
   - control panel 自身登录页。
 - `/sso/login`
   - SSO 授权弹窗页。
-- `/workspace`
-  - 受保护的 workspace 体验。
+
 - `/`
   - desktop 首页。
   - Desktop 中的 Message Hub 图标当前会以 `_blank` 方式打开 `/message-hub/chat`。
-  - Desktop 中的 Workspace 图标当前会以 `_blank` 方式打开 `/workspace`。
   - Desktop 中新增 `AI Models` 图标，并在 desktop 内打开 AI 管理窗口。
 - `/message-hub`
   - 独立 Message Hub route 前缀。
@@ -152,7 +150,6 @@
 | `auth.login` / `auth.logout` / `auth.refresh` / `auth.verify` | Implemented | current browser auth flow depends on them |
 | `system.overview` / `system.status` / `system.metrics` | Implemented | used by dashboard and monitor views |
 | `system.logs.list` / `system.logs.query` / `system.logs.tail` / `system.logs.download` | Implemented | log download also has an HTTP helper path |
-| `system.config.test` | Implemented | mostly diagnostic |
 | `apps.list` / `apps.version.list` | Implemented | install/update lifecycle is still planned-heavy |
 | `network.overview` / `network.metrics` | Implemented | interface and firewall config remain planned-heavy |
 | `zone.overview` / `zone.config` | Implemented | route naming differs from older PRD wording |
@@ -240,7 +237,6 @@
 | `system.logs.download` | Implemented | download filters | `SystemLogDownloadResponse` | HTTP helper route also exists |
 | `system.update.check` | Planned | optional | update info | dispatch placeholder |
 | `system.update.apply` | Planned | `version` | `task_id` | dispatch placeholder |
-| `system.config.test` | Implemented | `key?`, `service_url?`, `session_token?` | `{ key, value, version, isChanged }` | diagnostic surface |
 
 #### `apps.*`
 

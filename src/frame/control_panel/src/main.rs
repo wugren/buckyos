@@ -2,18 +2,13 @@ mod aicc_settings;
 mod app_installer;
 mod app_servcie_mgr;
 mod dashboard;
-mod file_manager;
-mod message_hub;
 mod sys_auth_backend;
 mod sys_log_mgr;
-mod sys_settings;
 mod ui_session_mgr;
 mod user_mgr;
 mod zone_mgr;
 
 use sys_log_mgr::LogDownloadEntry;
-
-pub(crate) use message_hub::ChatMessageView;
 
 use ::kRPC::*;
 use anyhow::Result;
@@ -211,7 +206,6 @@ struct ControlPanelServer {
     pending_sso_logins: Arc<Mutex<HashMap<u64, sys_auth_backend::PendingSsoLogin>>>,
     docker_overview_cache: Arc<Mutex<Option<DockerOverviewCacheEntry>>>,
     docker_overview_refresh_lock: Arc<Mutex<()>>,
-    file_manager: Arc<file_manager::BuckyFileServer>,
     app_installer: app_installer::AppInstaller,
     ndm_gateway: Option<Arc<NamedDataMgrZoneGateway>>,
     ndm_read_gateway: Option<Arc<NamedDataMgrNodeGateway>>,
@@ -221,36 +215,16 @@ impl ControlPanelServer {
     pub fn new() -> Self {
         let metrics_snapshot = Arc::new(RwLock::new(SystemMetricsSnapshot::default()));
         Self::start_metrics_sampler(metrics_snapshot.clone());
-        let file_manager_data_dir = get_buckyos_root_dir()
-            .join("data")
-            .join("control-panel")
-            .join("file-manager");
-        if let Err(err) = std::fs::create_dir_all(&file_manager_data_dir) {
-            log::warn!(
-                "failed to create file-manager data dir {}: {}",
-                file_manager_data_dir.display(),
-                err
-            );
-        }
-        let file_manager = Arc::new(file_manager::BuckyFileServer::new(
-            file_manager_data_dir,
-            false,
-        ));
         ControlPanelServer {
             log_downloads: Arc::new(Mutex::new(HashMap::new())),
             metrics_snapshot,
             pending_sso_logins: Arc::new(Mutex::new(HashMap::new())),
             docker_overview_cache: Arc::new(Mutex::new(None)),
             docker_overview_refresh_lock: Arc::new(Mutex::new(())),
-            file_manager,
             app_installer: app_installer::AppInstaller::new(),
             ndm_gateway: None,
             ndm_read_gateway: None,
         }
-    }
-
-    async fn init_file_manager(&self) -> Result<(), RPCErrors> {
-        self.file_manager.init_share_db().await
     }
 
     fn sum_disks(disks: &Disks) -> (u64, u64, Vec<Value>) {
@@ -436,16 +410,6 @@ impl ControlPanelServer {
             .get(key)
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
-    }
-
-    fn param_usize(req: &RPCRequest, key: &str) -> Option<usize> {
-        match req.params.get(key) {
-            Some(Value::Number(value)) => {
-                value.as_u64().and_then(|value| usize::try_from(value).ok())
-            }
-            Some(Value::String(value)) => value.trim().parse::<usize>().ok(),
-            _ => None,
-        }
     }
 
     fn param_u64(req: &RPCRequest, key: &str) -> Option<u64> {
@@ -1081,12 +1045,6 @@ impl RPCHandler for ControlPanelServer {
             "apps.stop" => self.handle_apps_stop(req, principal.as_ref()).await,
             "app.publish" => self.handle_app_publish(req, principal.as_ref()).await,
 
-            // MessageHub
-            "chat.bootstrap" => self.handle_chat_bootstrap(req, principal.as_ref()).await,
-            "chat.contact.list" => self.handle_chat_contact_list(req, principal.as_ref()).await,
-            "chat.message.list" => self.handle_chat_message_list(req, principal.as_ref()).await,
-            "chat.message.send" => self.handle_chat_message_send(req, principal.as_ref()).await,
-
             //ZoneMgr
             "zone.overview" | "zone.config" => self.handle_zone_overview(req).await,
             "gateway.overview" | "gateway.config" => self.handle_gateway_overview(req).await,
@@ -1097,14 +1055,6 @@ impl RPCHandler for ControlPanelServer {
             "container.action" | "containers.action" | "docker.action" => {
                 self.handle_container_action(req).await
             }
-
-            // System Config
-            "system.config.test" => self.handle_system_config_test(req).await,
-            "sys_config.get" => self.handle_sys_config_get(req).await,
-            "sys_config.set" => self.handle_sys_config_set(req).await,
-            "sys_config.list" => self.handle_sys_config_list(req).await,
-            "sys_config.tree" => self.handle_sys_config_tree(req).await,
-            "sys_config.history" => self.handle_unimplemented(req, "Config history").await,
 
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
@@ -1133,17 +1083,6 @@ impl HttpServer for ControlPanelServer {
 
         if path == "/api/desktop" || path.starts_with("/api/desktop/") {
             return self.handle_desktop_api(req).await;
-        }
-
-        if path == "/api" || path.starts_with("/api/") {
-            return self.file_manager.serve_request(req, info).await;
-        }
-
-        if method == Method::POST
-            && (path == "/kapi/control-panel/chat/stream"
-                || path == "/kapi/message-hub/chat/stream")
-        {
-            return self.handle_chat_stream_http(req).await;
         }
 
         if method == Method::POST
@@ -1202,10 +1141,6 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("register control-panel runtime failed: {}", err))?;
 
     let mut control_panel_server = ControlPanelServer::new();
-    control_panel_server
-        .init_file_manager()
-        .await
-        .map_err(|err| anyhow::anyhow!("init control-panel file manager failed: {}", err))?;
 
     // 初始化 NDM Zone Gateway（best-effort，named store 不可用时跳过）
     let runtime = get_buckyos_api_runtime()
@@ -1250,7 +1185,7 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
     let _ = runner.add_http_server("/sso_callback".to_string(), control_panel_server.clone());
     let _ = runner.add_http_server("/sso_refresh".to_string(), control_panel_server.clone());
     let _ = runner.add_http_server("/sso_logout".to_string(), control_panel_server.clone());
-    // File manager API exposed by control-panel.
+    // Control-panel desktop API endpoints.
     let _ = runner.add_http_server("/api".to_string(), control_panel_server.clone());
 
     // NDM zone gateway: 注册 /ndm 路径，供系统 App 使用 NDM 上传协议

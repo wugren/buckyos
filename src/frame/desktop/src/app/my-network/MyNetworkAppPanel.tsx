@@ -290,7 +290,7 @@ function MyNetworkShell() {
 }
 
 export function MyNetworkAppPanel() {
-  const [store] = useState(() => new UsersAgentsStore())
+  const [store] = useState(() => new UsersAgentsStore({ includeNetwork: true }))
 
   return (
     <UsersAgentsStoreContext.Provider value={store}>

@@ -406,8 +406,8 @@
 ### 共享 (share.*)
 
 实现状态（当前）:
-- 目前 UI 侧分享管理走 HTTP `/api/share*`，可创建、列表、删除分享链接。
-- `share.*` kRPC 尚未完成落地，实现路径保留在 control_panel 内。
+- control_panel 不再承载分享 HTTP API。
+- `share.*` kRPC 尚未完成落地，后续由独立文件服务承载分享能力。
 
 #### share.list
 响应字段:
@@ -447,8 +447,8 @@
 ### 文件 (files.*)
 
 实现状态（当前）:
-- 目前 UI 侧文件浏览/上传/编辑/下载走 HTTP `/api/resources*`、`/api/upload/session*`、`/api/raw*`。
-- `files.*` kRPC 尚未完成落地，实现路径保留在 control_panel 内。
+- control_panel 不再承载文件浏览/上传/编辑/下载 HTTP API。
+- `files.*` kRPC 尚未完成落地，后续由独立文件服务承载文件能力。
 
 #### files.browse
 用途: 列目录。
@@ -539,7 +539,7 @@
 ### Files 分享能力迭代计划（对齐 ShareContentMgr）
 
 #### P0（当前版本增强，先可用）
-- API 补齐：`GET /api/share/:id`、`PATCH /api/share/:id`（过期时间/密码/启停）。
+- 独立文件服务 API 补齐：分享详情、分享更新（过期时间/密码/启停）。
 - 前端改造：将 `prompt` 创建分享升级为表单弹窗，支持编辑与状态展示。
 - 安全增强：公共访问减少对 URL query 密码的长期依赖，改为短期访问凭据或一次性验证。
 - 可观测：记录公共访问成功/失败日志，形成基础审计能力。

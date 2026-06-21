@@ -8,7 +8,12 @@ export function getInternalEntities(
   localUsers: LocalUserEntity[],
   entityGroups: EntityGroupEntity[],
 ): AnyEntity[] {
-  return [self, agent, ...localUsers, ...entityGroups.filter((group) => group.isHostedBySelf)]
+  const entities: AnyEntity[] = [self, ...localUsers]
+  if (agent.id !== 'agent-unavailable') {
+    entities.push(agent)
+  }
+  entities.push(...entityGroups.filter((group) => group.isHostedBySelf))
+  return entities
 }
 
 export function filterInternalEntities(

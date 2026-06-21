@@ -1,5 +1,17 @@
 # key url Zone提供的一些重要的路径
 
+## 可以匿名访问的
+
+### Zone级别的公开内容
+
+http://public.$zone_hostname/xxxx -> 映射到 data/srv/publish
+
+
+### Zone内的DID Document
+
+### Desktop中定义的公共URL
+
+
 
 ## 发布的内容
 http://$zone_hostname/pub/$named_mgr/path (GET)
