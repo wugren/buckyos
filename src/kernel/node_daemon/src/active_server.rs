@@ -536,12 +536,12 @@ impl ActiveServer {
                 token_type: ::kRPC::RPCSessionTokenType::Normal,
                 appid: Some("active_service".to_string()),
                 jti: None,
-                session: None,
                 sub: Some(sn_username.clone()),
                 aud: Some("sn".to_string()), //sudo token MUST have aud filed
                 exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username),
                 token: None,
+                sudo: false,
                 extra: HashMap::new(),
             };
             Some(serde_json::to_value(&rpc_token).map_err(|e| {
@@ -673,12 +673,12 @@ impl ActiveServer {
                 token_type: ::kRPC::RPCSessionTokenType::Normal,
                 appid: Some("active_service".to_string()),
                 jti: None,
-                session: None,
                 sub: Some(sn_username.to_string()),
                 aud: Some("sn".to_string()),
                 exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
                 iss: Some(sn_username.to_string()),
                 token: None,
+                sudo: false,
                 extra: HashMap::new(),
             };
 
@@ -828,12 +828,12 @@ impl ActiveServer {
             token_type: ::kRPC::RPCSessionTokenType::Normal,
             appid: Some("active_service".to_string()),
             jti: Some(now.to_string()),
-            session: Some(now),
             sub: Some("$owner".to_string()),
             aud: None,
             exp: Some(now + 60 * 15),
             iss: None,
             token: None,
+            sudo: false,
             extra: HashMap::new(),
         };
         let access_token = rpc_token

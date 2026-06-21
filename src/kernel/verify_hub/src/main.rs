@@ -34,6 +34,7 @@ use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
 
 type Result<T> = std::result::Result<T, RPCErrors>;
+const SESSION_FIELD: &str = "session";
 
 #[derive(Clone, Debug, PartialEq)]
 struct VerifyServiceConfig {
@@ -70,6 +71,31 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
     static ref MY_RPC_TOKEN: Arc<Mutex<Option<RPCSessionToken>>> =  Arc::new(Mutex::new(None)) ;
 }
 
+fn set_token_session_id(token: &mut RPCSessionToken, session_id: u64) {
+    token
+        .extra
+        .insert(SESSION_FIELD.to_string(), Value::from(session_id));
+}
+
+fn get_token_session_id(token: &RPCSessionToken) -> Result<u64> {
+    let session = token
+        .extra
+        .get(SESSION_FIELD)
+        .ok_or(RPCErrors::ReasonError("Missing session".to_string()))?;
+
+    if let Some(session) = session.as_u64() {
+        return Ok(session);
+    }
+
+    if let Some(session) = session.as_str() {
+        return session
+            .parse::<u64>()
+            .map_err(|_| RPCErrors::ReasonError("Invalid session".to_string()));
+    }
+
+    Err(RPCErrors::ReasonError("Invalid session".to_string()))
+}
+
 /// Generate a session token with specified parameters
 /// Session token is short-lived and used for API requests
 async fn generate_session_token(
@@ -90,11 +116,12 @@ async fn generate_session_token(
         aud: aud,
         sub: Some(userid.to_string()),
         token: None,
-        session: Some(session),
         iss: Some(VERIFY_HUB_ISSUER.to_string()),
         exp: Some(exp),
+        sudo: false,
         extra: HashMap::new(),
     };
+    set_token_session_id(&mut session_token, session);
 
     {
         let private_key = VERIFY_HUB_PRIVATE_KEY.read().await;
@@ -124,11 +151,12 @@ async fn generate_refresh_token(
         aud: Some(VERIFY_HUB_UNIQUE_ID.to_string()), //refresh token audience is verify-hub
         sub: Some(userid.to_string()),
         token: None,
-        session: Some(session),
         iss: Some(VERIFY_HUB_ISSUER.to_string()),
         exp: Some(exp),
+        sudo: false,
         extra: HashMap::new(),
     };
+    set_token_session_id(&mut refresh_token, session);
 
     {
         let private_key = VERIFY_HUB_PRIVATE_KEY.read().await;
@@ -245,9 +273,7 @@ async fn validate_active_refresh_token(refresh_jwt: &str) -> Result<(RPCSessionT
         .appid
         .clone()
         .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
-    let session_id = rpc_session_token
-        .session
-        .ok_or(RPCErrors::ReasonError("Missing session".to_string()))?;
+    let session_id = get_token_session_id(&rpc_session_token)?;
     let session_key = format!("{}_{}_{}", userid, appid, session_id);
     let refresh_jti = rpc_session_token
         .jti
@@ -318,9 +344,9 @@ async fn get_my_krpc_token() -> Result<RPCSessionToken> {
         aud: None,
         sub: Some(device_id),
         token: None,
-        session: None,
         iss: Some(VERIFY_HUB_ISSUER.to_string()),
         exp: Some(exp),
+        sudo: false,
         extra: HashMap::new(),
     };
 
@@ -716,9 +742,7 @@ impl VerifyHubApiHandler for VerifyHubServer {
             .appid
             .clone()
             .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
-        let session_id = rpc_session_token
-            .session
-            .ok_or(RPCErrors::ReasonError("Missing session".to_string()))?;
+        let session_id = get_token_session_id(&rpc_session_token)?;
 
         info!("Handle refresh token request for session: {}", session_key);
 
@@ -1083,9 +1107,9 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
             aud: None,
             sub: Some(userid.to_string()),
             token: None,
-            session: Some(jti), // Use jti as session for first login
             iss: Some("root".to_string()),
             exp: Some(exp),
+            sudo: false,
             extra: HashMap::new(),
         };
 
@@ -1405,18 +1429,19 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
     async fn test_refresh_token_cache() {
         println!("\n=== Test: Refresh token cache operations ===");
 
-        let test_token = RPCSessionToken {
+        let mut test_token = RPCSessionToken {
             token_type: RPCSessionTokenType::Normal,
             jti: Some("123456".to_string()),
             appid: Some("test-app".to_string()),
             aud: None,
             sub: Some("test-user".to_string()),
             token: Some("test-token-value".to_string()),
-            session: Some(789),
             iss: Some("verify-hub".to_string()),
             exp: Some(buckyos_get_unix_timestamp() + 3600),
+            sudo: false,
             extra: HashMap::new(),
         };
+        set_token_session_id(&mut test_token, 789);
 
         let cache_key = "test_cache_key";
 

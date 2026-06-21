@@ -214,12 +214,12 @@ impl RunItemControl for KernelServiceRunItem {
             token_type: kRPC::RPCSessionTokenType::Normal,
             appid: Some(app_id.clone()),
             jti: Some(timestamp.to_string()),
-            session: None,
             sub: Some(device_doc.name.clone()),
             aud: None,
             exp: Some(timestamp + VERIFY_HUB_TOKEN_EXPIRE_TIME * 2),
             iss: Some(device_doc.name.clone()),
             token: None,
+            sudo: false,
             extra: HashMap::new(),
         };
 

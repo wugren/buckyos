@@ -998,9 +998,9 @@ fn build_device_jwt_token_for_sn(user_name: &str) -> Result<String> {
         exp: Some(now + 60 * 15),
         iss: Some(device_name),
         jti: None,
-        session: None,
         sub: Some(user_name.to_string()),
         appid: Some("aicc".to_string()),
+        sudo: false,
         extra: HashMap::new(),
     };
     claims

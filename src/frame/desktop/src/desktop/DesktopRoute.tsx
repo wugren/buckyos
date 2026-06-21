@@ -5,6 +5,7 @@ import {
   MenuItem,
   useMediaQuery,
 } from '@mui/material'
+import { buckyos } from 'buckyos'
 import clsx from 'clsx'
 import {
   useCallback,
@@ -17,7 +18,6 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import GridLayoutBase, {
-  type Layout,
   type LayoutItem as GridLayoutItem,
   noCompactor,
 } from 'react-grid-layout'
@@ -48,6 +48,7 @@ import {
   type ConnectionState,
 } from './shell'
 import { useI18n } from '../i18n/provider'
+import { isMockRuntime } from '../runtime'
 import type {
   AppDefinition,
   FormFactor,
@@ -79,6 +80,17 @@ import {
 // ---------------------------------------------------------------------------
 // Hooks that remain in the view layer (DOM / browser APIs)
 // ---------------------------------------------------------------------------
+
+const clearDesktopAuthState = () => {
+  if (!isMockRuntime()) {
+    buckyos.logout(true)
+  }
+
+  window.localStorage.removeItem('user_info')
+  window.localStorage.removeItem('buckyos.account_info')
+  window.localStorage.removeItem('buckyos.account_info.control-panel')
+  document.cookie = 'control-panel_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax'
+}
 
 /**
  * Reads env(safe-area-inset-*) values for immersive fullscreen on mobile.
@@ -442,6 +454,8 @@ export function DesktopRoute() {
         throw new Error(`Logout failed: ${response.status} ${response.statusText}`)
       }
 
+      clearDesktopAuthState()
+
       const loginUrl = new URL('/login', window.location.origin)
       loginUrl.searchParams.set('redirect_url', window.location.href)
       window.location.assign(loginUrl.toString())
@@ -518,7 +532,7 @@ export function DesktopRoute() {
     store.handleGridDragStop(pageId, oldItem, newItem)
   }
 
-  const handleLayoutChange = (_pageId: string, _nextLayout: Layout) => {}
+  const handleLayoutChange = () => {}
 
   // ---------------------------------------------------------------------------
   // Derived data
@@ -790,9 +804,7 @@ export function DesktopRoute() {
                             onDragStart={(_, oldItem, newItem) =>
                               handleGridDragStart(page.id, oldItem, newItem)
                             }
-                            onLayoutChange={(next: Layout) =>
-                              handleLayoutChange(page.id, next)
-                            }
+                            onLayoutChange={handleLayoutChange}
                             onDragStop={(_, oldItem, newItem) =>
                               handleGridDragStop(page.id, oldItem, newItem)
                             }

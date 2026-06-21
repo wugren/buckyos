@@ -1499,12 +1499,12 @@ async fn generate_device_session_token(
         token_type: kRPC::RPCSessionTokenType::Normal,
         appid: Some("node-daemon".to_string()),
         jti: Some(login_jti),
-        session: Some(timestamp),
         sub: Some(userid),
         aud: None,
         exp: Some(timestamp + 60 * 15),
         iss: Some(device_doc.name.clone()),
         token: None,
+        sudo: false,
         extra: HashMap::new(),
     };
 

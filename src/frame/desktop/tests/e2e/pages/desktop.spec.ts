@@ -311,6 +311,73 @@ test('empty and error states render', async ({ page }) => {
   await expect(page.getByText('Mock data failed')).toBeVisible()
 })
 
+test('logout clears persisted desktop auth state before returning to login', async ({
+  page,
+}) => {
+  await page.route('**/sso_logout', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true }),
+    })
+  })
+
+  await page.goto('/?scenario=normal')
+  await page.evaluate(() => {
+    window.localStorage.setItem(
+      'user_info',
+      JSON.stringify({
+        user_name: 'Alice',
+        user_id: 'did:buckyos:user:alice',
+        user_type: 'owner',
+      }),
+    )
+    window.localStorage.setItem(
+      'buckyos.account_info.control-panel',
+      JSON.stringify({
+        user_name: 'Alice',
+        user_id: 'did:buckyos:user:alice',
+        user_type: 'owner',
+        session_token: 'session-token',
+      }),
+    )
+    window.localStorage.setItem(
+      'buckyos.account_info',
+      JSON.stringify({
+        user_name: 'Alice',
+        user_id: 'did:buckyos:user:alice',
+        user_type: 'owner',
+        session_token: 'legacy-session-token',
+      }),
+    )
+    document.cookie = 'control-panel_token=session-token; Path=/; SameSite=Lax'
+  })
+
+  await page.getByRole('button', { name: 'BuckyOS' }).click()
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await page.waitForURL('**/login?**')
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        browserUserInfo: window.localStorage.getItem('user_info'),
+        desktopAccountInfo: window.localStorage.getItem(
+          'buckyos.account_info.control-panel',
+        ),
+        legacyAccountInfo: window.localStorage.getItem('buckyos.account_info'),
+        appCookie: document.cookie
+          .split(';')
+          .some((part) => part.trim().startsWith('control-panel_token=')),
+      })),
+    )
+    .toEqual({
+      browserUserInfo: null,
+      desktopAccountInfo: null,
+      legacyAccountInfo: null,
+      appCookie: false,
+    })
+})
+
 test('demos app renders common controls', async ({ page }) => {
   await page.goto('/?scenario=normal')
 

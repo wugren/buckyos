@@ -72,6 +72,16 @@ fn get_full_res_path(key_path: &str) -> Result<(String, String)> {
     ));
 }
 
+fn get_sudo_mode(session_token: &RPCSessionToken, userid: &str) -> Option<SudoMode> {
+    if session_token.sudo {
+        Some(SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(
+            userid,
+        )))
+    } else {
+        None
+    }
+}
+
 async fn handle_get(params: Value, session_token: &RPCSessionToken) -> Result<Value> {
     let key = params.get("key");
     if key.is_none() {
@@ -103,7 +113,14 @@ async fn handle_get(params: Value, session_token: &RPCSessionToken) -> Result<Va
         "GET: full_res_path:{},real_key_path:{:?},appid:{},userid:{}",
         full_res_path, real_key_path, appid, userid
     );
-    let is_allowed = enforce(userid, Some(appid), full_res_path.as_str(), "read").await;
+    let is_allowed = enforce(
+        userid,
+        Some(appid),
+        full_res_path.as_str(),
+        "read",
+        get_sudo_mode(session_token, userid),
+    )
+    .await;
     if !is_allowed {
         warn!("No read permission");
         return Err(RPCErrors::NoPermission("No read permission".to_string()));
@@ -155,6 +172,7 @@ async fn handle_set(params: Value, session_token: &RPCSessionToken) -> Result<Va
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "write",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -221,6 +239,7 @@ async fn handle_create(params: Value, session_token: &RPCSessionToken) -> Result
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "write",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -282,6 +301,7 @@ async fn handle_delete(params: Value, session_token: &RPCSessionToken) -> Result
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "write",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -347,6 +367,7 @@ async fn handle_append(params: Value, session_token: &RPCSessionToken) -> Result
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "write",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -423,6 +444,7 @@ async fn handle_set_by_json_path(params: Value, session_token: &RPCSessionToken)
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "write",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -497,6 +519,7 @@ async fn handle_exec_tx(params: Value, session_token: &RPCSessionToken) -> Resul
             session_token.appid.as_deref(),
             full_res_path.as_str(),
             "write",
+            get_sudo_mode(session_token, userid),
         )
         .await
         {
@@ -631,6 +654,7 @@ async fn handle_list(params: Value, session_token: &RPCSessionToken) -> Result<V
         session_token.appid.as_deref(),
         full_res_path.as_str(),
         "read",
+        get_sudo_mode(session_token, userid),
     )
     .await
     {
@@ -1264,8 +1288,8 @@ mod test {
             token: None,
             iss: Some("{owner}".to_string()),
             jti: None,
-            session: None,
             aud: None,
+            sudo: false,
             extra: HashMap::new(),
         };
         let jwt = token.generate_jwt(None, &private_key).unwrap();
@@ -1406,7 +1430,7 @@ mod test {
             token: None,
             iss: Some("alice".to_string()),
             jti: None,
-            session: None,
+            sudo: false,
             extra: HashMap::new(),
         };
         let jwt = token.generate_jwt(None, &private_key).unwrap();

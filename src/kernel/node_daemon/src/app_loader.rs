@@ -1146,12 +1146,12 @@ impl AppLoader {
                     token_type: kRPC::RPCSessionTokenType::Normal,
                     appid: Some(self.app_id.clone()),
                     jti: Some(login_jti.clone()),
-                    session: Some(timestamp),
                     sub: Some(config.app_spec.user_id.clone()),
                     aud: None,
                     exp: Some(timestamp + VERIFY_HUB_TOKEN_EXPIRE_TIME * 2),
                     iss: Some(device_doc.name.clone()),
                     token: None,
+                    sudo: false,
                     extra: HashMap::new(),
                 };
                 let session_token_jwt = session_token

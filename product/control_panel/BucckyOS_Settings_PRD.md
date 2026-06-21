@@ -670,9 +670,12 @@ V1 展示的对外域名：
    - 无需认证即可访问
    - 必须高可见
 
-2. `home.<zone_id>`（未来）
+2. `home.<zone_id>`
    - 类似私域/朋友圈入口
    - V1 仅可作为预留概念或占位说明，不要求开放配置
+
+3. `www.<zone_id>`（可选）
+   - zone以个人主页的形式展现
 
 #### 11.4.3 UI 文案建议
 
@@ -687,6 +690,7 @@ V1 展示的对外域名：
 ---
 
 ### 11.5 子模块 B：Messaging Access（消息接入）
+
 
 #### 11.5.1 背景
 
@@ -1097,10 +1101,7 @@ V1 对 Settings 内能力按可写性分层：
 
 随着专用页成熟，以下模块可逐步从 Settings 中移出：
 
-- Agent Center
-- AI / Provider Center
 - Storage Center
-- Messaging Center
 - Monitor / 实时系统监控
 
 ### 16.2 Privacy 的进一步细化
@@ -1153,7 +1154,7 @@ V1 对 Settings 内能力按可写性分层：
 2. Appearance
 3. Cluster Manager
 4. Privacy
-5. Developer Mode
+5. Developer
 ```
 
 排序原则：

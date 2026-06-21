@@ -603,8 +603,7 @@ impl BuckyOSRuntime {
                     self.app_owner_id = Some(owner_config.name.clone());
                 }
                 if !self.zone_id.is_valid() {
-                    if owner_config.default_zone_did.is_some() {
-                        let zone_did = owner_config.default_zone_did.clone().unwrap();
+                    if let Some(zone_did) = owner_config.get_default_zone_did() {
                         self.zone_id = zone_did.clone();
                     } else {
                         return Err(RPCErrors::ReasonError(
@@ -1636,7 +1635,13 @@ impl BuckyOSRuntime {
             }
         }
 
-        let result = rbac::enforce(userid, Some(appid), resource_path, action).await;
+        let sudo = decoded_json
+            .get("sudo")
+            .and_then(|sudo| sudo.as_bool())
+            .unwrap_or(false)
+            .then(|| rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(userid)));
+
+        let result = rbac::enforce(userid, Some(appid), resource_path, action, sudo).await;
         if !result {
             return Err(RPCErrors::NoPermission(format!(
                 "enforce failed,userid:{},appid:{},resource:{},action:{}",

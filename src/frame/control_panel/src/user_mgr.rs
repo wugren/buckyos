@@ -238,7 +238,7 @@ fn owner_is_bound_to_zone(owner_config: &OwnerConfig, zone_did: &DID) -> bool {
     if owner_config.id == *zone_did {
         return true;
     }
-    if owner_config.default_zone_did.as_ref() == Some(zone_did) {
+    if owner_config.is_bound_to_zone(zone_did) {
         return true;
     }
     let zone = zone_did.to_string();
