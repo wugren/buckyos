@@ -14,7 +14,7 @@ export type AppState =
   | 'deleted'
   | 'unknown'
 
-export type AppType = 'service' | 'dapp' | 'web' | 'agent'
+export type AppType = 'service' | 'dapp' | 'web'
 
 /**
  * Flattened summary of an app, returned by `apps.list` and embedded in
@@ -24,7 +24,7 @@ export interface AppSummary {
   app_id: string
   show_name: string | null
   version: string
-  app_type: AppType | string
+  app_type: AppType
   /** Icon URL as declared in AppDoc; may be null/empty. */
   app_icon_url: string | null
   /** Convention-based fallback: `res/<app_id>/appicon.png`. */
@@ -36,7 +36,6 @@ export interface AppSummary {
   enable: boolean
   state: AppState | string
   expected_instance_count: number
-  is_agent: boolean
   /** True for BuckyOS built-in apps (MessageHub, HomeStation, Content Store). */
   is_system: boolean
   spec_path: string
@@ -52,7 +51,6 @@ export interface AppsListResponse {
 export interface AppDetailsResponse {
   app_id: string
   user_id: string
-  is_agent: boolean
   is_system: boolean
   spec_path: string
   summary: AppSummary
@@ -68,9 +66,8 @@ export interface AppDetailsResponse {
 /**
  * Fetch the list of apps available to the caller (or an explicit user).
  *
- * The backend returns user-installed apps from
- * `users/{uid}/apps/*` and `users/{uid}/agents/*`, followed by BuckyOS
- * built-in system apps (marked `is_system: true`).
+ * The backend returns user-installed apps from `users/{uid}/apps/*`,
+ * followed by BuckyOS built-in system apps (marked `is_system: true`).
  */
 export const fetchAppList = async (
   options: { userId?: string } = {},
@@ -85,8 +82,8 @@ export const fetchAppList = async (
 /**
  * Fetch the full details (including full `AppServiceSpec`) for a single app.
  *
- * Resolves user-installed apps first (apps, then agents), and falls back to
- * built-in system apps so that callers can always inspect e.g. `messagehub`.
+ * Resolves user-installed apps first, and falls back to built-in system apps
+ * so that callers can always inspect e.g. `messagehub`.
  */
 export const fetchAppDetails = async (
   appId: string,

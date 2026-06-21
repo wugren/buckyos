@@ -106,16 +106,8 @@ async function fetchUsersAgentsCoreSnapshot(): Promise<UsersAgentsCoreSnapshot> 
         .map((user) => toLocalUserEntity(user, apps, now))
     : []
 
-  const agentApps = apps.filter((app) => app.is_agent || app.app_type === 'agent')
   const firstAgentInfo = agentsResult.data?.agents[0] ?? null
-  const firstAgentId = typeof firstAgentInfo?.agent_id === 'string'
-    ? firstAgentInfo.agent_id
-    : undefined
-  const firstAgentApp =
-    agentApps.find((app) => app.app_id === firstAgentId) ??
-    agentApps[0] ??
-    null
-  const agent = toAgentEntity(firstAgentInfo, firstAgentApp, empty.agent)
+  const agent = toAgentEntity(firstAgentInfo, empty.agent)
 
   return {
     self,

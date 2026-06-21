@@ -22,7 +22,7 @@ use std::sync::Arc;
     - 获取自动更新
     - 构造提示
     - 应用升级
-    
+
 系统应用(跟着系统版本升级自动添加)
     - MessageHub
     - HomeStation
@@ -109,7 +109,7 @@ impl ControlPanelServer {
         })
     }
 
-    //输入用户名，返回用户可用应用服务列表（含系统默认应用，但不含系统服务)
+    //输入用户名，返回用户可用应用服务列表（含系统默认应用，但不含系统服务和 Agent)
     // 返回值包括 名字、描述、图标的ObjectId,类型,版本 以及其他的Meta信息
     pub(crate) async fn handle_apps_list(
         &self,
@@ -122,34 +122,38 @@ impl ControlPanelServer {
 
         let mut apps: Vec<Value> = Vec::new();
 
-        // 1) 用户已安装的 app / agent
-        for base in ["apps", "agents"] {
-            let is_agent = base == "agents";
-            let base_key = format!("users/{}/{}", user_id, base);
-            let app_ids = match client.list(&base_key).await {
-                Ok(items) => items,
+        // 1) 用户已安装的普通 app
+        let base_key = format!("users/{}/apps", user_id);
+        let app_ids = match client.list(&base_key).await {
+            Ok(items) => items,
+            Err(SystemConfigError::KeyNotFound(_)) => Vec::new(),
+            Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
+        };
+
+        for app_id in app_ids {
+            let spec_key = format!("{}/{}/spec", base_key, app_id);
+            let record = match client.get(&spec_key).await {
+                Ok(record) => record,
                 Err(SystemConfigError::KeyNotFound(_)) => continue,
                 Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
             };
 
-            for app_id in app_ids {
-                let spec_key = format!("{}/{}/spec", base_key, app_id);
-                let record = match client.get(&spec_key).await {
-                    Ok(record) => record,
-                    Err(SystemConfigError::KeyNotFound(_)) => continue,
-                    Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
-                };
-
-                match serde_json::from_str::<AppServiceSpec>(&record.value) {
-                    Ok(spec) => {
-                        apps.push(Self::build_app_summary(&spec, is_agent, false, &spec_key));
-                    }
-                    Err(error) => {
+            match serde_json::from_str::<AppServiceSpec>(&record.value) {
+                Ok(spec) => {
+                    if spec.app_doc.get_app_type() == AppType::Agent {
                         warn!(
-                            "skip app `{}` for user `{}`: failed to parse spec `{}`: {}",
-                            app_id, user_id, spec_key, error
+                            "skip agent app `{}` for user `{}` from apps.list",
+                            app_id, user_id
                         );
+                        continue;
                     }
+                    apps.push(Self::build_app_summary(&spec, false, &spec_key));
+                }
+                Err(error) => {
+                    warn!(
+                        "skip app `{}` for user `{}`: failed to parse spec `{}`: {}",
+                        app_id, user_id, spec_key, error
+                    );
                 }
             }
         }
@@ -160,7 +164,7 @@ impl ControlPanelServer {
                 Ok(mut spec) => {
                     spec.user_id = user_id.clone();
                     let spec_key = format!("system/apps/{}/spec", system_app_id);
-                    apps.push(Self::build_app_summary(&spec, false, true, &spec_key));
+                    apps.push(Self::build_app_summary(&spec, true, &spec_key));
                 }
                 Err(error) => {
                     warn!("skip built-in system app `{}`: {}", system_app_id, error);
@@ -195,31 +199,32 @@ impl ControlPanelServer {
         let user_id = Self::resolve_target_user_id(&req, principal);
         let client = Self::app_service_system_config_client().await?;
 
-        let candidates = [
-            (false, format!("users/{}/apps/{}/spec", user_id, app_id)),
-            (true, format!("users/{}/agents/{}/spec", user_id, app_id)),
-        ];
+        let spec_key = format!("users/{}/apps/{}/spec", user_id, app_id);
+        let record = match client.get(&spec_key).await {
+            Ok(record) => Some(record),
+            Err(SystemConfigError::KeyNotFound(_)) => None,
+            Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
+        };
 
-        for (is_agent, spec_key) in candidates {
-            let record = match client.get(&spec_key).await {
-                Ok(record) => record,
-                Err(SystemConfigError::KeyNotFound(_)) => continue,
-                Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
-            };
-
+        if let Some(record) = record {
             let spec: AppServiceSpec = serde_json::from_str(&record.value).map_err(|error| {
                 RPCErrors::ReasonError(format!("Failed to parse spec `{}`: {}", spec_key, error))
             })?;
+            if spec.app_doc.get_app_type() == AppType::Agent {
+                return Err(RPCErrors::ReasonError(format!(
+                    "App `{}` not found for user `{}`",
+                    app_id, user_id
+                )));
+            }
             let spec_value = serde_json::to_value(&spec).map_err(|error| {
                 RPCErrors::ReasonError(format!("Failed to serialize spec: {}", error))
             })?;
-            let summary = Self::build_app_summary(&spec, is_agent, false, &spec_key);
+            let summary = Self::build_app_summary(&spec, false, &spec_key);
 
             return Ok(RPCResponse::new(
                 RPCResult::Success(json!({
                     "app_id": spec.app_id(),
                     "user_id": spec.user_id,
-                    "is_agent": is_agent,
                     "is_system": false,
                     "spec_path": spec_key,
                     "summary": summary,
@@ -229,20 +234,19 @@ impl ControlPanelServer {
             ));
         }
 
-        // 用户 apps/agents 下找不到时，回退到系统内置应用
+        // 用户 apps 下找不到时，回退到系统内置应用
         if let Ok(mut spec) = self.get_system_app_spec(&app_id).await {
             spec.user_id = user_id.clone();
             let spec_key = format!("system/apps/{}/spec", app_id);
             let spec_value = serde_json::to_value(&spec).map_err(|error| {
                 RPCErrors::ReasonError(format!("Failed to serialize spec: {}", error))
             })?;
-            let summary = Self::build_app_summary(&spec, false, true, &spec_key);
+            let summary = Self::build_app_summary(&spec, true, &spec_key);
 
             return Ok(RPCResponse::new(
                 RPCResult::Success(json!({
                     "app_id": spec.app_id(),
                     "user_id": spec.user_id,
-                    "is_agent": false,
                     "is_system": true,
                     "spec_path": spec_key,
                     "summary": summary,
@@ -264,12 +268,7 @@ impl ControlPanelServer {
     }
 
     // 将 AppServiceSpec 压扁成一份适合前端列表展示的摘要
-    fn build_app_summary(
-        spec: &AppServiceSpec,
-        is_agent: bool,
-        is_system: bool,
-        spec_path: &str,
-    ) -> Value {
+    fn build_app_summary(spec: &AppServiceSpec, is_system: bool, spec_path: &str) -> Value {
         let app_type = spec.app_doc.get_app_type().to_string();
         let state = serde_json::to_value(&spec.state)
             .ok()
@@ -292,7 +291,6 @@ impl ControlPanelServer {
             "enable": spec.enable,
             "state": state,
             "expected_instance_count": spec.expected_instance_count,
-            "is_agent": is_agent,
             "is_system": is_system,
             "spec_path": spec_path,
             "user_id": spec.user_id,

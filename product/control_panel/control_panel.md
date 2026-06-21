@@ -599,20 +599,31 @@
 ### 应用 (apps.*)
 
 #### apps.list
-用途: 列出当前已部署的应用/服务（基于 sys_config 的 services）。
+用途: 列出当前用户可见应用，不包含 Agent；Agent 列表使用 `agent.list`。
 
 请求参数:
-- key: string, optional (默认: services)
+- user_id: string, optional
 
 响应字段:
-- key: string
-- items: array
-  - name: string
-  - icon: string
-  - category: string
-  - status: string (installed/available)
+- user_id: string
+- total: number
+- apps: array
+  - app_id: string
+  - show_name: string|null
   - version: string
-  - settings: object|string|null (sys_config value)
+  - app_type: string
+  - app_icon_url: string|null
+  - icon_res_url: string
+  - author: string
+  - tags: string[]
+  - categories: string[]
+  - app_index: number
+  - enable: bool
+  - state: string
+  - expected_instance_count: number
+  - is_system: bool
+  - spec_path: string
+  - user_id: string
 
 #### apps.install
 请求参数:

@@ -1,7 +1,7 @@
 use ::kRPC::*;
 use buckyos_kit::*;
 use name_lib::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn generate_session_token() -> std::result::Result<String, String> {
     let etc_dir = get_buckyos_system_etc_dir();
@@ -80,17 +80,22 @@ async fn test() -> std::result::Result<(), String> {
 
     println!("==> test apps.list");
     let apps_payload = client
-        .call("apps.list", json!({ "key": "services" }))
+        .call("apps.list", json!({}))
         .await
         .map_err(|err| err.to_string())?;
-    let key = expect_string_field(&apps_payload, "key")?;
-    if key != "services" {
-        return Err(format!("unexpected apps.list key: {}", apps_payload));
-    }
-    apps_payload
-        .get("items")
+    let _user_id = expect_string_field(&apps_payload, "user_id")?;
+    let apps = apps_payload
+        .get("apps")
         .and_then(|value| value.as_array())
-        .ok_or_else(|| format!("missing `items` array in payload: {}", apps_payload))?;
+        .ok_or_else(|| format!("missing `apps` array in payload: {}", apps_payload))?;
+    for app in apps {
+        if app.get("is_agent").is_some() {
+            return Err(format!("apps.list returned `is_agent`: {}", app));
+        }
+        if app.get("app_type").and_then(|value| value.as_str()) == Some("agent") {
+            return Err(format!("apps.list returned an agent app: {}", app));
+        }
+    }
     println!("<== test apps.list, pass");
 
     Ok(())
