@@ -11,6 +11,7 @@ import { DesktopRoute } from './desktop/DesktopRoute'
 import { HomeStationRoute } from './app/homestation/HomeStationRoute'
 import { MessageHubRoute } from './app/messagehub/MessageHubRoute'
 import { TaskCenterRoute } from './app/task-center/TaskCenterRoute'
+import { UserProfileRoute } from './userprofile'
 
 const LoginPage = lazy(() => import('./auth/LoginPage'))
 
@@ -38,6 +39,10 @@ const router = createBrowserRouter([
   {
     path: '/taskcenter',
     element: <TaskCenterRoute />,
+  },
+  {
+    path: '/userprofile',
+    element: <UserProfileRoute />,
   },
   {
     path: '*',

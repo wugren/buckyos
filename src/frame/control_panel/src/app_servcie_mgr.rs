@@ -18,6 +18,11 @@ use std::sync::Arc;
     - Agent
     - 标准AppService(Docker Image)
 
+已安装App的自动升级(待实现)
+    - 获取自动更新
+    - 构造提示
+    - 应用升级
+    
 系统应用(跟着系统版本升级自动添加)
     - MessageHub
     - HomeStation

@@ -8,6 +8,7 @@ import './index.css'
 import App from './App.tsx'
 import { consumePendingSiteDataReset } from './app/settings/siteDataReset'
 import { isMockRuntime } from './runtime'
+import { isPublicRoute } from './publicRoutes'
 
 function redirectToDesktopLogin() {
   const loginUrl = new URL('/login', window.location.origin)
@@ -26,10 +27,9 @@ async function bootstrap() {
     console.log('[bootstrap] initBuckyOS starting...')
     await buckyos.initBuckyOS('control-panel')
     console.log('[bootstrap] initBuckyOS done')
-    const pathname =
-      (window.location.pathname || '/').replace(/\/+$/, '') || '/'
-    const isLoginRoute = pathname === '/login'
-    if (!isLoginRoute) {
+    // Login-optional internal pages (see publicRoutes.ts) skip the account
+    // gate so they remain reachable in a logged-out state.
+    if (!isPublicRoute(window.location.pathname)) {
       const accountInfo = await buckyos.getAccountInfo()
       console.log('[bootstrap] accountInfo:', accountInfo)
       if (accountInfo == null) {
