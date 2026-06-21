@@ -8,7 +8,6 @@ import { EmptyPlaceholder } from '../detail/EmptyPlaceholder'
 import { SelfDetailPage } from '../detail/SelfDetailPage'
 import { AgentDetailPage } from '../detail/AgentDetailPage'
 import { LocalUserDetailPage } from '../detail/LocalUserDetailPage'
-import { ContactDetailPage } from '../detail/ContactDetailPage'
 import { EntityGroupDetailPage } from '../detail/EntityGroupDetailPage'
 import { NewUserWizard } from '../shared/NewUserWizard'
 import { useEntity } from '../../hooks/use-users-agents-store'
@@ -26,8 +25,6 @@ function DetailRouter({ entityId, onRemoved }: { entityId: string; onRemoved?: (
       return <AgentDetailPage />
     case 'local-user':
       return <LocalUserDetailPage user={entity} onRemoved={onRemoved} />
-    case 'contact':
-      return <ContactDetailPage contact={entity} onRemoved={onRemoved} />
     case 'entity-group':
       return <EntityGroupDetailPage group={entity} />
     default:

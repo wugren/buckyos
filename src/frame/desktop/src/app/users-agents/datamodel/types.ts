@@ -4,7 +4,7 @@ import { z } from 'zod'
 
 // ── Entity types ──
 
-export type EntityKind = 'self' | 'agent' | 'local-user' | 'contact' | 'entity-group'
+export type EntityKind = 'self' | 'agent' | 'local-user' | 'entity-group'
 
 export type SocialAccountStatus = 'active' | 'pending' | 'error'
 
@@ -114,22 +114,6 @@ export interface LocalUserEntity extends EntityBase {
   invitation?: ZoneInvitation
 }
 
-// ── Contact ──
-
-export interface ContactEntity extends EntityBase {
-  kind: 'contact'
-  source: 'manual' | 'imported' | 'telegram' | 'email' | 'discovered'
-  sourceLabel?: string     // e.g. 'Bob.telegram'
-  isVerified: boolean      // bidirectional relationship
-  relation: 'one-way' | 'mutual'
-  lastSyncedAt?: string
-  importBatch?: string
-  isMergeCandidate?: boolean
-  tags: string[]
-  notes?: string
-  lastInteraction?: string
-}
-
 // ── Entity group ──
 
 export interface EntityGroupEntity extends EntityBase {
@@ -148,35 +132,12 @@ export type AnyEntity =
   | SelfEntity
   | AgentEntity
   | LocalUserEntity
-  | ContactEntity
   | EntityGroupEntity
-
-// ── Collections ──
-
-export type CollectionType = 'contacts' | 'friends' | 'groups' | 'custom' | 'dynamic-view'
-export type CollectionMode = 'static' | 'view'
-
-export interface Collection {
-  id: string
-  name: string
-  type: CollectionType
-  mode: CollectionMode
-  description?: string
-  sourceType: 'built-in' | 'manual' | 'import' | 'sync'
-  isBuiltIn: boolean
-  isReadOnly: boolean
-  entityIds: string[]
-  createdAt: string
-  updatedAt: string
-}
 
 // ── View state ──
 
-export type ViewMode = 'entity-detail' | 'collection-browse'
-
 export type SidebarSelection =
-  | { kind: 'entity'; entityId: string }
-  | { kind: 'collection'; collectionId: string }
+  { kind: 'entity'; entityId: string }
 
 // ── Store snapshot ──
 
@@ -184,9 +145,7 @@ export interface UsersAgentsSnapshot {
   self: SelfEntity
   agent: AgentEntity
   localUsers: LocalUserEntity[]
-  contacts: ContactEntity[]
   entityGroups: EntityGroupEntity[]
-  collections: Collection[]
 }
 
 // ── New user wizard ──

@@ -6,9 +6,9 @@ import { ContactDetailPage } from '../users-agents/components/detail/ContactDeta
 import { EntityGroupDetailPage } from '../users-agents/components/detail/EntityGroupDetailPage'
 import { CollectionList } from '../users-agents/components/layout/CollectionList'
 import { SearchFilterBar } from '../users-agents/components/shared/SearchFilterBar'
-import { UsersAgentsStoreContext, useCollections, useEntity, useUsersAgentsStore } from '../users-agents/hooks/use-users-agents-store'
-import { UsersAgentsStore } from '../users-agents/datamodel/store'
-import type { SidebarSelection } from '../users-agents/datamodel/types'
+import { MyNetworkStore } from './datamodel/store'
+import type { MyNetworkSelection } from './datamodel/types'
+import { MyNetworkStoreContext, useCollections, useEntity, useMyNetworkStore } from './hooks/use-my-network-store'
 
 type CollectionCreateMode = 'manual' | 'import'
 
@@ -40,9 +40,9 @@ function NetworkDetail({ entityId, onRemoved }: { entityId: string | null; onRem
 
 function MyNetworkShell() {
   const collections = useCollections()
-  const store = useUsersAgentsStore()
+  const store = useMyNetworkStore()
   const isMobile = useMediaQuery('(max-width: 767px)')
-  const [selection, setSelection] = useState<SidebarSelection>(() => ({ kind: 'collection', collectionId: 'col-contacts' }))
+  const [selection, setSelection] = useState<MyNetworkSelection>(() => ({ kind: 'collection', collectionId: 'col-contacts' }))
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [showSearch, setShowSearch] = useState(false)
@@ -290,11 +290,11 @@ function MyNetworkShell() {
 }
 
 export function MyNetworkAppPanel() {
-  const [store] = useState(() => new UsersAgentsStore({ includeNetwork: true }))
+  const [store] = useState(() => new MyNetworkStore())
 
   return (
-    <UsersAgentsStoreContext.Provider value={store}>
+    <MyNetworkStoreContext.Provider value={store}>
       <MyNetworkShell />
-    </UsersAgentsStoreContext.Provider>
+    </MyNetworkStoreContext.Provider>
   )
 }

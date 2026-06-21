@@ -5,8 +5,8 @@ import { Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Toggle
 import { Download, Merge, Trash2 } from 'lucide-react'
 import { SearchFilterBar } from '../shared/SearchFilterBar'
 import { CollectionListItem } from '../shared/CollectionListItem'
-import { useCollection, useCollectionEntities, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
-import type { AnyEntity, ContactEntity } from '../../datamodel/types'
+import { useCollection, useCollectionEntities, useMyNetworkStore } from '../../../my-network/hooks/use-my-network-store'
+import type { ContactEntity, MyNetworkEntity } from '../../../my-network/datamodel/types'
 
 interface CollectionListProps {
   collectionId: string
@@ -25,12 +25,12 @@ function CollectionListContent({ collectionId, selectedElementId, onSelectElemen
   const [mergeOpen, setMergeOpen] = useState(false)
   const collection = useCollection(collectionId)
   const entities = useCollectionEntities(collectionId)
-  const store = useUsersAgentsStore()
+  const store = useMyNetworkStore()
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase()
     return entities
-      .filter((entity: AnyEntity) => {
+      .filter((entity: MyNetworkEntity) => {
         if (filter === 'contacts') return entity.kind === 'contact'
         if (filter === 'groups') return entity.kind === 'entity-group'
         if (filter === 'imported') {
@@ -38,7 +38,7 @@ function CollectionListContent({ collectionId, selectedElementId, onSelectElemen
         }
         return true
       })
-      .filter((entity: AnyEntity) => {
+      .filter((entity: MyNetworkEntity) => {
         if (!q.trim()) return true
         return entity.displayName.toLowerCase().includes(q) ||
           (entity.did?.toLowerCase().includes(q) ?? false)

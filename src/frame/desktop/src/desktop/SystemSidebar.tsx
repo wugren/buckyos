@@ -1,6 +1,7 @@
 import clsx from 'clsx'
 import {
   House,
+  LogOut,
   ShieldAlert,
   ShieldCheck,
   ShieldX,
@@ -18,7 +19,9 @@ const SYSTEM_SIDEBAR_WIDTH = Math.round(390 * 0.37)
 export function SystemSidebar({
   connectionState,
   deadZone,
+  isLoggingOut = false,
   onClose,
+  onLogout,
   onOpenApp,
   onReturnDesktop,
   open,
@@ -29,7 +32,9 @@ export function SystemSidebar({
 }: {
   connectionState: ConnectionState
   deadZone: LayoutState['deadZone']
+  isLoggingOut?: boolean
   onClose: () => void
+  onLogout: () => void | Promise<void>
   onOpenApp: (appId: string) => void
   onReturnDesktop: () => void
   open: boolean
@@ -149,6 +154,27 @@ export function SystemSidebar({
           <div className="flex flex-col">
             {uiModel.systemApps.map(renderAppRow)}
           </div>
+
+          <div className="mt-auto h-px bg-[color:color-mix(in_srgb,var(--cp-border)_72%,transparent)]" />
+
+          <button
+            type="button"
+            onClick={() => {
+              void onLogout()
+            }}
+            disabled={isLoggingOut}
+            className={clsx(
+              itemClassName,
+              'font-medium text-[color:var(--cp-danger)] opacity-90 disabled:pointer-events-none disabled:opacity-55',
+            )}
+          >
+            <LogOut className="size-4 shrink-0 text-[color:var(--cp-danger)]" />
+            <span className="truncate">
+              {isLoggingOut
+                ? t('shell.loggingOut', 'Logging out...')
+                : t('shell.logout', 'Log out')}
+            </span>
+          </button>
         </div>
       </aside>
     </div>

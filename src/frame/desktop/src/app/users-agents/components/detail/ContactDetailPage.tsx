@@ -3,10 +3,10 @@
 import { useState } from 'react'
 import { Alert, Chip, Button } from '@mui/material'
 import { UserCheck, UserX, Trash2, FolderPlus, MessageSquare, ShieldCheck } from 'lucide-react'
-import type { ContactEntity } from '../../datamodel/types'
+import type { ContactEntity } from '../../../my-network/datamodel/types'
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
-import { useCollections, useUsersAgentsStore } from '../../hooks/use-users-agents-store'
+import { useCollections, useMyNetworkStore } from '../../../my-network/hooks/use-my-network-store'
 
 interface ContactDetailPageProps {
   contact: ContactEntity
@@ -15,7 +15,7 @@ interface ContactDetailPageProps {
 
 export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps) {
   const [showCommentFlow, setShowCommentFlow] = useState(false)
-  const store = useUsersAgentsStore()
+  const store = useMyNetworkStore()
   const collections = useCollections()
   const memberships = collections.filter((collection) =>
     collection.entityIds.includes(contact.id),
@@ -55,7 +55,7 @@ export function ContactDetailPage({ contact, onRemoved }: ContactDetailPageProps
         }
       />
 
-      <SocialAccountsSection entityId={contact.id} accounts={contact.socialAccounts} />
+      <SocialAccountsSection entityId={contact.id} accounts={contact.socialAccounts} editable={false} />
 
       {/* Source & history */}
       <div

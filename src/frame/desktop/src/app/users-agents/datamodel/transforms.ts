@@ -10,7 +10,6 @@ import type {
 import type { SelfHostGroupSummary } from '../../../api/self_host_groups.ts'
 import type {
   AgentEntity,
-  ContactEntity,
   EntityGroupEntity,
   LocalUserEntity,
   SelfEntity,
@@ -143,33 +142,6 @@ function socialAccountsFromUnknown(value: unknown): SocialAccount[] {
     }]
   })
   return toSocialAccounts(bindings)
-}
-
-function socialAccountsFromChatBindings(value: unknown): SocialAccount[] {
-  if (!Array.isArray(value)) return []
-  const bindings = value.flatMap((item): UserTunnelBinding[] => {
-    const record = asRecord(item)
-    const platform = stringValue(record.platform)
-    const accountId = stringValue(record.account_id ?? record.accountId)
-    if (!platform || !accountId) return []
-    return [{
-      platform,
-      account_id: accountId,
-      display_id: stringValue(record.display_id ?? record.displayId) ?? accountId,
-      tunnel_id: stringValue(record.tunnel_id ?? record.tunnelId),
-      status: 'active',
-      last_sync_at: numberValue(record.last_active_at ?? record.lastActiveAt),
-      meta: asRecord(record.meta) as Record<string, string>,
-    }]
-  })
-  return toSocialAccounts(bindings)
-}
-
-function chatContactSource(accessLevel: unknown): ContactEntity['source'] {
-  const normalized = String(accessLevel ?? '').toLowerCase()
-  if (normalized === 'friend') return 'manual'
-  if (normalized === 'temporary' || normalized === 'stranger') return 'discovered'
-  return 'imported'
 }
 
 function userStateBase(state: UserStateString | undefined): string {
@@ -382,42 +354,6 @@ export function toAgentEntity(
     },
     didDocument: Object.keys(raw).length > 0 ? raw : fallback.didDocument,
     runtime: runtimeFromAgentInfo(raw.runtime, status, fallback.runtime),
-  }
-}
-
-export function toContactEntity(value: unknown): ContactEntity {
-  const raw = asRecord(value)
-  const did = firstString(raw.did, raw.contact_did, raw.id)
-  const displayName = firstString(raw.name, raw.display_name, did, 'Unknown Contact') ?? 'Unknown Contact'
-  const socialAccounts = socialAccountsFromChatBindings(raw.bindings)
-  const createdAt = isoFromUnix(raw.created_at ?? raw.createdAt) ?? fallbackCreatedAt
-  const updatedAt = isoFromUnix(raw.updated_at ?? raw.updatedAt)
-  const isVerified = booleanValue(raw.is_verified ?? raw.isVerified) ?? false
-  const tags = Array.from(new Set([
-    ...stringArray(raw.groups),
-    ...stringArray(raw.tags),
-  ]))
-
-  return {
-    id: firstString(did, raw.contact_id, raw.id, displayName) ?? displayName,
-    kind: 'contact',
-    displayName,
-    avatarUrl: firstString(raw.avatar, raw.avatar_url, raw.avatarUrl),
-    did,
-    socialAccounts,
-    source: chatContactSource(raw.access_level ?? raw.accessLevel),
-    sourceLabel: firstString(
-      socialAccounts[0]?.displayId,
-      raw.access_level,
-      raw.accessLevel,
-    ),
-    isVerified,
-    relation: isVerified ? 'mutual' : 'one-way',
-    lastSyncedAt: updatedAt,
-    tags,
-    notes: firstString(raw.note, raw.notes),
-    lastInteraction: updatedAt,
-    createdAt,
   }
 }
 

@@ -3,7 +3,9 @@
 import { Bot, CircleUser, Contact, Users2 } from 'lucide-react'
 import type { EntityKind } from '../../datamodel/types'
 
-const kindIcon: Record<EntityKind, typeof Bot> = {
+export type EntityAvatarKind = EntityKind | 'contact'
+
+const kindIcon: Record<EntityAvatarKind, typeof Bot> = {
   self: CircleUser,
   agent: Bot,
   'local-user': CircleUser,
@@ -11,7 +13,7 @@ const kindIcon: Record<EntityKind, typeof Bot> = {
   'entity-group': Users2,
 }
 
-const kindColor: Record<EntityKind, string> = {
+const kindColor: Record<EntityAvatarKind, string> = {
   self: 'var(--cp-accent)',
   agent: 'var(--cp-success)',
   'local-user': 'var(--cp-accent)',
@@ -21,7 +23,7 @@ const kindColor: Record<EntityKind, string> = {
 
 interface EntityAvatarProps {
   name: string
-  kind: EntityKind
+  kind: EntityAvatarKind
   avatarUrl?: string
   size?: 'sm' | 'md' | 'lg'
   isOnline?: boolean

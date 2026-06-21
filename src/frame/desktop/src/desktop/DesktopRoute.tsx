@@ -201,6 +201,7 @@ export function DesktopRoute() {
   const initialScenario =
     (searchParams.get('scenario') as MockScenario | null) ?? 'normal'
   const [scenario] = useState<MockScenario>(initialScenario)
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
 
   // Refs for drag suppression (view-only concern)
   const suppressOpenItemId = useRef<string | null>(null)
@@ -423,6 +424,32 @@ export function DesktopRoute() {
   const handleSelectSidebarApp = (appId: string) => {
     handleOpenApp(appId)
     closeSidebar()
+  }
+  const handleLogout = async () => {
+    if (isLoggingOut) return
+
+    setIsLoggingOut(true)
+    try {
+      const response = await fetch('/sso_logout', {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+        },
+      })
+      if (!response.ok) {
+        throw new Error(`Logout failed: ${response.status} ${response.statusText}`)
+      }
+
+      const loginUrl = new URL('/login', window.location.origin)
+      loginUrl.searchParams.set('redirect_url', window.location.href)
+      window.location.assign(loginUrl.toString())
+    } catch (error) {
+      console.error('[logout] failed:', error)
+      store.setSnackbar(t('shell.logoutFailed', 'Log out failed. Please try again.'))
+      setIsLoggingOut(false)
+    }
   }
   const handleCycleLocale = () => setLocale(nextSupportedLocale(locale))
   const handleToggleTheme = () =>
@@ -660,7 +687,9 @@ export function DesktopRoute() {
               <SystemSidebar
                 connectionState={connectionState}
                 deadZone={resolvedDeadZone}
+                isLoggingOut={isLoggingOut}
                 onClose={closeSidebar}
+                onLogout={handleLogout}
                 onOpenApp={handleSelectSidebarApp}
                 onReturnDesktop={handleReturnDesktop}
                 open={isSystemSidebarOpen}

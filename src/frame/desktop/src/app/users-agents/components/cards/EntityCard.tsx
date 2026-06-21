@@ -9,13 +9,6 @@ interface EntityCardProps {
   onClick: () => void
 }
 
-const kindLabel: Record<string, string> = {
-  self: 'Self',
-  agent: 'Agent',
-  'local-user': 'User',
-  'entity-group': 'Group',
-}
-
 function getSubLabel(entity: AnyEntity) {
   if (entity.kind === 'self') {
     return entity.bio ?? 'Owner'
@@ -29,7 +22,7 @@ function getSubLabel(entity: AnyEntity) {
   if (entity.kind === 'entity-group') {
     return `${entity.memberCount} members · ${entity.isHostedBySelf ? 'Self-hosted' : 'Joined'}`
   }
-  return `${kindLabel[entity.kind] ?? entity.kind}${entity.did ? ` · ${entity.did}` : ''}`
+  return ''
 }
 
 export function EntityCard({ entity, isActive, onClick }: EntityCardProps) {

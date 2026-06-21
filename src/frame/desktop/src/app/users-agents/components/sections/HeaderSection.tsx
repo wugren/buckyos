@@ -3,11 +3,11 @@
 import { Copy, ExternalLink, ImagePlus, Pencil } from 'lucide-react'
 import { Button, IconButton } from '@mui/material'
 import { EntityAvatar } from '../shared/EntityAvatar'
-import type { EntityKind } from '../../datamodel/types'
+import type { EntityAvatarKind } from '../shared/EntityAvatar'
 
 interface HeaderSectionProps {
   name: string
-  kind: EntityKind
+  kind: EntityAvatarKind
   avatarUrl?: string
   did?: string
   subtitle?: string

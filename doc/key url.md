@@ -9,8 +9,12 @@ http://public.$zone_hostname/xxxx -> 映射到 data/srv/publish
 
 ### Zone内的DID Document
 
+
+
 ### Desktop中定义的公共URL
 
+暂时zone公开的用户信息（用户信息公开有 完全公开，zone内可见，自己可见3个隐私登记）
+https://test.buckyos.io/userprofile?user=devtest
 
 
 ## 发布的内容

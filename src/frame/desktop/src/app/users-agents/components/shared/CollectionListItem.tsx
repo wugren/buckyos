@@ -1,29 +1,23 @@
 /* ── Single-line dense list item for collection elements ── */
 
 import { EntityAvatar } from './EntityAvatar'
-import type { AnyEntity } from '../../datamodel/types'
+import type { MyNetworkEntity } from '../../../my-network/datamodel/types'
 import { Checkbox } from '@mui/material'
 
 interface CollectionListItemProps {
-  entity: AnyEntity
+  entity: MyNetworkEntity
   isActive: boolean
   isSelected?: boolean
   onClick: () => void
   onToggleSelected?: () => void
 }
 
-function getSubtitle(entity: AnyEntity): string {
+function getSubtitle(entity: MyNetworkEntity): string {
   switch (entity.kind) {
     case 'contact':
       return entity.sourceLabel ?? entity.source
     case 'entity-group':
       return `${entity.memberCount} members`
-    case 'local-user':
-      return entity.role
-    case 'agent':
-      return entity.agentType
-    case 'self':
-      return 'Self'
     default:
       return ''
   }
@@ -37,11 +31,6 @@ export function CollectionListItem({
   onToggleSelected,
 }: CollectionListItemProps) {
   const subtitle = getSubtitle(entity)
-  const isOnline =
-    entity.kind === 'local-user' ? entity.isOnline :
-    entity.kind === 'agent' ? entity.status === 'running' :
-    undefined
-
   return (
     <button
       type="button"
@@ -72,7 +61,6 @@ export function CollectionListItem({
         kind={entity.kind}
         avatarUrl={entity.avatarUrl}
         size="sm"
-        isOnline={isOnline}
       />
 
       <div className="flex-1 min-w-0">
