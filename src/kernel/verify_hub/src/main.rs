@@ -21,7 +21,8 @@ use name_lib::*;
 // Token expiration time constants
 // Session token: short-lived, used for API requests
 const SESSION_TOKEN_EXPIRE_SECONDS: u64 = 15 * 60; // 15 minutes
-                                                   // Refresh token: long-lived, used to obtain new token pairs
+const SUDO_SESSION_TOKEN_EXPIRE_SECONDS: u64 = 3 * 60;
+// Refresh token: long-lived, used to obtain new token pairs
 const REFRESH_TOKEN_EXPIRE_SECONDS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_LOGIN_NONCE_AGE_SECONDS: u64 = 3600 * 8; // 8 hours
 use buckyos_http_server::*;
@@ -105,6 +106,7 @@ async fn generate_session_token(
     session: u64,
     duration: u64,
     aud: Option<String>,
+    sudo: bool,
 ) -> Result<RPCSessionToken> {
     let now = buckyos_get_unix_timestamp();
     let exp = now + duration;
@@ -118,7 +120,7 @@ async fn generate_session_token(
         token: None,
         iss: Some(VERIFY_HUB_ISSUER.to_string()),
         exp: Some(exp),
-        sudo: false,
+        sudo,
         extra: HashMap::new(),
     };
     set_token_session_id(&mut session_token, session);
@@ -193,6 +195,7 @@ async fn generate_token_pair(
         session_id,
         SESSION_TOKEN_EXPIRE_SECONDS,
         None,
+        false,
     )
     .await?;
 
@@ -639,6 +642,63 @@ async fn verify_verify_hub_jwt(jwt: &str, expected_audience: Option<&str>) -> Re
     Ok(decoded_token.claims)
 }
 
+async fn validate_password_login(
+    username: &str,
+    password: &str,
+    appid: &str,
+    login_nonce: u64,
+) -> Result<(UserSettings, String)> {
+    let now = buckyos_get_unix_timestamp() * 1000;
+    let abs_diff = now.abs_diff(login_nonce);
+    debug!(
+        "{} login nonce and now abs_diff:{}, from:{}",
+        username, abs_diff, appid
+    );
+    if abs_diff > MAX_LOGIN_NONCE_AGE_SECONDS {
+        warn!(
+            "{} login nonce is too old, abs_diff:{}, this is a possible ATTACK?",
+            username, abs_diff
+        );
+        return Err(RPCErrors::ParseRequestError("Invalid nonce".to_string()));
+    }
+
+    let session_key = format!("{}_{}_{}", username, appid, login_nonce);
+    let cache_result = load_token_from_cache(session_key.as_str()).await;
+    if cache_result.is_some() {
+        warn!(
+            "{} login nonce {} already used, this is a REPLAY ATTACK!",
+            username, login_nonce
+        );
+        warn!(
+            "Revoking session {} due to replay attack detection",
+            session_key
+        );
+        revoke_session_tokens(session_key.as_str()).await;
+        return Err(RPCErrors::ReasonError(
+            "Login nonce already used".to_string(),
+        ));
+    }
+
+    let system_config_client = get_system_config_client().await?;
+    let control_panel_client = ControlPanelClient::new(system_config_client);
+    let user_settings = control_panel_client
+        .get_user_settings_by_username(username)
+        .await?;
+
+    let password_hash_input = STANDARD
+        .decode(password)
+        .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
+
+    let salt = format!("{}{}", user_settings.password, login_nonce);
+    let hash = Sha256::digest(salt.clone()).to_vec();
+    if hash != password_hash_input {
+        warn!("{} login by password failed, password is wrong!", username);
+        return Err(RPCErrors::InvalidPassword);
+    }
+
+    Ok((user_settings, session_key))
+}
+
 /**
 curl -X POST http://127.0.0.1/kapi/verify_hub -H "Content-Type: application/json" -d '{"method": "login","params":{"type":"jwt","jwt":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3d3dy53aGl0ZS5ib3Vjay5pbyIsImF1ZCI6Imh0dHBzOi8vd3d3LndoaXRlLmJvdWNrLmlvIiwiZXhwIjoxNzI3NzIwMDAwLCJpYXQiOjE3Mjc3MTY0MDAsInVzZXJpZCI6ImRpZDpleGFtcGxlOjEyMzQ1Njc4OTAiLCJhcHBpZCI6InN5c3RvbSIsInVzZXJuYW1lIjoiYWxpY2UifQ.6XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ5"}}'
 curl -X POST http://127.0.0.1:3300/kapi/verify_hub -H "Content-Type: application/json" -d '{"method": "login","params":{"type":"password","username":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3d3dy53aGl0ZS5ib3Vjay5pbyIsImF1ZCI6Imh0dHBzOi8vd3d3LndoaXRlLmJvdWNrLmlvIiwiZXhwIjoxNzI3NzIwMDAwLCJpYXQiOjE3Mjc3MTY0MDAsInVzZXJpZCI6ImRpZDpleGFtcGxlOjEyMzQ1Njc4OTAiLCJhcHBpZCI6InN5c3RvbSIsInVzZXJuYW1lIjoiYWxpY2UifQ.6XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ56XQ5"}}'
@@ -789,61 +849,9 @@ impl VerifyHubApiHandler for VerifyHubServer {
     ) -> Result<LoginByPasswordResponse> {
         gc_token_caches().await;
 
-        // Step 1: Validate nonce timestamp (should be recent)
-        let now = buckyos_get_unix_timestamp() * 1000;
-        let abs_diff = now.abs_diff(login_nonce);
-        debug!(
-            "{} login nonce and now abs_diff:{}, from:{}",
-            username, abs_diff, appid
-        );
-        if abs_diff > MAX_LOGIN_NONCE_AGE_SECONDS {
-            warn!(
-                "{} login nonce is too old, abs_diff:{}, this is a possible ATTACK?",
-                username, abs_diff
-            );
-            return Err(RPCErrors::ParseRequestError("Invalid nonce".to_string()));
-        }
-
-        // Step 2: Check if nonce has already been used (replay attack prevention)
-        // Use nonce as part of session_key to detect replay attacks
         let session_id = login_nonce;
-        let session_key = format!("{}_{}_{}", username, appid, session_id);
-        let cache_result = load_token_from_cache(session_key.as_str()).await;
-        if cache_result.is_some() {
-            warn!(
-                "{} login nonce {} already used, this is a REPLAY ATTACK!",
-                username, session_id
-            );
-            // Revoke the original session to force legitimate user to re-login
-            warn!(
-                "Revoking session {} due to replay attack detection",
-                session_key
-            );
-            revoke_session_tokens(session_key.as_str()).await;
-            return Err(RPCErrors::ReasonError(
-                "Login nonce already used".to_string(),
-            ));
-        }
-
-        // Step 3: Load user info from system config service
-        let system_config_client = get_system_config_client().await?;
-        let control_panel_client = ControlPanelClient::new(system_config_client);
-        let user_settings = control_panel_client
-            .get_user_settings_by_username(username)
-            .await?;
-
-        // Step 4: Verify password
-        // Password is hashed with nonce on client side: SHA256(stored_password + nonce)
-        let password_hash_input = STANDARD
-            .decode(password)
-            .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
-
-        let salt = format!("{}{}", user_settings.password, login_nonce);
-        let hash = Sha256::digest(salt.clone()).to_vec();
-        if hash != password_hash_input {
-            warn!("{} login by password failed, password is wrong!", username);
-            return Err(RPCErrors::InvalidPassword);
-        }
+        let (user_settings, session_key) =
+            validate_password_login(username, password, appid, login_nonce).await?;
 
         info!(
             "Password login successful for user: {}. Generating token pair.",
@@ -871,6 +879,45 @@ impl VerifyHubApiHandler for VerifyHubServer {
             refresh_token: token_pair.refresh_token,
         };
         return Ok(result_account_info);
+    }
+
+    async fn handle_sudo_by_password(
+        &self,
+        username: &str,
+        password: &str,
+        appid: &str,
+        aud: Option<String>,
+        login_nonce: u64,
+    ) -> Result<SudoByPasswordResponse> {
+        gc_token_caches().await;
+
+        let session_id = login_nonce;
+        let (_user_settings, session_key) =
+            validate_password_login(username, password, appid, login_nonce).await?;
+
+        let session_jti: u64;
+        {
+            let mut rng = rand::thread_rng();
+            session_jti = rng.gen::<u64>();
+        }
+
+        let session_token = generate_session_token(
+            appid,
+            username,
+            session_jti,
+            session_id,
+            SUDO_SESSION_TOKEN_EXPIRE_SECONDS,
+            aud,
+            true,
+        )
+        .await?;
+
+        cache_token(session_key.as_str(), session_token.clone()).await;
+        info!("Sudo session token cached for session: {}", session_key);
+
+        Ok(SudoByPasswordResponse {
+            session_token: session_token.to_string(),
+        })
     }
 
     async fn handle_verify_token(
@@ -1422,6 +1469,36 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
             refresh_token.exp.unwrap(),
             refresh_token.exp.unwrap() - buckyos_get_unix_timestamp()
         );
+    }
+
+    #[tokio::test]
+    async fn test_generate_sudo_session_token() {
+        let session_token = generate_session_token(
+            "control-panel",
+            "alice",
+            5678,
+            12345,
+            SUDO_SESSION_TOKEN_EXPIRE_SECONDS,
+            Some("system-config".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(!session_token.to_string().is_empty());
+        assert!(session_token.sudo);
+        assert_eq!(session_token.appid.as_deref(), Some("control-panel"));
+        assert_eq!(session_token.sub.as_deref(), Some("alice"));
+        assert_eq!(session_token.aud.as_deref(), Some("system-config"));
+        assert!(
+            session_token.exp.unwrap()
+                <= buckyos_get_unix_timestamp() + SUDO_SESSION_TOKEN_EXPIRE_SECONDS + 1,
+            "Sudo session token expiration should be short"
+        );
+
+        let parsed = RPCSessionToken::from_string(session_token.to_string().as_str()).unwrap();
+        assert!(parsed.sudo);
+        assert_eq!(parsed.aud.as_deref(), Some("system-config"));
     }
 
     /// Test refresh token cache operations

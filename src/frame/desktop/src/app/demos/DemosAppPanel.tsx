@@ -23,11 +23,13 @@ import {
   ChevronDown,
   MoonStar,
   Search,
+  ShieldCheck,
   SunMedium,
 } from 'lucide-react'
 import { useState } from 'react'
 import { AppIcon } from '../../components/DesktopVisuals'
 import { appIconSurfaceStyle } from '../../components/DesktopVisualTokens'
+import { useSudoByPassword } from '../../components/sudo'
 import { useI18n } from '../../i18n/provider'
 import { localeLabels } from '../../mock/data'
 import {
@@ -37,12 +39,15 @@ import {
 import { DemoSection, MetricCard, PanelIntro } from '../../components/AppPanelPrimitives'
 import type { AppContentLoaderProps } from '../types'
 
+type SudoDemoState = 'idle' | 'granted' | 'dismissed' | 'failed'
+
 export function DemosAppPanel({
   locale,
   themeMode,
 }: AppContentLoaderProps) {
   const { t } = useI18n()
   const windowDialog = useWindowDialog()
+  const requestSudo = useSudoByPassword()
   const isCompact = useMediaQuery('(max-width: 900px)')
   const [query, setQuery] = useState('Window controls')
   const [owner, setOwner] = useState('Prototype team')
@@ -60,6 +65,15 @@ export function DemosAppPanel({
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null)
   const [dialogState, setDialogState] = useState<'idle' | 'applied' | 'dismissed'>('idle')
   const [fullscreenState, setFullscreenState] = useState<'idle' | 'opened' | 'denied'>('idle')
+  const [sudoState, setSudoState] = useState<SudoDemoState>('idle')
+  const [sudoRequesting, setSudoRequesting] = useState(false)
+  const [sudoError, setSudoError] = useState<string | null>(null)
+  const [sudoGrantSummary, setSudoGrantSummary] = useState<{
+    appid: string
+    aud?: string
+    expiresInSeconds: number
+    tokenLength: number
+  } | null>(null)
 
   const densityLabels = {
     compact: t('demos.density.compact'),
@@ -85,6 +99,12 @@ export function DemosAppPanel({
     idle: t('demos.dialog.fullscreen.state.idle'),
     opened: t('demos.dialog.fullscreen.state.opened'),
     denied: t('demos.dialog.fullscreen.state.denied'),
+  }
+  const sudoStateLabels = {
+    idle: t('demos.sudo.state.idle'),
+    granted: t('demos.sudo.state.granted'),
+    dismissed: t('demos.sudo.state.dismissed'),
+    failed: t('demos.sudo.state.failed'),
   }
 
   const readiness = Math.min(
@@ -167,6 +187,40 @@ export function DemosAppPanel({
       }
 
       throw error
+    }
+  }
+
+  const handleRequestSudo = async () => {
+    setSudoRequesting(true)
+    setSudoError(null)
+    setSudoGrantSummary(null)
+
+    try {
+      const grant = await requestSudo({
+        aud: 'system-config',
+        title: t('demos.sudo.dialogTitle'),
+        description: t('demos.sudo.dialogDescription'),
+        reason: t('demos.sudo.reason'),
+        confirmLabel: t('demos.sudo.dialogConfirm'),
+      })
+
+      if (!grant) {
+        setSudoState('dismissed')
+        return
+      }
+
+      setSudoState('granted')
+      setSudoGrantSummary({
+        appid: grant.appid,
+        aud: grant.aud,
+        expiresInSeconds: grant.expiresInSeconds,
+        tokenLength: grant.sessionToken.length,
+      })
+    } catch (error) {
+      setSudoState('failed')
+      setSudoError(error instanceof Error ? error.message : String(error ?? ''))
+    } finally {
+      setSudoRequesting(false)
     }
   }
 
@@ -290,6 +344,67 @@ export function DemosAppPanel({
               <Chip size="small" label={`${t('demos.dialog.metric')}: ${dialogStateLabels[dialogState]}`} />
               <Chip size="small" label={`${t('demos.dialog.fullscreen.permission')}: ${windowDialog.permissions.fullscreen ? t('demos.dialog.fullscreen.allowed') : t('demos.dialog.fullscreen.denied')}`} />
               <Chip size="small" label={`${t('demos.dialog.fullscreen.metric')}: ${fullscreenStateLabels[fullscreenState]}`} />
+            </div>
+
+            <div className="mt-4 rounded-[22px] border border-[color:color-mix(in_srgb,var(--cp-border)_84%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_88%,transparent)] px-4 py-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-[color:var(--cp-text)]">
+                    {t('demos.sudo.title')}
+                  </p>
+                  <p className="mt-1 text-sm leading-6 text-[color:var(--cp-muted)]">
+                    {t('demos.sudo.body')}
+                  </p>
+                </div>
+                <Button
+                  className="sm:shrink-0"
+                  data-testid="demos-request-sudo"
+                  disabled={sudoRequesting}
+                  startIcon={<ShieldCheck size={16} />}
+                  type="button"
+                  variant="outlined"
+                  onClick={() => void handleRequestSudo()}
+                >
+                  {sudoRequesting ? t('demos.sudo.requesting') : t('demos.sudo.trigger')}
+                </Button>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Chip
+                  size="small"
+                  label={`${t('demos.sudo.state')}: ${sudoStateLabels[sudoState]}`}
+                />
+                {sudoGrantSummary ? (
+                  <>
+                    <Chip
+                      size="small"
+                      label={`${t('demos.sudo.appid')}: ${sudoGrantSummary.appid}`}
+                    />
+                    <Chip
+                      size="small"
+                      label={`${t('demos.sudo.aud')}: ${sudoGrantSummary.aud ?? 'system-config'}`}
+                    />
+                    <Chip
+                      size="small"
+                      label={t('demos.sudo.expiresIn', undefined, {
+                        seconds: sudoGrantSummary.expiresInSeconds,
+                      })}
+                    />
+                    <Chip
+                      size="small"
+                      label={t('demos.sudo.tokenLength', undefined, {
+                        count: sudoGrantSummary.tokenLength,
+                      })}
+                    />
+                  </>
+                ) : null}
+              </div>
+
+              {sudoError ? (
+                <Alert className="!mt-3" severity="error">
+                  {sudoError}
+                </Alert>
+              ) : null}
             </div>
 
             <Menu
