@@ -32,7 +32,7 @@ interface AccountInfo {
 
 type UsersAgentsCoreSnapshot = Pick<
   UsersAgentsSnapshot,
-  'self' | 'agent' | 'localUsers'
+  'self' | 'agent' | 'agents' | 'localUsers'
 >
 
 function accountDetail(account: AccountInfo): UserDetail {
@@ -106,12 +106,15 @@ async function fetchUsersAgentsCoreSnapshot(): Promise<UsersAgentsCoreSnapshot> 
         .map((user) => toLocalUserEntity(user, apps, now))
     : []
 
-  const firstAgentInfo = agentsResult.data?.agents[0] ?? null
-  const agent = toAgentEntity(firstAgentInfo, empty.agent)
+  const agents = agentsResult.data
+    ? agentsResult.data.agents.map((agentInfo) => toAgentEntity(agentInfo, empty.agent))
+    : []
+  const agent = agents[0] ?? empty.agent
 
   return {
     self,
     agent,
+    agents,
     localUsers,
   }
 }
@@ -170,6 +173,7 @@ export function createEmptyUsersAgentsSnapshot(): UsersAgentsSnapshot {
   return {
     self,
     agent,
+    agents: [],
     localUsers: [],
     entityGroups: [],
   }
@@ -183,6 +187,7 @@ export function createMockUsersAgentsSnapshot(): UsersAgentsSnapshot {
   return {
     self: structuredClone(mockSelf),
     agent: structuredClone(mockAgent),
+    agents: [structuredClone(mockAgent)],
     localUsers: structuredClone(mockLocalUsers),
     entityGroups,
   }

@@ -4,14 +4,12 @@ export type InternalEntityFilter = 'all' | 'users' | 'agents' | 'groups' | 'onli
 
 export function getInternalEntities(
   self: SelfEntity,
-  agent: AgentEntity,
+  agents: AgentEntity[],
   localUsers: LocalUserEntity[],
   entityGroups: EntityGroupEntity[],
 ): AnyEntity[] {
   const entities: AnyEntity[] = [self, ...localUsers]
-  if (agent.id !== 'agent-unavailable') {
-    entities.push(agent)
-  }
+  entities.push(...agents.filter((agent) => agent.id !== 'agent-unavailable'))
   entities.push(...entityGroups.filter((group) => group.isHostedBySelf))
   return entities
 }

@@ -151,13 +151,13 @@ p, client,/config/devices/{device}/info,read|write,allow
 
 p, service, /config/boot/*, read,allow
 p, service, /config/agents/*/doc,read,allow
-p, service,/config/services/{service}/*,read|write,allow
-p, service,/config/services/*/info,read,allow
-p, service,/config/users*,read,allow
-p, service,/config/users/*/*,read,allow
-p, service,/config/system/*,read,allow
-p, scheduler,/config/services/*/*,read|write,allow
-p, scheduler,/config/system/scheduler/*,read|write,allow
+p, service, /config/services/{service}/*,read|write,allow
+p, service, /config/services/*/info,read,allow
+p, service, /config/users*,read,allow
+p, service, /config/users/*/*,read,allow
+p, service, /config/system/*,read,allow
+p, scheduler, /config/services/*/*,read|write,allow
+p, scheduler, /config/system/scheduler/*,read|write,allow
 
 p, app, /config/boot/*, read,allow
 p, app, /config/agents/*/doc,read,allow

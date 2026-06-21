@@ -20,12 +20,23 @@ import {
   createUser,
   updateUser,
   updateUserContact,
+  fetchUserProfile,
+  setUserProfile,
+  setUserMsgTunnel,
+  removeUserMsgTunnel,
+  createUserInvite,
+  fetchUserInvite,
   changeUserPassword,
   changeUserState,
   changeUserType,
   deleteUser,
   fetchAgentList,
   fetchAgentDetail,
+  createAgent,
+  updateAgent,
+  deleteAgent,
+  fetchAgentProfile,
+  setAgentProfile,
   setAgentMsgTunnel,
   removeAgentMsgTunnel,
   type UserDetail,
@@ -377,6 +388,119 @@ async function main() {
     }),
   );
 
+  // -----------------------------------------------------------------------
+  // user.profile.get / user.profile.set
+  // -----------------------------------------------------------------------
+  console.log(`\n[user.profile.get / user.profile.set: ${testUserId}]`);
+
+  results.push(
+    await runCase("user.profile.set writes local profile fields", async () => {
+      const { data, error } = await setUserProfile({
+        userId: testUserId,
+        displayName: `DV ${testUserId}`,
+        title: "QA Bot",
+        bio: "created by test_user_mgr",
+        location: "DV Zone",
+        website: "https://buckyos.io",
+      });
+      assert(!error, `setUserProfile should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+    }),
+  );
+
+  results.push(
+    await runCase("user.profile.get returns the written profile", async () => {
+      const { data, error } = await fetchUserProfile(testUserId);
+      assert(!error, `fetchUserProfile should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(
+        data!.user_id === testUserId,
+        `user_id should be '${testUserId}', got '${data!.user_id}'`,
+      );
+      const profile = (data!.profile ?? {}) as Record<string, unknown>;
+      // The merged profile (local + DID) must reflect the local write.
+      assert(
+        profile.title === "QA Bot",
+        `profile.title should be 'QA Bot', got '${String(profile.title)}'`,
+      );
+      assert(
+        profile.bio === "created by test_user_mgr",
+        `profile.bio should round-trip, got '${String(profile.bio)}'`,
+      );
+    }),
+  );
+
+  // -----------------------------------------------------------------------
+  // user.set_msg_tunnel / user.remove_msg_tunnel
+  // -----------------------------------------------------------------------
+  console.log(
+    `\n[user.set_msg_tunnel / user.remove_msg_tunnel: ${testUserId}]`,
+  );
+
+  const userPlatform = `dvtest_user_${Date.now()}`;
+
+  results.push(
+    await runCase("user.set_msg_tunnel adds a binding", async () => {
+      const { data, error } = await setUserMsgTunnel({
+        userId: testUserId,
+        platform: userPlatform,
+        accountId: "dv-user-account",
+        displayId: "DV User Display",
+        tunnelId: "dv-user-tunnel",
+        meta: { source: "test_user_mgr" },
+      });
+      assert(!error, `setUserMsgTunnel should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+      assert(
+        data!.platform === userPlatform,
+        "platform should round-trip",
+      );
+      assert(
+        typeof data!.total_bindings === "number" && data!.total_bindings! >= 1,
+        "total_bindings should be >= 1",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase(
+      "user.set_msg_tunnel binding is visible via user.get contact",
+      async () => {
+        const { data, error } = await fetchUserDetail({ userId: testUserId });
+        assert(!error, `fetchUserDetail should not error: ${error}`);
+        assert(data !== null, "data should not be null");
+        const bindings = data!.contact?.bindings ?? [];
+        const found = bindings.find((b) => b.platform === userPlatform);
+        assert(
+          !!found,
+          `binding for '${userPlatform}' should appear in contact.bindings`,
+        );
+        assert(
+          found!.account_id === "dv-user-account",
+          "binding account_id should round-trip",
+        );
+      },
+    ),
+  );
+
+  results.push(
+    await runCase("user.remove_msg_tunnel removes the binding", async () => {
+      const { data, error } = await removeUserMsgTunnel({
+        userId: testUserId,
+        platform: userPlatform,
+      });
+      assert(!error, `removeUserMsgTunnel should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+      assert(
+        data!.platform === userPlatform,
+        "platform should round-trip",
+      );
+    }),
+  );
+
   results.push(
     await runCase("user.change_password updates password hash", async () => {
       const { data, error } = await changeUserPassword({
@@ -539,6 +663,92 @@ async function main() {
   );
 
   // -----------------------------------------------------------------------
+  // user.invite.create / user.invite.get
+  // invite.accept is intentionally not exercised here: it requires a valid
+  // owner_config DID document that can only be produced by a real client
+  // keypair, which is out of scope for this RPC-surface smoke test.
+  // -----------------------------------------------------------------------
+  console.log("\n[user.invite.create / user.invite.get]");
+
+  const inviteTargetUserId = `dvinvite${Date.now()}`;
+  let createdInviteId: string | null = null;
+
+  results.push(
+    await runCase("user.invite.create generates a pending invite", async () => {
+      const { data, error } = await createUserInvite({
+        userId: inviteTargetUserId,
+        showName: `Invited ${inviteTargetUserId}`,
+        userType: "user",
+        ttlSecs: 3600,
+        groups: ["dv-test"],
+      });
+      assert(!error, `createUserInvite should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(!!data!.invite, "response should carry an invite record");
+      assert(
+        typeof data!.invite.invite_id === "string" &&
+          data!.invite.invite_id.length > 0,
+        "invite_id should be a non-empty string",
+      );
+      createdInviteId = data!.invite.invite_id;
+      assert(
+        data!.invite.state === "pending",
+        `invite state should be 'pending', got '${data!.invite.state}'`,
+      );
+      assert(
+        data!.invite.target_user_id === inviteTargetUserId,
+        `invite target_user_id should be '${inviteTargetUserId}'`,
+      );
+      assert(
+        typeof data!.invite_url === "string" && data!.invite_url!.length > 0,
+        "response should include an invite_url",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("user.invite.get reads the invite back (public)", async () => {
+      assert(createdInviteId !== null, "createdInviteId should be populated");
+      const { data, error } = await fetchUserInvite(createdInviteId!);
+      assert(!error, `fetchUserInvite should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(
+        data!.invite.invite_id === createdInviteId,
+        "invite_id should round-trip",
+      );
+      assert(
+        data!.invite.state === "pending",
+        `invite state should be 'pending', got '${data!.invite.state}'`,
+      );
+      // Public invite view must carry zone routing info for the accept page.
+      assert(
+        typeof data!.zone_host === "string" && data!.zone_host!.length > 0,
+        "invite response should include zone_host",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("user.invite.get fails for unknown invite_id", async () => {
+      const { data, error } = await fetchUserInvite("nonexistent_invite_xyz");
+      assert(
+        error !== null || data === null,
+        "unknown invite_id should fail",
+      );
+    }),
+  );
+
+  // Clean up the pending user that invite.create pre-provisioned.
+  results.push(
+    await runCase("cleanup: soft-delete the invited pending user", async () => {
+      const { data, error } = await deleteUser(inviteTargetUserId);
+      assert(!error, `deleteUser should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+    }),
+  );
+
+  // -----------------------------------------------------------------------
   // Read-only: agent.list / agent.get
   // -----------------------------------------------------------------------
   console.log("\n[agent.list / agent.get]");
@@ -609,6 +819,126 @@ async function main() {
       assert(
         error !== null || data === null,
         "request should fail for non-existent agent",
+      );
+    }),
+  );
+
+  // -----------------------------------------------------------------------
+  // Agent write cycle: create → get → update → profile → delete
+  // Agent identity management is Admin-only (Agents are a Zone-level resource).
+  // -----------------------------------------------------------------------
+  const testAgentId = `dvagent${Date.now()}`;
+  console.log(`\n[agent write cycle: ${testAgentId}]`);
+
+  results.push(
+    await runCase("agent.create creates a new agent identity", async () => {
+      const { data, error } = await createAgent({
+        agentId: testAgentId,
+        displayName: `DV Agent ${testAgentId}`,
+        ownerUserId: callerUserId,
+        description: "created by test_user_mgr",
+      });
+      assert(!error, `createAgent should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+      assert(
+        data!.agent_id === testAgentId,
+        `agent_id should be '${testAgentId}', got '${data!.agent_id}'`,
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("agent.create rejects duplicate agent_id", async () => {
+      const { data, error } = await createAgent({ agentId: testAgentId });
+      assert(
+        error !== null || data === null,
+        "duplicate agent create should fail",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("agent.list now contains the new agent", async () => {
+      const { data, error } = await fetchAgentList();
+      assert(!error, `fetchAgentList should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      const found = data!.agents.find((a) => a.agent_id === testAgentId);
+      assert(!!found, `new agent '${testAgentId}' should appear in agent.list`);
+    }),
+  );
+
+  results.push(
+    await runCase("agent.get returns the new agent's detail", async () => {
+      const { data, error } = await fetchAgentDetail(testAgentId);
+      assert(!error, `fetchAgentDetail should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(
+        data!.agent_id === testAgentId,
+        `agent_id should be '${testAgentId}'`,
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("agent.update changes display_name", async () => {
+      const { data, error } = await updateAgent({
+        agentId: testAgentId,
+        displayName: `Renamed ${testAgentId}`,
+      });
+      assert(!error, `updateAgent should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+    }),
+  );
+
+  results.push(
+    await runCase("agent.profile.set then agent.profile.get round-trips", async () => {
+      const { data: setData, error: setErr } = await setAgentProfile({
+        agentId: testAgentId,
+        profile: { title: "DV Test Agent", bio: "round-trip check" },
+      });
+      assert(!setErr, `setAgentProfile should not error: ${setErr}`);
+      assert(setData !== null, "set data should not be null");
+      assert(setData!.ok === true, "ok should be true");
+
+      const { data, error } = await fetchAgentProfile(testAgentId);
+      assert(!error, `fetchAgentProfile should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(
+        data!.agent_id === testAgentId,
+        "profile agent_id should round-trip",
+      );
+      const profile = (data!.profile ?? {}) as Record<string, unknown>;
+      assert(
+        profile.title === "DV Test Agent",
+        `profile.title should round-trip, got '${String(profile.title)}'`,
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("agent.delete soft-deletes the test agent", async () => {
+      const { data, error } = await deleteAgent(testAgentId);
+      assert(!error, `deleteAgent should not error: ${error}`);
+      assert(data !== null, "data should not be null");
+      assert(data!.ok === true, "ok should be true");
+      assert(
+        (data as Record<string, unknown>).state === "deleted",
+        "delete response should report state 'deleted'",
+      );
+
+      // Soft-delete keeps the doc; agent.get still resolves but settings.state
+      // is now 'deleted'.
+      const { data: after, error: afterErr } = await fetchAgentDetail(
+        testAgentId,
+      );
+      assert(!afterErr, `fetchAgentDetail should not error: ${afterErr}`);
+      assert(after !== null, "soft-deleted agent should still be retrievable");
+      const settings = (after!.settings ?? {}) as Record<string, unknown>;
+      assert(
+        settings.state === "deleted",
+        `settings.state should be 'deleted', got '${String(settings.state)}'`,
       );
     }),
   );

@@ -1,16 +1,14 @@
 /* ── Agent detail page ── */
 
 import { Chip } from '@mui/material'
-import { useAgent } from '../../hooks/use-users-agents-store'
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'
 import { DIDDocumentSection } from '../sections/DIDDocumentSection'
 import { RuntimeInfoSection } from '../sections/RuntimeInfoSection'
+import type { AgentEntity } from '../../datamodel/types'
 
-export function AgentDetailPage() {
-  const agent = useAgent()
-
+export function AgentDetailPage({ agent }: { agent: AgentEntity }) {
   return (
     <div className="space-y-4">
       <HeaderSection

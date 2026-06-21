@@ -144,6 +144,7 @@ export type SidebarSelection =
 export interface UsersAgentsSnapshot {
   self: SelfEntity
   agent: AgentEntity
+  agents: AgentEntity[]
   localUsers: LocalUserEntity[]
   entityGroups: EntityGroupEntity[]
 }

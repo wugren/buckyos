@@ -8,7 +8,7 @@ import { SearchFilterBar } from '../shared/SearchFilterBar'
 import { filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
 import {
   useSelf,
-  useAgent,
+  useAgents,
   useLocalUsers,
   useEntityGroups,
 } from '../../hooks/use-users-agents-store'
@@ -34,7 +34,7 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<InternalEntityFilter>('all')
   const self = useSelf()
-  const agent = useAgent()
+  const agents = useAgents()
   const localUsers = useLocalUsers()
   const entityGroups = useEntityGroups()
 
@@ -42,8 +42,8 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
     selection?.kind === 'entity' && selection.entityId === id
 
   const entities = useMemo(
-    () => filterInternalEntities(getInternalEntities(self, agent, localUsers, entityGroups), query, filter),
-    [agent, entityGroups, filter, localUsers, query, self],
+    () => filterInternalEntities(getInternalEntities(self, agents, localUsers, entityGroups), query, filter),
+    [agents, entityGroups, filter, localUsers, query, self],
   )
 
   return (

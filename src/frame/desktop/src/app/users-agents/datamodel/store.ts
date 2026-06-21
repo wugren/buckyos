@@ -33,6 +33,7 @@ export class UsersAgentsStore {
 
   private self: SelfEntity
   private agent: AgentEntity
+  private agents: AgentEntity[]
   private localUsers: LocalUserEntity[]
   private entityGroups: EntityGroupEntity[]
 
@@ -46,6 +47,7 @@ export class UsersAgentsStore {
       : createEmptyUsersAgentsSnapshot()
     this.self = initial.self
     this.agent = initial.agent
+    this.agents = initial.agents
     this.localUsers = initial.localUsers
     this.entityGroups = initial.entityGroups
     this.snapshot = this.buildSnapshot()
@@ -80,6 +82,7 @@ export class UsersAgentsStore {
   private applySnapshot(snapshot: UsersAgentsSnapshot) {
     this.self = snapshot.self
     this.agent = snapshot.agent
+    this.agents = snapshot.agents
     this.localUsers = snapshot.localUsers
     this.entityGroups = snapshot.entityGroups
   }
@@ -93,6 +96,7 @@ export class UsersAgentsStore {
     return {
       self: this.self,
       agent: this.agent,
+      agents: this.agents,
       localUsers: this.localUsers,
       entityGroups: this.entityGroups,
     }
@@ -100,7 +104,8 @@ export class UsersAgentsStore {
 
   findEntity(id: string): AnyEntity | undefined {
     if (this.self.id === id) return this.self
-    if (this.agent.id === id) return this.agent
+    const agent = this.agents.find((item) => item.id === id)
+    if (agent) return agent
     return (
       this.localUsers.find((user) => user.id === id) ??
       this.entityGroups.find((group) => group.id === id)
@@ -154,8 +159,14 @@ export class UsersAgentsStore {
       return
     }
 
-    if (this.agent.id === entityId) {
-      this.agent = { ...this.agent, socialAccounts: [...this.agent.socialAccounts, account] }
+    const targetAgent = this.agents.find((agent) => agent.id === entityId)
+    if (targetAgent) {
+      this.agents = this.agents.map((agent) =>
+        agent.id === entityId
+          ? { ...agent, socialAccounts: [...agent.socialAccounts, account] }
+          : agent,
+      )
+      this.agent = this.agents[0] ?? this.agent
       this.notify()
       return
     }
@@ -199,8 +210,14 @@ export class UsersAgentsStore {
       return
     }
 
-    if (this.agent.id === entityId) {
-      this.agent = { ...this.agent, socialAccounts: updater(this.agent.socialAccounts) }
+    const targetAgent = this.agents.find((agent) => agent.id === entityId)
+    if (targetAgent) {
+      this.agents = this.agents.map((agent) =>
+        agent.id === entityId
+          ? { ...agent, socialAccounts: updater(agent.socialAccounts) }
+          : agent,
+      )
+      this.agent = this.agents[0] ?? this.agent
       this.notify()
       return
     }

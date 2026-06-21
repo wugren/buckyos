@@ -83,7 +83,7 @@ Agent 在系统中有**两副面孔**，需要区分：
    | `agents/{agent_id}/settings` | Agent 配置（`owner_user_id` / display_name / state / profile / bindings） |
    | `agents/{agent_id}/key` | ED25519 私钥（PEM，创建时写一次） |
 
-2. **作为可部署服务**（由 App Installer 管理）：`AppDoc.get_app_type() == AppType::Agent`，安装/启停/升级与普通 App **走同一套流程**，spec 存于 `users/{user_id}/agents/{app_id}/spec`。
+2. **作为可部署服务**（由 App Installer 管理）：`AppDoc.get_app_type() == AppType::Agent`，安装/启停/升级与普通 App **走同一套流程**，spec 存于 `users/{user_id}/agents/{app_id}/spec`。`agent.list` 以 `agents/*` 身份目录为准，同时补充匹配 spec 的 `app_doc`、`state`、`user_id` 等服务维度字段用于展示。
 
 ---
 
@@ -150,7 +150,7 @@ Agent 在系统中有**两副面孔**，需要区分：
 
 | 方法 | 说明 |
 |---|---|
-| `agent.list` / `agent.get` | 列出/查询 Agent 身份 |
+| `agent.list` / `agent.get` | 列出/查询 Agent 身份；`agent.list` 会补充匹配的用户 Agent spec 摘要 |
 | `agent.create` | 事务创建 doc+settings+key |
 | `agent.update` / `agent.delete` | 更新/删除 |
 | `agent.profile.get` / `agent.profile.set` | Agent profile |

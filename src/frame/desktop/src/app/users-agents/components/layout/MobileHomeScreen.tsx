@@ -8,7 +8,7 @@ import { SearchFilterBar } from '../shared/SearchFilterBar'
 import { filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
 import {
   useSelf,
-  useAgent,
+  useAgents,
   useLocalUsers,
   useEntityGroups,
 } from '../../hooks/use-users-agents-store'
@@ -288,7 +288,7 @@ export function MobileHomeScreen({
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<InternalEntityFilter>('all')
   const self = useSelf()
-  const agent = useAgent()
+  const agents = useAgents()
   const localUsers = useLocalUsers()
   const entityGroups = useEntityGroups()
 
@@ -296,8 +296,8 @@ export function MobileHomeScreen({
     selection?.kind === 'entity' && selection.entityId === id
 
   const filteredEntities = useMemo(
-    () => filterInternalEntities(getInternalEntities(self, agent, localUsers, entityGroups), query, filter),
-    [agent, entityGroups, filter, localUsers, query, self],
+    () => filterInternalEntities(getInternalEntities(self, agents, localUsers, entityGroups), query, filter),
+    [agents, entityGroups, filter, localUsers, query, self],
   )
   const identityEntities = filteredEntities.filter((entity) => entity.kind !== 'entity-group')
   const hostedGroups = filteredEntities.filter((entity) => entity.kind === 'entity-group') as EntityGroupEntity[]

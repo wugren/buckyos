@@ -282,16 +282,16 @@ function runtimeFromAgentInfo(
     uptime: available ? 'Online' : fallback.uptime,
     memoryUsage: fallback.memoryUsage,
     cpuUsage: fallback.cpuUsage,
-    lastActive: available || status === 'running' ? new Date().toISOString() : fallback.lastActive,
-    runningTasks: status === 'running' ? workSessions : 0,
+    lastActive: available ? new Date().toISOString() : fallback.lastActive,
+    runningTasks: available && status === 'running' ? workSessions : 0,
     queuedTasks: 0,
-    healthStatus: status === 'running'
-      ? workSessions > 10
-        ? 'busy'
-        : 'healthy'
-      : available
-        ? 'degraded'
-        : 'offline',
+    healthStatus: available
+      ? status === 'running'
+        ? workSessions > 10
+          ? 'busy'
+          : 'healthy'
+        : 'degraded'
+      : 'offline',
     uiSessions,
     workSessions,
     workspaces,
@@ -304,20 +304,34 @@ export function toAgentEntity(
 ): AgentEntity {
   const raw = asRecord(agentInfo)
   const settings = asRecord(raw.settings)
+  const spec = asRecord(raw.spec)
+  const appDoc = asRecord(raw.app_doc ?? spec.app_doc)
   const profile = asRecord(settings.profile ?? raw.profile)
   const capabilities = [
     ...stringArray(settings.capabilities),
     ...stringArray(profile.capabilities),
   ]
   const dedupedCapabilities = Array.from(new Set(capabilities)).slice(0, 6)
-  const status = agentStateToStatus(settings.state)
-  const agentId = firstString(raw.agent_id, fallback.id) ?? fallback.id
+  const status = agentStateToStatus(settings.state ?? raw.state ?? spec.state)
+  const agentDid = firstString(raw.id, raw.did, raw.agent_did, settings.agent_did, fallback.did)
+  const agentId = firstString(
+    raw.agent_id,
+    raw.agentId,
+    raw.app_id,
+    raw.appId,
+    appDoc.name,
+    agentDid,
+    fallback.id,
+  ) ?? fallback.id
   const displayName = firstString(
     profile.display_name,
     profile.displayName,
     settings.display_name,
     raw.display_name,
     raw.name,
+    appDoc.show_name,
+    appDoc.showName,
+    agentId,
     fallback.displayName,
   ) ?? fallback.displayName
 
@@ -326,9 +340,9 @@ export function toAgentEntity(
     id: agentId,
     displayName,
     avatarUrl: firstString(profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
-    did: firstString(raw.id, raw.did, raw.agent_did, settings.agent_did, fallback.did),
+    did: agentDid,
     agentType: firstString(profile.agent_type, settings.agent_type, fallback.agentType) ?? fallback.agentType,
-    version: firstString(raw.version, settings.version, fallback.version) ?? fallback.version,
+    version: firstString(raw.version, settings.version, appDoc.version, fallback.version) ?? fallback.version,
     status,
     capabilities: dedupedCapabilities.length > 0 ? dedupedCapabilities : fallback.capabilities,
     socialAccounts: socialAccountsFromUnknown(settings.bindings),
@@ -339,10 +353,10 @@ export function toAgentEntity(
       appType: 'agent',
     },
     settings: {
-      owner: firstString(settings.owner, settings.owner_user_id, fallback.settings.owner) ?? '',
+      owner: firstString(settings.owner, settings.owner_user_id, raw.owner_user_id, spec.user_id, fallback.settings.owner) ?? '',
       permissions: firstString(settings.permissions, fallback.settings.permissions) ?? 'Not configured',
       workspaceRoot: firstString(settings.workspace_root, settings.workspaceRoot, fallback.settings.workspaceRoot) ?? '',
-      serviceState: String(settings.state ?? 'unknown'),
+      serviceState: String(settings.state ?? raw.state ?? spec.state ?? 'unknown'),
     },
     didDocument: Object.keys(raw).length > 0 ? raw : fallback.didDocument,
     runtime: runtimeFromAgentInfo(raw.runtime, status, fallback.runtime),

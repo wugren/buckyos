@@ -79,18 +79,10 @@ const DV_PREINSTALLED_APPS: {
   },
 ];
 
-// DV 环境默认 Agent (来自 src/kernel/scheduler/src/system_config_builder.rs)
-const DV_DEFAULT_AGENTS: {
-  app_id: string;
-  show_name: string;
-  author: string;
-}[] = [
-  {
-    app_id: "jarvis",
-    show_name: "Jarvis",
-    author: "did:bns:buckyos",
-  },
-];
+// DV 环境默认 Agent (来自 src/kernel/scheduler/src/system_config_builder.rs)。
+// 按设计文档 §4.4，Agent 不出现在 apps.list / apps.details，读取走 agent.list /
+// agent.get（见 test_user_mgr.ts）。这里仅用于断言 apps.* 已正确把 Agent 排除。
+const DV_AGENT_IDS = ["jarvis"];
 
 async function main() {
   console.log("=== test_app_mgr: app_service_mgr.rs DV tests ===\n");
@@ -161,10 +153,6 @@ async function main() {
           `system app '${app.app_id}' should have is_system=true`,
         );
         assert(
-          app.is_agent === false,
-          `system app '${app.app_id}' should have is_agent=false`,
-        );
-        assert(
           app.enable === true,
           `system app '${app.app_id}' should be enabled`,
         );
@@ -193,10 +181,6 @@ async function main() {
         assert(
           typeof app.enable === "boolean",
           `app '${app.app_id}' enable should be boolean`,
-        );
-        assert(
-          typeof app.is_agent === "boolean",
-          `app '${app.app_id}' is_agent should be boolean`,
         );
         assert(
           typeof app.is_system === "boolean",
@@ -263,40 +247,19 @@ async function main() {
   );
 
   // -----------------------------------------------------------------------
-  // Test: apps.list — DV 默认 Agent
+  // Test: apps.list — DV 默认 Agent 必须被排除 (设计文档 §4.4)
+  // Agent 读取走 agent.list / agent.get，不会出现在 apps.list。
   // -----------------------------------------------------------------------
   results.push(
     await runCase(
-      "apps.list includes DV default agent (jarvis)",
+      "apps.list excludes agents (jarvis must not appear)",
       async () => {
         assert(appsList !== null, "appsList should be populated");
-        for (const expected of DV_DEFAULT_AGENTS) {
-          const found = appsList!.apps.find(
-            (app) => app.app_id === expected.app_id,
-          );
+        for (const agentId of DV_AGENT_IDS) {
+          const found = appsList!.apps.find((app) => app.app_id === agentId);
           assert(
-            !!found,
-            `DV default agent '${expected.app_id}' should be in list`,
-          );
-          assert(
-            found!.is_agent === true,
-            `'${expected.app_id}' should have is_agent=true`,
-          );
-          assert(
-            found!.is_system === false,
-            `'${expected.app_id}' should not be a system app`,
-          );
-          assert(
-            found!.show_name === expected.show_name,
-            `'${expected.app_id}' show_name should be '${expected.show_name}', got '${found!.show_name}'`,
-          );
-          assert(
-            found!.author === expected.author,
-            `'${expected.app_id}' author should be '${expected.author}', got '${found!.author}'`,
-          );
-          assert(
-            found!.enable === true,
-            `'${expected.app_id}' should be enabled`,
+            !found,
+            `agent '${agentId}' must NOT appear in apps.list (read via agent.list)`,
           );
         }
       },
@@ -322,10 +285,6 @@ async function main() {
             data!.is_system === false,
             `'${expected.app_id}' should not be a system app`,
           );
-          assert(
-            data!.is_agent === false,
-            `'${expected.app_id}' should not be an agent`,
-          );
           const spec = data!.spec as Record<string, unknown>;
           assert(
             typeof spec.app_doc === "object" && spec.app_doc !== null,
@@ -346,41 +305,20 @@ async function main() {
   }
 
   // -----------------------------------------------------------------------
-  // Test: apps.details — DV 默认 Agent 详情
+  // Test: apps.details — Agent 不可经 apps.details 读取 (设计文档 §4.4)
+  // 后端 handle_app_detials 命中 Agent 型 spec 时返回 "App not found"。
   // -----------------------------------------------------------------------
-  for (const expected of DV_DEFAULT_AGENTS) {
+  for (const agentId of DV_AGENT_IDS) {
     results.push(
       await runCase(
-        `apps.details returns DV default agent (${expected.app_id})`,
+        `apps.details rejects agent (${agentId})`,
         async () => {
-          const { data, error } = await fetchAppDetails(expected.app_id, { userId: ownerUserId });
-          assert(!error, `fetchAppDetails should not error: ${error}`);
-          assert(data !== null, "data should not be null");
+          const { data, error } = await fetchAppDetails(agentId, {
+            userId: ownerUserId,
+          });
           assert(
-            data!.app_id === expected.app_id,
-            `app_id should be '${expected.app_id}'`,
-          );
-          assert(
-            data!.is_agent === true,
-            `'${expected.app_id}' should be an agent`,
-          );
-          assert(
-            data!.is_system === false,
-            `'${expected.app_id}' should not be a system app`,
-          );
-          const spec = data!.spec as Record<string, unknown>;
-          assert(
-            typeof spec.app_doc === "object" && spec.app_doc !== null,
-            "spec should contain app_doc",
-          );
-          const appDoc = spec.app_doc as Record<string, unknown>;
-          assert(
-            appDoc.name === expected.app_id,
-            `app_doc.name should be '${expected.app_id}'`,
-          );
-          assert(
-            appDoc.author === expected.author,
-            `app_doc.author should be '${expected.author}'`,
+            error !== null || data === null,
+            `apps.details('${agentId}') should fail — agents are read via agent.get`,
           );
         },
       ),
@@ -418,7 +356,6 @@ async function main() {
           `app_id should be 'messagehub', got '${detail.app_id}'`,
         );
         assert(detail.is_system === true, "messagehub should be a system app");
-        assert(detail.is_agent === false, "messagehub should not be an agent");
         assert(
           typeof detail.spec === "object" && detail.spec !== null,
           "spec should be a non-null object",
@@ -573,37 +510,6 @@ async function main() {
           assert(
             data!.summary.version === listItem!.version,
             `summary.version mismatch for '${expected.app_id}'`,
-          );
-          assert(
-            data!.summary.show_name === listItem!.show_name,
-            `summary.show_name mismatch for '${expected.app_id}'`,
-          );
-        }
-      },
-    ),
-  );
-
-  results.push(
-    await runCase(
-      "apps.details matches apps.list for DV default agents",
-      async () => {
-        assert(appsList !== null, "appsList should be populated");
-        for (const expected of DV_DEFAULT_AGENTS) {
-          const listItem = appsList!.apps.find(
-            (app) => app.app_id === expected.app_id,
-          );
-          assert(!!listItem, `'${expected.app_id}' should be in apps.list`);
-
-          const { data, error } = await fetchAppDetails(expected.app_id, { userId: ownerUserId });
-          assert(!error, `fetchAppDetails('${expected.app_id}') should not error`);
-          assert(data !== null, `details for '${expected.app_id}' should not be null`);
-          assert(
-            data!.summary.app_id === listItem!.app_id,
-            `summary.app_id mismatch for '${expected.app_id}'`,
-          );
-          assert(
-            data!.summary.is_agent === listItem!.is_agent,
-            `summary.is_agent mismatch for '${expected.app_id}'`,
           );
           assert(
             data!.summary.show_name === listItem!.show_name,

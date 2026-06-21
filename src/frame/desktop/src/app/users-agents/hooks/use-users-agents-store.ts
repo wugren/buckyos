@@ -26,6 +26,10 @@ export function useAgent() {
   return useUsersAgentsSnapshot().agent
 }
 
+export function useAgents() {
+  return useUsersAgentsSnapshot().agents
+}
+
 export function useLocalUsers() {
   return useUsersAgentsSnapshot().localUsers
 }
@@ -37,7 +41,8 @@ export function useEntityGroups() {
 export function useEntity(id: string): AnyEntity | undefined {
   const snap = useUsersAgentsSnapshot()
   if (snap.self.id === id) return snap.self
-  if (snap.agent.id === id) return snap.agent
+  const agent = snap.agents.find((item) => item.id === id)
+  if (agent) return agent
   return (
     snap.localUsers.find((u) => u.id === id) ??
     snap.entityGroups.find((g) => g.id === id)

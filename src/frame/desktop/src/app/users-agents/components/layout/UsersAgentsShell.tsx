@@ -22,7 +22,7 @@ function DetailRouter({ entityId, onRemoved }: { entityId: string; onRemoved?: (
     case 'self':
       return <SelfDetailPage />
     case 'agent':
-      return <AgentDetailPage />
+      return <AgentDetailPage agent={entity} />
     case 'local-user':
       return <LocalUserDetailPage user={entity} onRemoved={onRemoved} />
     case 'entity-group':
