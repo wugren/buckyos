@@ -49,9 +49,8 @@
 | `users/<id>/doc` | control_panel / scheduler | 用户 DID 文档 |
 | `users/<id>/apps/<app_id>/spec` | control_panel / scheduler | 用户安装的 App 规格 |
 | `users/<id>/agents/<agent_id>/spec`、`.../settings` | scheduler | 用户的 Agent 配置 |
-| `system/rbac/base_policy` | 引导模板 | 静态策略模板 |
-| `system/rbac/policy` | **scheduler（`ood` 身份）** | 生效策略 = base_policy + 按用户/节点/服务生成的分组行 |
-| `system/rbac/model` | 引导模板 | Casbin model |
+| `system/rbac/policy` | **scheduler（`ood` 身份）** | 动态策略尾部：按用户/节点/服务生成的分组行 |
+| API runtime 内置 RBAC 配置 | API runtime / scheduler 二进制 | Casbin model + 稳定角色权限；运行时与 `system/rbac/policy` 合成生效策略 |
 
 > 约定：App 自身的可写数据**不在** system-config，而在 DFS / 本地数据目录（见 §5、§6.2）。system-config 只放控制面状态。
 
@@ -67,7 +66,7 @@
 
 ### 2.1 类型 → RBAC 角色的映射
 
-用户的有效权限**不来自 `user_type` 字段本身**，而来自 scheduler 在每轮调度时把 `user_type` 翻译成 Casbin 分组行 `g, <user_id>, <role>` 写入 `system/rbac/policy`（`src/kernel/scheduler/src/system_config_agent.rs` 的 `update_rbac`）。这是“谁是什么角色”的**唯一真相源**。
+用户的有效权限**不来自 `user_type` 字段本身**，而来自 scheduler 在每轮调度时把 `user_type` 翻译成 Casbin 分组行 `g, <user_id>, <role>` 写入 `system/rbac/policy`（`src/kernel/scheduler/src/system_config_agent.rs` 的 `update_rbac`）。该 KV 是动态角色归属的真相源，完整权限还会叠加 API runtime 内置的稳定角色策略。
 
 | `user_type` | 落地 RBAC role | 生成位置 |
 |---|---|---|

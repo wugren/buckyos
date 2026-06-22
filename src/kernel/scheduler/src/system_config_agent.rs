@@ -5,7 +5,6 @@ use anyhow::Result;
 use buckyos_api::{AppType, SelectorType};
 use log::*;
 use package_lib::PackageId;
-use rbac::DEFAULT_POLICY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -1236,30 +1235,29 @@ async fn update_rbac(
     input_config: &HashMap<String, String>,
     scheduler_ctx: &NodeScheduler,
 ) -> Result<HashMap<String, KVAction>> {
-    let basic_rbac_policy = input_config.get("system/rbac/base_policy");
     let current_rbac_policy = input_config.get("system/rbac/policy");
     let mut rbac_policy = String::new();
-    if basic_rbac_policy.is_none() {
-        warn!("basic_rbac_policy is not set, use default policy");
-        rbac_policy = DEFAULT_POLICY.to_string();
-    } else {
-        rbac_policy = basic_rbac_policy.unwrap().clone();
+    fn push_policy_line(policy: &mut String, line: String) {
+        if !policy.is_empty() {
+            policy.push('\n');
+        }
+        policy.push_str(line.as_str());
     }
 
     for (user_id, user_item) in scheduler_ctx.users.iter() {
         if user_id == "root" {
             continue;
         }
-        rbac_policy.push_str(&format!("\ng, {}, zone_users", user_id));
+        push_policy_line(&mut rbac_policy, format!("g, {}, zone_users", user_id));
         match user_item.user_type {
             crate::scheduler::UserType::Admin => {
-                rbac_policy.push_str(&format!("\ng, {}, admin", user_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, admin", user_id));
             }
             crate::scheduler::UserType::User => {
-                rbac_policy.push_str(&format!("\ng, {}, user", user_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, user", user_id));
             }
             crate::scheduler::UserType::Limited => {
-                rbac_policy.push_str(&format!("\ng, {}, limited", user_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, limited", user_id));
             }
             _ => {
                 continue;
@@ -1270,10 +1268,10 @@ async fn update_rbac(
     for (node_id, node_item) in scheduler_ctx.nodes.iter() {
         match node_item.node_type {
             NodeType::OOD => {
-                rbac_policy.push_str(&format!("\ng, {}, ood", node_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, ood", node_id));
             }
             NodeType::Server => {
-                rbac_policy.push_str(&format!("\ng, {}, server", node_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, server", node_id));
             }
             _ => {
                 continue;
@@ -1284,14 +1282,19 @@ async fn update_rbac(
     for (spec_id, service_spec) in scheduler_ctx.specs.iter() {
         match service_spec.spec_type {
             ServiceSpecType::App => {
-                rbac_policy.push_str(&format!("\ng, {}, app", service_spec.app_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, app", service_spec.app_id));
             }
             ServiceSpecType::Service => {
-                rbac_policy.push_str(&format!("\ng, {}, service", service_spec.app_id));
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!("g, {}, service", service_spec.app_id),
+                );
             }
             ServiceSpecType::Kernel => {
-                //kernel service already set in basic_policy
-                rbac_policy.push_str(&format!("\ng, {}, kernel", service_spec.app_id));
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!("g, {}, kernel", service_spec.app_id),
+                );
             }
         }
     }

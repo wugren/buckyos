@@ -209,20 +209,9 @@ impl ControlPanelClient {
 
     //return (rbac_model,rbac_policy)
     pub async fn load_rbac_config(&self) -> Result<(String, String)> {
-        let rbac_model_path = "system/rbac/model";
-        let rbac_model_result = self.system_config_client.get(rbac_model_path).await;
-        if rbac_model_result.is_err() {
-            return Err(RPCErrors::ReasonError("rbac model not found".to_string()));
-        }
-        let rbac_model_result = rbac_model_result.unwrap();
-
-        let rbac_policy_path = "system/rbac/policy";
-        let rbac_policy_result = self.system_config_client.get(rbac_policy_path).await;
-        if rbac_policy_result.is_err() {
-            return Err(RPCErrors::ReasonError("rbac policy not found".to_string()));
-        }
-        let rbac_policy_result = rbac_policy_result.unwrap();
-        Ok((rbac_model_result.value, rbac_policy_result.value))
+        let rbac_config =
+            crate::load_current_rbac_config(self.system_config_client.as_ref()).await?;
+        Ok((rbac_config.model, rbac_config.policy))
     }
 
     pub async fn load_zone_config(&self) -> Result<ZoneConfig> {

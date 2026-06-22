@@ -1,6 +1,6 @@
 # RBAC 设计与配置说明
 
-本文档说明 BuckyOS RBAC 的设计思路和核心资源隔离原则，用来指导最终的 `system/rbac/base_policy` 与 `system/rbac/policy` 编写。登录、token 签发、密码验证等认证细节不在这里展开。
+本文档说明 BuckyOS RBAC 的设计思路和核心资源隔离原则，用来指导内置默认策略与 `system/rbac/policy` 动态尾部的编写。登录、token 签发、密码验证等认证细节不在这里展开。
 
 当前版本是 beta 2.2 的 breaking change，不需要考虑旧的 `super_*` 方案。
 
@@ -45,9 +45,8 @@ RBAC 目标语义是：
 
 ## 策略文件
 
-- `system/rbac/model`：RBAC 模型，默认来自 `rbac::DEFAULT_MODEL`。
-- `system/rbac/base_policy`：基础策略，boot 时写入；没有显式配置时使用 `rbac::DEFAULT_POLICY`。
-- `system/rbac/policy`：运行期实际策略，由 scheduler 基于 `base_policy` 和当前用户、节点、服务重新构造。
+- API runtime 内置 RBAC 配置：RBAC model 与稳定角色权限，随二进制升级更新。
+- `system/rbac/policy`：运行期动态策略尾部，由 scheduler 基于当前用户、节点、服务重新构造。
 
 scheduler 当前会根据系统状态自动追加组关系：
 
@@ -65,7 +64,7 @@ g, repo-service, service
 g, system-config, kernel
 ```
 
-因此 `base_policy` 应主要表达稳定的角色权限，`policy` 则是 base policy 加上当前系统里真实用户、节点、服务之后的结果。
+因此内置默认策略应主要表达稳定的角色权限，`system/rbac/policy` 只保存当前系统里真实用户、节点、服务对应的动态分组行。完整策略由 API runtime 在加载 RBAC 时合成。
 
 
 
@@ -93,7 +92,7 @@ g, system-config, kernel
 
 ## 调度器增量生成规则
 
-调度器构造 `system/rbac/policy` 时，不应该只把 `base_policy` 原样复制出来，而应根据 system-config 当前状态补充真实主体的组关系和必要的精确授权。原则是：稳定的角色权限放在 `base_policy`，会随用户、设备、App、Agent 增删变化的规则由 scheduler 生成。
+调度器构造 `system/rbac/policy` 时，只写会随 system-config 当前状态变化的真实主体组关系和必要的精确授权。稳定的角色权限放在 API runtime 内置默认策略里，完整策略由 API runtime 合成。
 
 ### 添加用户
 
@@ -200,7 +199,7 @@ p, pir-living-room, /keyevents/devices/pir-living-room/*, fire, allow
 g, $appid, app
 ```
 
-App 的通用权限应通过 `base_policy` 的 `{app}` 变量绑定 AppID，例如：
+App 的通用权限应通过内置默认策略的 `{app}` 变量绑定 AppID，例如：
 
 ```rbac
 p, app, /config/users/*/apps/{app}/settings, read|write, allow
@@ -227,7 +226,7 @@ g, $appid, app
 g, $agentid, app
 ```
 
-同时 `base_policy` 应为 Agent 子树提供与 App 子树对应的隔离规则：
+同时内置默认策略应为 Agent 子树提供与 App 子树对应的隔离规则：
 
 ```rbac
 p, app, /config/users/*/agents/{app}/settings, read|write, allow
@@ -302,12 +301,12 @@ RBAC 主体大体分为几类：
 
 ### RBAC 配置
 
-`/config/system/rbac/model`、`/config/system/rbac/base_policy`、`/config/system/rbac/policy` 控制系统授权行为。
+`/config/system/rbac/policy` 与 API runtime 内置 RBAC 配置共同控制系统授权行为。
 
 设计原则：
 
-- `model` 和 `base_policy` 是基础规则，一般不在运行期频繁修改。
-- `policy` 是 scheduler 构造结果，应由 scheduler/OOD/kernel 路径维护。
+- model 和稳定角色权限是 API runtime 内置配置，随二进制升级更新。
+- `policy` 是 scheduler 构造的动态尾部，应由 scheduler/OOD/kernel 路径维护。
 - 普通 service 可以读 RBAC，用于本地 enforce；不应直接写。
 - 写 `policy` 等价于改变系统授权结果，必须当作高敏感操作。
 

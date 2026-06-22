@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 jsonwebtoken = { workspace = true }
 # rocksdb = "*"
 buckyos-kit = { workspace = true }
+buckyos-api = { path = "../buckyos-api" }
 name-lib = { workspace = true }
 kRPC = { workspace = true }
 rbac = { workspace = true }
@@ -29,5 +30,4 @@ buckyos-http-server = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
-
 

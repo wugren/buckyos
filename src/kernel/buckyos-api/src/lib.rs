@@ -32,6 +32,7 @@ pub mod network_observation;
 pub mod node_control;
 mod opendan_client;
 mod permission;
+mod rbac_config;
 mod rdb_mgr;
 mod repo_client;
 mod runtime;
@@ -71,6 +72,7 @@ pub use kevent_ringbuffer::*;
 pub use network_observation::*;
 pub use opendan_client::*;
 pub use permission::*;
+pub use rbac_config::*;
 pub use rdb_mgr::*;
 pub use runtime::*;
 

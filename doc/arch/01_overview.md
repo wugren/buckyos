@@ -297,7 +297,7 @@ boot_scheduler():
     fail("already booted")
 
   init_map = build_init_list_by_template(boot_jwt)
-  // includes: boot/config, services/*/spec, system/rbac/{model,base_policy}, verify-hub
+  // includes: boot/config, services/*/spec, system/rbac/policy, verify-hub
   system_config.exec_tx(init_map)
 ```
 

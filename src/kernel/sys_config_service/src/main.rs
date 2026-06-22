@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ::kRPC::*;
+use buckyos_api::build_current_rbac_config;
 use buckyos_http_server::*;
 use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
@@ -734,36 +735,18 @@ async fn handle_refresh_trust_keys() -> Result<Value> {
         error!("Missing BUCKYOS_THIS_DEVICE");
     }
 
-    let rbac_model = store.get("system/rbac/model".to_string()).await;
     let rbac_policy = store.get("system/rbac/policy".to_string()).await;
-    let mut set_rbac = false;
-    if rbac_model.is_ok() && rbac_policy.is_ok() {
-        let rbac_model = rbac_model.unwrap();
-        let rbac_policy = rbac_policy.unwrap();
-        if rbac_model.is_some() && rbac_policy.is_some() {
-            info!(
-                "model config loaded, bytes={}",
-                rbac_model.clone().unwrap().len()
-            );
-            info!(
-                "policy config loaded, bytes={}",
-                rbac_policy.clone().unwrap().len()
-            );
-            rbac::create_enforcer(
-                Some(rbac_model.unwrap().trim()),
-                Some(rbac_policy.unwrap().trim()),
-            )
-            .await
-            .unwrap();
-            set_rbac = true;
-            info!("load rbac model and policy from kv store successfully!");
-        }
-    }
-
-    if !set_rbac {
-        rbac::create_enforcer(None, None).await.unwrap();
-        info!("load rbac model and policy default setting successfully!");
-    }
+    let rbac_policy = rbac_policy.map_err(|err| RPCErrors::ReasonError(err.to_string()))?;
+    let rbac_config = build_current_rbac_config(rbac_policy.as_deref());
+    info!(
+        "rbac config loaded, model_bytes={}, policy_tail_bytes={}, policy_bytes={}",
+        rbac_config.model.len(),
+        rbac_config.policy_tail.len(),
+        rbac_config.policy.len()
+    );
+    rbac::create_enforcer(rbac_config.model.as_str(), rbac_config.policy.as_str())
+        .await
+        .unwrap();
 
     Ok(Value::Null)
 }

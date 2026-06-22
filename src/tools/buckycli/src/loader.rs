@@ -47,7 +47,7 @@ pub async fn load_app_service(app_id: &str, app_service_path: &str) -> Result<()
     let env_key = get_session_token_env_key(app_id, false);
 
     println!(
-        "MAKE SURE {} already in system/rbac/base_policy like g,{},kernel. (You can add it in boot.template.toml)",
+        "MAKE SURE {} is covered by the built-in RBAC policy or system/rbac/policy like g,{},kernel.",
         app_id, app_id
     );
 

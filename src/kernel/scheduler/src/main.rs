@@ -86,18 +86,6 @@ async fn create_init_list_by_template(
         ));
     }
     let mut boot_config: HashMap<String, String> = toml::from_str(&result)?;
-    if !boot_config.contains_key("system/rbac/base_policy") {
-        boot_config.insert(
-            "system/rbac/base_policy".to_string(),
-            rbac::DEFAULT_POLICY.to_string(),
-        );
-    }
-    if !boot_config.contains_key("system/rbac/model") {
-        boot_config.insert(
-            "system/rbac/model".to_string(),
-            rbac::DEFAULT_MODEL.to_string(),
-        );
-    }
 
     let ood_name = zone_boot_config.oods.first().unwrap().name.as_str();
     let mut builder = SystemConfigBuilder::new(boot_config);
@@ -510,67 +498,6 @@ mod test {
         }
     }
 }
-"""
-"system/rbac/base_policy" = """
-p, kernel, /config/*, read|write,allow
-p, kernel, dfs://*, read|write,allow
-p, kernel, ndn://*, read|write,allow
-
-p, root, /config/*, read|write,allow
-p, root, dfs://*, read|write,allow
-p, root, ndn://*, read|write,allow
-
-p, ood,/config/*,read,allow
-p, ood,/config/users/*/apps/*,read|write,allow
-p, ood,/config/users/*/agents/*,read|write,allow
-p, ood,/config/devices/{device}/*,read|write,allow
-p, ood,/config/nodes/{device}/*,read|write,allow
-p, ood,/config/services/*,read|write,allow
-p, ood,/config/system/rbac/policy,read|write,allow
-
-p, client, /config/boot/*, read,allow
-p, client,/config/devices/{device}/*,read,allow
-p, client,/config/devices/{device}/info,read|write,allow
-
-p, service, /config/boot/*, read,allow
-p, service,/config/services/{service}/*,read|write,allow
-p, service,/config/services/*/info,read,allow
-p, service,/config/users*,read,allow
-p, service,/config/users/*/*,read,allow
-p, service,/config/system/*,read,allow
-p, service,dfs://system/data/{service}/*,read|write,allow
-p, service,dfs://system/cache/{service}/*,read|write,allow
-
-p, app, /config/boot/*, read,allow
-p, app, /config/users/*/apps/{app}/settings,read|write,allow
-p, app, /config/users/*/apps/{app}/config,read,allow
-p, app, /config/users/*/apps/{app}/info,read,allow
-p, app, dfs://users/*/appdata/{app}/*, read|write,allow
-p, app, dfs://users/*/cache/{app}/*, read|write,allow
-p, admin, /config/boot/*, read,allow
-p, admin,/config/users/{user}/*,read|write,allow
-p, admin,dfs://users/{user}/*,read|write,allow
-p, admin,/config/services/*,read|write,allow
-p, admin,dfs://library/*,read|write,allow
-p, user, /config/boot/*, read,allow
-p, user,/config/users/{user}/*,read,allow
-p, user,/config/users/{user}/apps/*/*,read|write,allow
-p, user,dfs://users/{user}/*,read|write,allow
-p, user,dfs://users/{user}/home/*,read|write,allow
-p, user,dfs://library/*,read,allow
-
-g, node-daemon, kernel
-g, scheduler, kernel
-g, system-config, kernel
-g, verify-hub, kernel
-g, task-manager, kernel
-g, kmsg, kernel
-g, repo-service, kernel
-g, aicc, kernel
-g, msg-center, kernel
-g, control-panel, kernel
-g, buckycli, kernel
-g, cyfs-gateway, kernel
 """
 "#;
         fs::write(scheduler_dir.join("boot.template.toml"), template).unwrap();

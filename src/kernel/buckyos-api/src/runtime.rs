@@ -39,7 +39,8 @@ use crate::verify_hub_client::*;
 use crate::workflow_service::{WorkflowServiceClient, WORKFLOW_SERVICE_NAME};
 use crate::{
     get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, load_local_device_config,
-    load_local_device_private_key, load_local_node_identity_config, OPENDAN_SERVICE_NAME,
+    load_local_device_private_key, load_local_node_identity_config, RbacConfig,
+    OPENDAN_SERVICE_NAME,
 };
 
 const DEFAULT_NODE_GATEWAY_PORT: u16 = 3180;
@@ -1351,8 +1352,8 @@ impl BuckyOSRuntime {
         if self.runtime_type == BuckyOSRuntimeType::KernelService
             || self.runtime_type == BuckyOSRuntimeType::FrameService
         {
-            let (rbac_model, rbac_policy) = control_panel_client.load_rbac_config().await?;
-            rbac::create_enforcer(Some(rbac_model.as_str()), Some(rbac_policy.as_str()))
+            let rbac_config = self.get_current_rbac_config().await?;
+            rbac::create_enforcer(rbac_config.model.as_str(), rbac_config.policy.as_str())
                 .await
                 .map_err(|error| {
                     RPCErrors::ReasonError(format!("init rbac enforcer failed: {}", error))
@@ -1566,6 +1567,11 @@ impl BuckyOSRuntime {
         Ok(rpc_token)
     }
 
+    pub async fn get_current_rbac_config(&self) -> Result<RbacConfig> {
+        let system_config_client = self.get_system_config_client().await?;
+        crate::load_current_rbac_config(system_config_client.as_ref()).await
+    }
+
     //success return (userid,appid)
     pub async fn enforce(
         &self,
@@ -1627,12 +1633,13 @@ impl BuckyOSRuntime {
             .unwrap_or("kernel");
 
         let system_config_client = self.get_system_config_client().await?;
-        let rbac_policy = system_config_client.get("system/rbac/policy").await;
-        if rbac_policy.is_ok() {
-            let rbac_policy = rbac_policy.unwrap();
-            if rbac_policy.is_changed {
-                rbac::update_enforcer(Some(rbac_policy.value.as_str())).await;
-            }
+        let rbac_config = crate::load_current_rbac_config(system_config_client.as_ref()).await?;
+        if rbac_config.is_changed {
+            rbac::update_enforcer(rbac_config.model.as_str(), rbac_config.policy.as_str())
+                .await
+                .map_err(|error| {
+                    RPCErrors::ReasonError(format!("update rbac enforcer failed: {}", error))
+                })?;
         }
 
         let sudo = decoded_json

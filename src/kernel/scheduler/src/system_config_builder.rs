@@ -479,16 +479,16 @@ impl SystemConfigBuilder {
     }
 
     pub fn append_policy(&mut self, policy: &str) -> Result<&mut Self> {
-        let policy_str = self.entries.get("system/rbac/base_policy");
+        let policy_str = self.entries.get("system/rbac/policy");
         if policy_str.is_none() {
             self.entries
-                .insert("system/rbac/base_policy".to_string(), policy.to_string());
+                .insert("system/rbac/policy".to_string(), policy.to_string());
             return Ok(self);
         }
         let policy_str = policy_str.unwrap();
         let new_policy_str = format!("{}\n{}", policy_str, policy);
         self.entries
-            .insert("system/rbac/base_policy".to_string(), new_policy_str);
+            .insert("system/rbac/policy".to_string(), new_policy_str);
         Ok(self)
     }
 
