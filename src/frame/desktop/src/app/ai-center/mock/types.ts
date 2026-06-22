@@ -132,6 +132,21 @@ export interface ProviderView {
   account: ProviderAccountStatus
 }
 
+export type AiProviderCard = {
+  id: string
+  displayName: string
+  providerType: string
+  status: 'healthy' | 'needs_setup' | 'degraded' | 'planned'
+  endpoint: string
+  authMode: string
+  credentialConfigured?: boolean
+  maskedApiKey?: string
+  availableModels?: string[]
+  capabilities: string[]
+  defaultModel: string
+  note: string
+}
+
 // ========== Usage ==========
 
 export interface UsageEvent {

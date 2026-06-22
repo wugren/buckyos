@@ -2,6 +2,7 @@ import { buckyos } from 'buckyos'
 import { isMockRuntime } from '../runtime'
 import { MockDataStore } from '../app/ai-center/mock/store'
 import type {
+  AiProviderCard,
   AIStatus,
   ApiNamespace,
   ApiType,
@@ -26,7 +27,6 @@ import type {
   ValidationResult,
   WizardDraft,
 } from '../app/ai-center/mock/types'
-import type { AiProviderCard } from './index'
 
 export type {
   AIStatus,
