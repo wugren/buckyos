@@ -288,6 +288,8 @@ request -> verify JWT -> derive UserID -> derive AppID -> locate Resource Path -
 
 对于 `root + kernel` 组合，原则上拥有全部权限。但除该组合外，所有访问均应走标准 RBAC 判定。
 
+RBAC Policy 采用 **pull 模型**：业务服务端每 **30 秒** 从 SystemConfig 定期刷新 Policy。这会带来最长 30 秒的授权传播延迟，是"允许一致性抖动"取舍的一部分（参见 §5.5）。
+
 ### 5.4 系统服务的责任
 
 BuckyOS 并不存在一个完全自动的“硬栅栏”替系统服务完成所有权限隔离。系统服务必须承担以下责任：
@@ -300,6 +302,97 @@ BuckyOS 并不存在一个完全自动的“硬栅栏”替系统服务完成所
 - 不绕过 SystemConfig 中的权限事实源。
 
 这意味着系统安全不仅依赖 Policy 表本身，还依赖各系统服务正确实现拦截逻辑。
+
+### 5.5 Token / Session 生命周期与吊销
+
+VerifyHub 登录成功后签发的不是单个 JWT，而是绑定到同一 **session-id** 的一对令牌（token-pair）：
+
+| 令牌 | TTL | 用途 |
+|---|---|---|
+| Access Token | 15 分钟 | 业务访问；系统服务可离线验签，VerifyHub 短时不可用时仍可用到过期 |
+| Refresh Token | 7 天（device / user / service 当前不区分） | 向 VerifyHub 换取新的 token-pair |
+
+JWT 至少包含 `iss` / `sub` / `aud` / `iat` / `exp` / `kid` / `token_use` / `session_id`，其中 `token_use` 标识 access / refresh / bootstrap，签名算法为 Ed25519（JWT 为 EdDSA）。系统当前不使用 `jti`。
+
+生命周期策略：
+
+- **Refresh Token Rotation**：每次 refresh 返回新的 refresh token，旧的随即作废。
+- **Reuse Detection**：若检测到已作废的 refresh token 再次被使用，视为泄露信号，触发风控（至少要求重新登录，可升级为吊销整个 session）。
+- access 与 refresh 共享同一 session-id；refresh 过程复用 session-id，不生成新的。
+
+吊销以 **session-id 为主键**，VerifyHub 将其标记为无效。吊销的一致性语义直接体现"可用性优先"的取舍：
+
+- **refresh**：强一致，吊销后立即失败。
+- **access token**：若业务服务仅离线验签，吊销到业务侧完全生效存在最长 15 分钟（access TTL）的窗口。
+- 高风险场景可改为调用 VerifyHub 在线校验（introspection），以获得即时吊销效果。
+
+> 设计前提：BuckyOS 作为 NetworkOS 在安全与可用性之间明确取舍——允许 VerifyHub 短时不可用（access token 离线验签兜底），允许配置 / 授权传播延迟（如 RBAC 30 秒刷新）。单个 OOD 节点损坏不应导致 VerifyHub 永久不可用，因此其私钥存于 SystemConfig 高安全区以便在另一节点拉起。
+
+### 5.6 Service 启动换票（bootstrap JWT）
+
+System Service / App Service 启动时如何获得自己的身份令牌？BuckyOS 采用 **hosting device 背书 + 短时一次性 bootstrap JWT** 的方案，而不是让 service 自证身份：
+
+1. service 的运行授权由其所在 Node / OOD（hosting device）背书。
+2. hosting device 用 **device 私钥** 签发一枚短时一次性 bootstrap JWT，通过 ENV 注入给 service。
+3. service 用该 bootstrap JWT 调用 `VerifyHub.login_by_jwt` 换取长期 token-pair，之后周期性 refresh。
+
+bootstrap JWT 规范：
+
+- 签名者：hosting device 私钥；`iss = $devicename`
+- `aud = verify-hub`，`token_use = bootstrap`
+- exp 极短（远小于 refresh TTL）
+- `nonce`：随机一次性值，用于防重放
+- `target_service_id`：目标服务标识，与 Scheduler 构造的 stream URL 中 target service id 对齐
+
+VerifyHub 换票（`login_by_jwt`）校验：
+
+```text
+1. 基础 JWT 校验：exp / iat / aud / token_use
+2. device 身份：从 SystemConfig 读取 device 公钥与状态（kv://nodes/$devicename/config），验签并校验状态
+3. nonce 防重放：检查 (iss, nonce) 是否已用；去重记录 TTL 需覆盖 bootstrap 有效期 + clock skew
+4. service 运行授权：从 SystemConfig / NodeConfig 读取该 device 允许运行的 service allowlist / 策略，
+   校验 target_service_id 在授权范围内
+```
+
+校验通过后签发 token-pair。该方案的安全意义是：**device 自签 token 不作为业务服务的常规访问凭证**，service 必须经 VerifyHub 背书换票，降低单节点被攻破后的横向扩散风险（与 §4.4 Device Key、§5.2 AppID 呼应）。
+
+### 5.7 sudo：用户自签特权主体
+
+§3.1 提到"管理员需要时可以提权，但默认日常使用应接近普通用户态"。其落地机制是 **sudo token**——由 user 用自己的私钥（而非 VerifyHub）签名的 session token：
+
+- 业务服务（api-runtime）常规只信任 zone-owner / VerifyHub 签名的 token；sudo 是 api-runtime 中的**特例路径**。
+- 用户可声明 `sub = su_alice`；服务端从 SystemConfig 读取 alice 公钥（kv://users/alice/config）验签，并要求 `su_alice` 的签名公钥必须来自 `alice` 的配置（持钥即授权，不引入二次交互验证）。
+
+由于 RBAC 表达式 `kv://users/{user}/*` 无法覆盖 `su_alice` 这类主体，sudo 采用显式规则：
+
+```rbac
+p, su_alice, kv://users/alice/key_settings, read|write, allow
+g, alice, admin
+g, su_alice, sudo
+```
+
+api-runtime 识别到 `su_` 前缀时的授权流程：
+
+```text
+1. 验签 sudo token（从 kv://users/{alice}/config 取公钥）
+2. 先以普通主体 alice 执行 enforce
+3. 若失败，再以 su_alice 执行 enforce（仅在显式授权范围内放行）
+```
+
+该路径不改变"业务服务常规仅信任 zone-owner / VerifyHub 签名 token"的总体信任域。
+
+### 5.8 信任矩阵（摘要）
+
+| 校验者 | 接受的签名者 / 公钥 | 用途 |
+|---|---|---|
+| SystemConfig | ENV 注入的当前 device pubkey（自举期） | boot / self-host bring-up |
+| SystemConfig | zone-owner pubkey（BootConfig） | root 管理能力 |
+| SystemConfig | VerifyHub pubkey（BootConfig） | 常规系统操作与统一登录体系 |
+| VerifyHub | device pubkey（SystemConfig: kv://nodes/$devicename/config） | device 登录、service bootstrap 背书 |
+| VerifyHub | user pubkey（SystemConfig: kv://users/$user/config） | JWT-based user 证明场景（sudo 不走 VerifyHub） |
+| 业务 Service (api-runtime) | VerifyHub pubkey（BootConfig） | 常规业务 access / refresh token 验签 |
+| 业务 Service (api-runtime) | zone-owner pubkey（BootConfig） | root 级 token 验签 |
+| 业务 Service (api-runtime) | user pubkey（SystemConfig: kv://users/.../config） | sudo 特例路径 |
 
 ---
 
@@ -390,6 +483,28 @@ Node 启动
 
 当 Node 成功读取 BootConfig 后，才算真正进入 Zone 并可贡献物理资源。
 
+### 7.4 Boot 阶段自举（首个 OOD 与 Scheduler）
+
+§7.3 描述的是 Node 加入**已存在** Zone 的通用流程。Zone 首次 bring-up（首个 OOD）还有一段信任自举链路：
+
+```text
+OOD 启动 SystemConfig
+  -> ENV 注入当前 device 公钥，作为 SystemConfig 的初始 trust key（自举用，打破循环依赖）
+OOD 启动 Scheduler
+  -> ENV 注入一枚由 device 私钥签名的 session-token
+Scheduler
+  -> 用该 session-token 通过鉴权，完成首次 SystemConfig 写入（初始调度结果 + 配置）
+SystemConfig
+  -> 持久化到 kv://（OOD 集群，规模 2n+1 的一致性存储）
+```
+
+由此，SystemConfig 的 trust key 有两类来源：
+
+- **自举期**：ENV 注入的当前 device 公钥。
+- **稳定态**：BootConfig 中的 zone-owner 公钥与 VerifyHub 公钥。
+
+> SystemConfig 底层是类似 etcd 的一致性存储（`kv://`），仅运行在 OOD 集群上。VerifyHub 私钥存于 `kv://secrt/` 高安全区，正是为了在单个 OOD 节点损坏后能在另一节点重新拉起 VerifyHub（参见 §5.5 的可用性前提）。
+
 ---
 
 ## 8. Gateway 安全模型
@@ -453,6 +568,8 @@ SystemConfig 是最关键的内核组件之一。其安全风险分为两类。
 如果攻击者能修改 RBAC Policy，就可以给自己或恶意 App 注入最高权限。此时整个权限系统会失效。
 
 因此，RBAC Policy 的写权限必须严格限制在 Root / Administrator / Kernel 可信路径中。
+
+**稳定态判定与写权限收口（实现现状）**：现行约定是只要 BootConfig 存在，即认为系统处于稳定态。目标策略是在稳定态限制 device-key 仅 read（或受限写），敏感写（RBAC、信任根、关键配置）仅 root / VerifyHub 可执行。**该写限制当前尚未实现，是高优先级加固点**。此外 `kv://boot/config` 仅 boot 阶段可写、运行态仅 root 可写——具备其写权限即等价于系统最高权限（Root of Trust）。
 
 ### 9.2 读权限风险
 

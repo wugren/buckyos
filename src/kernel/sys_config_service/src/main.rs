@@ -33,6 +33,8 @@ use sled_provider::SledStore;
 
 use crate::zone_did_resolver::ZoneDidResolver;
 
+const SYS_CONFIG_URI_PERFIX: &str = "obj://config/";
+
 lazy_static! {
     static ref TRUST_KEYS: Arc<Mutex<HashMap<String, DecodingKey>>> = {
         let hashmap: HashMap<String, DecodingKey> = HashMap::new();
@@ -47,27 +49,24 @@ lazy_static! {
 
 const INTERNAL_META_PREFIX: &str = "__meta/";
 
+fn strip_config_key_prefix(key_path: &str) -> &str {
+    let mut key = key_path.trim_start_matches(SYS_CONFIG_URI_PERFIX);
+    if key.starts_with("/config/") {
+        key = &key[8..];
+    }
+    key.trim_start_matches('/').trim_start_matches('\\')
+}
+
 fn is_internal_meta_key(key_path: &str) -> bool {
-    let key = key_path
-        .trim_start_matches("/config/")
-        .trim_start_matches('/')
-        .trim_start_matches('\\');
-    key.starts_with(INTERNAL_META_PREFIX)
+    strip_config_key_prefix(key_path).starts_with(INTERNAL_META_PREFIX)
 }
 
 fn get_full_res_path(key_path: &str) -> Result<(String, String)> {
-    let mut real_key_path = key_path;
-    if key_path.starts_with("/config/") {
-        real_key_path = &key_path[8..];
-    }
-
-    let key = real_key_path
-        .trim_start_matches('/')
-        .trim_start_matches('\\');
+    let key = strip_config_key_prefix(key_path);
     let normalized_path = normalize_path(key);
 
     return Ok((
-        format!("/config/{}", normalized_path.as_str()),
+        format!("{}{}", SYS_CONFIG_URI_PERFIX, normalized_path),
         normalized_path,
     ));
 }
@@ -463,7 +462,10 @@ async fn handle_set_by_json_path(params: Value, session_token: &RPCSessionToken)
 }
 
 fn should_reload_security_state(full_res_path: &str) -> bool {
-    full_res_path == "/config/boot/config" || full_res_path.starts_with("/config/system/rbac/")
+    if let Some(key) = full_res_path.strip_prefix(SYS_CONFIG_URI_PERFIX) {
+        return key == "boot/config" || key.starts_with("system/rbac/");
+    }
+    false
 }
 
 async fn handle_exec_tx(params: Value, session_token: &RPCSessionToken) -> Result<Value> {
@@ -1268,6 +1270,51 @@ mod test {
             require_session_identity(&valid).unwrap(),
             ("alice", "control-panel")
         );
+    }
+
+    #[test]
+    fn get_full_res_path_builds_config_uri_and_storage_key() {
+        assert_eq!(
+            get_full_res_path("users/alice/settings").unwrap(),
+            (
+                "obj://config/users/alice/settings".to_string(),
+                "users/alice/settings".to_string()
+            )
+        );
+        assert_eq!(
+            get_full_res_path("/config/system/rbac/policy").unwrap(),
+            (
+                "obj://config/system/rbac/policy".to_string(),
+                "system/rbac/policy".to_string()
+            )
+        );
+        assert_eq!(
+            get_full_res_path("obj://config/boot/config").unwrap(),
+            (
+                "obj://config/boot/config".to_string(),
+                "boot/config".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn security_state_reload_uses_config_uri() {
+        assert!(should_reload_security_state("obj://config/boot/config"));
+        assert!(should_reload_security_state(
+            "obj://config/system/rbac/policy"
+        ));
+        assert!(!should_reload_security_state("/config/system/rbac/policy"));
+        assert!(!should_reload_security_state(
+            "obj://config/users/alice/settings"
+        ));
+    }
+
+    #[test]
+    fn internal_meta_key_accepts_config_uri() {
+        assert!(is_internal_meta_key("obj://config/__meta/revision"));
+        assert!(is_internal_meta_key("/config/__meta/revision"));
+        assert!(is_internal_meta_key("/__meta/revision"));
+        assert!(!is_internal_meta_key("obj://config/users/__meta/revision"));
     }
 
     #[allow(dead_code)]

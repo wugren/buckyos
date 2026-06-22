@@ -42,6 +42,7 @@ RBAC 目标语义是：
 
 这就是 RBAC 的基本交集模型：请求必须同时满足 AppID 权限和 UserID/DeviceID 权限。`appid == "kernel"` 不应成为跳过 `userid` 检查的例外，因为所有设备上都有 node-daemon，且 node-daemon 的 AppID 都是 `kernel`。如果不看 `userid=device_id`，OOD、普通 Node、Client Device、Sensor 上的内核行为就无法隔离。
 
+
 ## 策略文件
 
 - `system/rbac/model`：RBAC 模型，默认来自 `rbac::DEFAULT_MODEL`。
@@ -66,7 +67,27 @@ g, system-config, kernel
 
 因此 `base_policy` 应主要表达稳定的角色权限，`policy` 则是 base policy 加上当前系统里真实用户、节点、服务之后的结果。
 
+
+
 ## 主要资源的路径
+
+> 从Agent的万能read开始考虑
+
+资源有各个系统服务提供，用路表达
+
+- /config/*
+- /kmsgqueue/* 
+- /task_mgr/* 由task-mgr提供的task资源，目前该服务有基于自己业务逻辑的权限管理
+- /msg_center/$userid/
+- kevent 不独立配置，完全看相关对象的res_path 
+
+
+下面的是规划中未完整实现的
+- /workflow/*
+- /data/ dfs文件系统路径
+- /ndn/*
+- /$objid/? 用对象模型来统一管理 对象的属性方法和事件？，比如有taskxxx的权限，就自动得到了其kevent权限？
+
 
 
 

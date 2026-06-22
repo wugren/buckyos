@@ -139,6 +139,7 @@ Object DID 是对象身份：
 did:web:myhome.com:devices:cam01
 did:web:agent.booking.com:objects:stay-offer:abc123
 did:bns:myhome:devices:cam01
+did:bns:$named_objid.myhome
 ```
 
 Gateway / Resolver 层可以依赖 DID Object Resolver。协议目标允许输入 Object URL 或 DID：
