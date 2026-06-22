@@ -1641,7 +1641,7 @@ impl BuckyOSRuntime {
             .unwrap_or(false)
             .then(|| rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(userid)));
 
-        let result = rbac::enforce(userid, Some(appid), resource_path, action, sudo).await;
+        let result = rbac::enforce(userid, appid, resource_path, action, sudo).await;
         if !result {
             return Err(RPCErrors::NoPermission(format!(
                 "enforce failed,userid:{},appid:{},resource:{},action:{}",

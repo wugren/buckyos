@@ -82,6 +82,20 @@ fn get_sudo_mode(session_token: &RPCSessionToken, userid: &str) -> Option<SudoMo
     }
 }
 
+fn require_session_identity(session_token: &RPCSessionToken) -> Result<(&str, &str)> {
+    let userid = session_token
+        .sub
+        .as_deref()
+        .filter(|userid| !userid.trim().is_empty())
+        .ok_or_else(|| RPCErrors::ParseRequestError("Missing userid".to_string()))?;
+    let appid = session_token
+        .appid
+        .as_deref()
+        .filter(|appid| !appid.trim().is_empty())
+        .ok_or_else(|| RPCErrors::ParseRequestError("Missing appid".to_string()))?;
+    Ok((userid, appid))
+}
+
 async fn handle_get(params: Value, session_token: &RPCSessionToken) -> Result<Value> {
     let key = params.get("key");
     if key.is_none() {
@@ -101,12 +115,7 @@ async fn handle_get(params: Value, session_token: &RPCSessionToken) -> Result<Va
         ));
     }
 
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
-
-    let appid = session_token.appid.as_deref().unwrap_or("kernel");
+    let (userid, appid) = require_session_identity(session_token)?;
 
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     info!(
@@ -115,7 +124,7 @@ async fn handle_get(params: Value, session_token: &RPCSessionToken) -> Result<Va
     );
     let is_allowed = enforce(
         userid,
-        Some(appid),
+        appid,
         full_res_path.as_str(),
         "read",
         get_sudo_mode(session_token, userid),
@@ -162,14 +171,11 @@ async fn handle_set(params: Value, session_token: &RPCSessionToken) -> Result<Va
     }
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "write",
         get_sudo_mode(session_token, userid),
@@ -178,9 +184,7 @@ async fn handle_set(params: Value, session_token: &RPCSessionToken) -> Result<Va
     {
         warn!(
             "set denied: appid={} userid={} key={}",
-            session_token.appid.as_deref().unwrap_or("kernel"),
-            userid,
-            full_res_path
+            appid, userid, full_res_path
         );
         return Err(RPCErrors::NoPermission(format!(
             "No write permission for key: {}",
@@ -229,14 +233,11 @@ async fn handle_create(params: Value, session_token: &RPCSessionToken) -> Result
     }
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "write",
         get_sudo_mode(session_token, userid),
@@ -245,9 +246,7 @@ async fn handle_create(params: Value, session_token: &RPCSessionToken) -> Result
     {
         warn!(
             "create denied: appid={} userid={} key={}",
-            session_token.appid.as_deref().unwrap_or("kernel"),
-            userid,
-            full_res_path
+            appid, userid, full_res_path
         );
         return Err(RPCErrors::NoPermission(format!(
             "No write permission for key: {}",
@@ -291,14 +290,11 @@ async fn handle_delete(params: Value, session_token: &RPCSessionToken) -> Result
     }
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "write",
         get_sudo_mode(session_token, userid),
@@ -307,9 +303,7 @@ async fn handle_delete(params: Value, session_token: &RPCSessionToken) -> Result
     {
         warn!(
             "delete denied: appid={} userid={} key={}",
-            session_token.appid.as_deref().unwrap_or("kernel"),
-            userid,
-            full_res_path
+            appid, userid, full_res_path
         );
         return Err(RPCErrors::NoPermission(format!(
             "No write permission for key: {}",
@@ -357,14 +351,11 @@ async fn handle_append(params: Value, session_token: &RPCSessionToken) -> Result
     }
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "write",
         get_sudo_mode(session_token, userid),
@@ -373,9 +364,7 @@ async fn handle_append(params: Value, session_token: &RPCSessionToken) -> Result
     {
         warn!(
             "append denied: appid={} userid={} key={}",
-            session_token.appid.as_deref().unwrap_or("kernel"),
-            userid,
-            full_res_path
+            appid, userid, full_res_path
         );
         return Err(RPCErrors::NoPermission(format!(
             "No write permission for key: {}",
@@ -434,14 +423,11 @@ async fn handle_set_by_json_path(params: Value, session_token: &RPCSessionToken)
     let json_path = json_path.as_str().unwrap();
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "write",
         get_sudo_mode(session_token, userid),
@@ -450,9 +436,7 @@ async fn handle_set_by_json_path(params: Value, session_token: &RPCSessionToken)
     {
         warn!(
             "set_by_json_path denied: appid={} userid={} key={}",
-            session_token.appid.as_deref().unwrap_or("kernel"),
-            userid,
-            full_res_path
+            appid, userid, full_res_path
         );
         return Err(RPCErrors::NoPermission(format!(
             "No write permission for key: {}",
@@ -496,11 +480,7 @@ async fn handle_exec_tx(params: Value, session_token: &RPCSessionToken) -> Resul
     }
 
     // Check access control for all keys
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
-    let appid = session_token.appid.as_deref().unwrap_or("kernel");
+    let (userid, appid) = require_session_identity(session_token)?;
 
     let mut tx_actions = HashMap::new();
     let mut need_reload_security_state = false;
@@ -516,7 +496,7 @@ async fn handle_exec_tx(params: Value, session_token: &RPCSessionToken) -> Resul
         let (full_res_path, real_key_path) = get_full_res_path(key)?;
         if !enforce(
             userid,
-            session_token.appid.as_deref(),
+            appid,
             full_res_path.as_str(),
             "write",
             get_sudo_mode(session_token, userid),
@@ -638,20 +618,15 @@ async fn handle_list(params: Value, session_token: &RPCSessionToken) -> Result<V
     }
 
     //check access control
-    if session_token.sub.is_none() {
-        return Err(RPCErrors::NoPermission("No sub(userid)".to_string()));
-    }
-    let userid = session_token.sub.as_ref().unwrap();
+    let (userid, appid) = require_session_identity(session_token)?;
     let (full_res_path, real_key_path) = get_full_res_path(key)?;
     info!(
         "full_res_path: {},userid: {},appid: {}",
-        full_res_path,
-        userid,
-        session_token.appid.as_deref().unwrap()
+        full_res_path, userid, appid
     );
     if !enforce(
         userid,
-        session_token.appid.as_deref(),
+        appid,
         full_res_path.as_str(),
         "read",
         get_sudo_mode(session_token, userid),
@@ -795,7 +770,7 @@ async fn dump_configs_for_scheduler(
     _params: Value,
     session_token: &RPCSessionToken,
 ) -> Result<Value> {
-    let appid = session_token.appid.as_deref().unwrap();
+    let (_userid, appid) = require_session_identity(session_token)?;
     if appid != "scheduler" && appid != "node-daemon" {
         return Err(RPCErrors::NoPermission("No permission".to_string()));
     }
@@ -889,6 +864,7 @@ impl SystemConfigServer {
                     return dump_configs_for_scheduler(param, &rpc_session_token).await;
                 }
                 "sys_refresh_trust_keys" => {
+                    let _ = require_session_identity(&rpc_session_token)?;
                     return handle_refresh_trust_keys().await;
                 }
                 // Add more methods here
@@ -1245,6 +1221,55 @@ mod test {
     use tokio::{task, time::sleep};
 
     use super::*;
+
+    fn test_session_token(sub: Option<&str>, appid: Option<&str>) -> RPCSessionToken {
+        RPCSessionToken {
+            sub: sub.map(|value| value.to_string()),
+            appid: appid.map(|value| value.to_string()),
+            exp: None,
+            token_type: RPCSessionTokenType::Normal,
+            token: None,
+            iss: None,
+            jti: None,
+            aud: None,
+            sudo: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn require_session_identity_rejects_missing_or_blank_fields() {
+        let missing_userid = test_session_token(None, Some("test"));
+        assert!(matches!(
+            require_session_identity(&missing_userid),
+            Err(RPCErrors::ParseRequestError(message)) if message == "Missing userid"
+        ));
+
+        let blank_userid = test_session_token(Some("  "), Some("test"));
+        assert!(matches!(
+            require_session_identity(&blank_userid),
+            Err(RPCErrors::ParseRequestError(message)) if message == "Missing userid"
+        ));
+
+        let missing_appid = test_session_token(Some("alice"), None);
+        assert!(matches!(
+            require_session_identity(&missing_appid),
+            Err(RPCErrors::ParseRequestError(message)) if message == "Missing appid"
+        ));
+
+        let blank_appid = test_session_token(Some("alice"), Some(""));
+        assert!(matches!(
+            require_session_identity(&blank_appid),
+            Err(RPCErrors::ParseRequestError(message)) if message == "Missing appid"
+        ));
+
+        let valid = test_session_token(Some("alice"), Some("control-panel"));
+        assert_eq!(
+            require_session_identity(&valid).unwrap(),
+            ("alice", "control-panel")
+        );
+    }
+
     #[allow(dead_code)]
     //#[tokio::test(flavor = "current_thread")]
     async fn test_server_interface() {
