@@ -26,6 +26,7 @@ import type {
   ValidationResult,
   WizardDraft,
 } from '../app/ai-center/mock/types'
+import type { AiProviderCard } from './index'
 
 export type {
   AIStatus,
@@ -125,6 +126,8 @@ interface RawProviderInventory {
 
 interface RawModelMetadata {
   provider_model_id?: unknown
+  provider_actual_model_id?: unknown
+  provider_options?: unknown
   exact_model?: unknown
   model_driver?: unknown
   parameter_scale?: unknown
@@ -205,6 +208,7 @@ interface AiccDataProvider {
   addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
   setProviderWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
   getUsageSummary(): UsageSummary
@@ -221,6 +225,7 @@ export interface AICCMgr {
   addProvider(draft: WizardDraft): Promise<ProviderView>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
   setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
 }
@@ -262,15 +267,18 @@ export class AICCModelStore implements AICCMgr {
   async addProvider(draft: WizardDraft): Promise<ProviderView> {
     const nextDraft = withProviderInstanceName(draft, this.snapshot)
     await this.provider.addProvider(nextDraft)
-    await this.refresh()
     const providerInstanceName = nextDraft.provider_instance_name
-    const provider = this.snapshot.providers.find((item) =>
-      item.config.provider_instance_name === providerInstanceName,
-    )
-    if (!provider) {
-      throw new Error('aicc.provider_add_not_reflected')
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await this.refresh()
+      const provider = this.snapshot.providers.find((item) =>
+        item.config.provider_instance_name === providerInstanceName,
+      )
+      if (provider) {
+        return provider
+      }
+      await delay(250)
     }
-    return provider
+    throw new Error('aicc.provider_add_not_reflected')
   }
 
   async deleteProvider(id: string): Promise<void> {
@@ -280,6 +288,11 @@ export class AICCModelStore implements AICCMgr {
 
   async refreshProviderModels(id: string): Promise<void> {
     await this.provider.refreshProviderModels(id)
+    await this.refresh()
+  }
+
+  async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
+    await this.provider.updateProviderKey(provider, apiKey)
     await this.refresh()
   }
 
@@ -327,6 +340,10 @@ class MockAiccProvider implements AiccDataProvider {
 
   async refreshProviderModels(id: string): Promise<void> {
     this.store.refreshProviderModels(id)
+  }
+
+  async updateProviderKey(provider: ProviderView, _apiKey: string): Promise<void> {
+    this.store.updateProviderKey(provider.config.id)
   }
 
   async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
@@ -383,7 +400,6 @@ class BuckyOSAiccProvider implements AiccDataProvider {
         time_range: { kind: 'last30d' },
         filters: {},
         output_mode: 'events',
-        limit: 50,
       }),
       this.queryUsage({
         time_range: { kind: 'last1d' },
@@ -396,26 +412,39 @@ class BuckyOSAiccProvider implements AiccDataProvider {
         output_mode: 'summary',
       }),
     ])
+    const convertedUsageEvents = toUsageEvents(usageEvents)
     this.usageSummary = toUsageSummary({
       byModel: usageByModel,
       byCapability: usageByCapability,
       byApp: usageByApp,
       lastDay: usageLastDay,
       thisMonth: usageThisMonth,
+      usageEvents: convertedUsageEvents,
     })
-    this.usageTrend = toUsageTrend(usageTrend)
+    this.usageTrend = toUsageTrend(usageTrend, convertedUsageEvents)
     const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
-    return toStoreSnapshot(directory, rawProviders, toUsageEvents(usageEvents))
+    return toStoreSnapshot(directory, rawProviders, convertedUsageEvents)
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
     const validation = await this.validateConnection(draft)
     if (!validation.auth_valid || !validation.endpoint_reachable) {
-      throw new Error(validation.errors[0] ?? 'aicc.provider_validation_failed')
+      throw new Error(validation.error_details?.[0]?.message ?? validation.errors[0] ?? 'aicc.provider_validation_failed')
     }
-    const result = await this.call<{ ok?: unknown }>('provider.add', toProviderWritePayload(draft))
+    const result = await this.call<{
+      ok?: unknown
+      reason?: unknown
+      error?: unknown
+      reload?: { ok?: unknown; error?: unknown; reason?: unknown }
+    }>('provider.add', toProviderWritePayload(draft))
     if (result.ok !== true) {
-      throw new Error('aicc.provider_add_failed')
+      throw new Error(asNonEmptyString(result.reason, asNonEmptyString(result.error, 'aicc.provider_add_failed')))
+    }
+    if (result.reload?.ok === false) {
+      throw new Error(asNonEmptyString(
+        result.reload.error,
+        asNonEmptyString(result.reload.reason, 'aicc.provider_reload_failed'),
+      ))
     }
   }
 
@@ -432,6 +461,21 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     await this.call('provider.refresh_models', {
       provider_instance_name: id,
     })
+  }
+
+  async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
+    const result = await this.callControlPanel<{ provider?: unknown; ok?: unknown; reason?: unknown }>('ai.provider.set', {
+      provider: toAiProviderCard(provider),
+      api_key: apiKey.trim(),
+    })
+    if (result.ok === false) {
+      throw new Error(asNonEmptyString(result.reason, 'aicc.provider_key_update_failed'))
+    }
+    const reload = await this.callControlPanel<{ ok?: unknown; result?: { ok?: unknown }; reason?: unknown }>('ai.reload', {})
+    if (reload.ok === false || reload.result?.ok === false) {
+      throw new Error(asNonEmptyString(reload.reason, 'aicc.provider_reload_failed'))
+    }
+    await this.refreshProviderModels(provider.config.id)
   }
 
   async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
@@ -452,6 +496,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       models_discovered: toStringArray(result.models_discovered),
       balance_available: asBoolean(result.balance_available, false),
       errors: toStringArray(result.errors),
+      error_details: toValidationErrorDetails(result.error_details, result.errors),
     }
   }
 
@@ -517,6 +562,10 @@ function withProviderInstanceName(draft: WizardDraft, snapshot: StoreSnapshot): 
   return { ...draft, provider_instance_name: candidate }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function defaultProviderInstanceName(providerType: ProviderType, name: string): string {
   switch (providerType) {
     case 'sn_router': return 'sn-ai-provider-main'
@@ -542,10 +591,32 @@ function defaultProviderEndpoint(providerType: ProviderType | null): string {
   switch (providerType) {
     case 'sn_router': return 'https://sn.buckyos.ai/api/v1/ai/'
     case 'openai': return 'https://api.openai.com/v1'
-    case 'anthropic': return 'https://api.anthropic.com'
+    case 'anthropic': return 'https://api.anthropic.com/v1'
     case 'google': return 'https://generativelanguage.googleapis.com/v1beta'
     case 'openrouter': return 'https://openrouter.ai/api/v1'
     default: return ''
+  }
+}
+
+function toAiProviderCard(provider: ProviderView): AiProviderCard {
+  const { config, status } = provider
+  const defaultModel = status.discovered_models[0]?.provider_model_id ?? ''
+  return {
+    id: config.provider_instance_name,
+    displayName: config.name,
+    providerType: config.provider_type,
+    status: status.auth_status === 'invalid'
+      ? 'needs_setup'
+      : status.model_sync_status === 'failed' || status.auth_status === 'expired'
+        ? 'degraded'
+        : 'healthy',
+    endpoint: config.endpoint ?? '',
+    authMode: config.auth_mode ?? 'api_key',
+    credentialConfigured: true,
+    availableModels: status.discovered_models.map((model) => model.provider_model_id),
+    capabilities: Array.from(new Set(status.discovered_models.flatMap((model) => model.api_types))),
+    defaultModel,
+    note: '',
   }
 }
 
@@ -580,6 +651,7 @@ function toUsageSummary(raw: {
   byApp: RawUsageQueryResponse
   lastDay: RawUsageQueryResponse
   thisMonth: RawUsageQueryResponse
+  usageEvents: StoreSnapshot['usageEvents']
 }): UsageSummary {
   const total = raw.byModel.total ?? {}
   const byModel: Record<string, number> = {}
@@ -613,6 +685,7 @@ function toUsageSummary(raw: {
     by_api_namespace: byApiNamespace,
     total_tokens: aggregateTokens(total),
     total_requests: asNumber(total.total_requests, 0),
+    total_estimated_cost: aggregateUsageFinanceCost(raw.usageEvents),
     today_tokens: aggregateTokens(raw.lastDay.total),
     this_month_tokens: aggregateTokens(raw.thisMonth.total),
     by_provider: byProvider,
@@ -656,12 +729,18 @@ function providerInstanceFromExactModel(model: string): string | undefined {
   return model.slice(at + 1)
 }
 
-function toUsageTrend(raw: RawUsageQueryResponse): UsageTrendPoint[] {
+function toUsageTrend(raw: RawUsageQueryResponse, usageEvents: StoreSnapshot['usageEvents']): UsageTrendPoint[] {
   const buckets = Array.isArray(raw.buckets) ? raw.buckets : []
+  const costByDate = usageEvents.reduce<Record<string, number>>((acc, event) => {
+    const date = event.timestamp.slice(0, 10)
+    acc[date] = (acc[date] ?? 0) + usageFinanceAmount(event)
+    return acc
+  }, {})
+
   return buckets.map((bucket) => ({
     timestamp: new Date(asNumber(bucket.bucket_start_ms, 0)).toISOString().slice(0, 10),
     tokens: aggregateTokens(bucket.aggregate),
-    estimated_cost: 0,
+    estimated_cost: Number((costByDate[new Date(asNumber(bucket.bucket_start_ms, 0)).toISOString().slice(0, 10)] ?? 0).toFixed(4)),
   }))
 }
 
@@ -689,6 +768,7 @@ function toUsageEvents(raw: RawUsageQueryResponse): StoreSnapshot['usageEvents']
       tokens_out: tokensOut,
       token_equivalent: tokenEquivalent,
       estimated_cost: estimatedCost(event.finance_snapshot_json),
+      finance_snapshot: toUsageFinanceSnapshot(event.finance_snapshot_json),
       status: 'success',
     }
   })
@@ -711,8 +791,33 @@ function capabilityToApiType(value: string): ApiType {
 }
 
 function estimatedCost(value: unknown): number | undefined {
+  return toUsageFinanceSnapshot(value)?.amount
+}
+
+function toUsageFinanceSnapshot(value: unknown): StoreSnapshot['usageEvents'][number]['finance_snapshot'] {
   const snapshot = asRecord(value)
-  return asOptionalNumber(snapshot.amount)
+  const amount = asOptionalNumber(snapshot.amount)
+  const currency = asOptionalString(snapshot.currency)
+  const providerTraceId = asOptionalString(snapshot.provider_trace_id)
+
+  if (amount == null && currency == null && providerTraceId == null && snapshot.billing == null) {
+    return undefined
+  }
+
+  return {
+    amount,
+    currency,
+    provider_trace_id: providerTraceId,
+    billing: snapshot.billing,
+  }
+}
+
+function usageFinanceAmount(event: StoreSnapshot['usageEvents'][number]): number {
+  return event.finance_snapshot?.amount ?? 0
+}
+
+function aggregateUsageFinanceCost(events: StoreSnapshot['usageEvents']): number {
+  return Number(events.reduce((sum, event) => sum + usageFinanceAmount(event), 0).toFixed(2))
 }
 
 function aggregateTokens(raw?: RawUsageAggregate): number {
@@ -847,6 +952,8 @@ function toModelMetadata(
 
   return {
     provider_model_id: providerModelId,
+    provider_actual_model_id: asOptionalString(raw.provider_actual_model_id),
+    provider_options: raw.provider_options,
     exact_model: exactModel,
     model_driver: asNonEmptyString(raw.model_driver, providerDriver),
     parameter_scale: asOptionalString(raw.parameter_scale),
@@ -1368,6 +1475,39 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : []
+}
+
+function toValidationErrorDetails(
+  value: unknown,
+  fallbackErrors: unknown,
+): ValidationResult['error_details'] {
+  if (Array.isArray(value)) {
+    const details = value
+      .map((item) => {
+        const record = asRecord(item)
+        const kind = asOptionalString(record.kind)
+        const message = asOptionalString(record.message)
+        if (
+          !message ||
+          (kind !== 'endpoint' && kind !== 'auth' && kind !== 'models')
+        ) {
+          return null
+        }
+        return { kind, message }
+      })
+      .filter((item): item is NonNullable<ValidationResult['error_details']>[number] => item !== null)
+    if (details.length > 0) return details
+  }
+
+  return toStringArray(fallbackErrors).map((message) => {
+    const lower = message.toLowerCase()
+    const kind = lower.includes('api_key') || lower.includes('auth') || lower.includes('token')
+      ? 'auth'
+      : lower.includes('endpoint') || lower.includes('url') || lower.includes('connect')
+        ? 'endpoint'
+        : 'models'
+    return { kind, message }
+  })
 }
 
 function asNumberRecord(value: unknown): Record<string, number> {

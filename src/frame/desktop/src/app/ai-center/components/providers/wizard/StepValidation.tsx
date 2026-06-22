@@ -27,6 +27,9 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
   ])
   const [models, setModels] = useState<string[]>([])
 
+  const detailFor = (result: ValidationResult, kind: 'endpoint' | 'auth' | 'models') =>
+    result.error_details?.find((item) => item.kind === kind)?.message
+
   useEffect(() => {
     let cancelled = false
     const timers: number[] = []
@@ -43,6 +46,7 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
               ? t('aiCenter.wizard.endpointOk', 'Endpoint reachable')
               : t('aiCenter.wizard.endpointFail', 'Endpoint not reachable'),
             status: result.endpoint_reachable ? 'ok' as const : 'error' as const,
+            detail: detailFor(result, 'endpoint'),
           }),
         },
         {
@@ -54,6 +58,7 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
               ? t('aiCenter.wizard.authOk', 'Authentication valid')
               : t('aiCenter.wizard.authFail', 'Authentication failed'),
             status: result.auth_valid ? 'ok' as const : 'error' as const,
+            detail: detailFor(result, 'auth'),
           }),
         },
         {
@@ -62,7 +67,8 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
           update: (): CheckItem => ({
             key: 'models',
             label: t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
-            status: result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
+            status: detailFor(result, 'models') ? 'error' as const : result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
+            detail: detailFor(result, 'models'),
           }),
         },
         {
@@ -106,6 +112,10 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
         models_discovered: [],
         balance_available: false,
         errors: [error instanceof Error ? error.message : 'Validation failed'],
+        error_details: [{
+          kind: 'endpoint',
+          message: error instanceof Error ? error.message : 'Validation failed',
+        }],
       }
       setChecks((prev) => prev.map((item) => ({ ...item, status: 'error' as const })))
       onResult(result)
@@ -138,14 +148,21 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
   return (
     <div className="flex flex-col gap-4 max-w-lg">
       {checks.map((check) => (
-        <div key={check.key} className="flex items-center gap-3">
-          {statusIcon(check.status)}
-          <span
-            className="text-sm"
-            style={{ color: check.status === 'pending' ? 'var(--cp-muted)' : 'var(--cp-text)' }}
-          >
-            {check.label}
-          </span>
+        <div key={check.key} className="flex items-start gap-3">
+          <div className="pt-0.5">{statusIcon(check.status)}</div>
+          <div className="flex min-w-0 flex-col gap-1">
+            <span
+              className="text-sm"
+              style={{ color: check.status === 'pending' ? 'var(--cp-muted)' : 'var(--cp-text)' }}
+            >
+              {check.label}
+            </span>
+            {check.detail && (
+              <span className="text-xs leading-5" style={{ color: 'var(--cp-danger)' }}>
+                {check.detail}
+              </span>
+            )}
+          </div>
         </div>
       ))}
 

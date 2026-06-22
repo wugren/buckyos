@@ -267,6 +267,140 @@ impl ControlPanelServer {
             .and_then(Self::mask_secret)
     }
 
+    fn aicc_provider_instance_matches(instance: &Value, provider_id: &str) -> bool {
+        instance
+            .get("provider_instance_name")
+            .or_else(|| instance.get("instance_id"))
+            .and_then(Value::as_str)
+            == Some(provider_id)
+    }
+
+    fn update_aicc_provider_instance(
+        settings: &mut Value,
+        provider_id: &str,
+        provider: &Value,
+        api_key: Option<&str>,
+        has_new_api_key: bool,
+    ) -> Option<(String, bool, bool, String, String)> {
+        const AICC_PROVIDER_SECTIONS: &[&str] = &[
+            "openai",
+            "google",
+            "gimini",
+            "gemini",
+            "claude",
+            "anthropic",
+            "minimax",
+            "fal",
+            "sn-ai-provider",
+        ];
+
+        let root = settings.as_object_mut()?;
+        for section_name in AICC_PROVIDER_SECTIONS {
+            let Some(section) = root.get_mut(*section_name).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let instance_index = section
+                .get("instances")
+                .and_then(Value::as_array)
+                .and_then(|instances| {
+                    instances.iter().position(|instance| {
+                        Self::aicc_provider_instance_matches(instance, provider_id)
+                    })
+                });
+            let Some(instance_index) = instance_index else {
+                continue;
+            };
+
+            let endpoint = provider
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let default_model = provider
+                .get("defaultModel")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let enabled = provider
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|value| value == "healthy" || value == "degraded")
+                .unwrap_or(false)
+                || has_new_api_key
+                || provider
+                    .get("credentialConfigured")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+            section.insert("enabled".to_string(), Value::Bool(enabled));
+
+            let api_key_present = {
+                let instances = section
+                    .get_mut("instances")
+                    .and_then(Value::as_array_mut)
+                    .expect("instances was checked as array");
+                let instance = instances
+                    .get_mut(instance_index)
+                    .expect("instance index came from instances");
+                if !instance.is_object() {
+                    *instance = json!({});
+                }
+                let instance_obj = instance
+                    .as_object_mut()
+                    .expect("instance must be object after initialization");
+
+                if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+                    instance_obj.insert(
+                        "api_token".to_string(),
+                        Value::String(api_key.trim().to_string()),
+                    );
+                }
+                if !endpoint.is_empty() {
+                    instance_obj.insert("base_url".to_string(), Value::String(endpoint.clone()));
+                }
+                if !default_model.is_empty() {
+                    instance_obj.insert(
+                        "default_model".to_string(),
+                        Value::String(default_model.clone()),
+                    );
+                    let models = instance_obj
+                        .entry("models".to_string())
+                        .or_insert_with(|| json!([]));
+                    if !models.is_array() {
+                        *models = json!([]);
+                    }
+                    if let Some(models) = models.as_array_mut() {
+                        if !models
+                            .iter()
+                            .any(|item| item.as_str() == Some(default_model.as_str()))
+                        {
+                            models.insert(0, Value::String(default_model.clone()));
+                        }
+                    }
+                }
+
+                instance_obj
+                    .get("api_token")
+                    .or_else(|| instance_obj.get("api_key"))
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            };
+
+            return Some((
+                (*section_name).to_string(),
+                enabled,
+                api_key_present,
+                default_model,
+                endpoint,
+            ));
+        }
+
+        None
+    }
+
     fn ai_openai_provider_card(settings: &Value) -> Value {
         let openai = settings.get("openai").cloned().unwrap_or_else(|| json!({}));
         let enabled = openai
@@ -1325,116 +1459,20 @@ impl ControlPanelServer {
             provider.get("endpoint").and_then(|value| value.as_str()),
         );
 
-        if provider_id == "openai-main"
-            || provider_id == "google-main"
-            || provider_id == "claude-main"
-            || provider_id == "minimax-main"
+        let mut settings =
+            Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
+        if let Some((key, enabled, api_key_present, default_model, endpoint)) =
+            Self::update_aicc_provider_instance(
+                &mut settings,
+                provider_id,
+                &provider,
+                api_key.as_deref(),
+                has_new_api_key,
+            )
         {
-            let mut settings =
-                Self::load_json_config_or_default(&client, AICC_SETTINGS_KEY, json!({})).await;
-            let key = if provider_id == "openai-main" {
-                "openai"
-            } else if provider_id == "google-main" {
-                "google"
-            } else if provider_id == "claude-main" {
-                "claude"
-            } else {
-                "minimax"
-            };
-            let endpoint = provider
-                .get("endpoint")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let default_model = provider
-                .get("defaultModel")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let enabled = provider
-                .get("status")
-                .and_then(|value| value.as_str())
-                .map(|value| value == "healthy" || value == "degraded")
-                .unwrap_or(false)
-                || has_new_api_key
-                || provider
-                    .get("credentialConfigured")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-
-            let mut section = settings.get(key).cloned().unwrap_or_else(|| json!({}));
-            if !section.is_object() {
-                section = json!({});
-            }
-
-            section["enabled"] = Value::Bool(enabled);
-
-            let existing_api_token = section
-                .get("api_token")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            section["api_token"] = Value::String(
-                api_key
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(existing_api_token),
-            );
-
-            let mut instances = section
-                .get("instances")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_else(|| vec![json!({})]);
-            if instances.is_empty() {
-                instances.push(json!({}));
-            }
-
-            let mut first = instances.first().cloned().unwrap_or_else(|| json!({}));
-            if !first.is_object() {
-                first = json!({});
-            }
-            first["base_url"] = Value::String(endpoint.to_string());
-            first["default_model"] = Value::String(default_model.to_string());
-            if provider_id == "minimax-main" {
-                first["provider_type"] = Value::String("minimax".to_string());
-            } else if provider_id == "claude-main" {
-                first["provider_type"] = Value::String("claude".to_string());
-            }
-            if first.get("models").is_none() {
-                first["models"] = json!([default_model]);
-            }
-            if let Some(models) = first
-                .get_mut("models")
-                .and_then(|value| value.as_array_mut())
-            {
-                if !models
-                    .iter()
-                    .any(|item| item.as_str() == Some(default_model))
-                {
-                    models.insert(0, Value::String(default_model.to_string()));
-                }
-            }
-            if provider_id == "claude-main" {
-                let mut alias_map = section
-                    .get("alias_map")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                if !alias_map.is_object() {
-                    alias_map = json!({});
-                }
-                alias_map["claude-reasoning"] = Value::String(default_model.to_string());
-                section["alias_map"] = alias_map;
-            }
-            let api_key_present = section
-                .get("api_token")
-                .and_then(|value| value.as_str())
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false);
-            instances[0] = first;
-            section["instances"] = Value::Array(instances);
-            settings[key] = section;
             Self::save_json_config(&client, AICC_SETTINGS_KEY, &settings).await?;
             info!(
-                "control_panel.ai.provider.set persisted_aicc provider_id={} settings_key={} enabled={} api_key_present={} default_model={} endpoint={}",
+                "control_panel.ai.provider.set persisted_aicc_instance provider_id={} settings_key={} enabled={} api_key_present={} default_model={} endpoint={}",
                 provider_id,
                 key,
                 enabled,
@@ -1443,46 +1481,10 @@ impl ControlPanelServer {
                 endpoint,
             );
         } else {
-            let mut overrides = Self::load_json_config_or_default(
-                &client,
-                AI_MODELS_PROVIDER_OVERRIDES_KEY,
-                Self::default_ai_provider_overrides_value(),
-            )
-            .await;
-            let mut items = overrides
-                .get("items")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default();
-            Self::upsert_item_by_id(&mut items, provider_id, provider.clone());
-            overrides["items"] = Value::Array(items);
-            Self::save_json_config(&client, AI_MODELS_PROVIDER_OVERRIDES_KEY, &overrides).await?;
-
-            if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
-                let mut secret_doc = Self::load_json_config_or_default(
-                    &client,
-                    AI_MODELS_PROVIDER_SECRETS_KEY,
-                    Self::default_ai_provider_secrets_value(),
-                )
-                .await;
-                let mut secret_items = secret_doc
-                    .get("items")
-                    .and_then(|value| value.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                Self::upsert_item_by_id(
-                    &mut secret_items,
-                    provider_id,
-                    json!({ "id": provider_id, "apiKey": api_key }),
-                );
-                secret_doc["items"] = Value::Array(secret_items);
-                Self::save_json_config(&client, AI_MODELS_PROVIDER_SECRETS_KEY, &secret_doc)
-                    .await?;
-                info!(
-                    "control_panel.ai.provider.set persisted_secret provider_id={} api_key_present=true",
-                    provider_id,
-                );
-            }
+            return Err(RPCErrors::ReasonError(format!(
+                "provider_not_found_in_aicc_settings: {}",
+                provider_id
+            )));
         }
 
         let settings =

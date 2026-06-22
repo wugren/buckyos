@@ -602,6 +602,7 @@ function generateUsageEvents(): UsageEvent[] {
     const tokensOut = row.api === 'image.txt2img' ? undefined : 120 + ((i * 97) % 2400)
     const tokenEquivalent = row.api === 'image.txt2img' ? 1600 + ((i * 71) % 1200) : undefined
     const billableTokens = tokenEquivalent ?? (tokensIn ?? 0) + (tokensOut ?? 0)
+    const estimatedCost = Number((billableTokens * row.cost).toFixed(4))
 
     events.push({
       id: `evt-${i.toString().padStart(3, '0')}`,
@@ -617,7 +618,12 @@ function generateUsageEvents(): UsageEvent[] {
       tokens_in: tokensIn,
       tokens_out: tokensOut,
       token_equivalent: tokenEquivalent,
-      estimated_cost: Number((billableTokens * row.cost).toFixed(4)),
+      estimated_cost: estimatedCost,
+      finance_snapshot: {
+        amount: estimatedCost,
+        currency: 'USD',
+        provider_trace_id: `trace-${i.toString().padStart(3, '0')}`,
+      },
       status: i % 23 === 0 ? 'failed' : 'success',
     })
   }

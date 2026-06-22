@@ -35,6 +35,8 @@ export type PricingMode = 'per_token' | 'subscription' | 'free_quota' | 'unknown
 
 export interface ModelMetadata {
   provider_model_id: string
+  provider_actual_model_id?: string
+  provider_options?: unknown
   exact_model: string
   model_driver: string
   parameter_scale?: string
@@ -147,7 +149,15 @@ export interface UsageEvent {
   tokens_out?: number
   token_equivalent?: number
   estimated_cost?: number
+  finance_snapshot?: UsageFinanceSnapshot
   status: 'success' | 'failed'
+}
+
+export interface UsageFinanceSnapshot {
+  amount?: number
+  currency?: string
+  provider_trace_id?: string
+  billing?: unknown
 }
 
 export interface UsageSummary {
@@ -289,6 +299,12 @@ export interface ValidationResult {
   models_discovered: string[]
   balance_available: boolean
   errors: string[]
+  error_details?: ValidationErrorDetail[]
+}
+
+export interface ValidationErrorDetail {
+  kind: 'endpoint' | 'auth' | 'models'
+  message: string
 }
 
 // ========== Store Snapshot ==========

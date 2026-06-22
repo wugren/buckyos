@@ -38,6 +38,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::aicc::{AIComputeCenter, NamedStoreResourceResolver};
 use crate::aicc_usage_log_db::AiccUsageLogDb;
@@ -298,8 +299,9 @@ fn section_for_provider_type(provider_type: &str) -> std::result::Result<&'stati
 fn default_endpoint(provider_type: &str) -> &'static str {
     match provider_type {
         "sn_router" => "https://sn.buckyos.ai/api/v1/ai/",
-        "openai" | "openrouter" | "custom" => "https://api.openai.com/v1",
-        "anthropic" => "https://api.anthropic.com",
+        "openai" | "custom" => "https://api.openai.com/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
         "google" => "https://generativelanguage.googleapis.com/v1beta",
         "minimax" => "https://api.minimax.io/v1",
         "fal" => "https://fal.run",
@@ -430,6 +432,216 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
     Ok(Value::Object(wrapped))
 }
 
+fn validation_issue(kind: &str, message: impl Into<String>) -> Value {
+    json!({
+        "kind": kind,
+        "message": message.into()
+    })
+}
+
+fn validation_issue_message(issue: &Value) -> String {
+    issue
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("provider validation failed")
+        .to_string()
+}
+
+fn validation_issue_kind(issue: &Value) -> Option<&str> {
+    issue.get("kind").and_then(Value::as_str)
+}
+
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 500;
+    let clean = body.replace(['\r', '\n'], " ");
+    if clean.chars().count() <= LIMIT {
+        clean
+    } else {
+        format!("{}...", clean.chars().take(LIMIT).collect::<String>())
+    }
+}
+
+fn discovery_http_issue(provider: &str, status: reqwest::StatusCode, body: String) -> Value {
+    let kind = if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        "auth"
+    } else if status == reqwest::StatusCode::NOT_FOUND || status.is_server_error() {
+        "endpoint"
+    } else {
+        "models"
+    };
+    validation_issue(
+        kind,
+        format!(
+            "{} model discovery failed: status={} body={}",
+            provider,
+            status.as_u16(),
+            truncate_error_body(body.as_str())
+        ),
+    )
+}
+
+fn request_error_issue(provider: &str, err: reqwest::Error) -> Value {
+    let kind = if err.is_timeout() || err.is_connect() || err.is_request() {
+        "endpoint"
+    } else {
+        "models"
+    };
+    validation_issue(kind, format!("{} model discovery request failed: {}", provider, err))
+}
+
+async fn send_discovery_request(
+    provider: &str,
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<Value, Value> {
+    let response = request
+        .send()
+        .await
+        .map_err(|err| request_error_issue(provider, err))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(discovery_http_issue(provider, status, body));
+    }
+    response.json::<Value>().await.map_err(|err| {
+        validation_issue(
+            "models",
+            format!("{} model discovery response is not valid JSON: {}", provider, err),
+        )
+    })
+}
+
+fn collect_model_id_from_entry(entry: &Value) -> Option<String> {
+    let raw = if let Some(value) = entry.as_str() {
+        Some(value)
+    } else {
+        entry
+            .get("id")
+            .or_else(|| entry.get("name"))
+            .or_else(|| entry.get("provider_model_id"))
+            .or_else(|| entry.get("provider_actual_model_id"))
+            .and_then(Value::as_str)
+    }?;
+    let id = raw
+        .trim()
+        .strip_prefix("models/")
+        .unwrap_or(raw.trim())
+        .trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn collect_model_ids(body: &Value) -> Vec<String> {
+    let mut ids = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for key in ["data", "models"] {
+        let Some(items) = body.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(id) = collect_model_id_from_entry(item) else {
+                continue;
+            };
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+fn openai_models_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with("/chat/completions") {
+        let prefix = &trimmed[..trimmed.len() - "/chat/completions".len()];
+        return format!("{}/models", prefix.trim_end_matches('/'));
+    }
+    if lower.ends_with("/responses") || lower.ends_with("/images/generations") {
+        if let Some((prefix, _)) = trimmed.rsplit_once('/') {
+            return format!("{}/models", prefix.trim_end_matches('/'));
+        }
+    }
+    format!("{}/models", trimmed)
+}
+
+async fn discover_openai_compatible_models(
+    client: &reqwest::Client,
+    provider: &str,
+    endpoint: &str,
+    api_key: &str,
+) -> std::result::Result<Vec<String>, Value> {
+    let body = send_discovery_request(
+        provider,
+        client
+            .get(openai_models_endpoint(endpoint).as_str())
+            .bearer_auth(api_key),
+    )
+    .await?;
+    let ids = collect_model_ids(&body);
+    if ids.is_empty() {
+        Err(validation_issue(
+            "models",
+            format!("{} model discovery returned no models", provider),
+        ))
+    } else {
+        Ok(ids)
+    }
+}
+
+async fn discover_anthropic_models(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+) -> std::result::Result<Vec<String>, Value> {
+    let url = format!("{}/models?limit=1000", endpoint.trim_end_matches('/'));
+    let body = send_discovery_request(
+        "anthropic",
+        client
+            .get(url.as_str())
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+    )
+    .await?;
+    let ids = collect_model_ids(&body);
+    if ids.is_empty() {
+        Err(validation_issue(
+            "models",
+            "anthropic model discovery returned no models",
+        ))
+    } else {
+        Ok(ids)
+    }
+}
+
+async fn discover_google_models(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+) -> std::result::Result<Vec<String>, Value> {
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let body = send_discovery_request(
+        "google",
+        client
+            .get(url.as_str())
+            .query(&[("key", api_key), ("pageSize", "1000")]),
+    )
+    .await?;
+    let ids = collect_model_ids(&body);
+    if ids.is_empty() {
+        Err(validation_issue(
+            "models",
+            "google model discovery returned no models",
+        ))
+    } else {
+        Ok(ids)
+    }
+}
+
 impl AiccHttpServer {
     fn new(center: AIComputeCenter) -> Self {
         Self {
@@ -548,45 +760,136 @@ impl AiccHttpServer {
         }
     }
 
-    fn handle_provider_validate(&self, params: &Value) -> std::result::Result<Value, RPCErrors> {
-        let mut errors = Vec::<String>::new();
+    async fn handle_provider_validate(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<Value, RPCErrors> {
+        let mut issues = Vec::<Value>::new();
         let provider_type =
             param_string(params, "provider_type").unwrap_or_else(|| "custom".into());
 
         if let Some(name) = param_string(params, "provider_instance_name") {
             if let Err(err) = validate_provider_instance_name(name.as_str()) {
-                errors.push(err.to_string());
+                issues.push(validation_issue("models", err.to_string()));
             }
         }
 
-        let endpoint = param_string(params, "endpoint").unwrap_or_default();
+        let endpoint = param_string(params, "endpoint")
+            .unwrap_or_else(|| default_endpoint(provider_type.as_str()).to_string());
         if provider_type == "custom" && endpoint.is_empty() {
-            errors.push("endpoint is required for custom provider".to_string());
+            issues.push(validation_issue(
+                "endpoint",
+                "endpoint is required for custom provider",
+            ));
         }
         if !endpoint.is_empty() && reqwest::Url::parse(endpoint.as_str()).is_err() {
-            errors.push("endpoint is not a valid URL".to_string());
+            issues.push(validation_issue("endpoint", "endpoint is not a valid URL"));
         }
 
         let api_key = param_string(params, "api_key").unwrap_or_default();
         if provider_type != "sn_router" && api_key.is_empty() {
-            errors.push("api_key is required".to_string());
+            issues.push(validation_issue("auth", "api_key is required"));
         }
 
-        if provider_type == "custom" && param_string(params, "protocol_type").is_none() {
-            errors.push("protocol_type is required for custom provider".to_string());
+        let protocol_type = param_string(params, "protocol_type");
+        if provider_type == "custom" && protocol_type.is_none() {
+            issues.push(validation_issue(
+                "models",
+                "protocol_type is required for custom provider",
+            ));
         }
 
-        let endpoint_reachable = !errors
+        let mut models_discovered = Vec::<String>::new();
+        if issues.is_empty() && provider_type != "sn_router" {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .map_err(|err| {
+                    RPCErrors::ReasonError(format!("build discovery client failed: {}", err))
+                })?;
+            let discovery = match provider_type.as_str() {
+                "openai" => {
+                    discover_openai_compatible_models(
+                        &client,
+                        "openai",
+                        endpoint.as_str(),
+                        api_key.as_str(),
+                    )
+                    .await
+                }
+                "openrouter" => {
+                    discover_openai_compatible_models(
+                        &client,
+                        "openrouter",
+                        endpoint.as_str(),
+                        api_key.as_str(),
+                    )
+                    .await
+                }
+                "anthropic" => {
+                    discover_anthropic_models(&client, endpoint.as_str(), api_key.as_str()).await
+                }
+                "google" => discover_google_models(&client, endpoint.as_str(), api_key.as_str()).await,
+                "custom" => match protocol_type.as_deref() {
+                    Some("openai_compatible") => {
+                        discover_openai_compatible_models(
+                            &client,
+                            "custom openai-compatible",
+                            endpoint.as_str(),
+                            api_key.as_str(),
+                        )
+                        .await
+                    }
+                    Some("anthropic_compatible") => {
+                        discover_anthropic_models(&client, endpoint.as_str(), api_key.as_str())
+                            .await
+                    }
+                    Some("google_compatible") => {
+                        discover_google_models(&client, endpoint.as_str(), api_key.as_str()).await
+                    }
+                    Some(other) => Err(validation_issue(
+                        "models",
+                        format!("unsupported custom protocol_type: {}", other),
+                    )),
+                    None => Err(validation_issue(
+                        "models",
+                        "protocol_type is required for custom provider",
+                    )),
+                },
+                other => Err(validation_issue(
+                    "models",
+                    format!("unsupported provider_type: {}", other),
+                )),
+            };
+
+            match discovery {
+                Ok(models) => {
+                    models_discovered = models;
+                }
+                Err(issue) => {
+                    issues.push(issue);
+                }
+            }
+        }
+
+        let endpoint_reachable = !issues
             .iter()
-            .any(|err| err.contains("endpoint") || err.contains("URL"));
-        let auth_valid = !errors.iter().any(|err| err.contains("api_key"));
+            .any(|issue| validation_issue_kind(issue) == Some("endpoint"));
+        let auth_valid = !issues
+            .iter()
+            .any(|issue| validation_issue_kind(issue) == Some("auth"));
+        let errors = issues
+            .iter()
+            .map(validation_issue_message)
+            .collect::<Vec<_>>();
 
         Ok(json!({
             "endpoint_reachable": endpoint_reachable,
             "auth_valid": auth_valid,
-            "models_discovered": [],
+            "models_discovered": models_discovered,
             "balance_available": provider_type != "custom" && auth_valid,
             "errors": errors,
+            "error_details": issues,
         }))
     }
 
@@ -749,7 +1052,7 @@ impl RPCHandler for AiccHttpServer {
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_VALIDATE {
-            let result = self.handle_provider_validate(&req.params)?;
+            let result = self.handle_provider_validate(&req.params).await?;
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_ADD {

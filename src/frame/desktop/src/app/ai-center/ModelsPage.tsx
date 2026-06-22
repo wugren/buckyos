@@ -1,9 +1,12 @@
+import type { ReactNode } from 'react'
 import { Cpu, Download, Pause, Play, Store, Trash2 } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
 import { useLocalModels } from './hooks/use-aicc-store'
 import { EmptyState } from './components/shared/EmptyState'
 import { StatusBadge } from './components/shared/StatusBadge'
 import type { LocalModel } from '../../api/aicc_mgr'
+
+const SHOW_LOCAL_MODELS_PAGE = false
 
 function formatSize(bytes?: number): string {
   if (!bytes) return '—'
@@ -17,6 +20,46 @@ function statusVariant(status: LocalModel['health']['status']): 'ok' | 'warning'
 }
 
 export function ModelsPage() {
+  if (SHOW_LOCAL_MODELS_PAGE) {
+    return <LocalModelsPage />
+  }
+
+  return <ComingSoonModelsPage />
+}
+
+function ComingSoonModelsPage() {
+  const { t } = useI18n()
+
+  return (
+    <div className="flex min-h-[420px] flex-col items-center justify-center px-4 py-16 text-center">
+      <div
+        className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-lg"
+        style={{
+          background: 'var(--cp-surface)',
+          border: '1px solid var(--cp-border)',
+          color: 'var(--cp-accent)',
+        }}
+      >
+        <Cpu size={28} />
+      </div>
+
+      <p className="mb-2 text-xs font-semibold uppercase" style={{ color: 'var(--cp-accent)' }}>
+        {t('aiCenter.models.kicker', 'Models')}
+      </p>
+      <h2 className="text-xl font-semibold" style={{ color: 'var(--cp-text)' }}>
+        {t('aiCenter.models.comingSoon.title', 'Coming Soon')}
+      </h2>
+      <p className="mt-3 max-w-xl text-sm leading-6" style={{ color: 'var(--cp-muted)' }}>
+        {t(
+          'aiCenter.models.comingSoon.desc',
+          'Local Provider and local LLM Engine support is planned for a future release. Installed local model inventory is not available in this version.'
+        )}
+      </p>
+    </div>
+  )
+}
+
+function LocalModelsPage() {
   const { t } = useI18n()
   const models = useLocalModels()
 
@@ -117,7 +160,7 @@ function Fact({ label, value }: { label: string; value: string }) {
   )
 }
 
-function IconButton({ icon, label, danger }: { icon: React.ReactNode; label: string; danger?: boolean }) {
+function IconButton({ icon, label, danger }: { icon: ReactNode; label: string; danger?: boolean }) {
   return (
     <button
       type="button"

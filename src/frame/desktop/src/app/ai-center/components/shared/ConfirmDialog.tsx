@@ -5,6 +5,8 @@ interface ConfirmDialogProps {
   title: string
   message: string
   confirmLabel?: string
+  confirming?: boolean
+  error?: string | null
   onConfirm: () => void
   onCancel: () => void
 }
@@ -14,6 +16,8 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel,
+  confirming = false,
+  error,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -45,6 +49,7 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={onCancel}
+            disabled={confirming}
             className="px-4 py-2 rounded-lg text-sm"
             style={{ color: 'var(--cp-muted)' }}
           >
@@ -53,12 +58,18 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={onConfirm}
-            className="px-4 py-2 rounded-lg text-sm font-medium"
+            disabled={confirming}
+            className="px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-60"
             style={{ background: 'var(--cp-danger)', color: '#fff' }}
           >
-            {confirmLabel ?? t('common.confirm', 'Confirm')}
+            {confirming ? t('common.deleting', 'Deleting') : confirmLabel ?? t('common.confirm', 'Confirm')}
           </button>
         </div>
+        {error && (
+          <div className="mt-3 text-xs" style={{ color: 'var(--cp-danger)' }}>
+            {error}
+          </div>
+        )}
       </div>
     </div>
   )

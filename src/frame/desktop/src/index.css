@@ -4,6 +4,11 @@
 @tailwind components;
 @tailwind utilities;
 
+.aicc-password-input::-ms-reveal,
+.aicc-password-input::-ms-clear {
+  display: none;
+}
+
 :root {
   color-scheme: light;
   --cp-bg: oklch(0.966 0.014 286);

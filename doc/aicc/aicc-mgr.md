@@ -167,7 +167,13 @@ Response：
   "auth_valid": true,
   "models_discovered": ["gpt-4.1-mini", "text-embedding-3-large"],
   "balance_available": false,
-  "errors": []
+  "errors": [],
+  "error_details": [
+    {
+      "kind": "models",
+      "message": "model discovery returned no models"
+    }
+  ]
 }
 ```
 
