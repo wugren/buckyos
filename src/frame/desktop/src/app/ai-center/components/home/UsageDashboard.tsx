@@ -324,10 +324,12 @@ export function UsageDashboard() {
                     <span className="inline-flex items-center gap-1">
                       {h}
                       {h === 'Task / Session' && (
-                        <HelpCircle
-                          size={12}
+                        <span
+                          className="inline-flex"
                           title={t('aiCenter.home.taskSessionTooltip', 'Task / Session is the AICC task id or Agent session id that produced this usage event.')}
-                        />
+                        >
+                          <HelpCircle size={12} />
+                        </span>
                       )}
                     </span>
                   </th>
