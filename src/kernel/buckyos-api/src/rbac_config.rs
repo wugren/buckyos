@@ -58,6 +58,23 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
 ## Resource URLs
 
+基本规则 
+- spec 本机安装规格，只读,su_admin可以修改
+- info 当前状态，读写
+- doc 核心身份资料，只读，默认上链
+- profile 当前资料 读写，可上链
+- settings 设置，通常是读写, 有的敏感settings需要sudo修改
+
+所有可上链的资源修改都要su权限，在未上链时可本地修改，否则统一走先更新链再同步的逻辑
+
+### user
+- obj://config/users/{user}/settings 用户设置(含密码)，需要su_users修改
+- obj://config/users/{user}/doc 用户身份资料，需要su_users修改修改 
+- obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链）
+- obj://config/security/{user}/key 用户密钥，local账户才有，需要su_admin修改
+ 
+
+
  */
 pub const DEFAULT_RBAC_POLICY: &str = r#"
 p, kernel, obj://*, all,allow

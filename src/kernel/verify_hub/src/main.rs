@@ -47,6 +47,7 @@ struct VerifyServiceConfig {
 
 const VERIFY_HUB_ISSUER: &str = "verify-hub";
 const VERIFY_HUB_SERVICE_MAIN_PORT: u16 = 3300;
+const ROOT_USER_ID: &str = "root";
 
 lazy_static! {
     static ref VERIFY_HUB_PRIVATE_KEY: Arc<RwLock<EncodingKey>> = {
@@ -97,6 +98,29 @@ fn get_token_session_id(token: &RPCSessionToken) -> Result<u64> {
     Err(RPCErrors::ReasonError("Invalid session".to_string()))
 }
 
+fn is_root_userid(userid: &str) -> bool {
+    userid.trim().eq_ignore_ascii_case(ROOT_USER_ID)
+}
+
+fn reject_root_session_subject(userid: &str) -> Result<()> {
+    if is_root_userid(userid) {
+        return Err(RPCErrors::NoPermission(
+            "verify-hub does not issue session tokens for root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_root_user_settings(user_settings: &UserSettings) -> Result<()> {
+    reject_root_session_subject(user_settings.user_id.as_str())?;
+    if matches!(user_settings.user_type, UserType::Root) {
+        return Err(RPCErrors::NoPermission(
+            "verify-hub does not issue session tokens for root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a session token with specified parameters
 /// Session token is short-lived and used for API requests
 async fn generate_session_token(
@@ -108,6 +132,7 @@ async fn generate_session_token(
     aud: Option<String>,
     sudo: bool,
 ) -> Result<RPCSessionToken> {
+    reject_root_session_subject(userid)?;
     let now = buckyos_get_unix_timestamp();
     let exp = now + duration;
 
@@ -143,6 +168,7 @@ async fn generate_refresh_token(
     session: u64,
     duration: u64,
 ) -> Result<RPCSessionToken> {
+    reject_root_session_subject(userid)?;
     let now = buckyos_get_unix_timestamp();
     let exp = now + duration;
 
@@ -272,6 +298,7 @@ async fn validate_active_refresh_token(refresh_jwt: &str) -> Result<(RPCSessionT
         .sub
         .clone()
         .ok_or(RPCErrors::ReasonError("Missing sub".to_string()))?;
+    reject_root_session_subject(userid.as_str())?;
     let appid = rpc_session_token
         .appid
         .clone()
@@ -739,6 +766,7 @@ impl VerifyHubApiHandler for VerifyHubServer {
         let userid = rpc_session_token
             .sub
             .ok_or(RPCErrors::ReasonError("Missing sub".to_string()))?;
+        reject_root_session_subject(userid.as_str())?;
         let appid = rpc_session_token
             .appid
             .ok_or(RPCErrors::ReasonError("Missing appid".to_string()))?;
@@ -848,10 +876,12 @@ impl VerifyHubApiHandler for VerifyHubServer {
         login_nonce: u64,
     ) -> Result<LoginByPasswordResponse> {
         gc_token_caches().await;
+        reject_root_session_subject(username)?;
 
         let session_id = login_nonce;
         let (user_settings, session_key) =
             validate_password_login(username, password, appid, login_nonce).await?;
+        reject_root_user_settings(&user_settings)?;
 
         info!(
             "Password login successful for user: {}. Generating token pair.",
@@ -890,10 +920,12 @@ impl VerifyHubApiHandler for VerifyHubServer {
         login_nonce: u64,
     ) -> Result<SudoByPasswordResponse> {
         gc_token_caches().await;
+        reject_root_session_subject(username)?;
 
         let session_id = login_nonce;
-        let (_user_settings, session_key) =
+        let (user_settings, session_key) =
             validate_password_login(username, password, appid, login_nonce).await?;
+        reject_root_user_settings(&user_settings)?;
 
         let session_jti: u64;
         {
@@ -947,6 +979,9 @@ impl VerifyHubApiHandler for VerifyHubServer {
                 return Err(RPCErrors::InvalidToken(
                     "refresh token cannot be used as session token".to_string(),
                 ));
+            }
+            if let Some(userid) = rpc_session_token.sub.as_deref() {
+                reject_root_session_subject(userid)?;
             }
 
             if let Some(expected_appid) = appid {
@@ -1203,6 +1238,122 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
         assert!(
             verify_bad.is_err(),
             "verify_token should reject wrong appid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_hub_rejects_root_login_jwt() {
+        let private_key = setup_test_environment().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let test_jwt = create_login_jwt(&private_key, "root", "kernel", 9001, now + 3600);
+        let handler = VerifyHubServer::new();
+        let login_result = handler.handle_login_by_jwt(test_jwt.as_str(), None).await;
+
+        assert!(
+            matches!(login_result, Err(RPCErrors::NoPermission(_))),
+            "verify-hub must reject root login JWT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_hub_rejects_root_password_entrypoints() {
+        let handler = VerifyHubServer::new();
+
+        let login_result = handler
+            .handle_login_by_password("root", "not-used", "control-panel", 9002)
+            .await;
+        assert!(
+            matches!(login_result, Err(RPCErrors::NoPermission(_))),
+            "verify-hub must reject root password login"
+        );
+
+        let sudo_result = handler
+            .handle_sudo_by_password(
+                "root",
+                "not-used",
+                "control-panel",
+                Some("system-config".to_string()),
+                9003,
+            )
+            .await;
+        assert!(
+            matches!(sudo_result, Err(RPCErrors::NoPermission(_))),
+            "verify-hub must reject root sudo password login"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_root_token_generation_rejected() {
+        let session_result = generate_session_token(
+            "control-panel",
+            "root",
+            5678,
+            12345,
+            SESSION_TOKEN_EXPIRE_SECONDS,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(session_result, Err(RPCErrors::NoPermission(_))),
+            "root session token generation must fail"
+        );
+
+        let refresh_result = generate_refresh_token(
+            "control-panel",
+            "root",
+            5679,
+            12345,
+            REFRESH_TOKEN_EXPIRE_SECONDS,
+        )
+        .await;
+        assert!(
+            matches!(refresh_result, Err(RPCErrors::NoPermission(_))),
+            "root refresh token generation must fail"
+        );
+
+        let token_pair_result = generate_token_pair("control-panel", "root", 12345).await;
+        assert!(
+            matches!(token_pair_result, Err(RPCErrors::NoPermission(_))),
+            "root token pair generation must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_token_rejects_verify_hub_root_token() {
+        setup_test_environment().await;
+        let mut token = RPCSessionToken {
+            token_type: RPCSessionTokenType::Normal,
+            jti: Some("root-session".to_string()),
+            appid: Some("kernel".to_string()),
+            aud: None,
+            sub: Some("root".to_string()),
+            token: None,
+            iss: Some(VERIFY_HUB_ISSUER.to_string()),
+            exp: Some(buckyos_get_unix_timestamp() + 3600),
+            sudo: false,
+            extra: HashMap::new(),
+        };
+        set_token_session_id(&mut token, 12345);
+        {
+            let private_key = VERIFY_HUB_PRIVATE_KEY.read().await;
+            let jwt = token
+                .generate_jwt(Some(VERIFY_HUB_ISSUER.to_string()), &private_key)
+                .unwrap();
+            token.token = Some(jwt);
+        }
+
+        let handler = VerifyHubServer::new();
+        let verify_result = handler
+            .handle_verify_token(token.to_string().as_str(), None)
+            .await;
+        assert!(
+            matches!(verify_result, Err(RPCErrors::NoPermission(_))),
+            "verify-hub issued root session token must not be accepted"
         );
     }
 

@@ -71,7 +71,7 @@ async function runCase(
   } catch (err) {
     const ms = Date.now() - start;
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`  ✗ ${name} (${ms}ms): ${msg}`);
+    console.error(`  ❌ ${name} (${ms}ms): ${msg}`);
     return { name, ok: false, durationMs: ms, error: msg };
   }
 }
@@ -122,12 +122,20 @@ const hashPassword = buckyos.hashPassword as unknown as (
   nonce?: number,
 ) => string;
 
-// Minimal typed view of the SDK's raw RPC client. We MUST use a raw client
-// (not buckyos.getServiceRpcClient): in AppClient mode getServiceRpcClient
-// returns a *managed* client that re-injects the runtime's default (non-sudo)
-// session token on every call, silently overriding setSessionToken — which
-// drops the sudo elevation and makes user.create fail with "No write
-// permission". A raw kRPCClient sends exactly the token we pass.
+// Typed view of the SDK rpc client used here.
+//  - The managed client from buckyos.getServiceRpcClient supports a per-call
+//    session-token override (3rd arg) — required to drive a single elevated
+//    (sudo) request without polluting the AppClient runtime's token. (Earlier
+//    websdk versions silently dropped this; the current one honors it.)
+//  - For verify-hub login/sudo, which are unauthenticated, we use a raw client
+//    so no caller token is attached at all.
+type ManagedRpcClient = {
+  call(
+    method: string,
+    params: Record<string, unknown>,
+    options?: { sessionToken?: string },
+  ): Promise<unknown>;
+};
 type RawRpcClient = {
   setSeq(seq: number): void;
   call(method: string, params: Record<string, unknown>): Promise<unknown>;
@@ -196,8 +204,9 @@ async function loginByPassword(
 
 /**
  * Call control-panel `user.create` with an explicit session token (the sudo
- * grant). Mirrors the param mapping of the typed `createUser` helper, but lets
- * us drive the auth token directly via a raw client (see RawRpcClient note).
+ * grant), using the managed client's per-call session-token override. This is
+ * the pattern the desktop UI should use to perform a sudo'd operation without
+ * mutating the AppClient runtime's own token.
  */
 async function createUserWithToken(
   token: string,
@@ -210,7 +219,9 @@ async function createUserWithToken(
   },
 ): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
   try {
-    const rpc = new KRpcClient(serviceUrl("control-panel"), token);
+    const rpc = buckyos.getServiceRpcClient(
+      "control-panel",
+    ) as unknown as ManagedRpcClient;
     const params: Record<string, unknown> = {
       user_id: input.userId,
       password_hash: input.passwordHash,
@@ -220,7 +231,9 @@ async function createUserWithToken(
     if (input.allowPasswordChange !== undefined) {
       params.allow_password_change = input.allowPasswordChange;
     }
-    const result = (await rpc.call("user.create", params)) as SimpleOkResponse;
+    const result = (await rpc.call("user.create", params, {
+      sessionToken: token,
+    })) as SimpleOkResponse;
     if (!result || typeof result !== "object") {
       throw new Error("Invalid user.create response");
     }
