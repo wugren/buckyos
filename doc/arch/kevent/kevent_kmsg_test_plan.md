@@ -122,9 +122,9 @@
 
 除 kevent/kmsg 模块本身外，测试还需要覆盖当前代码中已经形成的调用方契约：
 
-- `msg_center` 在消息 box 变化时发布 `/msg_center/{owner}/box/{box}/changed` 事件，payload 包含 `operation`、`owner`、`box_kind`、`box_name`、`record_id`、`msg_id`、`state`、`updated_at_ms`。
-- `control_panel` 的 chat stream 订阅 `/msg_center/{owner}/box/in/**` 和 `/msg_center/{owner}/box/out/**`，收到事件后必须重新读取 `MsgCenterClient.get_record(...)`，事件只作为加速信号。
-- `OpenDAN msg_center_pump` 订阅 `/msg_center/{owner}/box/{in,group_in,request}/**`，同时兼容旧路径 `/msg_center/{owner}/{box}/**`；无法识别的 `/msg_center/` 事件应防御性 sweep 全部 inbox 类 box。
+- `msg_center` 在消息 box 变化时发布 `/msg_center/{owner}/box_{box}_{owner}/changed` 事件，payload 包含 `operation`、`owner`、`box_kind`、`box_id`、`record_id`、`msg_id`、`state`、`updated_at_ms`。
+- `control_panel` 的 chat stream 订阅 `/msg_center/{owner}/box_in_{owner}/**` 和 `/msg_center/{owner}/box_out_{owner}/**`，收到事件后必须重新读取 `MsgCenterClient.get_record(...)`，事件只作为加速信号。
+- `OpenDAN msg_center_pump` 订阅 `/msg_center/{owner}/box_{in,group_in,request}_{owner}/**`；无法识别的 `/msg_center/` 事件应防御性 sweep 全部 inbox 类 box。
 - `OpenDAN session_event_pump` 聚合各 session 的 kevent 订阅 pattern，动态重建 reader，并把匹配事件路由成目标 session 的 `Inbound::Event`。
 - `TaskManagerClient::wait_for_task_end_kevent` 明确把 kevent 当作加速层：订阅后立即回读 `get_task`，event 或 timeout 后都回读真相源，订阅失败时退化为轮询。
 - `agent_tool` 文档提供 `subscribe_event` / `unsubscribe_event`，说明 Agent Session 可以订阅 KEvent pattern；这依赖 `session_event_pump` 的 pattern 聚合、路由和 reader 重建行为。
@@ -409,7 +409,7 @@ cargo test -p kmsg --test sled_contract -- --ignored --nocapture
 | 编号 | 功能契约 | 测试目的 | 重要性 | 测试方法 | 命令 | 验证和证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | UF-01 | kevent 唤醒后回读真相源 | 覆盖 TaskMgr、AgentRuntime、control_panel、OpenDAN 这类“event 只唤醒，状态靠回读”的共同模式。 | 高 | 用 mock 构造 event payload 与真相源不一致、event timeout、重复 event、订阅失败四种场景；业务处理必须调用 `get_task`、`get_record`、kmsg fetch 或对应真相源。 | 默认落点：对应模块的最小验证测试；若 mock 成本高，先做静态检查并记录未验证风险。 | 状态变化只来自真相源读取；无 event 时仍能通过 timeout/poll 收敛。 |
-| UF-02 | event path 与 pattern 兼容 | 覆盖 msg_center -> control_panel/OpenDAN、task_mgr -> wait/AgentRuntime 等 path 约定，防止 path 改动导致静默失效。 | 高 | 静态检查 + 小型匹配测试：用事件生产方实际 event id 样本验证消费方 pattern 能匹配；包含 `/msg_center/{owner}/box/{box}/changed`、OpenDAN 旧路径兼容、`/task_mgr/{id}`、`/task_mgr/{root_id}` 和 `/task_mgr/runner/{runner}/task_ready`。 | `cargo test -p kevent --test usage_contract`；`cargo test -p task_manager event_id -- --nocapture` | 所有事件样本均能被目标消费方 pattern 匹配；TaskMgr runner/root event id 只接受合法 kevent path segment。 |
+| UF-02 | event path 与 pattern 兼容 | 覆盖 msg_center -> control_panel/OpenDAN、task_mgr -> wait/AgentRuntime 等 path 约定，防止 path 改动导致静默失效。 | 高 | 静态检查 + 小型匹配测试：用事件生产方实际 event id 样本验证消费方 pattern 能匹配；包含 `/msg_center/{owner}/box_{box}_{owner}/changed`、`/task_mgr/{id}`、`/task_mgr/{root_id}` 和 `/task_mgr/runner/{runner}/task_ready`。 | `cargo test -p kevent --test usage_contract`；`cargo test -p task_manager event_id -- --nocapture` | 所有事件样本均能被目标消费方 pattern 匹配；TaskMgr runner/root event id 只接受合法 kevent path segment。 |
 | UF-03 | event payload 最小可用字段 | 覆盖“event 轻量提示，完整数据回读”的共同约束，防止业务把 payload 当可靠数据源。 | 中高 | 对 msg_center box changed、task_mgr event、task_ready、kmsg notification 样本检查 payload 只包含定位和摘要字段；消费侧用 payload 定位后必须回读 record/task/message。TaskMgr 大 data 事件需避免超过 shared ring slot，具体省略策略作为源码风险跟踪。 | `cargo test -p kevent --test usage_contract`；TaskMgr 通过源码审视与 `kevent_kmsg/task_mgr` DV smoke 覆盖当前路径 | payload 包含定位字段，例如 `record_id`、`msg_id`、`queue_urn/index` 或 `task_id`；消费侧不直接信任业务状态字段；过大 task data 不内联。 |
 | UF-04 | reader 生命周期和动态订阅 | 覆盖 session_event_pump、agent_tool subscribe_event、chat stream 这类动态 reader 使用方式。 | 中高 | mock 测试多 session 重叠 pattern、取消订阅、pattern 去重排序、reader close 后重建、匹配事件 fanout。 | `cargo test -p kevent --test usage_contract`；目标证据还应包含 `cargo test -p opendan route_event_targets_matching_sessions -- --nocapture`，若 OpenDAN crate 编译被其它 workspace 依赖阻塞则记录为该项未完整验证。 | 匹配事件只投递到目标订阅；取消后不再投递；reader 关闭后可重建；重复 pattern 不导致重复投递。 |
 | UF-05 | kevent 失败后的兜底路径 | 覆盖 kevent daemon 不可用、reader 创建失败、pull timeout、stream 断开、重复/丢失 event 的共同退化行为。 | 高 | 用 mock 或真实环境测试注入失败：create reader 失败、pull 返回 timeout/ReaderClosed、重复 event、无 event；消费侧必须 fallback 到 poll/sweep/fetch。TaskMgr / AgentRuntime task inbox 必须在 `task_ready` event 丢失时通过 `list_tasks` 轮询兜底。 | 模块最小验证 + 真实环境最小验证；完整服务重启作为手工验证；目标证据还应包含 OpenDAN task inbox 定向测试。 | 失败路径不 panic、不卡死；最终通过真相源读取恢复；错误可解释并有日志证据。 |
@@ -644,7 +644,7 @@ uv run test/run.py -p kevent_kmsg/dv
 | R-06 | kmsg 配置字段是否真正生效 | `max_messages`、`retention_seconds`、权限字段等配置若当前未实现，需明确是缺陷、未完成还是文档未定义。 | 高 | 创建带配置的 queue 后写入超过限制、跨 app/user 场景检查；若未实现，在报告中标记设计/实现偏差。 |
 | R-07 | kmsg 可靠性边界 | kmsg 是可靠数据通道，持久化、cursor、ack、重启恢复不能只按当前 happy path 测试。 | 高 | reopen、delete/compact 后 fetch、auto_commit=false 重复读取、commit_ack 后推进。 |
 | R-08 | kevent + kmsg 协作退化路径 | 不能只验证收到 kevent 的快路径，还要验证 kevent 丢失/重启/断流时 kmsg 轮询兜底仍能保证功能。 | 高 | 组合测试中同时覆盖 event-driven 和 polling fallback。 |
-| R-09 | msg_center / control_panel / OpenDAN event path 兼容 | msg_center 是当前 kevent 真实生产调用方之一，事件生产方和消费方的 path/payload 约定必须一致。 | 高 | 静态检查和最小验证覆盖 `/msg_center/{owner}/box/{box}/changed`、OpenDAN legacy pattern 兼容、control_panel in/out 订阅和回读 record 语义。 |
+| R-09 | msg_center / control_panel / OpenDAN event path 兼容 | msg_center 是当前 kevent 真实生产调用方之一，事件生产方和消费方的 path/payload 约定必须一致。 | 高 | 静态检查和最小验证覆盖 `/msg_center/{owner}/box_{box}_{owner}/changed`、OpenDAN inbox pattern、control_panel in/out 订阅和回读 record 语义。 |
 | R-10 | TaskMgr task event producer / AgentRuntime task inbox 兼容 | beta2.2 后 TaskMgr 明确发布 task changed、root fanout 和 runner task_ready event；AgentRuntime task inbox 订阅 runner channel 和 `/task_mgr/**`。这些路径和 payload 是新的 kevent 生产/消费契约。 | 高 | TaskMgr 单元测试固定 event id、payload、data inline limit；`kevent_kmsg/task_mgr` DV 通过 gateway 验证 task_ready event 后回读 TaskMgr 真相源，若 gateway 未暴露 `task-manager` 则按配置阻塞记录。 |
 
 ### 当前已发现的设计 / 实现偏差
@@ -663,7 +663,7 @@ uv run test/run.py -p kevent_kmsg/dv
 | D-08 | kmsg | kevent 文档把 kmsg 描述为“拉模型（HTTP GET）”，但当前 kmsg HTTP 服务只接受 POST，并通过 kRPC handler 提供 `fetch_messages` / `read_message`。 | `doc/arch/kevent.md` 多处写 kMsgQueue 拉模型（HTTP GET）；`sled_msg_queue.rs` 的 `HttpServer` 只接受 `Method::POST`。 | 已静态确认 | 文档和现实现状不一致。该项先作为当前行为记录和文档偏差，不作为默认测试失败项。 | DV 中记录 POST 可用和 GET 当前 status；报告建议确认最终协议是 HTTP GET 还是 kRPC POST。 |
 | D-09 | kmsg | `sync_write` 当前只在 create/update/post/delete_message_before 等路径触发 flush；订阅状态变化如 subscribe、unsubscribe、fetch auto_commit、commit_ack、seek 没有按 queue config flush。若 `sync_write` 代表 WAL/可靠队列状态，则 cursor 可靠性不足。 | `doc/arch/kmsg.md` 将 `sync_write` 描述为 Write-Ahead-Log 语义；`sled_msg_queue.rs` 中 cursor 更新路径无 flush。 | 已静态确认 | 需要设计确认；对 at-least-once 重启恢复有生产风险。 | sync_write=true 队列中 fetch/ack 后 reopen，验证 cursor 是否稳定；进一步需要 crash 级验证。 |
 | D-10 | kmsg | `doc/arch/kmsg.md` 描述的是基础 trait，没有包含当前公开 API 中的 `read_message`、权限 bool、绝对路径 QueueUrn 透传规则等扩展。 | `doc/arch/kmsg.md` 与 `msg_queue.rs` 差异。 | 文档需补充 | 文档落后于实现，不一定是代码错误，但测试计划和报告要明确当前契约来源。 | 在测试报告里列出“文档未覆盖但当前 API 暴露”的能力，建议补文档。 |
-| D-11 | kevent 调用方 | `msg_center` 当前发布 `/msg_center/{owner}/box/{box}/changed`，OpenDAN 同时订阅新旧两类 path，control_panel 只订阅 `/box/in/**` 和 `/box/out/**`。如果未来 msg_center path 或 box name 变化，两个消费方容易静默失效。 | `msg_center.rs` 的 `build_box_changed_event_id`；`message_hub.rs` 的 chat stream patterns；`msg_center_pump.rs` 的 `build_msg_center_event_patterns`。 | 已静态确认风险 | 不是当前实现 bug，但属于调用方约定脆弱点，应固化测试。 | 增加事件生产方和消费方 pattern 兼容性最小验证，验证所有消费方 pattern 能匹配 msg_center 当前发布路径。 |
+| D-11 | kevent 调用方 | `msg_center` 当前发布 `/msg_center/{owner}/box_{box}_{owner}/changed`，OpenDAN 订阅 inbox 类 box id，control_panel 订阅 inbox/outbox box id。如果未来 msg_center path 或 box id 变化，两个消费方容易静默失效。 | `msg_center.rs` 的 `build_box_changed_event_id`；`message_hub.rs` 的 chat stream patterns；`msg_center_pump.rs` 的 `build_msg_center_event_patterns`。 | 已静态确认风险 | 不是当前实现 bug，但属于调用方约定脆弱点，应固化测试。 | 增加事件生产方和消费方 pattern 兼容性最小验证，验证所有消费方 pattern 能匹配 msg_center 当前发布路径。 |
 
 ## 14. 附录：测试方案维护原则
 

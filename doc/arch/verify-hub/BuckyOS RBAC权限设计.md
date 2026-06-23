@@ -75,7 +75,7 @@ g, demo-app, app
 - obj://kmsg/* 
 - obj://msg_center/*
 - obj://task_mgr/* 由task-mgr提供的task资源，目前该服务有基于自己业务逻辑的权限管理
-- obj://msg_center/$userid/$box_id
+- obj://$box_id，例如 obj:///msg_center/$userid/box_in_$userid
 - kevent 不独立配置，完全看相关对象的res_path 
 
 

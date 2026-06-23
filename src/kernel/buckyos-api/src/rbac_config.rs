@@ -63,18 +63,20 @@ pub const DEFAULT_RBAC_POLICY: &str = r#"
 p, kernel, obj://*, all,allow
 p, ood, obj://*, all,allow
 p, root, obj://*, all,allow
+
 p, system, obj://*, all,allow
 p, system, obj://dfs/security/*,all,deny
 p, system, obj://config/security/*,all,deny
 
 
 p, frame, obj://config/boot/*, read,allow
+p, frame, obj://config/system/*,read,allow
 p, frame, obj://config/agents/*/doc,read,allow
-p, frame, obj://config/services/{service}/*,read|write,allow
+p, frame, obj://config/services/{frame}/*,all,allow
 p, frame, obj://config/services/*/info,read,allow
 p, frame, obj://config/users*,read,allow
-p, frame, obj://config/users/*/*,read,allow
-p, frame, obj://config/system/*,read,allow
+
+
 
 
 p, app, obj://config/boot/*, read,allow

@@ -35,7 +35,7 @@ impl TruthSource {
 enum TruthLocator {
     Task(String),
     MsgRecord(String),
-    MsgBox { owner: String, box_name: String },
+    MsgBox { box_id: String },
     Kmsg { queue_urn: String, index: u64 },
 }
 
@@ -48,13 +48,9 @@ fn locator_from_payload(payload: &Value) -> Option<TruthLocator> {
         return Some(TruthLocator::MsgRecord(record_id.to_string()));
     }
 
-    if let (Some(owner), Some(box_name)) = (
-        payload.get("owner").and_then(Value::as_str),
-        payload.get("box").and_then(Value::as_str),
-    ) {
+    if let Some(box_id) = payload.get("box_id").and_then(Value::as_str) {
         return Some(TruthLocator::MsgBox {
-            owner: owner.to_string(),
-            box_name: box_name.to_string(),
+            box_id: box_id.to_string(),
         });
     }
 
@@ -131,43 +127,31 @@ fn assert_patterns_do_not_match(patterns: &[String], eventid: &str) {
 fn msg_center_box_events_match_current_consumers() {
     let owner = "alice";
     let control_panel_patterns = vec![
-        format!("/msg_center/{owner}/box/in/**"),
-        format!("/msg_center/{owner}/box/out/**"),
+        format!("/msg_center/{owner}/box_in_{owner}/**"),
+        format!("/msg_center/{owner}/box_out_{owner}/**"),
     ];
-    let opendan_patterns = [
-        "in",
-        "inbox",
-        "group_in",
-        "group_inbox",
-        "request",
-        "request_box",
-    ]
-    .into_iter()
-    .flat_map(|box_name| {
-        [
-            format!("/msg_center/{owner}/box/{box_name}/**"),
-            format!("/msg_center/{owner}/{box_name}/**"),
-        ]
-    })
-    .collect::<Vec<_>>();
+    let opendan_patterns = ["box_in", "box_group_in", "box_request"]
+        .into_iter()
+        .map(|box_prefix| format!("/msg_center/{owner}/{box_prefix}_{owner}/**"))
+        .collect::<Vec<_>>();
 
-    assert_patterns_match(&control_panel_patterns, "/msg_center/alice/box/in/changed");
-    assert_patterns_match(&control_panel_patterns, "/msg_center/alice/box/out/changed");
+    assert_patterns_match(
+        &control_panel_patterns,
+        "/msg_center/alice/box_in_alice/changed",
+    );
+    assert_patterns_match(
+        &control_panel_patterns,
+        "/msg_center/alice/box_out_alice/changed",
+    );
     assert_patterns_do_not_match(
         &control_panel_patterns,
-        "/msg_center/alice/box/group_in/changed",
+        "/msg_center/alice/box_group_in_alice/changed",
     );
 
     for eventid in [
-        "/msg_center/alice/box/in/changed",
-        "/msg_center/alice/box/inbox/changed",
-        "/msg_center/alice/box/group_in/changed",
-        "/msg_center/alice/box/group_inbox/changed",
-        "/msg_center/alice/box/request/changed",
-        "/msg_center/alice/box/request_box/changed",
-        "/msg_center/alice/in/changed",
-        "/msg_center/alice/group_in/changed",
-        "/msg_center/alice/request/changed",
+        "/msg_center/alice/box_in_alice/changed",
+        "/msg_center/alice/box_group_in_alice/changed",
+        "/msg_center/alice/box_request_alice/changed",
     ] {
         assert_patterns_match(&opendan_patterns, eventid);
     }
@@ -201,13 +185,11 @@ fn event_payload_carries_locator_not_truth() {
     );
     assert_eq!(
         locator_from_payload(&json!({
-            "owner": "alice",
-            "box": "in",
+            "box_id": "/msg_center/alice/box_in_alice",
             "changed": true
         })),
         Some(TruthLocator::MsgBox {
-            owner: "alice".to_string(),
-            box_name: "in".to_string()
+            box_id: "/msg_center/alice/box_in_alice".to_string()
         })
     );
     assert_eq!(

@@ -584,7 +584,7 @@ POST /kapi/kevent/stream
 
 ```json
 {
-  "patterns": ["/msg_center/user1/box/in/**"],
+  "patterns": ["/msg_center/user1/box_in_user1/**"],
   "keepalive_ms": 15000
 }
 ```
@@ -606,7 +606,7 @@ POST /kapi/kevent/stream
 
 ```json
 { "type": "ack", "connection_id": "c1", "keepalive_ms": 15000 }
-{ "type": "event", "event": { "eventid": "/msg_center/user1/box/in/msg_001", "source_node": "ood1", "source_pid": 1234, "ingress_node": "ood1", "timestamp": 1708588800000, "data": { "record_id": "msg_001" } } }
+{ "type": "event", "event": { "eventid": "/msg_center/user1/box_in_user1/msg_001", "source_node": "ood1", "source_pid": 1234, "ingress_node": "ood1", "timestamp": 1708588800000, "data": { "record_id": "msg_001" } } }
 { "type": "keepalive", "at_ms": 1708588805000 }
 { "type": "error", "error": "INVALID_PATTERN: daemon only supports global patterns" }
 ```
@@ -836,7 +836,7 @@ Wrapper Service
 
 ```json
 { "type": "ack", "connection_id": "..." }
-{ "type": "event", "event": { "eventid": "/msg_center/u1/box/in/...", "source_node": "ood1", "source_pid": 1234, "timestamp": 1708588800000, "data": {} } }
+{ "type": "event", "event": { "eventid": "/msg_center/u1/box_in_u1/...", "source_node": "ood1", "source_pid": 1234, "timestamp": 1708588800000, "data": {} } }
 { "type": "keepalive", "at_ms": 1708588800000 }
 { "type": "error", "error": "..." }
 ```
@@ -877,7 +877,7 @@ loop:
 
 ```ts
 const reader = await kevent.create_event_reader([
-  `/msg_center/${owner}/box/in/**`
+  `/msg_center/${owner}/box_in_${owner}/**`
 ]);
 
 let cursor = "";

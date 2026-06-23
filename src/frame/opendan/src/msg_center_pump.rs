@@ -3,7 +3,7 @@
 //! Bridges buckyos's msg-center inbox boxes into [`AIAgent::inbox()`]:
 //!
 //! ```text
-//!   kevent_client.create_event_reader(["/msg_center/{owner}/box/**", ...])
+//!   kevent_client.create_event_reader(["/msg_center/{owner}/box_in_{owner}/**", ...])
 //!       └── pull_event(1s) ──┐
 //!                            ├─ Ok(Some(e))  → derive BoxKind from eventid → drain
 //!                            ├─ Ok(None)     → sweep all inbox boxes (timeout fallback)
@@ -46,21 +46,6 @@ const EVENT_PULL_TIMEOUT_MS: u64 = 1_000;
 /// Max msgs drained from a single box per dispatch tick — keeps a flood from
 /// monopolizing the pump.
 const MAX_MSG_PULL_PER_TICK: usize = 128;
-
-/// Box names the kevent patterns alias to — keep in sync with msg-center's
-/// publish side. The pump tolerates both `box/<name>` (canonical) and
-/// `<name>` (legacy) eventid layouts.
-const MSG_CENTER_EVENT_BOX_PATTERN_NAMES: [&str; 9] = [
-    "in",
-    "inbox",
-    "INBOX",
-    "group_in",
-    "group_inbox",
-    "GROUP_INBOX",
-    "request",
-    "request_box",
-    "REQUEST_BOX",
-];
 
 /// Inputs to [`run`]. Bundled because `tokio::spawn` would otherwise want a
 /// long argument list and we'd lose the field-name documentation at call
@@ -355,9 +340,18 @@ fn append_all_inbox_boxes(target: &mut Vec<BoxKind>) {
     }
 }
 
-/// Build the kevent patterns the agent subscribes to so msg-center
-/// publishes accelerate inbox draining. Mirrors the legacy paths the
-/// msg-center server emits today.
+fn msg_center_box_id_segment(owner_token: &str, box_kind: &BoxKind) -> String {
+    let prefix = match box_kind {
+        BoxKind::Inbox => "box_in",
+        BoxKind::GroupInbox => "box_group_in",
+        BoxKind::RequestBox => "box_request",
+        BoxKind::Outbox | BoxKind::TunnelOutbox => return String::new(),
+    };
+    format!("{prefix}_{owner_token}")
+}
+
+/// Build the kevent patterns the agent subscribes to so msg-center publishes
+/// accelerate inbox draining.
 pub fn build_msg_center_event_patterns(owner: &DID) -> Vec<String> {
     let owner_token = owner.to_raw_host_name();
     let normalized = owner_token.to_ascii_lowercase();
@@ -368,14 +362,11 @@ pub fn build_msg_center_event_patterns(owner: &DID) -> Vec<String> {
 
     let mut out = Vec::new();
     for owner_token in owner_tokens {
-        for box_name in MSG_CENTER_EVENT_BOX_PATTERN_NAMES {
-            for pattern in [
-                format!("/msg_center/{owner_token}/box/{box_name}/**"),
-                format!("/msg_center/{owner_token}/{box_name}/**"),
-            ] {
-                if !out.contains(&pattern) {
-                    out.push(pattern);
-                }
+        for box_kind in [BoxKind::Inbox, BoxKind::GroupInbox, BoxKind::RequestBox] {
+            let box_id_segment = msg_center_box_id_segment(&owner_token, &box_kind);
+            let pattern = format!("/msg_center/{owner_token}/{box_id_segment}/**");
+            if !out.contains(&pattern) {
+                out.push(pattern);
             }
         }
     }
@@ -407,22 +398,24 @@ fn msg_center_event_box_kind(event: &Event) -> Option<BoxKind> {
     if parts.len() < 3 || parts[0] != "msg_center" {
         return None;
     }
-    if let Some(idx) = parts.iter().position(|p| *p == "box") {
-        return parts
-            .get(idx + 1)
-            .and_then(|name| event_name_to_box_kind(name));
-    }
-    parts.get(2).and_then(|name| event_name_to_box_kind(name))
+    parts.get(2).and_then(|name| event_box_id_to_box_kind(name))
 }
 
-fn event_name_to_box_kind(raw: &str) -> Option<BoxKind> {
+fn event_box_id_to_box_kind(raw: &str) -> Option<BoxKind> {
     let n = raw.trim().to_ascii_lowercase().replace('-', "_");
-    match n.as_str() {
-        "in" | "inbox" => Some(BoxKind::Inbox),
-        "group_in" | "group_inbox" => Some(BoxKind::GroupInbox),
-        "request" | "request_box" => Some(BoxKind::RequestBox),
-        _ => None,
+    if has_box_id_prefix(&n, "box_group_in_") {
+        Some(BoxKind::GroupInbox)
+    } else if has_box_id_prefix(&n, "box_request_") {
+        Some(BoxKind::RequestBox)
+    } else if has_box_id_prefix(&n, "box_in_") {
+        Some(BoxKind::Inbox)
+    } else {
+        None
     }
+}
+
+fn has_box_id_prefix(value: &str, prefix: &str) -> bool {
+    value.len() > prefix.len() && value.starts_with(prefix)
 }
 
 /// Parse `agent.toml`'s `agent_did` into a `DID`. Returns `None` on empty /
@@ -454,20 +447,40 @@ mod tests {
 
     #[test]
     fn classifies_box_kind_from_canonical_path() {
-        let e = ev("/msg_center/alice/box/inbox/changed");
+        let e = ev("/msg_center/alice/box_in_alice/changed");
         assert_eq!(msg_center_event_box_kind(&e), Some(BoxKind::Inbox));
     }
 
     #[test]
-    fn classifies_box_kind_from_legacy_path() {
-        let e = ev("/msg_center/alice/request/changed");
+    fn classifies_request_box_kind_from_canonical_path() {
+        let e = ev("/msg_center/alice/box_request_alice/changed");
         assert_eq!(msg_center_event_box_kind(&e), Some(BoxKind::RequestBox));
     }
 
     #[test]
     fn unknown_box_returns_none() {
-        let e = ev("/msg_center/alice/box/mystery/changed");
+        let e = ev("/msg_center/alice/box_mystery_alice/changed");
         assert_eq!(msg_center_event_box_kind(&e), None);
+    }
+
+    #[test]
+    fn event_patterns_use_unique_box_ids() {
+        let owner = DID::from_str("did:dev:alice").unwrap();
+        let owner_token = owner.to_raw_host_name();
+        let patterns = build_msg_center_event_patterns(&owner);
+
+        assert!(patterns.contains(&format!(
+            "/msg_center/{owner_token}/box_in_{owner_token}/**"
+        )));
+        assert!(patterns.contains(&format!(
+            "/msg_center/{owner_token}/box_group_in_{owner_token}/**"
+        )));
+        assert!(patterns.contains(&format!(
+            "/msg_center/{owner_token}/box_request_{owner_token}/**"
+        )));
+        assert!(!patterns
+            .iter()
+            .any(|pattern| pattern.contains("/box/") || pattern.ends_with("/in/**")));
     }
 
     #[test]

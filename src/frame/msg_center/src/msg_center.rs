@@ -190,13 +190,13 @@ impl MessageCenter {
         }
     }
 
-    fn box_event_name(box_kind: &BoxKind) -> &'static str {
+    fn box_id_prefix(box_kind: &BoxKind) -> &'static str {
         match box_kind {
-            BoxKind::Inbox => "in",
-            BoxKind::Outbox => "out",
-            BoxKind::GroupInbox => "group_in",
-            BoxKind::TunnelOutbox => "tunnel_out",
-            BoxKind::RequestBox => "request",
+            BoxKind::Inbox => "box_in",
+            BoxKind::Outbox => "box_out",
+            BoxKind::GroupInbox => "box_group_in",
+            BoxKind::TunnelOutbox => "box_tunnel_out",
+            BoxKind::RequestBox => "box_request",
         }
     }
 
@@ -214,12 +214,20 @@ impl MessageCenter {
             .clone()
     }
 
-    fn build_box_changed_event_id(owner: &DID, box_kind: &BoxKind) -> String {
+    fn build_box_id(owner: &DID, box_kind: &BoxKind) -> String {
         let owner_token = owner.to_raw_host_name();
         format!(
-            "/msg_center/{}/box/{}/{}",
+            "/msg_center/{}/{}_{}",
             owner_token,
-            Self::box_event_name(box_kind),
+            Self::box_id_prefix(box_kind),
+            owner_token
+        )
+    }
+
+    fn build_box_changed_event_id(owner: &DID, box_kind: &BoxKind) -> String {
+        format!(
+            "{}/{}",
+            Self::build_box_id(owner, box_kind),
             MSG_CENTER_BOX_CHANGED_EVENT_NAME
         )
     }
@@ -235,12 +243,13 @@ impl MessageCenter {
                 return;
             }
         };
+        let box_id = Self::build_box_id(&owner, &record.box_kind);
         let event_id = Self::build_box_changed_event_id(&owner, &record.box_kind);
         let payload = json!({
             "operation": operation,
             "owner": owner.to_string(),
             "box_kind": Self::box_kind_name(&record.box_kind),
-            "box_name": Self::box_event_name(&record.box_kind),
+            "box_id": box_id,
             "record_id": record.record_id.clone(),
             "msg_id": record.msg_id.to_string(),
             "state": record.state.clone(),
