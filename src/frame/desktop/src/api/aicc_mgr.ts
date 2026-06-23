@@ -105,6 +105,10 @@ interface AiccRpcClient {
   call(method: string, params: Record<string, unknown>): Promise<unknown>
 }
 
+interface AccountInfo {
+  session_token?: unknown
+}
+
 interface RawModelDirectory {
   providers?: RawProviderInventory[]
   directory?: Record<string, Record<string, RawLogicalRouteItem>>
@@ -509,7 +513,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   }
 
   private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getClient().call(method, params)
+    const result = await this.getClient().call(method, await withSessionToken(params))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
@@ -517,7 +521,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   }
 
   private async callControlPanel<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getControlPanelClient().call(method, params)
+    const result = await this.getControlPanelClient().call(method, await withSessionToken(params))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
@@ -546,6 +550,17 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     }
     return this.controlPanelClient
   }
+}
+
+async function withSessionToken(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (typeof params.session_token === 'string' && params.session_token.trim()) {
+    return params
+  }
+  const accountInfo = await buckyos.getAccountInfo() as AccountInfo | null
+  const sessionToken = typeof accountInfo?.session_token === 'string'
+    ? accountInfo.session_token.trim()
+    : ''
+  return sessionToken ? { ...params, session_token: sessionToken } : params
 }
 
 function withProviderInstanceName(draft: WizardDraft, snapshot: StoreSnapshot): WizardDraft {

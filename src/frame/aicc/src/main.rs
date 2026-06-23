@@ -1036,9 +1036,12 @@ impl AiccHttpServer {
 impl RPCHandler for AiccHttpServer {
     async fn handle_rpc_call(
         &self,
-        req: RPCRequest,
+        mut req: RPCRequest,
         ip_from: IpAddr,
     ) -> std::result::Result<RPCResponse, RPCErrors> {
+        if req.token.is_none() {
+            req.token = param_string(&req.params, "session_token");
+        }
         if req.method == METHOD_RELOAD_SETTINGS
             || req.method == METHOD_SERVICE_RELOAD_SETTINGS
             || req.method == METHOD_REALOAD_SETTINGS
