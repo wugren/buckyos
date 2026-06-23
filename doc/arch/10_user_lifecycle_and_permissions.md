@@ -72,7 +72,7 @@
 |---|---|---|
 | `Root` | （不通过 `g` 分配，按**精确主体名 `root`** 匹配；对应 Owner Root Key） | 引导账户 `system_config_builder.rs`；调度桥接把 `Root`→`Admin` role |
 | `Admin` | `admin` | `system_config_agent.rs`（`update_rbac`）；创建 admin 时 `user_mgr.rs` 也会追加 `g,<id>,admin` |
-| `User` | `user` | `system_config_agent.rs` |
+| `User` | `users` | `system_config_agent.rs` |
 | `Limited` | `limited` | `system_config_agent.rs` |
 | `Guest` | （无映射） | — |
 
@@ -152,7 +152,7 @@ allow = enforce(appid, resource, action)   // App 角色是否允许
 | 要求 `password_hash` | 服务端不生成、不接触明文口令 | ✅ |
 | 拒绝创建 `Root` | 运行期不能造 Root | ✅ |
 | 事务写 `users/<id>/settings` + `users/<id>/doc` | `state=Active`，`res_pool_id=default`；doc 为最小 `{id,name,full_name}` | ✅ |
-| RBAC 分组 | **仅当 `user_type==Admin`** 时用 service token 追加 `g,<id>,admin`；失败仅告警不致命。非 admin 用户由 scheduler `update_rbac` 在下一轮补齐分组行 | ⚠️ |
+| RBAC 分组 | 用 service token 追加当前用户类型对应的角色分组（`Admin -> admin`，`User -> users`，`Limited -> limited`）；失败仅告警不致命，scheduler `update_rbac` 会在下一轮重建 | ⚠️ |
 | DID 密钥对 | **运行期不生成密钥对**（与引导期 `OwnerConfig` 不对称，doc 无公钥字段） | ⚠️ |
 | Home 目录 / 数据目录 | **不创建**（见下「App 标准」） | ❌（标准要求显式 provision） |
 | 默认 App / Agent | **不安装** | ❌（标准要求可配默认集） |

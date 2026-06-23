@@ -1248,15 +1248,19 @@ async fn update_rbac(
         if user_id == "root" {
             continue;
         }
-        push_policy_line(&mut rbac_policy, format!("g, {}, zone_users", user_id));
         match user_item.user_type {
             crate::scheduler::UserType::Admin => {
+                info!("add admin rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, admin", user_id));
+                push_policy_line(&mut rbac_policy, format!("g, su_{}, su_admin", user_id));
             }
             crate::scheduler::UserType::User => {
-                push_policy_line(&mut rbac_policy, format!("g, {}, user", user_id));
+                info!("add users rbac policy for user {}", user_id);
+                push_policy_line(&mut rbac_policy, format!("g, {}, users", user_id));
+                push_policy_line(&mut rbac_policy, format!("g, su_{}, su_users", user_id));
             }
             crate::scheduler::UserType::Limited => {
+                info!("add limited rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, limited", user_id));
             }
             _ => {
@@ -1271,7 +1275,7 @@ async fn update_rbac(
                 push_policy_line(&mut rbac_policy, format!("g, {}, ood", node_id));
             }
             NodeType::Server => {
-                push_policy_line(&mut rbac_policy, format!("g, {}, server", node_id));
+                push_policy_line(&mut rbac_policy, format!("g, {}, node", node_id));
             }
             _ => {
                 continue;
@@ -1287,7 +1291,7 @@ async fn update_rbac(
             ServiceSpecType::Service => {
                 push_policy_line(
                     &mut rbac_policy,
-                    format!("g, {}, service", service_spec.app_id),
+                    format!("g, {}, system", service_spec.app_id),
                 );
             }
             ServiceSpecType::Kernel => {
@@ -1834,6 +1838,73 @@ mod tests {
             second_plan.schedule_snapshot.schedule_time,
             persisted_snapshot.schedule_time
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_schedule_plan_generates_current_user_rbac_groups() {
+        let zone_config = create_test_zone_config();
+        let device_ood1 = create_test_device_info("ood1", None);
+        let mut input_system_config = HashMap::new();
+        input_system_config.insert(
+            "boot/config".to_string(),
+            serde_json::to_string(&zone_config).unwrap(),
+        );
+        input_system_config.insert(
+            "devices/ood1/info".to_string(),
+            serde_json::to_string(&device_ood1).unwrap(),
+        );
+        input_system_config.insert(
+            "users/alice/settings".to_string(),
+            serde_json::to_string(&json!({
+                "type": "admin",
+                "user_id": "alice",
+                "show_name": "alice",
+                "password": "hashed",
+                "state": "active",
+                "res_pool_id": "default"
+            }))
+            .unwrap(),
+        );
+        input_system_config.insert(
+            "users/bob/settings".to_string(),
+            serde_json::to_string(&json!({
+                "type": "user",
+                "user_id": "bob",
+                "show_name": "bob",
+                "password": "hashed",
+                "state": "active",
+                "res_pool_id": "default"
+            }))
+            .unwrap(),
+        );
+        input_system_config.insert(
+            "users/carol/settings".to_string(),
+            serde_json::to_string(&json!({
+                "type": "limited",
+                "user_id": "carol",
+                "show_name": "carol",
+                "password": "hashed",
+                "state": "active",
+                "res_pool_id": "default"
+            }))
+            .unwrap(),
+        );
+
+        let plan = build_schedule_plan(&input_system_config, true)
+            .await
+            .expect("boot plan should build");
+        let policy = match plan.tx_actions.get("system/rbac/policy").unwrap() {
+            KVAction::Update(value) => value,
+            other => panic!("unexpected rbac kv action: {:?}", other),
+        };
+
+        assert!(policy.contains("g, alice, admin"));
+        assert!(policy.contains("g, su_alice, su_admin"));
+        assert!(policy.contains("g, bob, users"));
+        assert!(policy.contains("g, su_bob, su_users"));
+        assert!(policy.contains("g, carol, limited"));
+        assert!(!policy.contains("zone_users"));
+        assert!(!policy.lines().any(|line| line.trim() == "g, bob, user"));
     }
 
     #[test]

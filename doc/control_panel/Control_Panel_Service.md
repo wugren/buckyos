@@ -109,7 +109,7 @@ Agent 在系统中有**两副面孔**，需要区分：
 ### 3.2 权限闸门：调用者 token + RBAC
 
 * **不滥用服务 token**：访问受保护路径时，本服务用**调用者自己的 session token** 构造 `SystemConfigClient`（`system_config_client_for_caller()`），让 `system_config` 侧的 RBAC 直接对调用者生效，而不是用服务级 token 绕过权限。
-* **RBAC 模型**：基于角色（`UserType`）+ Casbin 风格策略，策略文本存 `system/rbac/policy`，按行追加，如 `g, {user_id}, zone_users`、`g, {user_id}, admin`。
+* **RBAC 模型**：基于角色（`UserType`）+ Casbin 风格策略，策略文本存 `system/rbac/policy`，按行追加，如 `g, {user_id}, users`、`g, {user_id}, admin`。
 * **路径闸门**（来自 boot 模板约定）：`users/*`、`agents/*` 等路径对普通调用者受限；OOD 设备 token 对 `users/*/apps/*`、`users/*/agents/*` 有读写、对 `users/*/doc`、`users/*/settings` 等有只读。
 * **Handler 级角色校验**：每个写 handler 先 `require_rpc_principal(principal)?` 取得已认证主体，再按操作类型校验：
   * `require_admin(principal)` — 仅 `Admin`/`Root`；

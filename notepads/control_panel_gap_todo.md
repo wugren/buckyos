@@ -83,7 +83,7 @@ MessageHub                      = 消息与会话（control_panel/message_hub.rs
 ### TODO-5　默认基础组强制加入
 - **PRD**：§7.3「所有本空间用户默认属于同一不可移除基础组」。
 - **现状**：`user.create` 仅 Admin 时 append `g,{user},admin`（`user_mgr.rs:296`），普通用户不入基础组。
-- **做什么**：create / invite.accept 时把用户加入 zone 基础组（如 `g,{user},zone_users`），接口不允许移除。
+- **做什么**：create / invite.accept 时把普通用户加入 `users` 组（如 `g,{user},users`），管理员加入 `admin` 组，接口不允许移除默认组。
 
 ### TODO-6　Profile / Settings 分区（Settings 留本地，Profile 读取走协议）
 - **PRD**：§5.6 / §8.4；`UserType.md` §通过 did 获取 profile。

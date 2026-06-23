@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const ZONE_USERS_GROUP: &str = "zone_users";
+const DEFAULT_USERS_GROUP: &str = "users";
 const USER_INVITE_PREFIX: &str = "services/control_panel/user_invites";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -162,15 +162,19 @@ fn default_contact_settings(did: Option<String>) -> UserContactSettings {
     UserContactSettings {
         did,
         note: None,
-        groups: vec![ZONE_USERS_GROUP.to_string()],
+        groups: vec![DEFAULT_USERS_GROUP.to_string()],
         tags: Vec::new(),
         bindings: Vec::new(),
     }
 }
 
-fn ensure_zone_users_group(contact: &mut UserContactSettings) {
-    if !contact.groups.iter().any(|group| group == ZONE_USERS_GROUP) {
-        contact.groups.push(ZONE_USERS_GROUP.to_string());
+fn ensure_default_users_group(contact: &mut UserContactSettings) {
+    if !contact
+        .groups
+        .iter()
+        .any(|group| group == DEFAULT_USERS_GROUP)
+    {
+        contact.groups.push(DEFAULT_USERS_GROUP.to_string());
     }
 }
 
@@ -303,20 +307,18 @@ async fn save_user_settings(
 async fn append_user_rbac_groups(user_id: &str, user_type: &UserType) -> Result<(), RPCErrors> {
     let runtime = get_buckyos_api_runtime()?;
     let service_client = runtime.get_system_config_client().await?;
-    let zone_line = format!("g, {}, {}", user_id, ZONE_USERS_GROUP);
-    if let Err(e) = service_client
-        .append("system/rbac/policy", &zone_line)
-        .await
-    {
-        warn!("Failed to add {} to zone_users RBAC group: {}", user_id, e);
-    }
-    if matches!(user_type, UserType::Admin) {
-        let policy_line = format!("g, {}, admin", user_id);
+    let policy_line = match user_type {
+        UserType::Admin => Some(format!("g, {}, admin", user_id)),
+        UserType::User => Some(format!("g, {}, {}", user_id, DEFAULT_USERS_GROUP)),
+        UserType::Limited => Some(format!("g, {}, limited", user_id)),
+        _ => None,
+    };
+    if let Some(policy_line) = policy_line {
         if let Err(e) = service_client
             .append("system/rbac/policy", &policy_line)
             .await
         {
-            warn!("Failed to add user {} to admin RBAC group: {}", user_id, e);
+            warn!("Failed to add user {} RBAC group: {}", user_id, e);
         }
     }
     Ok(())
@@ -715,7 +717,7 @@ impl ControlPanelServer {
                 contact.bindings = b;
             }
         }
-        ensure_zone_users_group(&mut contact);
+        ensure_default_users_group(&mut contact);
 
         settings.contact = Some(contact.clone());
 
@@ -883,7 +885,7 @@ impl ControlPanelServer {
         } else {
             contact.bindings.push(binding);
         }
-        ensure_zone_users_group(&mut contact);
+        ensure_default_users_group(&mut contact);
         settings.contact = Some(contact.clone());
         save_user_settings(&client, &target, &settings).await?;
 
@@ -925,7 +927,7 @@ impl ControlPanelServer {
                 platform, target
             )));
         }
-        ensure_zone_users_group(&mut contact);
+        ensure_default_users_group(&mut contact);
         settings.contact = Some(contact.clone());
         save_user_settings(&client, &target, &settings).await?;
 
@@ -983,8 +985,8 @@ impl ControlPanelServer {
             .get("groups")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default();
-        if !groups.iter().any(|group| group == ZONE_USERS_GROUP) {
-            groups.push(ZONE_USERS_GROUP.to_string());
+        if !groups.iter().any(|group| group == DEFAULT_USERS_GROUP) {
+            groups.push(DEFAULT_USERS_GROUP.to_string());
         }
         let app_ids: Vec<String> = req
             .params
@@ -1156,7 +1158,7 @@ impl ControlPanelServer {
                 contact.groups.push(group.clone());
             }
         }
-        ensure_zone_users_group(&mut contact);
+        ensure_default_users_group(&mut contact);
         let profile = profile_from_owner_config(&owner_config);
         let show_name = invite
             .show_name

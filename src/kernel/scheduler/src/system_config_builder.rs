@@ -688,7 +688,7 @@ fn build_zone_user_contact_settings(
     Ok(Some(UserContactSettings {
         did: Some(DID::new("bns", &config.user_name).to_string()),
         note: None,
-        groups: vec!["zone_user".to_string()],
+        groups: vec!["users".to_string()],
         tags: vec!["zone_user".to_string()],
         bindings: vec![UserTunnelBinding {
             platform: "telegram".to_string(),

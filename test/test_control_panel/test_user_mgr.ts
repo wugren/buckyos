@@ -13,6 +13,7 @@
  *     --unsafely-ignore-certificate-errors test_user_mgr.ts
  */
 
+import { buckyos } from "buckyos";
 import { initTestRuntime } from "../test_helpers/buckyos_client.ts";
 import {
   fetchUserList,
@@ -42,6 +43,8 @@ import {
   type UserDetail,
   type UsersListResponse,
   type AgentsListResponse,
+  type UserType,
+  type SimpleOkResponse,
 } from "../../src/frame/desktop/src/api/user_mgr.ts";
 
 // ---------------------------------------------------------------------------
@@ -79,12 +82,153 @@ function assert(condition: boolean, message: string): void {
 
 // Derived from the DV zone config (src/kernel/scheduler/src/system_config_builder.rs)
 const DV_DEFAULT_AGENT_ID = "jarvis";
-// Fake sha256 hashes for the test user — format doesn't matter to the backend,
-// it only stores the string verbatim.
-const FAKE_PW_HASH_A =
-  "a1".padEnd(64, "0");
+// Fake sha256 hash for change_password — format doesn't matter to the backend,
+// it only stores the string verbatim (no login happens after this point).
 const FAKE_PW_HASH_B =
   "b2".padEnd(64, "0");
+
+function getEnv(name: string, fallback: string): string {
+  const val = Deno.env.get(name);
+  return typeof val === "string" && val.trim().length > 0 ? val.trim() : fallback;
+}
+
+// Admin credentials used to obtain a sudo grant. The DV zone provisions the
+// owner/admin account ("devtest") with the password "bucky2025"; the stored
+// hash o8XyToejrbCYou84h/VkF4Tht0BeQQbuX3XKG+8+GQ4= equals
+// hashPassword("devtest", "bucky2025") — see
+// src/kernel/buckyos-api/src/test_config.rs (ADMIN_PASSWORD_HASH).
+const DV_ADMIN_USER = getEnv("BUCKYOS_TEST_ADMIN_USER", "devtest");
+const DV_ADMIN_PASSWORD = getEnv("BUCKYOS_TEST_ADMIN_PASSWORD", "bucky2025");
+// appid must match the token appid the gateway accepts for the AppClient — the
+// test runtime logs in as "buckycli" (see buckyos_client.ts).
+const TEST_APP_ID = getEnv("BUCKYOS_TEST_APP_ID", "buckycli");
+
+// ---------------------------------------------------------------------------
+// Sudo / local-account auth helpers
+//
+// Sensitive writes under config/users/* (user.create) require an *elevated*
+// sudo session token, not the regular admin login token. The flow mirrors the
+// desktop sudo dialog (src/frame/desktop/src/components/sudo.tsx):
+//   1. hashPassword(user, pw, nonce) -> verify-hub.sudo_by_password -> sudo token
+//   2. call control-panel user.create with that sudo token as the session token
+// ---------------------------------------------------------------------------
+
+// The SDK's hashPassword typings are loose (nonce typed as `null`, return as a
+// union). The runtime always takes an optional numeric nonce and returns the
+// base64 string hash, so narrow it here.
+const hashPassword = buckyos.hashPassword as unknown as (
+  username: string,
+  password: string,
+  nonce?: number,
+) => string;
+
+// Minimal typed view of the SDK's raw RPC client. We MUST use a raw client
+// (not buckyos.getServiceRpcClient): in AppClient mode getServiceRpcClient
+// returns a *managed* client that re-injects the runtime's default (non-sudo)
+// session token on every call, silently overriding setSessionToken — which
+// drops the sudo elevation and makes user.create fail with "No write
+// permission". A raw kRPCClient sends exactly the token we pass.
+type RawRpcClient = {
+  setSeq(seq: number): void;
+  call(method: string, params: Record<string, unknown>): Promise<unknown>;
+};
+const KRpcClient = buckyos.kRPCClient as unknown as new (
+  url: string,
+  token?: string | null,
+  seq?: number,
+) => RawRpcClient;
+
+/** Absolute gateway URL for a zone service (AppClient mode has no page origin). */
+function serviceUrl(service: string): string {
+  const cfg = buckyos.getBuckyOSConfig() as
+    | { zoneHost?: string; defaultProtocol?: string }
+    | null;
+  const host = cfg?.zoneHost;
+  if (!host) throw new Error("zoneHost is not configured on the runtime");
+  const protocol = cfg?.defaultProtocol ?? "https://";
+  return `${protocol}${host}/kapi/${service}`;
+}
+
+/** Request an elevated sudo session token from verify-hub via password. */
+async function obtainSudoToken(
+  username: string,
+  password: string,
+  appId: string,
+): Promise<string> {
+  const nonce = Date.now();
+  const passwordHash = hashPassword(username, password, nonce);
+  // verify-hub login/sudo endpoints are unauthenticated — use a raw client.
+  const rpc = new KRpcClient(serviceUrl("verify-hub"), null, nonce);
+  const res = (await rpc.call("sudo_by_password", {
+    username,
+    password: passwordHash,
+    appid: appId,
+    login_nonce: nonce,
+  })) as { session_token?: unknown };
+  const token = typeof res?.session_token === "string" ? res.session_token : "";
+  if (!token) {
+    throw new Error("sudo_by_password did not return a session_token");
+  }
+  return token;
+}
+
+/** Log in a local (password) account via verify-hub. Returns the account info. */
+async function loginByPassword(
+  username: string,
+  password: string,
+  appId: string,
+): Promise<{
+  session_token?: string;
+  user_id?: string;
+  user_info?: { user_id?: string; user_type?: string; show_name?: string };
+}> {
+  const nonce = Date.now();
+  const passwordHash = hashPassword(username, password, nonce);
+  const rpc = new KRpcClient(serviceUrl("verify-hub"), null, nonce);
+  return (await rpc.call("login_by_password", {
+    type: "password",
+    username,
+    password: passwordHash,
+    appid: appId,
+    login_nonce: nonce,
+  })) as Awaited<ReturnType<typeof loginByPassword>>;
+}
+
+/**
+ * Call control-panel `user.create` with an explicit session token (the sudo
+ * grant). Mirrors the param mapping of the typed `createUser` helper, but lets
+ * us drive the auth token directly via a raw client (see RawRpcClient note).
+ */
+async function createUserWithToken(
+  token: string,
+  input: {
+    userId: string;
+    passwordHash: string;
+    showName?: string;
+    userType?: Exclude<UserType, "root">;
+    allowPasswordChange?: boolean;
+  },
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  try {
+    const rpc = new KRpcClient(serviceUrl("control-panel"), token);
+    const params: Record<string, unknown> = {
+      user_id: input.userId,
+      password_hash: input.passwordHash,
+    };
+    if (input.showName !== undefined) params.show_name = input.showName;
+    if (input.userType !== undefined) params.user_type = input.userType;
+    if (input.allowPasswordChange !== undefined) {
+      params.allow_password_change = input.allowPasswordChange;
+    }
+    const result = (await rpc.call("user.create", params)) as SimpleOkResponse;
+    if (!result || typeof result !== "object") {
+      throw new Error("Invalid user.create response");
+    }
+    return { data: result, error: null };
+  } catch (error) {
+    return { data: null, error };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -236,15 +380,61 @@ async function main() {
   // -----------------------------------------------------------------------
   console.log(`\n[user write cycle: ${testUserId}]`);
 
+  // The new account is a *local* (password) account — created with a username
+  // and a password hash, logged in via verify-hub.login_by_password. It is not
+  // an account backed by an independent BNS identity.
+  //
+  // IMPORTANT: the stored password hash must be hashPassword(user, pw) with NO
+  // nonce (the "org" hash). verify-hub re-salts it with the per-login nonce
+  // (src/kernel/verify_hub/src/main.rs::validate_password_login), so a fake
+  // hash here would store fine but make login impossible.
+  const NEW_USER_PASSWORD = "DvTest-Pass-2025";
+  const newUserPasswordHash = hashPassword(testUserId, NEW_USER_PASSWORD);
+
+  let sudoToken: string | null = null;
+
   results.push(
-    await runCase("user.create creates a new user", async () => {
+    await runCase("sudo: admin obtains an elevated sudo token", async () => {
+      sudoToken = await obtainSudoToken(
+        DV_ADMIN_USER,
+        DV_ADMIN_PASSWORD,
+        TEST_APP_ID,
+      );
+      assert(
+        typeof sudoToken === "string" && sudoToken.length > 0,
+        "sudo token should be a non-empty string",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("user.create is rejected without sudo", async () => {
+      // Uses the regular (non-elevated) admin session token. Sensitive writes
+      // under config/users/* require sudo, so this must fail. A distinct
+      // user_id keeps this isolated from the real create below.
       const { data, error } = await createUser({
+        userId: `${testUserId}nosudo`,
+        passwordHash: newUserPasswordHash,
+        showName: "DV Test User (no sudo)",
+        userType: "user",
+      });
+      assert(
+        error !== null || data === null,
+        "create without sudo must be rejected",
+      );
+    }),
+  );
+
+  results.push(
+    await runCase("user.create with sudo creates a new local user", async () => {
+      assert(sudoToken !== null, "sudoToken should have been granted");
+      const { data, error } = await createUserWithToken(sudoToken!, {
         userId: testUserId,
-        passwordHash: FAKE_PW_HASH_A,
+        passwordHash: newUserPasswordHash,
         showName: `DV Test User ${testUserId}`,
         userType: "user",
       });
-      assert(!error, `createUser should not error: ${error}`);
+      assert(!error, `createUser (sudo) should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
       assert(
@@ -255,10 +445,34 @@ async function main() {
   );
 
   results.push(
-    await runCase("user.create rejects duplicate user_id", async () => {
-      const { data, error } = await createUser({
+    await runCase(
+      "new local user can log in with username + password",
+      async () => {
+        const res = await loginByPassword(
+          testUserId,
+          NEW_USER_PASSWORD,
+          TEST_APP_ID,
+        );
+        assert(
+          typeof res?.session_token === "string" &&
+            res.session_token.length > 0,
+          "login should return a non-empty session_token",
+        );
+        const loggedInUserId = res.user_info?.user_id ?? res.user_id;
+        assert(
+          loggedInUserId === testUserId,
+          `logged-in user_id should be '${testUserId}', got '${loggedInUserId}'`,
+        );
+      },
+    ),
+  );
+
+  results.push(
+    await runCase("user.create rejects duplicate user_id (with sudo)", async () => {
+      assert(sudoToken !== null, "sudoToken should have been granted");
+      const { data, error } = await createUserWithToken(sudoToken!, {
         userId: testUserId,
-        passwordHash: FAKE_PW_HASH_A,
+        passwordHash: newUserPasswordHash,
       });
       assert(
         error !== null || data === null,
@@ -268,10 +482,11 @@ async function main() {
   );
 
   results.push(
-    await runCase("user.create rejects reserved username", async () => {
-      const { data, error } = await createUser({
+    await runCase("user.create rejects reserved username (with sudo)", async () => {
+      assert(sudoToken !== null, "sudoToken should have been granted");
+      const { data, error } = await createUserWithToken(sudoToken!, {
         userId: "root",
-        passwordHash: FAKE_PW_HASH_A,
+        passwordHash: newUserPasswordHash,
       });
       assert(
         error !== null || data === null,

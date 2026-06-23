@@ -64,12 +64,10 @@ p, kernel, obj://*, all,allow
 p, ood, obj://*, all,allow
 p, root, obj://*, all,allow
 p, su_admin, obj://*, all,allow
-p, su_admin, obj://users/*,all,deny
 
 p, system, obj://*, all,allow
 p, system, obj://dfs/security/*,all,deny
 p, system, obj://config/security/*,all,deny
-
 
 p, frame, obj://config/boot/*, read,allow
 p, frame, obj://config/system/*,read,allow
@@ -78,13 +76,11 @@ p, frame, obj://config/services/{frame}/*,all,allow
 p, frame, obj://config/services/{service}/info,read,allow
 p, frame, obj://config/users*,read,allow
 
-
 p, app, obj://config/boot/*, read,allow
 p, app, obj://config/users/{user}/apps/{app}/settings,read|write,allow
 p, app, obj://config/users/{user}/apps/{app}/spec,read,allow
 p, app, obj://config/users/{user}/apps/{app}/info,read|write,allow
 p, app, obj://config/services/{service}/info,read,allow
-
 
 p, agent, obj://config/boot/*, read,allow
 p, agent, obj://config/agents/{agent}/*,read,allow
@@ -92,7 +88,6 @@ p, agent, obj://config/users/{user}/agents/{agent}/settings,read|write,allow
 p, agent, obj://config/users/{user}/agents/{agent}/spec,read,allow
 p, agent, obj://config/users/{user}/agents/{agent}/info,read|write,allow
 p, agent, obj://config/services/{service}/info,read,allow
-
 
 p, admin,obj://config/boot/*, read,allow
 p, admin,obj://config/system/*,read,allow
@@ -103,18 +98,17 @@ p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
 p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
 p, admin,obj://config/services/*,read,allow
 
-p, user,obj://config/boot/*, read,allow
-p, user,obj://config/agents/{agent}/doc,read,allow
+p, users,obj://config/boot/*, read,allow
+p, users,obj://config/agents/{agent}/doc,read,allow
 # p, su_user,obj://config/users/{user}/*,all,allow
-p, user,obj://config/users/{user}/*,read,allow
-p, user,obj://config/users/{user}/apps/{app}/{key},read|write,allow
-p, user,obj://config/users/{user}/agents/{agent}/{key},read|write,allow
-p, user,obj://config/services/{service}/info,read,allow
+p, users,obj://config/users/{users}/*,read,allow
+p, users,obj://config/users/{users}/apps/{app}/{key},read|write,allow
+p, users,obj://config/users/{users}/agents/{agent}/{key},read|write,allow
+p, users,obj://config/services/{service}/info,read,allow
 
 g, node-daemon, kernel
 g, scheduler, kernel
 g, system-config, kernel
-g, system_config, kernel
 g, verify-hub, kernel
 g, cyfs-gateway, kernel
 g, buckycli, kernel
@@ -277,7 +271,8 @@ p, root, obj://config/*, read|write,allow
 
         let policy_tail = r#"
 g, alice, admin
-g, bob, user
+g, bob, users
+g, su_alice, su_admin
 "#;
         let config = build_current_rbac_config(Some(policy_tail));
         rbac::create_enforcer(&config.model, &config.policy)
@@ -315,6 +310,16 @@ g, bob, user
             )
             .await
         );
+        assert!(
+            rbac::enforce(
+                "su_alice",
+                "buckycli",
+                "obj://config/users/dvtest1782201008431/doc",
+                "write",
+                None,
+            )
+            .await
+        );
 
         // 用一个 Vec 收集所有"过度匹配"的命中, 这样一次运行就能把
         // 所有 BUG 都打印出来, 而不是在第一条 assert 上 panic 就停下.
@@ -335,7 +340,7 @@ g, bob, user
                 "buckycli",
                 "obj://config/agents/foo/bar/doc",
                 "read",
-                "BUG: user 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
+                "BUG: users 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
             ),
             (
                 "alice",
@@ -376,6 +381,73 @@ g, bob, user
             bugs.is_empty(),
             "RBAC 规则存在 {} 条过度匹配, 详情见上方 `-> BUG:` 行",
             bugs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn users_role_is_bound_to_own_user_path() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = "g, bob, users";
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        assert!(
+            rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/bob/settings",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/alice/settings",
+                "read",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_admin_can_read_own_user_data_but_not_other_users_data() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = r#"
+g, alice, admin
+g, su_alice, su_admin
+"#;
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        assert!(
+            rbac::enforce(
+                "alice",
+                "buckycli",
+                "obj://config/users/alice/settings",
+                "read",
+                Some(rbac::SudoMode::Sudo("su_alice".to_string())),
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "alice",
+                "buckycli",
+                "obj://config/users/bob/settings",
+                "read",
+                Some(rbac::SudoMode::Sudo("su_alice".to_string())),
+            )
+            .await
         );
     }
 }

@@ -52,7 +52,7 @@ scheduler 当前会根据系统状态自动追加组关系：
 ```rbac
 g, alice, admin
 g, su_alice, su_admin
-g, bob, user
+g, bob, users
 g, su_bob, su_user
 
 g, ood1, ood
@@ -94,8 +94,7 @@ g, demo-app, app
 当 `users/$userid/settings` 中存在一个 active 用户时，scheduler 应增加：
 
 ```rbac
-g, $userid, zone_users
-g, $userid, admin|user|limited
+g, $userid, admin|users|limited
 ```
 
 用户类型来自 `UserSettings.user_type`：
@@ -241,11 +240,11 @@ g, subject, role
 例如：
 
 ```rbac
-p, user, obj://config/users/{user}/*, read, allow
-g, bob, user
+p, users, obj://config/users/{users}/*, read, allow
+g, bob, users
 ```
 
-`bob` 只能读 `obj://config/users/bob/*`，不能读 `obj://config/users/alice/*`。因为 pattern 里的 `{user}` 会和 `p.sub == user` 绑定。
+`bob` 只能读 `obj://config/users/bob/*`，不能读 `obj://config/users/alice/*`。因为 pattern 里的 `{users}` 会和 `p.sub == users` 绑定。
 
 再比如：
 
