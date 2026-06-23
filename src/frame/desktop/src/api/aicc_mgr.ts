@@ -431,10 +431,6 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
-    const validation = await this.validateConnection(draft)
-    if (!validation.auth_valid || !validation.endpoint_reachable) {
-      throw new Error(validation.error_details?.[0]?.message ?? validation.errors[0] ?? 'aicc.provider_validation_failed')
-    }
     const result = await this.call<{
       ok?: unknown
       reason?: unknown
@@ -501,6 +497,8 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       balance_available: asBoolean(result.balance_available, false),
       errors: toStringArray(result.errors),
       error_details: toValidationErrorDetails(result.error_details, result.errors),
+      validation_fingerprint: asOptionalString(result.validation_fingerprint),
+      validation_ttl_ms: asOptionalNumber(result.validation_ttl_ms),
     }
   }
 

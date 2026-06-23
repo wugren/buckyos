@@ -315,6 +315,8 @@ export interface ValidationResult {
   balance_available: boolean
   errors: string[]
   error_details?: ValidationErrorDetail[]
+  validation_fingerprint?: string
+  validation_ttl_ms?: number
 }
 
 export interface ValidationErrorDetail {

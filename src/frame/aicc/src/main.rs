@@ -36,9 +36,11 @@ use http_body_util::combinators::BoxBody;
 use log::{error, info, warn};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::aicc::{AIComputeCenter, NamedStoreResourceResolver};
 use crate::aicc_usage_log_db::AiccUsageLogDb;
@@ -63,6 +65,7 @@ const METHOD_PROVIDER_REFRESH_MODELS: &str = "provider.refresh_models";
 const METHOD_USAGE_QUERY: &str = "usage.query";
 const AICC_SETTINGS_KEY: &str = "services/aicc/settings";
 const REDACTED_SECRET: &str = "***";
+const PROVIDER_VALIDATION_CACHE_TTL: Duration = Duration::from_secs(300);
 const PROVIDER_SECTIONS: &[&str] = &[
     "sn-ai-provider",
     "openai",
@@ -79,6 +82,12 @@ const PROVIDER_SECTIONS: &[&str] = &[
 
 struct AiccHttpServer {
     rpc_handler: AiccServerHandler<AIComputeCenter>,
+    provider_validation_cache: Mutex<HashMap<String, ProviderValidationCacheEntry>>,
+}
+
+struct ProviderValidationCacheEntry {
+    fingerprint: String,
+    validated_at: Instant,
 }
 
 struct SettingsDocument {
@@ -432,6 +441,33 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
     Ok(Value::Object(wrapped))
 }
 
+fn normalized_endpoint_for_validation(provider_type: &str, params: &Value) -> String {
+    param_string(params, "endpoint")
+        .unwrap_or_else(|| default_endpoint(provider_type).to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn provider_validation_cache_key(params: &Value) -> String {
+    let provider_type = param_string(params, "provider_type").unwrap_or_else(|| "custom".into());
+    let endpoint = normalized_endpoint_for_validation(provider_type.as_str(), params);
+    let protocol_type = param_string(params, "protocol_type");
+    let api_key = param_string(params, "api_key").unwrap_or_default();
+    serde_json::to_string(&json!({
+        "provider_type": provider_type,
+        "endpoint": endpoint,
+        "protocol_type": protocol_type,
+        "api_key": api_key,
+    }))
+    .expect("provider validation cache key must serialize")
+}
+
+fn provider_validation_fingerprint(cache_key: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    format!("provider-validation-{:x}", hasher.finish())
+}
+
 fn validation_issue(kind: &str, message: impl Into<String>) -> Value {
     json!({
         "kind": kind,
@@ -646,6 +682,7 @@ impl AiccHttpServer {
     fn new(center: AIComputeCenter) -> Self {
         Self {
             rpc_handler: AiccServerHandler::new(center),
+            provider_validation_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -760,10 +797,58 @@ impl AiccHttpServer {
         }
     }
 
+    fn remember_provider_validation(&self, cache_key: String, fingerprint: String) {
+        match self.provider_validation_cache.lock() {
+            Ok(mut cache) => {
+                cache.retain(|_, entry| {
+                    entry.validated_at.elapsed() <= PROVIDER_VALIDATION_CACHE_TTL
+                });
+                cache.insert(
+                    cache_key,
+                    ProviderValidationCacheEntry {
+                        fingerprint,
+                        validated_at: Instant::now(),
+                    },
+                );
+            }
+            Err(err) => {
+                warn!("provider validation cache lock poisoned: {}", err);
+            }
+        }
+    }
+
+    fn require_recent_provider_validation(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<String, RPCErrors> {
+        let cache_key = provider_validation_cache_key(params);
+        let expected_fingerprint = provider_validation_fingerprint(cache_key.as_str());
+        let mut cache = self.provider_validation_cache.lock().map_err(|err| {
+            RPCErrors::ReasonError(format!("provider validation cache unavailable: {}", err))
+        })?;
+        cache.retain(|_, entry| {
+            entry.validated_at.elapsed() <= PROVIDER_VALIDATION_CACHE_TTL
+        });
+        let Some(entry) = cache.get(cache_key.as_str()) else {
+            return Err(RPCErrors::ReasonError(
+                "provider_validation_required".to_string(),
+            ));
+        };
+        if entry.fingerprint != expected_fingerprint {
+            return Err(RPCErrors::ReasonError(
+                "provider_validation_mismatch".to_string(),
+            ));
+        }
+        Ok(expected_fingerprint)
+    }
+
     async fn handle_provider_validate(
         &self,
         params: &Value,
     ) -> std::result::Result<Value, RPCErrors> {
+        let validation_cache_key = provider_validation_cache_key(params);
+        let validation_fingerprint =
+            provider_validation_fingerprint(validation_cache_key.as_str());
         let mut issues = Vec::<Value>::new();
         let provider_type =
             param_string(params, "provider_type").unwrap_or_else(|| "custom".into());
@@ -883,6 +968,13 @@ impl AiccHttpServer {
             .map(validation_issue_message)
             .collect::<Vec<_>>();
 
+        if issues.is_empty() {
+            self.remember_provider_validation(
+                validation_cache_key,
+                validation_fingerprint.clone(),
+            );
+        }
+
         Ok(json!({
             "endpoint_reachable": endpoint_reachable,
             "auth_valid": auth_valid,
@@ -890,6 +982,8 @@ impl AiccHttpServer {
             "balance_available": provider_type != "custom" && auth_valid,
             "errors": errors,
             "error_details": issues,
+            "validation_fingerprint": validation_fingerprint,
+            "validation_ttl_ms": PROVIDER_VALIDATION_CACHE_TTL.as_millis() as u64,
         }))
     }
 
@@ -900,6 +994,7 @@ impl AiccHttpServer {
     ) -> std::result::Result<Value, RPCErrors> {
         let (client, mut doc) = self.load_settings_for_request(req, ip_from).await?;
         let built = build_provider_instance_settings(&req.params)?;
+        let validation_fingerprint = self.require_recent_provider_validation(&req.params)?;
         let section = built
             .get("section")
             .and_then(Value::as_str)
@@ -941,6 +1036,7 @@ impl AiccHttpServer {
             "ok": true,
             "provider_instance_name": provider_instance_name,
             "settings_revision": settings_revision,
+            "validation_fingerprint": validation_fingerprint,
             "reload": reload
         }))
     }

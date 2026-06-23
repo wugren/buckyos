@@ -67,7 +67,14 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
         await store.addProvider(draft)
         onCreated()
       } catch (error) {
-        setCreateError(error instanceof Error ? error.message : t('aiCenter.wizard.createFailed', 'Could not create provider.'))
+        const message = error instanceof Error ? error.message : ''
+        if (message.includes('provider_validation_required') || message.includes('provider_validation_mismatch')) {
+          setCreateError(t('aiCenter.wizard.validationExpired', 'Provider validation expired. Please validate again.'))
+          setValidation(null)
+          setStep(2)
+        } else {
+          setCreateError(message || t('aiCenter.wizard.createFailed', 'Could not create provider.'))
+        }
       } finally {
         setCreating(false)
       }
