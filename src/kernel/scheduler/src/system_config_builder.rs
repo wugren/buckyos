@@ -278,7 +278,7 @@ impl SystemConfigBuilder {
 
     pub async fn add_verify_hub(&mut self, verify_hub_private_key: &str) -> Result<&mut Self> {
         self.entries.insert(
-            "system/verify-hub/key".into(),
+            "security/verify-hub/key".into(),
             verify_hub_private_key.to_string(),
         );
 

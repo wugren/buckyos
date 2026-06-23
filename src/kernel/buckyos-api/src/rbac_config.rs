@@ -63,6 +63,8 @@ pub const DEFAULT_RBAC_POLICY: &str = r#"
 p, kernel, obj://*, all,allow
 p, ood, obj://*, all,allow
 p, root, obj://*, all,allow
+p, su_admin, obj://*, all,allow
+p, su_admin, obj://users/*,all,deny
 
 p, system, obj://*, all,allow
 p, system, obj://dfs/security/*,all,deny
@@ -71,37 +73,39 @@ p, system, obj://config/security/*,all,deny
 
 p, frame, obj://config/boot/*, read,allow
 p, frame, obj://config/system/*,read,allow
-p, frame, obj://config/agents/*/doc,read,allow
+p, frame, obj://config/agents/*/*,read,allow
 p, frame, obj://config/services/{frame}/*,all,allow
 p, frame, obj://config/services/*/info,read,allow
 p, frame, obj://config/users*,read,allow
 
 
-
-
 p, app, obj://config/boot/*, read,allow
-p, app, obj://config/agents/*/doc,read,allow
-p, app, obj://config/agents/*/settings,read,allow
 p, app, obj://config/users/*/apps/{app}/settings,read|write,allow
 p, app, obj://config/users/*/apps/{app}/spec,read,allow
 p, app, obj://config/users/*/apps/{app}/info,read|write,allow
-p, app, obj://config/users/*/agents/{app}/settings,read|write,allow
-p, app, obj://config/users/*/agents/{app}/spec,read,allow
-p, app, obj://config/users/*/agents/{app}/info,read|write,allow
 p, app, obj://config/services/*/info,read,allow
-p, app, obj://config/services/{app}/*,read|write,allow
+
+
+p, agent, obj://config/boot/*, read,allow
+p, agent, obj://config/agents/{agent}/*,read,allow
+p, agent, obj://config/users/*/agents/{agent}/settings,read|write,allow
+p, agent, obj://config/users/*/agents/{agent}/spec,read,allow
+p, agent, obj://config/users/*/agents/{agent}/info,read|write,allow
+p, agent, obj://config/services/*/info,read,allow
 
 
 p, admin,obj://config/boot/*, read,allow
-p, admin,obj://config/system/rbac/policy,read,allow
-p, admin,obj://config/system/scheduler/*,read,allow
-p, admin,obj://config/agents/*/doc,read|write,allow
+p, admin,obj://config/system/*,read,allow
+p, admin,obj://config/agents/*/doc,read,allow
 p, admin,obj://config/agents/*/settings,read|write,allow
-p, admin,obj://config/users/*,read|write,allow
-p, admin,obj://config/services/*,read|write,allow
+p, admin,obj://config/users/{admin}/*,read,allow
+p, admin,obj://config/users/{admin}/apps/*/*,read|write,allow
+p, admin,obj://config/users/{admin}/agents/*/*,read|write,allow
+p, admin,obj://config/services/*,read,allow
 
 p, user,obj://config/boot/*, read,allow
 p, user,obj://config/agents/*/doc,read,allow
+# p, su_user,obj://config/users/{user}/*,all,allow
 p, user,obj://config/users/{user}/*,read,allow
 p, user,obj://config/users/{user}/apps/*/*,read|write,allow
 p, user,obj://config/users/{user}/agents/*/*,read|write,allow
@@ -188,6 +192,16 @@ pub async fn load_current_rbac_config(
 mod tests {
     use super::*;
 
+    use lazy_static::lazy_static;
+    use tokio::sync::Mutex;
+
+    // `rbac::SYS_ENFORCE` is a process-wide singleton, so any test that
+    // calls `create_enforcer` + `enforce` against it must run serialized;
+    // otherwise a parallel test can swap the policy out from under us.
+    lazy_static! {
+        static ref TEST_LOCK: Mutex<()> = Mutex::new(());
+    }
+
     #[test]
     fn overlap_rbac_policy_appends_tail_to_default() {
         let policy = overlap_rbac_policy(
@@ -212,6 +226,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_model_matches_all_and_regex_action_policies() {
+        let _guard = TEST_LOCK.lock().await;
+
         let policy = r#"
 p, kernel, obj://config/*, all,allow
 p, root, obj://config/*, all,allow
@@ -236,5 +252,130 @@ p, root, obj://config/*, read|write,allow
         assert!(rbac::enforce("root", "kernel", "obj://config/foo", "read", None).await);
         assert!(rbac::enforce("root", "kernel", "obj://config/foo", "write", None).await);
         assert!(!rbac::enforce("root", "kernel", "obj://config/foo", "delete", None).await);
+    }
+
+    // -------------------------------------------------------------------
+    // 下面这个测试用来揭示当前 DEFAULT_RBAC_POLICY 里几条 `obj://.../*/...`
+    // 规则的写法是错误的:
+    //
+    //   keyMatch3 会把模式里所有 `/*` 替换成 `/.*` 再做正则匹配,
+    //   `.*` 是贪婪且能跨 `/`, 所以"中间段"的 `*` 实际上在匹配任意深度
+    //   的子路径, 超出了原本"单段 agent_id / app_id"的意图.
+    //
+    // 单段通配应该改用 `{xxx}` 占位符 (会被替换成 `[^/]+`), 例如:
+    //   obj://config/agents/{agent_id}/doc
+    //   obj://config/agents/{agent_id}/settings
+    //   obj://config/agents/{agent_id}/{key}
+    //
+    // 下面 `assert!(!...)` 断言的都是"修复后的正确语义", 因此 BUG 还在
+    // 的时候每条断言都会 FAIL, 并把对应的 BUG 信息打印出来; 等 BUG
+    // 修好以后这些断言会全部 PASS, 测试就变成了回归门禁.
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn default_policy_wildcards_overmatch_multi_level_paths() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = r#"
+g, alice, admin
+g, bob, user
+"#;
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        // ---- sanity: 单段 agent_id 下的访问应当通过 ----
+        assert!(
+            rbac::enforce(
+                "alice",
+                "buckycli",
+                "obj://config/agents/jarvis/doc",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/agents/jarvis/doc",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "alice",
+                "buckycli",
+                "obj://config/agents/jarvis/settings",
+                "write",
+                None,
+            )
+            .await
+        );
+
+        // 用一个 Vec 收集所有"过度匹配"的命中, 这样一次运行就能把
+        // 所有 BUG 都打印出来, 而不是在第一条 assert 上 panic 就停下.
+        let mut bugs: Vec<&'static str> = Vec::new();
+
+        // 每条 case: (userid, appid, res_path, action, bug 描述).
+        // 期望: enforce 返回 false; 若返回 true 就说明该规则过度匹配.
+        let over_match_cases: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "alice",
+                "buckycli",
+                "obj://config/agents/foo/bar/doc",
+                "read",
+                "BUG: admin 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
+            ),
+            (
+                "bob",
+                "buckycli",
+                "obj://config/agents/foo/bar/doc",
+                "read",
+                "BUG: user 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
+            ),
+            (
+                "alice",
+                "buckycli",
+                "obj://config/agents/foo/bar/settings",
+                "write",
+                "BUG: admin 的 agents/*/settings 不应匹配多层路径 (foo/bar/settings)",
+            ),
+            // frame 的 `obj://config/agents/*/*` 等效于 agents/.*/.*.
+            // user side 用 root (有全权), app side 用 repo-service
+            // (g, repo-service, frame), 把 BUG 隔离到 frame 这条规则.
+            (
+                "root",
+                "repo-service",
+                "obj://config/agents/a/b/c/d",
+                "read",
+                "BUG: frame 的 agents/*/* 不应匹配 4 层路径 (a/b/c/d)",
+            ),
+            // admin 的 `obj://config/users/{admin}/apps/*/*` 同样会跨段:
+            // 期望 apps 下面正好是 "{app_id}/{key}" 两段.
+            (
+                "alice",
+                "buckycli",
+                "obj://config/users/alice/apps/some_app/extra/key",
+                "write",
+                "BUG: admin 的 users/{admin}/apps/*/* 不应匹配 apps 下 3 层以上路径",
+            ),
+        ];
+
+        for (userid, appid, res, act, bug_msg) in over_match_cases {
+            if rbac::enforce(userid, appid, res, act, None).await {
+                eprintln!("  -> {}", bug_msg);
+                bugs.push(bug_msg);
+            }
+        }
+
+        assert!(
+            bugs.is_empty(),
+            "RBAC 规则存在 {} 条过度匹配, 详情见上方 `-> BUG:` 行",
+            bugs.len()
+        );
     }
 }

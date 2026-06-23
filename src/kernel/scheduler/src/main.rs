@@ -372,6 +372,8 @@ mod test {
         .expect("device info generation failed");
 
         assert!(init_map.contains_key("boot/config"));
+        assert!(init_map.contains_key("security/verify-hub/key"));
+        assert!(!init_map.contains_key("system/verify-hub/key"));
         assert!(init_map.contains_key("services/verify-hub/spec"));
         assert!(init_map.contains_key("services/scheduler/spec"));
         assert!(init_map.contains_key("services/task-manager/spec"));

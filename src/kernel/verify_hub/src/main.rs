@@ -1006,7 +1006,7 @@ async fn load_service_config() -> Result<()> {
     let system_config_client = SystemConfigClient::new(None, Some(session_token.as_str()));
 
     //load verify-hub private key from system config service
-    let private_key_str = system_config_client.get("system/verify-hub/key").await;
+    let private_key_str = system_config_client.get("security/verify-hub/key").await;
     if let Ok(private_key_str) = private_key_str {
         let private_key = private_key_str.value;
         let private_key = EncodingKey::from_ed_pem(private_key.as_bytes());

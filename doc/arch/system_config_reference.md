@@ -99,7 +99,7 @@ scheduler 初始化当前会创建这些系统服务 spec：
 | --- | --- | --- | --- |
 | `services/verify-hub/settings` | `VerifyHubSettings`，初始化包含 `trust_keys` 空数组。 | scheduler 初始化 | verify-hub 相关设置的保留位置。当前信任 key 主要从 `boot/config` 和 RBAC 刷新逻辑派生。 |
 
-verify-hub 的私钥不在 `services/verify-hub/settings`，而在 `system/verify-hub/key`。
+verify-hub 的私钥不在 `services/verify-hub/settings`，而在 `security/verify-hub/key`。
 
 ### aicc
 
@@ -168,7 +168,7 @@ app instance id 当前按 `<app_id>@<user_id>@<node_id>` 组织；服务聚合 i
 | --- | --- | --- | --- |
 | `system/install_settings` | 安装期 seed 配置。rootfs boot template 中包含 `pre_install_apps` 和 install_config。 | rootfs boot template / scheduler 初始化导入 | scheduler 首次初始化时读取，用于创建预装 app spec。启动完成后不是运行时主配置。 |
 | `system/system_pkgs` | 系统包信息。当前初始化为空对象。 | scheduler 初始化 | 包管理保留路径。 |
-| `system/verify-hub/key` | verify-hub 私钥 PEM。 | scheduler 初始化 | verify-hub 启动时读取，用于 token 签发。敏感数据。 |
+| `security/verify-hub/key` | verify-hub 私钥 PEM。 | scheduler 初始化 | verify-hub 启动时读取，用于 token 签发。敏感数据。 |
 | `system/rbac/policy` | Casbin policy 文本。包含初始策略、用户角色、节点角色、服务/app/kernel 分组等。 | scheduler 初始化和重建；control-panel 用户流程会追加用户分组；buckycli 旧流程会追加 app 分组 | system-config RBAC、verify-hub / 权限判断。 |
 | `system/scheduler/snapshot` | scheduler 内部 `NodeScheduler` 状态快照。 | scheduler | scheduler 重启后恢复调度状态。 |
 
@@ -185,7 +185,7 @@ scheduler 首次启动时，如果 `boot/config` 不存在，会合并 rootfs bo
 3. 写入系统服务 spec 和 settings：`services/*/spec`、`services/*/settings`。
 4. 根据 `system/install_settings.pre_install_apps` 创建预装 app spec。
 5. 写入初始 node target：`nodes/<ood>/config`、`nodes/<ood>/gateway_config`、`nodes/<ood>/gateway_info`。
-6. 写入安全和调度基础数据：`system/rbac/policy`、`system/verify-hub/key`、`system/system_pkgs`。
+6. 写入安全和调度基础数据：`system/rbac/policy`、`security/verify-hub/key`、`system/system_pkgs`。
 
 ### 调度循环
 
