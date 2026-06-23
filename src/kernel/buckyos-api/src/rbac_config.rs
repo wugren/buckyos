@@ -16,37 +16,66 @@ g = _, _
 e = priority(p.eft) || deny
 
 [matchers]
-m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.sub) || keyGet3(r.obj, p.obj, p.sub) =="") && keyMatch3(r.obj,p.obj)) && regexMatch(r.act, p.act)
+m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.sub) || keyGet3(r.obj, p.obj, p.sub) =="") && keyMatch3(r.obj,p.obj)) && (p.act == "all" || regexMatch(r.act, p.act))
 "#;
 
+/*
+# RBAC配置快速说明
+
+## user groups:
+### device group
+- ood(含gateway) 全部权限
+- node 标准的运行服务的节点，只有访问自己设备配置的权限
+- client 一般权限等于其device owner
+- sensor
+
+### client-user groups
+- root 系统所有权限 (root是特殊用户，只有一种认知方法)
+- su_admin 系统所有权限
+- admin 除别的用户的数据之外的读权限，
+- users 自己的数据的读权限，不包含敏感数据的写权限
+- su_users 自己敏感数据的写权限
+- limit_users 暂不实现
+- author 逻辑权限，资源的创建者
+
+
+## app groups
+- kernel 全部权限
+- system (services) 除security相关的权限外的全部权限
+- frame (services) 对一些系统全局配置有读权限
+- app (services) 限制在app data范围内
+- agent 对agent的身份数据有读权限，对agaent rootfs有完整权限
+
+## Operation
+- policy act 可以写 `read|write` 这类正则集合；`all` 匹配任意请求 action
+- all (所有权限)
+- update
+- delete
+- create （只给目录）
+- read
+- list|query (只给目录)
+- subscribe
+
+## Resource URLs
+
+ */
 pub const DEFAULT_RBAC_POLICY: &str = r#"
-p, kernel, obj://config/*, read|write,allow
-p, root, obj://config/*, read|write,allow
+p, kernel, obj://*, all,allow
+p, ood, obj://*, all,allow
+p, root, obj://*, all,allow
+p, system, obj://*, all,allow
+p, system, obj://dfs/security/*,all,deny
+p, system, obj://config/security/*,all,deny
 
-p, ood,obj://config/*,read,allow
-p, ood,obj://config/agents/*/doc,read,allow
-p, ood,obj://config/agents/*/settings,read,allow
-p, ood,obj://config/users/*/apps/*,read|write,allow
-p, ood,obj://config/users/*/agents/*,read|write,allow
-p, ood,obj://config/nodes/{device}/*,read|write,allow
-p, ood,obj://config/services/*,read|write,allow
-p, ood,obj://config/system/rbac/policy,read|write,allow
-p, ood,obj://config/system/scheduler/*,read|write,allow
 
-p, client,obj://config/boot/*, read,allow
-p, client,obj://config/agents/*/doc,read,allow
-p, client,obj://config/devices/{device}/*,read,allow
-p, client,obj://config/devices/{device}/info,read|write,allow
+p, frame, obj://config/boot/*, read,allow
+p, frame, obj://config/agents/*/doc,read,allow
+p, frame, obj://config/services/{service}/*,read|write,allow
+p, frame, obj://config/services/*/info,read,allow
+p, frame, obj://config/users*,read,allow
+p, frame, obj://config/users/*/*,read,allow
+p, frame, obj://config/system/*,read,allow
 
-p, service, obj://config/boot/*, read,allow
-p, service, obj://config/agents/*/doc,read,allow
-p, service, obj://config/services/{service}/*,read|write,allow
-p, service, obj://config/services/*/info,read,allow
-p, service, obj://config/users*,read,allow
-p, service, obj://config/users/*/*,read,allow
-p, service, obj://config/system/*,read,allow
-p, scheduler, obj://config/services/*/*,read|write,allow
-p, scheduler, obj://config/system/scheduler/*,read|write,allow
 
 p, app, obj://config/boot/*, read,allow
 p, app, obj://config/agents/*/doc,read,allow
@@ -59,6 +88,7 @@ p, app, obj://config/users/*/agents/{app}/spec,read,allow
 p, app, obj://config/users/*/agents/{app}/info,read|write,allow
 p, app, obj://config/services/*/info,read,allow
 p, app, obj://config/services/{app}/*,read|write,allow
+
 
 p, admin,obj://config/boot/*, read,allow
 p, admin,obj://config/system/rbac/policy,read,allow
@@ -80,14 +110,20 @@ g, scheduler, kernel
 g, system-config, kernel
 g, system_config, kernel
 g, verify-hub, kernel
-g, task-manager, kernel
-g, kmsg, kernel
-g, repo-service, kernel
-g, aicc, kernel
-g, msg-center, kernel
-g, control-panel, kernel
-g, buckycli, kernel
 g, cyfs-gateway, kernel
+g, buckycli, kernel
+
+g, task-manager, system
+g, kmsg, system
+g, control-panel, system
+
+g, repo-service, frame
+g, aicc, frame
+g, msg-center, frame
+g, opendan, frame
+g, slog_server, frame
+g, smb_service, frame
+
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,8 +202,37 @@ mod tests {
     fn build_current_rbac_config_uses_default_model_and_policy() {
         let config = build_current_rbac_config(Some("g, alice, admin\n"));
         assert!(config.model.contains("[request_definition]"));
-        assert!(config.policy.contains("p, root, obj://config/*"));
+        assert!(config.model.contains("p.act == \"all\""));
+        assert!(config.policy.contains("p, root, obj://*, all,allow"));
         assert!(config.policy.ends_with("g, alice, admin"));
         assert_eq!(config.policy_tail, "g, alice, admin");
+    }
+
+    #[tokio::test]
+    async fn default_model_matches_all_and_regex_action_policies() {
+        let policy = r#"
+p, kernel, obj://config/*, all,allow
+p, root, obj://config/*, all,allow
+"#;
+        rbac::create_enforcer(DEFAULT_RBAC_MODEL.trim(), policy.trim())
+            .await
+            .unwrap();
+
+        assert!(rbac::enforce("root", "kernel", "obj://config/foo", "read", None).await);
+        assert!(rbac::enforce("root", "kernel", "obj://config/foo", "write", None).await);
+        assert!(rbac::enforce("root", "kernel", "obj://config/foo", "delete", None).await);
+        assert!(!rbac::enforce("root", "kernel", "obj://other/foo", "read", None).await);
+
+        let policy = r#"
+p, kernel, obj://config/*, read|write,allow
+p, root, obj://config/*, read|write,allow
+"#;
+        rbac::create_enforcer(DEFAULT_RBAC_MODEL.trim(), policy.trim())
+            .await
+            .unwrap();
+
+        assert!(rbac::enforce("root", "kernel", "obj://config/foo", "read", None).await);
+        assert!(rbac::enforce("root", "kernel", "obj://config/foo", "write", None).await);
+        assert!(!rbac::enforce("root", "kernel", "obj://config/foo", "delete", None).await);
     }
 }

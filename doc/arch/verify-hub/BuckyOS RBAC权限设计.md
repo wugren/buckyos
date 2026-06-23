@@ -2,7 +2,6 @@
 
 本文档说明 BuckyOS RBAC 的设计思路和核心资源隔离原则，用来指导内置默认策略与 `system/rbac/policy` 动态尾部的编写。登录、token 签发、密码验证等认证细节不在这里展开。
 
-当前版本是 beta 2.2 的 breaking change，不需要考虑旧的 `super_*` 方案。
 
 ## 目标
 
@@ -40,7 +39,7 @@ RBAC 目标语义是：
 3. `userid` 通过时，返回 AppID 与 UserID 的交集结果。
 4. `userid` 未通过，且请求带有 sudo 模式时，再检查 sudo 主体。
 
-这就是 RBAC 的基本交集模型：请求必须同时满足 AppID 权限和 UserID/DeviceID 权限。`appid == "kernel"` 不应成为跳过 `userid` 检查的例外，因为所有设备上都有 node-daemon，且 node-daemon 的 AppID 都是 `kernel`。如果不看 `userid=device_id`，OOD、普通 Node、Client Device、Sensor 上的内核行为就无法隔离。
+这就是 RBAC 的基本交集模型：请求必须同时满足 AppID 权限和 UserID/DeviceID 权限。
 
 
 ## 策略文件
@@ -51,17 +50,15 @@ RBAC 目标语义是：
 scheduler 当前会根据系统状态自动追加组关系：
 
 ```rbac
-g, alice, zone_users
 g, alice, admin
+g, su_alice, su_admin
 g, bob, user
-g, child, limited
+g, su_bob, su_user
 
 g, ood1, ood
-g, node1, server
-
+g, node1, node
 g, demo-app, app
-g, repo-service, service
-g, system-config, kernel
+
 ```
 
 因此内置默认策略应主要表达稳定的角色权限，`system/rbac/policy` 只保存当前系统里真实用户、节点、服务对应的动态分组行。完整策略由 API runtime 在加载 RBAC 时合成。
@@ -74,20 +71,18 @@ g, system-config, kernel
 
 资源有各个系统服务提供，用路表达
 
-- /config/*
-- /kmsgqueue/* 
-- /task_mgr/* 由task-mgr提供的task资源，目前该服务有基于自己业务逻辑的权限管理
-- /msg_center/$userid/
+- obj://config/*
+- obj://kmsg/* 
+- obj://msg_center/*
+- obj://task_mgr/* 由task-mgr提供的task资源，目前该服务有基于自己业务逻辑的权限管理
+- obj://msg_center/$userid/$box_id
 - kevent 不独立配置，完全看相关对象的res_path 
 
 
 下面的是规划中未完整实现的
-- /workflow/*
-- /data/ dfs文件系统路径
-- /ndn/*
-- /$objid/? 用对象模型来统一管理 对象的属性方法和事件？，比如有taskxxx的权限，就自动得到了其kevent权限？
 
-
+- obj://workflow/*
+- obj://dfs/* dfs文件系统路径
 
 
 ## 调度器增量生成规则
@@ -122,29 +117,21 @@ g, su_$userid, su_user
 涉及用户自有资源的 sudo 权限必须生成精确规则，例如：
 
 ```rbac
-p, su_bob, /config/users/bob/settings, write, allow
+p, su_bob, obj://config/users/bob/settings, write, allow
 ```
 
-不要用 `p, su_user, /config/users/{user}/settings, write, allow` 表达这类权限。当前 matcher 不能把 `su_bob` 反向绑定到 `bob`，该规则会退化为对所有 `/config/users/*/settings` 的通配匹配。
+不要用 `p, su_user, obj://config/users/{user}/settings, write, allow` 表达这类权限。当前 matcher 不能把 `su_bob` 反向绑定到 `bob`，该规则会退化为对所有 `obj://config/users/*/settings` 的通配匹配。
 
 当用户被禁用、删除或不再 active 时，scheduler 通过重新构造 `system/rbac/policy` 移除该用户及其 sudo 主体的动态规则。
 
 ### 添加设备
 
-当 `devices/$deviceid/info` 中出现设备，scheduler 会把它加入调度上下文。设备权限应遵守 `BuckyOS 设备权限思考.md` 的核心结论：DeviceID 应成为权限判断的一等输入；在当前 RBAC 接口仍以 `userid + appid` 为主的阶段，可以先用 `$deviceid` 作为兼容主体，但策略必须保留“这是设备主体”的语义。
+当 `devices/$deviceid/info` 中出现设备，scheduler 会把它加入调度上下文。设备权限应遵守 `BuckyOS 设备权限.md` 的核心结论：DeviceID 应成为权限判断的一等输入；在当前 RBAC 接口仍以 `userid + appid` 为主的阶段，可以先用 `$deviceid` 作为兼容主体，但策略必须保留“这是设备主体”的语义。
 
 设备角色必须来自可信状态，例如 DeviceDoc、ZoneConfig 或管理员配置，不能来自设备自己上报的普通 `DeviceInfo` 字段。
 
-当前实现还有一个需要修正的限制：`rbac::enforce` 对字面量 `appid == "kernel"` 会只检查 AppID，不再检查 `userid`。这与设备权限模型冲突。设备启动后的一些内核行为应该使用：
 
-```text
-appid = kernel
-userid = $deviceid
-```
-
-也就是说，scheduler 生成设备主体规则后，enforce 仍必须检查 `userid=$deviceid`，否则所有设备上的 node-daemon 都会因为同一个 `appid=kernel` 获得同一组权限，设备身份隔离会失效。这个问题应作为实现修正项处理；中长期应把 DeviceID 放进独立的 DeviceContext，而不是依赖字符串形式的 `userid`。
-
-按设备类型，scheduler 应增加的组关系是：
+按设备类型，scheduler 的组关系是：
 
 ```rbac
 g, ood1, ood
@@ -165,15 +152,15 @@ g, ood-gw1, gateway
 设备自身路径的权限应生成精确规则。典型规则：
 
 ```rbac
-p, node1, /config/devices/node1/info, read|write, allow
-p, node1, /config/nodes/node1/config, read, allow
-p, node1, /config/nodes/node1/gateway_config, read, allow
+p, node1, obj://config/devices/node1/info, read|write, allow
+p, node1, obj://config/nodes/node1/config, read, allow
+p, node1, obj://config/nodes/node1/gateway_config, read, allow
 ```
 
 这表达“设备只能默认更新自己的 DeviceInfo，只能读取自己的 node config”。不要用下面这种 role 级规则表达自有设备路径：
 
 ```rbac
-p, server, /config/devices/{device}/info, read|write, allow
+p, server, obj://config/devices/{device}/info, read|write, allow
 ```
 
 因为当前 matcher 不会把 `server` 角色反向绑定成某个具体 device id。
@@ -185,8 +172,8 @@ Client Device 默认权限不应超过 device owner。当前 RBAC 尚未把 `Dev
 Sensor / IoT 设备只应获得极小写权限，例如写自己的 DeviceInfo，或向自己命名空间下的事件路径 fire event：
 
 ```rbac
-p, pir-living-room, /config/devices/pir-living-room/info, read|write, allow
-p, pir-living-room, /keyevents/devices/pir-living-room/*, fire, allow
+p, pir-living-room, obj://config/devices/pir-living-room/info, read|write, allow
+p, pir-living-room, obj://kevents/devices/pir-living-room/*, fire, allow
 ```
 
 高频遥测、事件流和应用状态不应写入 system-config，应进入 IoT Hub、消息系统、事件系统或专用应用存储。
@@ -202,8 +189,8 @@ g, $appid, app
 App 的通用权限应通过内置默认策略的 `{app}` 变量绑定 AppID，例如：
 
 ```rbac
-p, app, /config/users/*/apps/{app}/settings, read|write, allow
-p, app, /config/users/*/apps/{app}/info, read|write, allow
+p, app, obj://config/users/*/apps/{app}/settings, read|write, allow
+p, app, obj://config/users/*/apps/{app}/info, read|write, allow
 ```
 
 这类规则表达“App 只能访问自己的 App 子树”。它不绑定用户，因此最终仍要依赖 UserID 维度限制当前用户能访问哪些 `users/$userid` 路径。
@@ -220,6 +207,11 @@ g, $appid, app
 
 ### 添加 Agent
 
+Agent是一种特殊的App,但权限比App要大一些
+1）Agent有自己的身份文件
+2）Agent有自己的rootfs,以appdata的方式保存的，因为一个Agent实例只为一个用户服务。
+3）Agent通常会得到自己Owner的授权
+
 当前 scheduler 会把 `users/$userid/agents/$agentid/spec` 与普通 App spec 一样构造成 `ServiceSpecType::App`。因此 runnable Agent 也应先加入 `app` 角色：
 
 ```rbac
@@ -229,8 +221,8 @@ g, $agentid, app
 同时内置默认策略应为 Agent 子树提供与 App 子树对应的隔离规则：
 
 ```rbac
-p, app, /config/users/*/agents/{app}/settings, read|write, allow
-p, app, /config/users/*/agents/{app}/info, read|write, allow
+p, app, obj://config/users/*/agents/{app}/settings, read|write, allow
+p, app, obj://config/users/*/agents/{app}/info, read|write, allow
 ```
 
 如果未来需要区分普通 App 和 Agent 的权限，应增加独立的 `agent` 角色，而不是让所有 Agent 继承更多 `app` 权限。Agent 的 session、工具授权、长期记忆和工作目录通常比普通 App 更敏感，默认应只访问自己的 agent scope 和被用户显式授权的资源。
@@ -249,16 +241,16 @@ g, subject, role
 例如：
 
 ```rbac
-p, user, /config/users/{user}/*, read, allow
+p, user, obj://config/users/{user}/*, read, allow
 g, bob, user
 ```
 
-`bob` 只能读 `/config/users/bob/*`，不能读 `/config/users/alice/*`。因为 pattern 里的 `{user}` 会和 `p.sub == user` 绑定。
+`bob` 只能读 `obj://config/users/bob/*`，不能读 `obj://config/users/alice/*`。因为 pattern 里的 `{user}` 会和 `p.sub == user` 绑定。
 
 再比如：
 
 ```rbac
-p, app, /config/users/*/apps/{app}/settings, read|write, allow
+p, app, obj://config/users/*/apps/{app}/settings, read|write, allow
 g, photos, app
 ```
 
@@ -267,10 +259,10 @@ g, photos, app
 但下面这类规则不会绑定原用户：
 
 ```rbac
-p, su_user, /config/users/{user}/settings, write, allow
+p, su_user, obj://config/users/{user}/settings, write, allow
 ```
 
-因为当前主体是 `su_bob`，角色是 `su_user`，而 pattern 里的变量名是 `{user}`，不是 `{su_user}`。它会退化成对 `/config/users/*/settings` 的通配匹配。需要按原用户绑定时，应由 scheduler 生成精确规则。
+因为当前主体是 `su_bob`，角色是 `su_user`，而 pattern 里的变量名是 `{user}`，不是 `{su_user}`。它会退化成对 `obj://config/users/*/settings` 的通配匹配。需要按原用户绑定时，应由 scheduler 生成精确规则。
 
 ## 主体分层
 
@@ -280,9 +272,9 @@ RBAC 主体大体分为几类：
 | --- | --- | --- |
 | `root` | `root` | Zone owner/root key 对应的最高权限；系统不应把普通 sudo 配成 root 等价权限 |
 | 内核服务 | `kernel` | node-daemon、scheduler、system-config、verify-hub 等核心服务 |
-| 系统服务 | `service` | repo-service、msg-center、aicc 等系统服务，通常只写自己的服务配置和服务数据 |
+| 系统服务 | `system` | repo-service、msg-center、aicc 等系统服务，通常只写自己的服务配置和服务数据 |
 | 用户应用 | `app` | 普通 App/Agent，必须被 AppID 限制在自己的 app scope 内 |
-| OOD/Node | `ood`、`server` | 设备和节点主体，用于节点状态上报、节点配置读取等 |
+| OOD/Node | `ood`、`node` | 设备和节点主体，用于节点状态上报、节点配置读取等 |
 | 登录用户 | `admin`、`user`、`limited` | 可登录用户的日常权限 |
 | sudo 用户 | `su_admin`、`su_user` | 仅表达 sudo 后新增的敏感权限 |
 | 外部访问者 | `guest`、`friend/contact` | 外部或匿名访问，默认只允许显式 public resource |
@@ -291,7 +283,7 @@ RBAC 主体大体分为几类：
 
 ### boot config
 
-`/config/boot/*` 是 Zone 的根信任信息，例如 ZoneConfig、owner public key、verify-hub public key 等。
+`obj://config/boot/*` 是 Zone 的根信任信息，例如 ZoneConfig、owner public key、verify-hub public key 等。
 
 设计原则：
 
@@ -301,7 +293,7 @@ RBAC 主体大体分为几类：
 
 ### RBAC 配置
 
-`/config/system/rbac/policy` 与 API runtime 内置 RBAC 配置共同控制系统授权行为。
+`obj://config/system/rbac/policy` 与 API runtime 内置 RBAC 配置共同控制系统授权行为。
 
 设计原则：
 
@@ -312,7 +304,7 @@ RBAC 主体大体分为几类：
 
 ### 用户配置
 
-`/config/users/$userid/*` 保存用户设置、profile、应用设置、agent/app 配置等。
+`obj://config/users/$userid/*` 保存用户设置、profile、应用设置、agent/app 配置等。
 
 设计原则：
 
@@ -322,22 +314,22 @@ RBAC 主体大体分为几类：
 - 需要绑定原用户的 sudo 权限，使用 scheduler 生成精确规则：
 
 ```rbac
-p, su_bob, /config/users/bob/settings, write, allow
+p, su_bob, obj://config/users/bob/settings, write, allow
 ```
 
 用户名创建后不可修改，因此这类精确规则可以稳定生成。
 
 ### App 子树
 
-`/config/users/$userid/apps/$appid/*` 和 `/config/users/$userid/agents/$agentid/*` 是 App/Agent 的用户域配置。
+`obj://config/users/$userid/apps/$appid/*` 和 `obj://config/users/$userid/agents/$agentid/*` 是 App/Agent 的用户域配置。
 
 设计原则：
 
 - AppID 只能访问自己的 app scope：
 
 ```rbac
-p, app, /config/users/*/apps/{app}/settings, read|write, allow
-p, app, /config/users/*/apps/{app}/info, read|write, allow
+p, app, obj://config/users/*/apps/{app}/settings, read|write, allow
+p, app, obj://config/users/*/apps/{app}/info, read|write, allow
 ```
 
 - App 不能通过用户 token 访问其它 App 的配置。
@@ -346,14 +338,14 @@ p, app, /config/users/*/apps/{app}/info, read|write, allow
 
 ### Service 配置
 
-`/config/services/$service/*` 保存系统服务或 App Service 的运行配置、状态、info 等。
+`obj://config/services/$service/*` 保存系统服务或 App Service 的运行配置、状态、info 等。
 
 设计原则：
 
 - `service` 只能写自己的服务配置：
 
 ```rbac
-p, service, /config/services/{service}/*, read|write, allow
+p, service, obj://config/services/{service}/*, read|write, allow
 ```
 
 - `services/*/info` 可以给其它服务或用户读取，用于服务发现和状态展示。
@@ -361,7 +353,7 @@ p, service, /config/services/{service}/*, read|write, allow
 
 ### Node 和 Device
 
-`/config/devices/$device/*` 与 `/config/nodes/$node/*` 表达设备 DID、设备状态、节点运行配置、gateway config 等。
+`obj://config/devices/$device/*` 与 `obj://config/nodes/$node/*` 表达设备 DID、设备状态、节点运行配置、gateway config 等。
 
 设计原则：
 
@@ -370,20 +362,10 @@ p, service, /config/services/{service}/*, read|write, allow
 - node config/gateway config 由 scheduler/OOD 构造，普通用户和普通 App 不应写。
 - OOD 可以管理 Zone 内节点配置；普通 server node 不应具备 OOD 级别权限。
 
-### DFS/NDN 和本地文件系统
-
-RBAC 的资源路径可以覆盖 `dfs://`、`ndn://` 这类逻辑资源，但当前系统还有另一层隔离：容器挂载和本地文件系统权限。
-
-设计原则：
-
-- `/config/` 这类结构化 KV 数据主要通过 system-config + RBAC 控制。
-- 用户文件、App 数据、service 数据最终还要受容器挂载范围限制。
-- App 即使 RBAC 上有某个逻辑资源权限，也不应默认看到 Node Host 的任意本地路径。
-- 对用户 home、App data、service data 的授权要同时考虑 RBAC 策略和运行时 mount 视图。
 
 ## 用户类型与 sudo
 
-`UserType.md` 里的可登录用户与 RBAC 的关系如下：
+可登录用户与 RBAC 的关系如下：
 
 | 用户类型 | 普通主体 | sudo 主体 | RBAC 配置目标 |
 | --- | --- | --- | --- |
@@ -420,17 +402,17 @@ g, su_bob, su_user
 4. 需要绑定原用户身份的 sudo 权限，用 scheduler 展开精确规则。
 5. `admin` 和 `su_admin` 都不等于 `root`。
 6. App/Service 只给自己的 scope 写权限；跨 scope 读写必须是明确的产品需求。
-7. `/config/system/rbac/*`、`/config/boot/*`、node config、service spec 这类控制面数据默认按高敏感处理。
+7. `obj://config/system/rbac/*`、`obj://config/boot/*`、node config、service spec 这类控制面数据默认按高敏感处理。
 
 ## 需要避免的配置
 
 不要用宽泛规则替代隔离设计：
 
 ```rbac
-p, app, /config/users/*, read|write, allow
-p, service, /config/services/*, read|write, allow
-p, su_user, /config/users/*, read|write, allow
-p, su_admin, /config/*, read|write, allow
+p, app, obj://config/users/*, read|write, allow
+p, service, obj://config/services/*, read|write, allow
+p, su_user, obj://config/users/*, read|write, allow
+p, su_admin, obj://config/*, read|write, allow
 ```
 
 这些规则会破坏 AppID 隔离、服务自有配置隔离、用户自有数据隔离，或者把 sudo admin 提升成事实上的 root。
