@@ -156,6 +156,7 @@ cyfs://$zone_id/home/$userid/  用户的全部个人数据
 ### 配置数据
 
 /config/users/$userid/settings 需要sudo才能写
+/config/users/$userid/profile 用户私有 Profile，普通用户可自行读写
 /config/users/$userid/apps/$appid/settings 普通权限即可读写
 
 ### 个人数据（传统的home文件夹)
@@ -296,4 +297,3 @@ library,publish,home,cache,var,storage,local,tmp,logs
 | instance/tools/$agentid/$sessionid(Agent) | ✓ | ✓ | ✓ |
 | app data/               | ✓  | ✓  | ✗    |
 | /mnt/<zone>             | ✓  | ✓* | ✗    |
-

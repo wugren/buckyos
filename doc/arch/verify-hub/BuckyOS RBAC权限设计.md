@@ -310,6 +310,7 @@ RBAC 主体大体分为几类：
 - 普通 `user` 只能访问自己的用户树。
 - `admin` 可以管理用户配置，但不等于能读取或改写所有用户的私密数据。
 - `settings` 这类敏感用户配置可以要求 sudo。
+- `profile` 保存 `UserPrivateProfile`，普通用户可自行读写，不要求 sudo。
 - 需要绑定原用户的 sudo 权限，使用 scheduler 生成精确规则：
 
 ```rbac

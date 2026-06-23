@@ -10,9 +10,9 @@ use buckyos_api::{
     generate_workflow_service_doc, AppDoc, AppServiceSpec, AppType, GatewaySettings,
     GatewayShortcut, KernelServiceSpec, NodeConfig, NodeState, SelectorType, ServiceExposeConfig,
     ServiceInfo, ServiceInstallConfig, ServiceInstanceReportInfo, ServiceInstanceState,
-    ServiceNode, ServiceState, SubPkgDesc, UserContactSettings, UserSettings, UserState,
-    UserTunnelBinding, UserType, OPENDAN_SERVICE_PORT, OPENDAN_SERVICE_UNIQUE_ID,
-    SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
+    ServiceNode, ServiceState, SubPkgDesc, UserContactSettings, UserPrivateProfile, UserProfile,
+    UserSettings, UserState, UserTunnelBinding, UserType, OPENDAN_SERVICE_PORT,
+    OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
 };
 use buckyos_api::{load_local_device_private_key, load_local_node_identity_config};
 use buckyos_api::{
@@ -119,8 +119,8 @@ impl SystemConfigBuilder {
             password: config.admin_password_hash.clone(),
             state: UserState::Active,
             res_pool_id: "default".to_string(),
+            is_local: true,
             contact: None,
-            profile: None,
             allow_password_change: None,
         };
         self.insert_json_if_absent("users/root/settings", &root_settings)?;
@@ -133,8 +133,8 @@ impl SystemConfigBuilder {
             password: config.admin_password_hash.clone(),
             state: UserState::Active,
             res_pool_id: "default".to_string(),
+            is_local: true,
             contact: admin_contact,
-            profile: None,
             allow_password_change: None,
         };
         self.insert_json_if_absent(&admin_key, &admin_settings)?;
@@ -155,6 +155,27 @@ impl SystemConfigBuilder {
 
         let key = format!("users/{}/doc", config.user_name);
         self.insert_json(&key, &owner_config)?;
+
+        let profile = UserPrivateProfile::from(UserProfile {
+            did: owner_config.id.clone(),
+            name: Some(owner_config.name.clone()),
+            display_name: Some(owner_config.display_name.clone()),
+            avatar: owner_config.avatar.clone(),
+            meta: owner_config.meta.clone(),
+            headline: None,
+            bio: None,
+            location: None,
+            organization: None,
+            title: None,
+            birthday: None,
+            tags: Vec::new(),
+            bkg_image: None,
+            links: HashMap::new(),
+            public_contacts: HashMap::new(),
+            extra: owner_config.extra_info.clone(),
+        });
+        let profile_key = format!("users/{}/profile", config.user_name);
+        self.insert_json_if_absent(&profile_key, &profile)?;
         Ok(self)
     }
 

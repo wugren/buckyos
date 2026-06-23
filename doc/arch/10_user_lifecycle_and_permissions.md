@@ -39,6 +39,7 @@
 | `password` | 口令哈希（**客户端计算后上传，服务端从不接触明文**） |
 | `state` | `Active` / `Suspended` / `Deleted` / `Banned`（见 §1.3） |
 | `res_pool_id` | 资源池，默认 `"default"` |
+| `is_local` | 是否为本地持有用户私钥的账号 |
 | `contact` | 联系方式（可选） |
 
 ### 1.2 用户相关的 system-config key 命名空间
@@ -46,6 +47,7 @@
 | Key | 写入者 | 内容 |
 |---|---|---|
 | `users/<id>/settings` | control_panel / scheduler | `UserSettings`（账户权威记录） |
+| `users/<id>/profile` | control_panel / scheduler | `UserPrivateProfile`（用户私有 Profile，普通用户可自行读写） |
 | `users/<id>/doc` | control_panel / scheduler | 用户 DID 文档 |
 | `users/<id>/apps/<app_id>/spec` | control_panel / scheduler | 用户安装的 App 规格 |
 | `users/<id>/agents/<agent_id>/spec`、`.../settings` | scheduler | 用户的 Agent 配置 |

@@ -58,7 +58,7 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
 ## Resource URLs
 
-基本规则 
+基本规则
 - spec 本机安装规格，只读,su_admin可以修改
 - info 当前状态，读写
 - doc 核心身份资料，只读，默认上链
@@ -69,10 +69,10 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
 ### user
 - obj://config/users/{user}/settings 用户设置(含密码)，需要su_users修改
-- obj://config/users/{user}/doc 用户身份资料，需要su_users修改修改 
-- obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链）
+- obj://config/users/{user}/doc 用户身份资料，需要su_users修改修改
+- obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链），注意保存的是private profile
 - obj://config/security/{user}/key 用户密钥，local账户才有，需要su_admin修改
- 
+
 
 
  */
@@ -111,6 +111,7 @@ p, admin,obj://config/system/*,read,allow
 p, admin,obj://config/agents/{agent}/doc,read,allow
 p, admin,obj://config/agents/{agent}/settings,read|write,allow
 p, admin,obj://config/users/{admin}/*,read,allow
+p, admin,obj://config/users/{admin}/profile,read|write,allow
 p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
 p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
 p, admin,obj://config/services/*,read,allow
@@ -119,6 +120,7 @@ p, users,obj://config/boot/*, read,allow
 p, users,obj://config/agents/{agent}/doc,read,allow
 # p, su_user,obj://config/users/{user}/*,all,allow
 p, users,obj://config/users/{users}/*,read,allow
+p, users,obj://config/users/{users}/profile,read|write,allow
 p, users,obj://config/users/{users}/apps/{app}/{key},read|write,allow
 p, users,obj://config/users/{users}/agents/{agent}/{key},read|write,allow
 p, users,obj://config/services/{service}/info,read,allow
@@ -422,11 +424,41 @@ g, su_alice, su_admin
             .await
         );
         assert!(
+            rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/bob/profile",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/bob/settings",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
             !rbac::enforce(
                 "bob",
                 "buckycli",
                 "obj://config/users/alice/settings",
                 "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/alice/profile",
+                "write",
                 None,
             )
             .await

@@ -1,8 +1,9 @@
 use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use buckyos_api::{
-    get_buckyos_api_runtime, SystemConfigClient, UserContactSettings, UserProfile, UserSettings,
-    UserState, UserTunnelBinding, UserType,
+    get_buckyos_api_runtime, ProfileLink, SystemConfigClient, SystemConfigError,
+    UserContactSettings, UserPrivateProfile, UserProfile, UserSettings, UserState,
+    UserTunnelBinding, UserType,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, KVAction};
 use jsonwebtoken::jwk::Jwk;
@@ -178,23 +179,67 @@ fn ensure_default_users_group(contact: &mut UserContactSettings) {
     }
 }
 
-fn profile_from_owner_config(owner_config: &OwnerConfig) -> UserProfile {
-    let mut profile = UserProfile {
-        display_name: Some(owner_config.full_name.clone()),
-        ..UserProfile::default()
-    };
-    if let Some(meta) = owner_config.meta.clone() {
-        profile.extra.insert("meta".to_string(), meta);
+fn public_profile_from_parts(
+    did: DID,
+    name: Option<String>,
+    display_name: Option<String>,
+    avatar: Option<String>,
+    meta: Option<Value>,
+    extra: HashMap<String, Value>,
+) -> UserProfile {
+    UserProfile {
+        did,
+        name,
+        display_name,
+        avatar,
+        meta,
+        headline: None,
+        bio: None,
+        location: None,
+        organization: None,
+        title: None,
+        birthday: None,
+        tags: Vec::new(),
+        bkg_image: None,
+        links: HashMap::new(),
+        public_contacts: HashMap::new(),
+        extra,
     }
-    for (key, value) in owner_config.extra_info.iter() {
-        profile.extra.insert(key.clone(), value.clone());
-    }
-    profile
 }
 
-fn merge_profile_values(local_profile: Option<UserProfile>, did_profile: Option<Value>) -> Value {
+fn profile_from_owner_config(owner_config: &OwnerConfig) -> UserPrivateProfile {
+    UserPrivateProfile::from(public_profile_from_parts(
+        owner_config.id.clone(),
+        Some(owner_config.name.clone()),
+        Some(owner_config.display_name.clone()),
+        owner_config.avatar.clone(),
+        owner_config.meta.clone(),
+        owner_config.extra_info.clone(),
+    ))
+}
+
+fn profile_from_settings(settings: &UserSettings) -> Result<UserPrivateProfile, RPCErrors> {
+    let did = settings
+        .contact
+        .as_ref()
+        .and_then(|contact| contact.did.as_ref())
+        .map(|did| DID::from_str(did))
+        .transpose()
+        .map_err(|e| RPCErrors::ReasonError(format!("Invalid user DID: {}", e)))?
+        .unwrap_or_else(|| DID::new("bns", &settings.user_id));
+    Ok(UserPrivateProfile::from(public_profile_from_parts(
+        did,
+        Some(settings.user_id.clone()),
+        Some(settings.show_name.clone()),
+        None,
+        None,
+        HashMap::new(),
+    )))
+}
+
+fn merge_profile_values(local_profile: Option<Value>, did_profile: Option<Value>) -> Value {
     let mut merged = match local_profile {
-        Some(profile) => serde_json::to_value(profile).unwrap_or_else(|_| json!({})),
+        Some(profile) => profile,
         None => json!({}),
     };
     if let Some(Value::Object(remote)) = did_profile {
@@ -208,6 +253,10 @@ fn merge_profile_values(local_profile: Option<UserProfile>, did_profile: Option<
         }
     }
     merged
+}
+
+fn public_profile_value(profile: &UserPrivateProfile) -> Value {
+    serde_json::to_value(profile.to_public_profile()).unwrap_or_else(|_| json!({}))
 }
 
 fn profile_value_from_doc(doc: &Value) -> Option<Value> {
@@ -227,6 +276,26 @@ fn parse_owner_config_value(value: &Value) -> Result<OwnerConfig, RPCErrors> {
             "owner_config must be a JSON object or string".to_string(),
         )),
     }
+}
+
+fn parse_user_profile_payload(
+    value: &Value,
+    fallback_did: &DID,
+) -> Result<UserPrivateProfile, RPCErrors> {
+    let mut profile_value = value.clone();
+    if let Value::Object(map) = &mut profile_value {
+        if !map.contains_key("did") && !map.contains_key("id") {
+            map.insert("did".to_string(), Value::String(fallback_did.to_string()));
+        }
+    }
+    let profile = serde_json::from_value::<UserPrivateProfile>(profile_value)
+        .map_err(|e| RPCErrors::ParseRequestError(format!("Invalid profile payload: {}", e)))?;
+    if profile.did != *fallback_did {
+        return Err(RPCErrors::ParseRequestError(
+            "profile.did does not match target user".to_string(),
+        ));
+    }
+    Ok(profile)
 }
 
 fn value_contains_zone(value: &Value, zone_did: &str) -> bool {
@@ -301,6 +370,40 @@ async fn save_user_settings(
         .set(&settings_path, &updated_json)
         .await
         .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user settings: {}", e)))?;
+    Ok(())
+}
+
+async fn load_user_profile(
+    client: &SystemConfigClient,
+    user_id: &str,
+) -> Result<Option<UserPrivateProfile>, RPCErrors> {
+    let profile_path = format!("users/{}/profile", user_id);
+    match client.get(&profile_path).await {
+        Ok(profile_val) => serde_json::from_str::<UserPrivateProfile>(&profile_val.value)
+            .map(Some)
+            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user profile: {}", e))),
+        Err(SystemConfigError::KeyNotFound(_)) => Ok(None),
+        Err(e) => Err(RPCErrors::ReasonError(format!(
+            "Failed to load user profile: {}",
+            e
+        ))),
+    }
+}
+
+async fn save_user_profile(
+    client: &SystemConfigClient,
+    user_id: &str,
+    profile: &UserPrivateProfile,
+) -> Result<(), RPCErrors> {
+    let profile_path = format!("users/{}/profile", user_id);
+    let profile_json = serde_json::to_string(profile)
+        .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
+    if client.set(&profile_path, &profile_json).await.is_err() {
+        client
+            .create(&profile_path, &profile_json)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user profile: {}", e)))?;
+    }
     Ok(())
 }
 
@@ -506,7 +609,7 @@ impl ControlPanelServer {
             "user_type": settings.user_type.clone(),
             "state": settings.state.clone(),
             "res_pool_id": settings.res_pool_id,
-            "profile": settings.profile.clone(),
+            "is_local": settings.is_local,
             "allow_password_change": settings.allow_password_change.unwrap_or(!matches!(settings.user_type, UserType::Limited)),
         });
         if include_contact {
@@ -515,12 +618,23 @@ impl ControlPanelServer {
             }
         }
 
+        let local_profile = load_user_profile(&client, &target).await?;
+        if let Some(profile) = local_profile.as_ref() {
+            result["local_profile"] = serde_json::to_value(profile).unwrap_or(json!(null));
+            result["profile"] =
+                serde_json::to_value(profile.to_public_profile()).unwrap_or(json!(null));
+        } else {
+            result["profile"] = json!({});
+        }
+
         // Try to load the DID document (best-effort)
         let doc_path = format!("users/{}/doc", target);
         if let Ok(doc_val) = client.get(&doc_path).await {
             if let Ok(doc) = serde_json::from_str::<Value>(&doc_val.value) {
-                result["profile"] =
-                    merge_profile_values(settings.profile.clone(), profile_value_from_doc(&doc));
+                result["profile"] = merge_profile_values(
+                    local_profile.as_ref().map(public_profile_value),
+                    profile_value_from_doc(&doc),
+                );
                 result["did_document"] = doc;
             }
         }
@@ -586,8 +700,8 @@ impl ControlPanelServer {
             password: password_hash,
             state: UserState::Active,
             res_pool_id: "default".to_string(),
+            is_local: true,
             contact: Some(default_contact_settings(Some(user_did))),
-            profile: None,
             allow_password_change,
         };
         let settings_json = serde_json::to_string(&new_settings)
@@ -595,14 +709,19 @@ impl ControlPanelServer {
 
         let doc_json = serde_json::to_string(&owner_config)
             .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
+        let profile = profile_from_owner_config(&owner_config);
+        let profile_json = serde_json::to_string(&profile)
+            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
 
         // Execute as transaction
         let doc_path = format!("users/{}/doc", user_id);
         let key_path = format!("users/{}/key", user_id);
+        let profile_path = format!("users/{}/profile", user_id);
         let mut tx = HashMap::new();
         tx.insert(settings_path, KVAction::Create(settings_json));
         tx.insert(doc_path, KVAction::Create(doc_json));
         tx.insert(key_path, KVAction::Create(private_key));
+        tx.insert(profile_path, KVAction::Create(profile_json));
 
         client
             .exec_tx(tx, None)
@@ -751,6 +870,7 @@ impl ControlPanelServer {
 
         let client = system_config_client_for_caller(&req).await?;
         let settings = load_user_settings(&client, &target).await?;
+        let local_profile = load_user_profile(&client, &target).await?;
         let mut did_profile = None;
         let doc_path = format!("users/{}/doc", target);
         if let Ok(doc_val) = client.get(&doc_path).await {
@@ -762,9 +882,13 @@ impl ControlPanelServer {
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
                 "user_id": target,
-                "profile": merge_profile_values(settings.profile.clone(), did_profile.clone()),
-                "local_profile": settings.profile,
+                "profile": merge_profile_values(
+                    local_profile.as_ref().map(public_profile_value),
+                    did_profile.clone()
+                ),
+                "local_profile": local_profile,
                 "did_profile": did_profile,
+                "is_local": settings.is_local,
             })),
             req.seq,
         ))
@@ -787,20 +911,31 @@ impl ControlPanelServer {
         }
 
         let client = system_config_client_for_caller(&req).await?;
-        let mut settings = load_user_settings(&client, &target).await?;
+        let settings = load_user_settings(&client, &target).await?;
+        let fallback_profile = match load_user_profile(&client, &target).await? {
+            Some(profile) => profile,
+            None => profile_from_settings(&settings)?,
+        };
+        let fallback_did = fallback_profile.did.clone();
         let mut profile = if let Some(value) = req.params.get("profile") {
-            serde_json::from_value::<UserProfile>(value.clone()).map_err(|e| {
-                RPCErrors::ParseRequestError(format!("Invalid profile payload: {}", e))
-            })?
+            parse_user_profile_payload(value, &fallback_did)?
         } else {
-            settings.profile.clone().unwrap_or_default()
+            fallback_profile
         };
 
         if let Some(value) = Self::param_str(&req, "display_name") {
             profile.display_name = Some(value);
         }
-        if let Some(value) = Self::param_str(&req, "avatar_url") {
-            profile.avatar_url = Some(value);
+        if let Some(value) = Self::param_str(&req, "name") {
+            profile.name = Some(value);
+        }
+        if let Some(value) =
+            Self::param_str(&req, "avatar").or_else(|| Self::param_str(&req, "avatar_url"))
+        {
+            profile.avatar = Some(value);
+        }
+        if let Some(value) = Self::param_str(&req, "headline") {
+            profile.headline = Some(value);
         }
         if let Some(value) = Self::param_str(&req, "title") {
             profile.title = Some(value);
@@ -811,23 +946,51 @@ impl ControlPanelServer {
         if let Some(value) = Self::param_str(&req, "location") {
             profile.location = Some(value);
         }
+        if let Some(value) = Self::param_str(&req, "organization") {
+            profile.organization = Some(value);
+        }
+        if let Some(value) = Self::param_str(&req, "birthday") {
+            profile.birthday = Some(value);
+        }
+        if let Some(value) = Self::param_str(&req, "bkg_image") {
+            profile.bkg_image = Some(value);
+        }
         if let Some(value) = Self::param_str(&req, "website") {
-            profile.website = Some(value);
+            profile.links.insert(
+                "website".to_string(),
+                ProfileLink {
+                    label: "Website".to_string(),
+                    url: value,
+                },
+            );
         }
         if let Some(value) = Self::param_str(&req, "email") {
-            profile.email = Some(value);
+            profile
+                .extra
+                .insert("email".to_string(), Value::String(value));
         }
         if let Some(value) = Self::param_str(&req, "phone") {
-            profile.phone = Some(value);
+            profile
+                .extra
+                .insert("phone".to_string(), Value::String(value));
+        }
+        if let Some(tags) = req.params.get("tags") {
+            profile.tags = serde_json::from_value(tags.clone()).map_err(|e| {
+                RPCErrors::ParseRequestError(format!("Invalid profile tags payload: {}", e))
+            })?;
         }
         if let Some(extra) = req.params.get("extra") {
             profile.extra = serde_json::from_value(extra.clone()).map_err(|e| {
                 RPCErrors::ParseRequestError(format!("Invalid profile extra payload: {}", e))
             })?;
         }
+        if let Some(private_extra) = req.params.get("private_extra") {
+            profile.private_extra = serde_json::from_value(private_extra.clone()).map_err(|e| {
+                RPCErrors::ParseRequestError(format!("Invalid private_extra payload: {}", e))
+            })?;
+        }
 
-        settings.profile = Some(profile.clone());
-        save_user_settings(&client, &target, &settings).await?;
+        save_user_profile(&client, &target, &profile).await?;
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1038,6 +1201,7 @@ impl ControlPanelServer {
                 password: String::new(),
                 state: UserState::Pending,
                 res_pool_id: "default".to_string(),
+                is_local: false,
                 contact: Some(UserContactSettings {
                     did: target_did.clone(),
                     note: None,
@@ -1045,7 +1209,6 @@ impl ControlPanelServer {
                     tags: Vec::new(),
                     bindings: Vec::new(),
                 }),
-                profile: None,
                 allow_password_change: None,
             };
             let settings_json = serde_json::to_string(&pending_settings)
@@ -1163,7 +1326,7 @@ impl ControlPanelServer {
         let show_name = invite
             .show_name
             .clone()
-            .unwrap_or_else(|| owner_config.full_name.clone());
+            .unwrap_or_else(|| owner_config.display_name.clone());
 
         let settings_path = format!("users/{}/settings", user_id);
         let mut settings = match client.get(&settings_path).await {
@@ -1184,7 +1347,7 @@ impl ControlPanelServer {
                 }
                 settings.state = UserState::Active;
                 settings.contact = Some(contact.clone());
-                settings.profile = Some(profile.clone());
+                settings.is_local = false;
                 settings
             }
             Err(_) => UserSettings {
@@ -1194,8 +1357,8 @@ impl ControlPanelServer {
                 password: password_hash.clone(),
                 state: UserState::Active,
                 res_pool_id: "default".to_string(),
+                is_local: false,
                 contact: Some(contact.clone()),
-                profile: Some(profile.clone()),
                 allow_password_change: None,
             },
         };
@@ -1219,6 +1382,8 @@ impl ControlPanelServer {
                 .await
                 .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user doc: {}", e)))?;
         }
+
+        save_user_profile(&client, &user_id, &profile).await?;
 
         invite.state = "accepted".to_string();
         invite.accepted_at = Some(now);
@@ -1833,12 +1998,7 @@ impl ControlPanelServer {
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
                 "agent_id": agent_id,
-                "profile": merge_profile_values(
-                    local_profile
-                        .clone()
-                        .and_then(|value| serde_json::from_value::<UserProfile>(value).ok()),
-                    doc_profile.clone(),
-                ),
+                "profile": merge_profile_values(local_profile.clone(), doc_profile.clone()),
                 "local_profile": local_profile,
                 "did_profile": doc_profile,
             })),

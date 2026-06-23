@@ -43,16 +43,40 @@ export interface UserContactSettings {
   bindings?: UserTunnelBinding[]
 }
 
+export interface ProfileLink {
+  label: string
+  url: string
+}
+
+export type ProfileContact = {
+  platform: string
+  [key: string]: unknown
+}
+
 export interface UserProfile {
+  did: string
+  name?: string | null
   display_name?: string | null
-  avatar_url?: string | null
+  avatar?: string | null
+  meta?: unknown
+  headline?: string | null
   title?: string | null
   bio?: string | null
   location?: string | null
-  website?: string | null
-  email?: string | null
-  phone?: string | null
-  extra?: Record<string, unknown>
+  organization?: string | null
+  birthday?: string | null
+  tags?: string[]
+  bkg_image?: string | null
+  links?: Record<string, ProfileLink>
+  public_contacts?: Record<string, ProfileContact>
+  [key: string]: unknown
+}
+
+export interface UserPrivateProfile extends UserProfile {
+  privacy?: Record<string, unknown>
+  private_contacts?: Record<string, ProfileContact>
+  private_meta?: unknown
+  private_extra?: Record<string, unknown>
 }
 
 /** Minimal user listing entry as returned by `user.list`. */
@@ -75,7 +99,9 @@ export interface UserDetail {
   user_type: UserType | string
   state: UserStateString
   res_pool_id: string
+  is_local?: boolean
   profile?: UserProfile | Record<string, unknown> | null
+  local_profile?: UserPrivateProfile | null
   allow_password_change?: boolean
   /** Only present if caller is the user themselves or an admin. */
   contact?: UserContactSettings
@@ -92,8 +118,9 @@ export interface SimpleOkResponse {
 export interface UserProfileResponse {
   user_id: string
   profile: UserProfile | Record<string, unknown>
-  local_profile?: UserProfile | null
+  local_profile?: UserPrivateProfile | null
   did_profile?: Record<string, unknown> | null
+  is_local?: boolean
 }
 
 export interface UserInviteRecord {
@@ -247,30 +274,46 @@ export const fetchUserProfile = async (
 
 export const setUserProfile = async (input: {
   userId?: string
-  profile?: UserProfile
+  profile?: UserPrivateProfile
+  name?: string
   displayName?: string
+  avatar?: string
   avatarUrl?: string
+  headline?: string
   title?: string
   bio?: string
   location?: string
+  organization?: string
+  birthday?: string
+  bkgImage?: string
+  tags?: string[]
   website?: string
   email?: string
   phone?: string
+  privateExtra?: Record<string, unknown>
   extra?: Record<string, unknown>
-}): Promise<{ data: (SimpleOkResponse & { profile?: UserProfile }) | null; error: unknown }> => {
+}): Promise<{ data: (SimpleOkResponse & { profile?: UserPrivateProfile }) | null; error: unknown }> => {
   const params: Record<string, unknown> = {}
   if (input.userId) params.user_id = input.userId
   if (input.profile !== undefined) params.profile = input.profile
+  if (input.name !== undefined) params.name = input.name
   if (input.displayName !== undefined) params.display_name = input.displayName
-  if (input.avatarUrl !== undefined) params.avatar_url = input.avatarUrl
+  if (input.avatar !== undefined) params.avatar = input.avatar
+  if (input.avatarUrl !== undefined) params.avatar = input.avatarUrl
+  if (input.headline !== undefined) params.headline = input.headline
   if (input.title !== undefined) params.title = input.title
   if (input.bio !== undefined) params.bio = input.bio
   if (input.location !== undefined) params.location = input.location
+  if (input.organization !== undefined) params.organization = input.organization
+  if (input.birthday !== undefined) params.birthday = input.birthday
+  if (input.bkgImage !== undefined) params.bkg_image = input.bkgImage
+  if (input.tags !== undefined) params.tags = input.tags
   if (input.website !== undefined) params.website = input.website
   if (input.email !== undefined) params.email = input.email
   if (input.phone !== undefined) params.phone = input.phone
+  if (input.privateExtra !== undefined) params.private_extra = input.privateExtra
   if (input.extra !== undefined) params.extra = input.extra
-  return callRpc<SimpleOkResponse & { profile?: UserProfile }>('user.profile.set', params)
+  return callRpc<SimpleOkResponse & { profile?: UserPrivateProfile }>('user.profile.set', params)
 }
 
 export const setUserMsgTunnel = async (input: {

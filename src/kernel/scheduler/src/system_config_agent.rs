@@ -1861,7 +1861,8 @@ mod tests {
                 "show_name": "alice",
                 "password": "hashed",
                 "state": "active",
-                "res_pool_id": "default"
+                "res_pool_id": "default",
+                "is_local": true
             }))
             .unwrap(),
         );
@@ -1873,7 +1874,8 @@ mod tests {
                 "show_name": "bob",
                 "password": "hashed",
                 "state": "active",
-                "res_pool_id": "default"
+                "res_pool_id": "default",
+                "is_local": true
             }))
             .unwrap(),
         );
@@ -1885,7 +1887,8 @@ mod tests {
                 "show_name": "carol",
                 "password": "hashed",
                 "state": "active",
-                "res_pool_id": "default"
+                "res_pool_id": "default",
+                "is_local": true
             }))
             .unwrap(),
         );
@@ -1930,7 +1933,8 @@ mod tests {
                 "show_name": "alice",
                 "password": "hashed",
                 "state": "active",
-                "res_pool_id": "default"
+                "res_pool_id": "default",
+                "is_local": true
             }))
             .unwrap(),
         );

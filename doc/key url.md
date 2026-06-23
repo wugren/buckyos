@@ -63,6 +63,7 @@ p, root,  obj://config/*,                              read|write, allow
 p, ood,   obj://config/nodes/{device}/*,               read|write, allow
 p, app,   obj://config/users/*/apps/{app}/settings,    read|write, allow
 p, users, obj://config/users/{users}/*,                read,       allow
+p, users, obj://config/users/{users}/profile,          read|write, allow
 p, users, dfs://users/{users}/*,                        read|write, allow
 ```
 
@@ -128,7 +129,6 @@ https://$appid-$userid.$zonehost/
 
 
 ## 钱包相关协议
-
 
 
 

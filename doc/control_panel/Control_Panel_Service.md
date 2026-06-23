@@ -38,8 +38,8 @@ Control Panel Service 是 Zone 内的**核心资源管理服务**，其本质是
 
 ### 2.1 User（用户）
 
-* 身份与账号信息，核心结构 `UserSettings`（`user_type` / `state` / 密码哈希 / 是否允许改密 等），来自 `buckyos-api`。
-* 关联结构：`UserProfile`（展示资料）、`UserContactSettings`（DID / groups / tags / 消息平台绑定）、`UserTunnelBinding`（消息平台账号绑定）。
+* 身份与账号信息，核心结构 `UserSettings`（`user_type` / `state` / 密码哈希 / `is_local` / 是否允许改密 等），来自 `buckyos-api`。
+* 关联结构：`UserPrivateProfile`（用户私有展示资料，保存在独立 profile 路径）、`UserContactSettings`（DID / groups / tags / 消息平台绑定）、`UserTunnelBinding`（消息平台账号绑定）。
 * 状态机 `UserState`：`Active`（正常，可签发/使用 session）/ `Pending`（已邀请未激活）/ `Deleted`（软删除，记录保留但禁止登录）。
 * 角色 `UserType`：`Root`（Zone 拥有者，不可删除/不可降级）/ `Admin`（管理员）/ `User`（普通）/ `Limited`（受限，改密受 `allow_password_change` 控制）/ `Guest`。
 * `system_config` 路径：
@@ -47,6 +47,7 @@ Control Panel Service 是 Zone 内的**核心资源管理服务**，其本质是
   | 路径 | 内容 |
   |---|---|
   | `users/{user_id}/settings` | `UserSettings` JSON（账号主数据） |
+  | `users/{user_id}/profile` | `UserPrivateProfile` JSON（普通用户可自行读写） |
   | `users/{user_id}/doc` | DID Document / OwnerConfig（身份与公开资料） |
   | `users/{user_id}/key` | ED25519 私钥（PEM，仅创建时写一次） |
   | `services/control_panel/user_invites/{invite_id}` | 邀请记录 `UserInviteRecord` |
@@ -100,7 +101,7 @@ Agent 在系统中有**两副面孔**，需要区分：
 
 整个事务**全成功或全失败**，由 `system_config` 层保证，本服务不实现应用层回滚。典型事务：
 
-* **创建用户**（[user_mgr.rs](../../src/frame/control_panel/src/user_mgr.rs)）：一次事务写 `users/{uid}/settings` + `users/{uid}/doc` + `users/{uid}/key` 三路径。
+* **创建用户**（[user_mgr.rs](../../src/frame/control_panel/src/user_mgr.rs)）：一次事务写 `users/{uid}/settings` + `users/{uid}/doc` + `users/{uid}/key` + `users/{uid}/profile` 四路径。
 * **创建 Agent**：一次事务写 `agents/{id}/doc` + `agents/{id}/settings` + `agents/{id}/key`。
 * **创建邀请**：一次事务写 `services/control_panel/user_invites/{invite_id}`，若指向已存在用户则同时写其 `settings`（置 Pending）。
 
@@ -130,7 +131,7 @@ Agent 在系统中有**两副面孔**，需要区分：
 | `user.create` | **Admin** | 事务创建 settings+doc+key，追加 RBAC 组；不允许创建 Root |
 | `user.update` | 本人/Admin | 改 `show_name` 等 |
 | `user.update_contact` | 本人/Admin | 改 DID/groups/tags/消息平台绑定 |
-| `user.profile.get` / `user.profile.set` | 本人/Admin | 本地 profile（DID profile 只读，响应中两源合并） |
+| `user.profile.get` / `user.profile.set` | 本人/Admin | `users/{uid}/profile` 中的私有 profile（DID profile 只读，响应中两源合并） |
 | `user.set_msg_tunnel` / `user.remove_msg_tunnel` | 本人/Admin | 增删消息平台账号绑定 |
 | `user.invite.create` | **Admin** | 生成邀请（可预建 Pending 用户或绑定已有 DID），返回 `invite_url` |
 | `user.invite.get` | **公开** | 凭 `invite_id` 读邀请详情（含过期、zone_did/host） |
@@ -296,7 +297,7 @@ export const PUBLIC_ROUTE_PREFIXES = ['/login', '/userprofile'] as const
 
 | 实体 | 路径 | 写入方式 |
 |---|---|---|
-| User | `users/{uid}/settings` · `users/{uid}/doc` · `users/{uid}/key` | `exec_tx` 原子三写 |
+| User | `users/{uid}/settings` · `users/{uid}/doc` · `users/{uid}/key` · `users/{uid}/profile` | `exec_tx` 原子四写 |
 | User Invite | `services/control_panel/user_invites/{invite_id}` | `exec_tx`（可含目标用户 settings） |
 | Agent（身份） | `agents/{id}/doc` · `agents/{id}/settings` · `agents/{id}/key` | `exec_tx` 原子三写 |
 | App / Agent（服务） | `users/{uid}/apps\|agents/{app_id}/spec` | 单次原子 `set` |

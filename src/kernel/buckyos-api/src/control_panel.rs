@@ -2,7 +2,13 @@ use crate::app_mgr::*;
 use crate::system_config::*;
 use crate::{AppDoc, AppType, SelectorType};
 use ::kRPC::*;
-use name_lib::*;
+use name_lib::{
+    DIDDocumentTrait, DeviceConfig, DeviceInfo, EncodedDocument, OwnerConfig, ZoneConfig, DID,
+};
+pub use name_lib::{
+    ProfileContact, ProfileLink, ProfilePrivacyRule, ProfileVisibility, UserPrivateProfile,
+    UserProfile, UserProfilePrivacy,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,28 +96,6 @@ pub struct UserContactSettings {
     pub bindings: Vec<UserTunnelBinding>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct UserProfile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avatar_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bio: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub location: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub website: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phone: Option<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub extra: HashMap<String, serde_json::Value>,
-}
-
 //did:bns:$user_id user_id is-> UserSettings
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserSettings {
@@ -123,10 +107,10 @@ pub struct UserSettings {
     pub password: String,
     pub state: UserState,
     pub res_pool_id: String,
+    #[serde(default)]
+    pub is_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<UserContactSettings>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<UserProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_password_change: Option<bool>,
 }

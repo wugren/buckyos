@@ -79,6 +79,8 @@ function isoFromUnix(value: unknown): string | undefined {
 function profileMap(profile: unknown, fallback: Record<string, string> = {}): Record<string, string> {
   const source = asRecord(profile)
   const extra = asRecord(source.extra)
+  const links = asRecord(source.links)
+  const websiteLink = asRecord(links.website)
   const result: Record<string, string> = {}
 
   for (const [key, value] of Object.entries({
@@ -87,7 +89,7 @@ function profileMap(profile: unknown, fallback: Record<string, string> = {}): Re
     bio: firstString(source.bio, fallback.bio),
     location: firstString(source.location, fallback.location),
     organization: firstString(source.organization, extra.organization, fallback.organization),
-    website: firstString(source.website, fallback.website),
+    website: firstString(source.website, websiteLink.url, fallback.website),
     email: firstString(source.email, fallback.email),
     phone: firstString(source.phone, fallback.phone),
   })) {
@@ -195,7 +197,7 @@ export function toSelfEntity(
     ...fallback,
     id: detail.user_id,
     displayName,
-    avatarUrl: firstString(profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
+    avatarUrl: firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
     did: firstString(contact?.did, asRecord(detail.did_document).id, fallback.did),
     socialAccounts: toSocialAccounts(contact?.bindings),
     bio,
@@ -339,7 +341,7 @@ export function toAgentEntity(
     ...fallback,
     id: agentId,
     displayName,
-    avatarUrl: firstString(profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
+    avatarUrl: firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
     did: agentDid,
     agentType: firstString(profile.agent_type, settings.agent_type, fallback.agentType) ?? fallback.agentType,
     version: firstString(raw.version, settings.version, appDoc.version, fallback.version) ?? fallback.version,

@@ -20,6 +20,14 @@
 }
 """
 
+"users/devtest/profile" = """
+{
+  "did": "did:bns:devtest",
+  "name": "devtest",
+  "display_name": "$YOUR NAME"
+}
+"""
+
 "services/aicc/settings" = """
 {
     "openai": {
@@ -55,6 +63,7 @@
   "password": "o8XyToejrbCYou84h/VkF4Tht0BeQQbuX3XKG+8+GQ4=",
   "state": "active",
   "res_pool_id": "default",
+  "is_local": true,
   "contact": {
     "did": "did:bns:devtest",
     "groups": ["zone_user"],
