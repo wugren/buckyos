@@ -73,43 +73,43 @@ p, system, obj://config/security/*,all,deny
 
 p, frame, obj://config/boot/*, read,allow
 p, frame, obj://config/system/*,read,allow
-p, frame, obj://config/agents/*/*,read,allow
+p, frame, obj://config/agents/{agent}/{key},read,allow
 p, frame, obj://config/services/{frame}/*,all,allow
-p, frame, obj://config/services/*/info,read,allow
+p, frame, obj://config/services/{service}/info,read,allow
 p, frame, obj://config/users*,read,allow
 
 
 p, app, obj://config/boot/*, read,allow
-p, app, obj://config/users/*/apps/{app}/settings,read|write,allow
-p, app, obj://config/users/*/apps/{app}/spec,read,allow
-p, app, obj://config/users/*/apps/{app}/info,read|write,allow
-p, app, obj://config/services/*/info,read,allow
+p, app, obj://config/users/{user}/apps/{app}/settings,read|write,allow
+p, app, obj://config/users/{user}/apps/{app}/spec,read,allow
+p, app, obj://config/users/{user}/apps/{app}/info,read|write,allow
+p, app, obj://config/services/{service}/info,read,allow
 
 
 p, agent, obj://config/boot/*, read,allow
 p, agent, obj://config/agents/{agent}/*,read,allow
-p, agent, obj://config/users/*/agents/{agent}/settings,read|write,allow
-p, agent, obj://config/users/*/agents/{agent}/spec,read,allow
-p, agent, obj://config/users/*/agents/{agent}/info,read|write,allow
-p, agent, obj://config/services/*/info,read,allow
+p, agent, obj://config/users/{user}/agents/{agent}/settings,read|write,allow
+p, agent, obj://config/users/{user}/agents/{agent}/spec,read,allow
+p, agent, obj://config/users/{user}/agents/{agent}/info,read|write,allow
+p, agent, obj://config/services/{service}/info,read,allow
 
 
 p, admin,obj://config/boot/*, read,allow
 p, admin,obj://config/system/*,read,allow
-p, admin,obj://config/agents/*/doc,read,allow
-p, admin,obj://config/agents/*/settings,read|write,allow
+p, admin,obj://config/agents/{agent}/doc,read,allow
+p, admin,obj://config/agents/{agent}/settings,read|write,allow
 p, admin,obj://config/users/{admin}/*,read,allow
-p, admin,obj://config/users/{admin}/apps/*/*,read|write,allow
-p, admin,obj://config/users/{admin}/agents/*/*,read|write,allow
+p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
+p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
 p, admin,obj://config/services/*,read,allow
 
 p, user,obj://config/boot/*, read,allow
-p, user,obj://config/agents/*/doc,read,allow
+p, user,obj://config/agents/{agent}/doc,read,allow
 # p, su_user,obj://config/users/{user}/*,all,allow
 p, user,obj://config/users/{user}/*,read,allow
-p, user,obj://config/users/{user}/apps/*/*,read|write,allow
-p, user,obj://config/users/{user}/agents/*/*,read|write,allow
-p, user,obj://config/services/*/info,read,allow
+p, user,obj://config/users/{user}/apps/{app}/{key},read|write,allow
+p, user,obj://config/users/{user}/agents/{agent}/{key},read|write,allow
+p, user,obj://config/services/{service}/info,read,allow
 
 g, node-daemon, kernel
 g, scheduler, kernel
