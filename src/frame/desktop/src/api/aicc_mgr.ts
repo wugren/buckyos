@@ -1,4 +1,4 @@
-import { buckyos } from 'buckyos'
+import { buckyos, getActiveSessionToken } from 'buckyos'
 import { isMockRuntime } from '../runtime'
 import { MockDataStore } from '../app/ai-center/mock/store'
 import type {
@@ -436,7 +436,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       reason?: unknown
       error?: unknown
       reload?: { ok?: unknown; error?: unknown; reason?: unknown }
-    }>('provider.add', toProviderWritePayload(draft))
+    }>('provider.add', toProviderWritePayload(draft), { requireSession: true })
     if (result.ok !== true) {
       throw new Error(asNonEmptyString(result.reason, asNonEmptyString(result.error, 'aicc.provider_add_failed')))
     }
@@ -451,7 +451,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   async deleteProvider(id: string): Promise<void> {
     const result = await this.call<{ ok?: unknown; reason?: unknown }>('provider.delete', {
       provider_instance_name: id,
-    })
+    }, { requireSession: true })
     if (result.ok === false) {
       throw new Error(asNonEmptyString(result.reason, 'aicc.provider_delete_failed'))
     }
@@ -460,18 +460,18 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   async refreshProviderModels(id: string): Promise<void> {
     await this.call('provider.refresh_models', {
       provider_instance_name: id,
-    })
+    }, { requireSession: true })
   }
 
   async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
     const result = await this.callControlPanel<{ provider?: unknown; ok?: unknown; reason?: unknown }>('ai.provider.set', {
       provider: toAiProviderCard(provider),
       api_key: apiKey.trim(),
-    })
+    }, { requireSession: true })
     if (result.ok === false) {
       throw new Error(asNonEmptyString(result.reason, 'aicc.provider_key_update_failed'))
     }
-    const reload = await this.callControlPanel<{ ok?: unknown; result?: { ok?: unknown }; reason?: unknown }>('ai.reload', {})
+    const reload = await this.callControlPanel<{ ok?: unknown; result?: { ok?: unknown }; reason?: unknown }>('ai.reload', {}, { requireSession: true })
     if (reload.ok === false || reload.result?.ok === false) {
       throw new Error(asNonEmptyString(reload.reason, 'aicc.provider_reload_failed'))
     }
@@ -482,7 +482,7 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     const result = await this.callControlPanel<{ ok?: unknown; reason?: unknown }>('ai.provider.weight.set', {
       provider_instance_name: providerInstanceName,
       weight,
-    })
+    }, { requireSession: true })
     if (result.ok !== true) {
       throw new Error(asNonEmptyString(result.reason, 'aicc.provider_weight_set_failed'))
     }
@@ -510,16 +510,24 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     return this.usageTrend
   }
 
-  private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getClient().call(method, await withSessionToken(params))
+  private async call<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options: { requireSession?: boolean } = {},
+  ): Promise<T> {
+    const result = await this.getClient().call(method, await prepareSessionToken(params, options.requireSession === true))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
     return result as T
   }
 
-  private async callControlPanel<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getControlPanelClient().call(method, await withSessionToken(params))
+  private async callControlPanel<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options: { requireSession?: boolean } = {},
+  ): Promise<T> {
+    const result = await this.getControlPanelClient().call(method, await prepareSessionToken(params, options.requireSession === true))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
@@ -550,14 +558,21 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   }
 }
 
-async function withSessionToken(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function prepareSessionToken(params: Record<string, unknown>, requireSession: boolean): Promise<Record<string, unknown>> {
   if (typeof params.session_token === 'string' && params.session_token.trim()) {
     return params
   }
   const accountInfo = await buckyos.getAccountInfo() as AccountInfo | null
-  const sessionToken = typeof accountInfo?.session_token === 'string'
+  let sessionToken = typeof accountInfo?.session_token === 'string'
     ? accountInfo.session_token.trim()
     : ''
+  if (!sessionToken) {
+    const refreshedToken = await getActiveSessionToken()
+    sessionToken = typeof refreshedToken === 'string' ? refreshedToken.trim() : ''
+  }
+  if (!sessionToken && requireSession) {
+    throw new Error('Current login session expired. Please sign in again.')
+  }
   return sessionToken ? { ...params, session_token: sessionToken } : params
 }
 
