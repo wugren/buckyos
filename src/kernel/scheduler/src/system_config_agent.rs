@@ -1263,17 +1263,11 @@ async fn update_rbac(
                 push_policy_line(
                     &mut rbac_policy,
                     format!(
-                        "p, {}, obj://config/users/{}/settings, read|write,allow",
+                        "p, {}, obj://config/users/{}/*, all,allow",
                         sudo_user_id, user_id
                     ),
                 );
-                push_policy_line(
-                    &mut rbac_policy,
-                    format!(
-                        "p, {}, obj://config/users/{}/doc, read|write,allow",
-                        sudo_user_id, user_id
-                    ),
-                );
+ 
             }
             crate::scheduler::UserType::Limited => {
                 info!("add limited rbac policy for user {}", user_id);
