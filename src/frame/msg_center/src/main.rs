@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use buckyos_api::{
     get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime, AccountBinding,
     BoxKind, BuckyOSRuntimeType, DeliveryReportResult, MsgCenterClient, MsgCenterServerHandler,
-    MsgState, UserSettings, UserState, MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
+    MsgState, SystemConfigClient, UserContactSettings, UserPrivateProfile, UserSettings, UserState,
+    MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
 };
 use buckyos_http_server::Runner;
 use buckyos_http_server::{
@@ -39,6 +40,7 @@ use crate::tg_tunnel::{GrammersTgGatewayConfig, TgBotBinding, TgTunnel, TgTunnel
 
 const MSG_CENTER_HTTP_PATH: &str = "/kapi/msg-center";
 const MSG_CENTER_DEFAULT_TG_TUNNEL_DID: &str = "did:bns:msg-center-default-tunnel";
+const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 const TG_BINDING_BOT_TOKEN_KEY: &str = "bot_token";
 const METHOD_RELOAD_SETTINGS: &str = "reload_settings";
 const METHOD_SERVICE_RELOAD_SETTINGS: &str = "service.reload_settings";
@@ -460,7 +462,18 @@ fn start_tunnel_egress_worker(center: MessageCenter, tunnel_mgr: Arc<MsgTunnelIn
     });
 }
 
-fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUserContactSeed> {
+fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSettings> {
+    profile
+        .private_extra
+        .get(PROFILE_SYSTEM_CONTACT_KEY)
+        .and_then(|value| serde_json::from_value::<UserContactSettings>(value.clone()).ok())
+}
+
+fn build_zone_user_seed(
+    username: &str,
+    settings: UserSettings,
+    profile: Option<UserPrivateProfile>,
+) -> Option<ZoneUserContactSeed> {
     if !matches!(settings.state, UserState::Active) {
         return None;
     }
@@ -471,7 +484,7 @@ fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUs
     let mut tags = vec!["zone_user".to_string()];
     let mut bindings = Vec::new();
 
-    if let Some(contact_cfg) = settings.contact {
+    if let Some(contact_cfg) = profile.as_ref().and_then(profile_system_contact) {
         if let Some(raw_did) = contact_cfg.did.as_ref() {
             let did = raw_did.trim();
             if !did.is_empty() {
@@ -530,7 +543,11 @@ fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUs
         }
     }
 
-    let name = settings.show_name.trim().to_string();
+    let name = profile
+        .as_ref()
+        .and_then(|profile| profile.display_name.as_ref().or(profile.name.as_ref()))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
     Some(ZoneUserContactSeed {
         did: contact_did,
         name: if name.is_empty() {
@@ -545,6 +562,32 @@ fn build_zone_user_seed(username: &str, settings: UserSettings) -> Option<ZoneUs
     })
 }
 
+async fn load_zone_user_profile(
+    system_config_client: &SystemConfigClient,
+    username: &str,
+) -> Option<UserPrivateProfile> {
+    let profile_path = format!("users/{}/profile", username);
+    match system_config_client.get(&profile_path).await {
+        Ok(profile_val) => match serde_json::from_str::<UserPrivateProfile>(&profile_val.value) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                warn!(
+                    "parse user profile failed while syncing zone users: username={}, error={}",
+                    username, error
+                );
+                None
+            }
+        },
+        Err(error) => {
+            warn!(
+                "load user profile failed while syncing zone users: username={}, error={}",
+                username, error
+            );
+            None
+        }
+    }
+}
+
 async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
     let runtime = get_buckyos_api_runtime()?;
     let control_panel_client = runtime
@@ -557,6 +600,7 @@ async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
         .await
         .map_err(|error| anyhow::anyhow!("list users failed: {}", error))?;
     let mut contacts = Vec::new();
+    let system_config_client = runtime.get_system_config_client().await?;
 
     for username in users {
         let settings = match control_panel_client
@@ -572,8 +616,9 @@ async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
                 continue;
             }
         };
+        let profile = load_zone_user_profile(&system_config_client, username.as_str()).await;
 
-        if let Some(seed) = build_zone_user_seed(username.as_str(), settings) {
+        if let Some(seed) = build_zone_user_seed(username.as_str(), settings, profile) {
             contacts.push(seed);
         }
     }

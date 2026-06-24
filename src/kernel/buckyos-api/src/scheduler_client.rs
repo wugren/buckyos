@@ -2,11 +2,11 @@ use crate::{AppDoc, AppType, FunctionObject, SelectorType, ThunkObject};
 use ::kRPC::*;
 use name_lib::DID;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const SCHEDULER_SERVICE_UNIQUE_ID: &str = "scheduler";
 pub const SCHEDULER_SERVICE_SERVICE_NAME: &str = "scheduler";
-pub const SCHEDULER_SERVICE_SERVICE_PORT: u16 = 3220;
+pub const SCHEDULER_SERVICE_SERVICE_PORT: u16 = 3400;
 
 //define the resource type
 pub const RESOURCE_TYPE_CPU: &str = "cpu"; //mhz
@@ -68,6 +68,12 @@ pub struct SchedulerRunThunkResponse {
     pub dispatch: Option<SchedulerDispatchReceipt>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerRefreshRbacResponse {
+    pub updated: bool,
+    pub tx_action_count: usize,
+}
+
 pub struct SchedulerClient {
     rpc_client: kRPC,
 }
@@ -91,6 +97,16 @@ impl SchedulerClient {
         serde_json::from_value(result).map_err(|err| {
             RPCErrors::ParserResponseError(format!(
                 "expected SchedulerRunThunkResponse response: {}",
+                err
+            ))
+        })
+    }
+
+    pub async fn refresh_rbac(&self) -> Result<SchedulerRefreshRbacResponse> {
+        let result = self.rpc_client.call("refresh_rbac", json!({})).await?;
+        serde_json::from_value(result).map_err(|err| {
+            RPCErrors::ParserResponseError(format!(
+                "expected SchedulerRefreshRbacResponse response: {}",
                 err
             ))
         })

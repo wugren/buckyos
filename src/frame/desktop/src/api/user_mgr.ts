@@ -31,7 +31,7 @@ export interface UserTunnelBinding {
 }
 
 /**
- * System-level contact settings stored alongside a user account. Full
+ * System-level contact settings stored in `UserPrivateProfile.private_extra`. Full
  * contact/friend management lives in MessageCenter; this block only holds
  * the account-level binding info needed for user management UIs.
  */
@@ -95,7 +95,7 @@ export interface UsersListResponse {
 /** Full user detail as returned by `user.get`. */
 export interface UserDetail {
   user_id: string
-  show_name: string
+  show_name?: string | null
   user_type: UserType | string
   state: UserStateString
   res_pool_id: string
@@ -103,7 +103,7 @@ export interface UserDetail {
   profile?: UserProfile | Record<string, unknown> | null
   local_profile?: UserPrivateProfile | null
   allow_password_change?: boolean
-  /** Only present if caller is the user themselves or an admin. */
+  /** Compatibility field; source of truth is `local_profile.private_extra.system_contact`. */
   contact?: UserContactSettings
   /** Optional DID document loaded from `users/{uid}/doc`. */
   did_document?: Record<string, unknown>
@@ -224,7 +224,7 @@ export const createUser = async (input: {
   return callRpc<SimpleOkResponse>('user.create', params)
 }
 
-/** Update basic user fields (currently `show_name`). */
+/** Update basic user profile fields (currently `display_name`, via `show_name` RPC param). */
 export const updateUser = async (input: {
   userId?: string
   showName?: string
@@ -236,7 +236,7 @@ export const updateUser = async (input: {
 }
 
 /**
- * Update the system-level contact settings for a user. Partial update — only
+ * Update the system-level contact profile data for a user. Partial update — only
  * fields present in `input` are written. For full contact/friend management
  * use the MessageCenter RPCs.
  */

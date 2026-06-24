@@ -24,7 +24,21 @@
 {
   "did": "did:bns:devtest",
   "name": "devtest",
-  "display_name": "$YOUR NAME"
+  "display_name": "$YOUR NAME",
+  "private_extra": {
+    "system_contact": {
+      "did": "did:bns:devtest",
+      "groups": ["zone_user"],
+      "bindings": [
+        {
+          "platform": "telegram",
+          "account_id": "$YOUR_TG_AccountId$",
+          "display_id": "$YOUR_TG_AccountName$",
+          "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+        }
+      ]
+    }
+  }
 }
 """
 
@@ -59,22 +73,9 @@
 {
   "user_id": "devtest",
   "type": "user",
-  "show_name": "$YOUR NAME",
   "password": "o8XyToejrbCYou84h/VkF4Tht0BeQQbuX3XKG+8+GQ4=",
   "state": "active",
   "res_pool_id": "default",
-  "is_local": true,
-  "contact": {
-    "did": "did:bns:devtest",
-    "groups": ["zone_user"],
-    "bindings": [
-      {
-        "platform": "telegram",
-        "account_id": "$YOUR_TG_AccountId$",
-        "display_id": "$YOUR_TG_AccountName$",
-        "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
-      }
-    ]
-  }
+  "is_local": true
 }
 """

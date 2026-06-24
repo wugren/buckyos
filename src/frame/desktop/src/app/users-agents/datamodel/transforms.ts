@@ -1,6 +1,7 @@
 import type { AppSummary } from '../../../api/app_mgr.ts'
 import type {
   AgentInfo,
+  UserContactSettings,
   UserDetail,
   UserInfo,
   UserStateString,
@@ -40,6 +41,14 @@ function firstString(...values: unknown[]): string | undefined {
     if (next) return next
   }
   return undefined
+}
+
+function systemContactFromDetail(detail: UserDetail): UserContactSettings | undefined {
+  if (detail.contact) return detail.contact
+  const localProfile = asRecord(detail.local_profile)
+  const privateExtra = asRecord(localProfile.private_extra)
+  const systemContact = asRecord(privateExtra.system_contact)
+  return Object.keys(systemContact).length > 0 ? systemContact as UserContactSettings : undefined
 }
 
 function stringArray(value: unknown): string[] {
@@ -183,10 +192,11 @@ export function toSelfEntity(
   if (!detail) return fallback
 
   const profile = asRecord(detail.profile)
-  const contact = detail.contact
+  const contact = systemContactFromDetail(detail)
   const displayName = firstString(
     profile.display_name,
     profile.displayName,
+    asRecord(detail.local_profile).display_name,
     detail.show_name,
     fallback.displayName,
   ) ?? fallback.displayName
@@ -198,7 +208,7 @@ export function toSelfEntity(
     id: detail.user_id,
     displayName,
     avatarUrl: firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
-    did: firstString(contact?.did, asRecord(detail.did_document).id, fallback.did),
+    did: firstString(profile.did, asRecord(detail.local_profile).did, contact?.did, asRecord(detail.did_document).id, fallback.did),
     socialAccounts: toSocialAccounts(contact?.bindings),
     bio,
     email: firstString(profile.email, fallback.email),

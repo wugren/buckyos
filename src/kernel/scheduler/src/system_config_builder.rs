@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 
 const DEFAULT_OOD_ID: &str = "ood1";
+const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 const DEFAULT_SN_AI_PROVIDER_MODELS: &[&str] =
     &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro"];
 const DEFAULT_SN_AI_PROVIDER_IMAGE_MODELS: &[&str] = &["dall-e-3", "dall-e-2"];
@@ -111,33 +112,28 @@ impl SystemConfigBuilder {
     }
 
     pub fn add_default_accounts(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
-        let admin_contact = build_zone_user_contact_settings(config)?;
         let root_settings = UserSettings {
             user_type: UserType::Root,
             user_id: config.user_name.clone(),
-            show_name: config.user_name.clone(),
             password: config.admin_password_hash.clone(),
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             is_local: true,
-            contact: None,
             allow_password_change: None,
         };
-        self.insert_json_if_absent("users/root/settings", &root_settings)?;
+        self.insert_json("users/root/settings", &root_settings)?;
 
         let admin_key = format!("users/{}/settings", config.user_name);
         let admin_settings = UserSettings {
             user_type: UserType::Admin,
             user_id: config.user_name.clone(),
-            show_name: config.user_name.clone(),
             password: config.admin_password_hash.clone(),
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             is_local: true,
-            contact: admin_contact,
             allow_password_change: None,
         };
-        self.insert_json_if_absent(&admin_key, &admin_settings)?;
+        self.insert_json(&admin_key, &admin_settings)?;
         self.append_policy(&format!("g, {}, admin", config.user_name));
         Ok(self)
     }
@@ -156,7 +152,7 @@ impl SystemConfigBuilder {
         let key = format!("users/{}/doc", config.user_name);
         self.insert_json(&key, &owner_config)?;
 
-        let profile = UserPrivateProfile::from(UserProfile {
+        let mut profile = UserPrivateProfile::from(UserProfile {
             did: owner_config.id.clone(),
             name: Some(owner_config.name.clone()),
             display_name: Some(owner_config.display_name.clone()),
@@ -174,6 +170,12 @@ impl SystemConfigBuilder {
             public_contacts: HashMap::new(),
             extra: owner_config.extra_info.clone(),
         });
+        if let Some(contact) = build_zone_user_contact_settings(config)? {
+            profile.private_extra.insert(
+                PROFILE_SYSTEM_CONTACT_KEY.to_string(),
+                serde_json::to_value(contact)?,
+            );
+        }
         let profile_key = format!("users/{}/profile", config.user_name);
         self.insert_json_if_absent(&profile_key, &profile)?;
         Ok(self)

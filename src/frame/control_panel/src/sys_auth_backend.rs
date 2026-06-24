@@ -1,7 +1,8 @@
 use crate::{gateway_etc_dir, ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult, RPCSessionToken};
 use buckyos_api::{
-    get_buckyos_api_runtime, LoginByPasswordResponse, UserInfo, UserSettings, UserState,
+    get_buckyos_api_runtime, LoginByPasswordResponse, UserInfo, UserPrivateProfile, UserSettings,
+    UserState,
 };
 use buckyos_http_server::{server_err, ServerError, ServerErrorCode, ServerResult, StreamInfo};
 use buckyos_kit::buckyos_get_unix_timestamp;
@@ -436,7 +437,16 @@ impl ControlPanelServer {
                 username
             )));
         }
-        Ok(user_settings.to_user_info())
+        let mut user_info = user_settings.to_user_info();
+        let profile_path = format!("users/{}/profile", username);
+        if let Ok(profile_val) = system_config_client.get(&profile_path).await {
+            if let Ok(profile) = serde_json::from_str::<UserPrivateProfile>(&profile_val.value) {
+                if let Some(show_name) = profile.display_name.or(profile.name) {
+                    user_info.show_name = show_name;
+                }
+            }
+        }
+        Ok(user_info)
     }
 
     async fn store_pending_sso_login(&self, nonce: u64, pending: PendingSsoLogin) {
@@ -920,11 +930,19 @@ impl ControlPanelServer {
                 username
             )));
         }
-        let owner_did = user_settings
-            .contact
-            .as_ref()
-            .and_then(|contact| contact.did.clone())
-            .unwrap_or_else(|| DID::new("bns", &username).to_string());
+        let profile_path = format!("users/{}/profile", username);
+        let owner_did = match system_config_client.get(&profile_path).await {
+            Ok(profile_val) => serde_json::from_str::<UserPrivateProfile>(&profile_val.value)
+                .map(|profile| profile.did.to_string())
+                .unwrap_or_else(|error| {
+                    warn!("failed to parse user profile for principal did: {}", error);
+                    DID::new("bns", &username).to_string()
+                }),
+            Err(error) => {
+                warn!("failed to load user profile for principal did: {}", error);
+                DID::new("bns", &username).to_string()
+            }
+        };
 
         Ok(Some(RpcAuthPrincipal {
             username,

@@ -384,6 +384,16 @@ mod test {
         assert!(init_map.contains_key("services/aicc/spec"));
         assert!(init_map.contains_key("services/msg-center/spec"));
         //assert!(init_map.contains_key("services/smb-service/spec"));
+        assert!(init_map.contains_key(&format!("users/{}/profile", TEST_USERNAME)));
+        let user_settings: serde_json::Value = serde_json::from_str(
+            init_map
+                .get(&format!("users/{}/settings", TEST_USERNAME))
+                .expect("user settings should exist"),
+        )
+        .expect("user settings should be valid json");
+        assert_eq!(user_settings["is_local"], true);
+        assert!(user_settings.get("show_name").is_none());
+        assert!(user_settings.get("contact").is_none());
 
         for (key, value) in init_map.iter() {
             println!("#{} ==> {}", key, value);

@@ -15,6 +15,7 @@ use std::net::IpAddr;
 use std::result::Result;
 use std::sync::Arc;
 
+use crate::system_config_agent::refresh_rbac;
 use crate::thunk_runner::DefaultThunkRunner;
 
 pub const SCHEDULER_SERVICE_MAIN_PORT: u16 = 3400;
@@ -51,6 +52,12 @@ impl RPCHandler for SchedulerServer {
                 let response = self
                     .thunk_runner
                     .run_thunk(run_req.task_id, run_req.thunk, run_req.function_object)
+                    .await
+                    .map_err(|err| RPCErrors::ReasonError(err.to_string()))?;
+                RPCResult::Success(json!(response))
+            }
+            "refresh_rbac" => {
+                let response = refresh_rbac()
                     .await
                     .map_err(|err| RPCErrors::ReasonError(err.to_string()))?;
                 RPCResult::Success(json!(response))

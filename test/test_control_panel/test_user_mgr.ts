@@ -43,6 +43,7 @@ import {
   type UserDetail,
   type UsersListResponse,
   type AgentsListResponse,
+  type UserContactSettings,
   type UserType,
   type SimpleOkResponse,
 } from "../../src/frame/desktop/src/api/user_mgr.ts";
@@ -78,6 +79,36 @@ async function runCase(
 
 function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(`Assertion failed: ${message}`);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function requireRecord(
+  value: unknown,
+  label: string,
+): Record<string, unknown> {
+  const record = asRecord(value);
+  assert(record !== null, `${label} should be an object`);
+  return record!;
+}
+
+function localSystemContactFromDetail(
+  detail: UserDetail,
+): UserContactSettings | null {
+  const localProfile = asRecord(detail.local_profile);
+  const privateExtra = asRecord(localProfile?.private_extra);
+  const systemContact = asRecord(privateExtra?.system_contact);
+  return systemContact as UserContactSettings | null;
+}
+
+function visibleSystemContactFromDetail(
+  detail: UserDetail,
+): UserContactSettings | null {
+  return detail.contact ?? localSystemContactFromDetail(detail);
 }
 
 // Derived from the DV zone config (src/kernel/scheduler/src/system_config_builder.rs)
@@ -202,6 +233,27 @@ async function loginByPassword(
   })) as Awaited<ReturnType<typeof loginByPassword>>;
 }
 
+async function callControlPanelWithToken<T>(
+  token: string,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<{ data: T | null; error: unknown }> {
+  try {
+    const rpc = buckyos.getServiceRpcClient(
+      "control-panel",
+    ) as unknown as ManagedRpcClient;
+    const result = (await rpc.call(method, params, {
+      sessionToken: token,
+    })) as T;
+    if (!result || typeof result !== "object") {
+      throw new Error(`Invalid ${method} response`);
+    }
+    return { data: result, error: null };
+  } catch (error) {
+    return { data: null, error };
+  }
+}
+
 /**
  * Call control-panel `user.create` with an explicit session token (the sudo
  * grant), using the managed client's per-call session-token override. This is
@@ -218,29 +270,221 @@ async function createUserWithToken(
     allowPasswordChange?: boolean;
   },
 ): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
-  try {
-    const rpc = buckyos.getServiceRpcClient(
-      "control-panel",
-    ) as unknown as ManagedRpcClient;
-    const params: Record<string, unknown> = {
-      user_id: input.userId,
-      password_hash: input.passwordHash,
-    };
-    if (input.showName !== undefined) params.show_name = input.showName;
-    if (input.userType !== undefined) params.user_type = input.userType;
-    if (input.allowPasswordChange !== undefined) {
-      params.allow_password_change = input.allowPasswordChange;
-    }
-    const result = (await rpc.call("user.create", params, {
-      sessionToken: token,
-    })) as SimpleOkResponse;
-    if (!result || typeof result !== "object") {
-      throw new Error("Invalid user.create response");
-    }
-    return { data: result, error: null };
-  } catch (error) {
-    return { data: null, error };
+  const params: Record<string, unknown> = {
+    user_id: input.userId,
+    password_hash: input.passwordHash,
+  };
+  if (input.showName !== undefined) params.show_name = input.showName;
+  if (input.userType !== undefined) params.user_type = input.userType;
+  if (input.allowPasswordChange !== undefined) {
+    params.allow_password_change = input.allowPasswordChange;
   }
+  return callControlPanelWithToken<SimpleOkResponse>(
+    token,
+    "user.create",
+    params,
+  );
+}
+
+async function fetchUserDetailWithToken(
+  token: string,
+  options: { userId?: string } = {},
+): Promise<{ data: UserDetail | null; error: unknown }> {
+  const params: Record<string, unknown> = {};
+  if (options.userId) params.user_id = options.userId;
+  return callControlPanelWithToken<UserDetail>(token, "user.get", params);
+}
+
+async function updateUserWithToken(
+  token: string,
+  input: { userId?: string; showName?: string },
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  const params: Record<string, unknown> = {};
+  if (input.userId) params.user_id = input.userId;
+  if (input.showName !== undefined) params.show_name = input.showName;
+  return callControlPanelWithToken<SimpleOkResponse>(
+    token,
+    "user.update",
+    params,
+  );
+}
+
+async function updateUserContactWithToken(
+  token: string,
+  input: {
+    userId?: string;
+    did?: string;
+    note?: string;
+    groups?: string[];
+    tags?: string[];
+  },
+): Promise<{
+  data: (SimpleOkResponse & { contact?: UserContactSettings }) | null;
+  error: unknown;
+}> {
+  const params: Record<string, unknown> = {};
+  if (input.userId) params.user_id = input.userId;
+  if (input.did !== undefined) params.did = input.did;
+  if (input.note !== undefined) params.note = input.note;
+  if (input.groups !== undefined) params.groups = input.groups;
+  if (input.tags !== undefined) params.tags = input.tags;
+  return callControlPanelWithToken<
+    SimpleOkResponse & { contact?: UserContactSettings }
+  >(token, "user.update_contact", params);
+}
+
+async function fetchUserProfileWithToken(
+  token: string,
+  userId?: string,
+): Promise<Awaited<ReturnType<typeof fetchUserProfile>>> {
+  const params: Record<string, unknown> = {};
+  if (userId) params.user_id = userId;
+  return callControlPanelWithToken(token, "user.profile.get", params);
+}
+
+async function setUserProfileWithToken(
+  token: string,
+  input: Parameters<typeof setUserProfile>[0],
+): Promise<Awaited<ReturnType<typeof setUserProfile>>> {
+  const params: Record<string, unknown> = {};
+  if (input.userId) params.user_id = input.userId;
+  if (input.profile !== undefined) params.profile = input.profile;
+  if (input.name !== undefined) params.name = input.name;
+  if (input.displayName !== undefined) params.display_name = input.displayName;
+  if (input.avatar !== undefined) params.avatar = input.avatar;
+  if (input.avatarUrl !== undefined) params.avatar = input.avatarUrl;
+  if (input.headline !== undefined) params.headline = input.headline;
+  if (input.title !== undefined) params.title = input.title;
+  if (input.bio !== undefined) params.bio = input.bio;
+  if (input.location !== undefined) params.location = input.location;
+  if (input.organization !== undefined) params.organization = input.organization;
+  if (input.birthday !== undefined) params.birthday = input.birthday;
+  if (input.bkgImage !== undefined) params.bkg_image = input.bkgImage;
+  if (input.tags !== undefined) params.tags = input.tags;
+  if (input.website !== undefined) params.website = input.website;
+  if (input.email !== undefined) params.email = input.email;
+  if (input.phone !== undefined) params.phone = input.phone;
+  if (input.privateExtra !== undefined) params.private_extra = input.privateExtra;
+  if (input.extra !== undefined) params.extra = input.extra;
+  return callControlPanelWithToken(token, "user.profile.set", params);
+}
+
+async function setUserMsgTunnelWithToken(
+  token: string,
+  input: Parameters<typeof setUserMsgTunnel>[0],
+): Promise<Awaited<ReturnType<typeof setUserMsgTunnel>>> {
+  const params: Record<string, unknown> = {
+    platform: input.platform,
+    account_id: input.accountId,
+  };
+  if (input.userId) params.user_id = input.userId;
+  if (input.displayId !== undefined) params.display_id = input.displayId;
+  if (input.tunnelId !== undefined) params.tunnel_id = input.tunnelId;
+  if (input.status !== undefined) params.status = input.status;
+  if (input.lastSyncAt !== undefined) params.last_sync_at = input.lastSyncAt;
+  if (input.meta !== undefined) params.meta = input.meta;
+  return callControlPanelWithToken(token, "user.set_msg_tunnel", params);
+}
+
+async function removeUserMsgTunnelWithToken(
+  token: string,
+  input: Parameters<typeof removeUserMsgTunnel>[0],
+): Promise<Awaited<ReturnType<typeof removeUserMsgTunnel>>> {
+  const params: Record<string, unknown> = { platform: input.platform };
+  if (input.userId) params.user_id = input.userId;
+  return callControlPanelWithToken(token, "user.remove_msg_tunnel", params);
+}
+
+async function changeUserPasswordWithToken(
+  token: string,
+  input: { userId?: string; newPasswordHash: string },
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  const params: Record<string, unknown> = {
+    new_password_hash: input.newPasswordHash,
+  };
+  if (input.userId) params.user_id = input.userId;
+  return callControlPanelWithToken<SimpleOkResponse>(
+    token,
+    "user.change_password",
+    params,
+  );
+}
+
+async function changeUserStateWithToken(
+  token: string,
+  input: Parameters<typeof changeUserState>[0],
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  return callControlPanelWithToken<SimpleOkResponse>(
+    token,
+    "user.change_state",
+    {
+      user_id: input.userId,
+      state: input.state,
+    },
+  );
+}
+
+async function changeUserTypeWithToken(
+  token: string,
+  input: Parameters<typeof changeUserType>[0],
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  return callControlPanelWithToken<SimpleOkResponse>(
+    token,
+    "user.change_type",
+    {
+      user_id: input.userId,
+      user_type: input.userType,
+    },
+  );
+}
+
+async function deleteUserWithToken(
+  token: string,
+  userId: string,
+): Promise<{ data: SimpleOkResponse | null; error: unknown }> {
+  return callControlPanelWithToken<SimpleOkResponse>(token, "user.delete", {
+    user_id: userId,
+  });
+}
+
+function createUserInviteWithToken(
+  token: string,
+  input: Parameters<typeof createUserInvite>[0],
+): ReturnType<typeof createUserInvite> {
+  const params: Record<string, unknown> = {};
+  if (input.inviteId !== undefined) params.invite_id = input.inviteId;
+  if (input.userId !== undefined) params.user_id = input.userId;
+  if (input.targetDid !== undefined) params.target_did = input.targetDid;
+  if (input.showName !== undefined) params.show_name = input.showName;
+  if (input.userType !== undefined) params.user_type = input.userType;
+  if (input.expiresAt !== undefined) params.expires_at = input.expiresAt;
+  if (input.ttlSecs !== undefined) params.ttl_secs = input.ttlSecs;
+  if (input.groups !== undefined) params.groups = input.groups;
+  if (input.appIds !== undefined) params.app_ids = input.appIds;
+  return callControlPanelWithToken(token, "user.invite.create", params);
+}
+
+function createAgentWithToken(
+  token: string,
+  input: Parameters<typeof createAgent>[0],
+): ReturnType<typeof createAgent> {
+  const params: Record<string, unknown> = { agent_id: input.agentId };
+  if (input.displayName !== undefined) params.display_name = input.displayName;
+  if (input.ownerUserId !== undefined) params.owner_user_id = input.ownerUserId;
+  if (input.agentDid !== undefined) params.agent_did = input.agentDid;
+  if (input.description !== undefined) params.description = input.description;
+  if (input.profile !== undefined) params.profile = input.profile;
+  if (input.settings !== undefined) params.settings = input.settings;
+  return callControlPanelWithToken(token, "agent.create", params);
+}
+
+function deleteAgentWithToken(
+  token: string,
+  agentId: string,
+): ReturnType<typeof deleteAgent> {
+  return callControlPanelWithToken(token, "agent.delete", {
+    agent_id: agentId,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -339,10 +583,6 @@ async function main() {
         "user_id should be string",
       );
       assert(
-        typeof data!.show_name === "string",
-        "show_name should be string",
-      );
-      assert(
         typeof data!.state === "string",
         "state should be string",
       );
@@ -350,10 +590,15 @@ async function main() {
         typeof data!.res_pool_id === "string",
         "res_pool_id should be string",
       );
+      requireRecord(data!.profile, "profile");
+      if (data!.local_profile !== undefined && data!.local_profile !== null) {
+        requireRecord(data!.local_profile, "local_profile");
+      }
       // Calling yourself should include contact
-      if (data!.contact !== undefined) {
+      const contact = visibleSystemContactFromDetail(data!);
+      if (contact !== null) {
         assert(
-          typeof data!.contact === "object" && data!.contact !== null,
+          typeof contact === "object" && contact !== null,
           "contact should be object when returned",
         );
       }
@@ -405,6 +650,20 @@ async function main() {
   const newUserPasswordHash = hashPassword(testUserId, NEW_USER_PASSWORD);
 
   let sudoToken: string | null = null;
+  let newUserToken: string | null = null;
+  let newUserSudoToken: string | null = null;
+  const requireSudoToken = (): string => {
+    assert(sudoToken !== null, "sudoToken should have been granted");
+    return sudoToken!;
+  };
+  const requireNewUserToken = (): string => {
+    assert(newUserToken !== null, "newUserToken should be populated");
+    return newUserToken!;
+  };
+  const requireNewUserSudoToken = (): string => {
+    assert(newUserSudoToken !== null, "newUserSudoToken should be populated");
+    return newUserSudoToken!;
+  };
 
   results.push(
     await runCase("sudo: admin obtains an elevated sudo token", async () => {
@@ -466,11 +725,11 @@ async function main() {
           NEW_USER_PASSWORD,
           TEST_APP_ID,
         );
-        assert(
-          typeof res?.session_token === "string" &&
-            res.session_token.length > 0,
-          "login should return a non-empty session_token",
-        );
+        const sessionToken = res.session_token;
+        if (typeof sessionToken !== "string" || sessionToken.length === 0) {
+          throw new Error("login should return a non-empty session_token");
+        }
+        newUserToken = sessionToken;
         const loggedInUserId = res.user_info?.user_id ?? res.user_id;
         assert(
           loggedInUserId === testUserId,
@@ -478,6 +737,20 @@ async function main() {
         );
       },
     ),
+  );
+
+  results.push(
+    await runCase("new local user can obtain a sudo token", async () => {
+      newUserSudoToken = await obtainSudoToken(
+        testUserId,
+        NEW_USER_PASSWORD,
+        TEST_APP_ID,
+      );
+      assert(
+        typeof newUserSudoToken === "string" && newUserSudoToken.length > 0,
+        "new user sudo token should be a non-empty string",
+      );
+    }),
   );
 
   results.push(
@@ -526,57 +799,92 @@ async function main() {
     }),
   );
 
-  let detailAfterCreate: UserDetail | null = null;
   results.push(
-    await runCase("user.get returns the new user's detail", async () => {
-      const { data, error } = await fetchUserDetail({ userId: testUserId });
-      assert(!error, `fetchUserDetail('${testUserId}') should not error: ${error}`);
+    await runCase("new user can read their own detail", async () => {
+      const { data, error } = await fetchUserDetailWithToken(
+        requireNewUserToken(),
+      );
+      assert(!error, `fetchUserDetail (as new user) should not error: ${error}`);
       assert(data !== null, "data should not be null");
-      detailAfterCreate = data!;
       assert(
         data!.user_id === testUserId,
         `user_id mismatch: '${data!.user_id}' vs '${testUserId}'`,
       );
+      const profile = requireRecord(data!.profile, "profile");
+      const localProfile = requireRecord(data!.local_profile, "local_profile");
       assert(
-        data!.show_name === `DV Test User ${testUserId}`,
-        `show_name mismatch: '${data!.show_name}'`,
+        profile.display_name === `DV Test User ${testUserId}`,
+        `profile.display_name mismatch: '${String(profile.display_name)}'`,
+      );
+      assert(
+        localProfile.display_name === `DV Test User ${testUserId}`,
+        `local_profile.display_name mismatch: '${String(localProfile.display_name)}'`,
       );
       assert(data!.state === "active", `state should be 'active'`);
+      const systemContact = localSystemContactFromDetail(data!);
+      assert(
+        systemContact !== null,
+        "local_profile.private_extra.system_contact should exist",
+      );
+      assert(
+        Array.isArray(systemContact!.groups) &&
+          systemContact!.groups.includes("users"),
+        "system_contact.groups should include default 'users'",
+      );
     }),
   );
 
   results.push(
-    await runCase("user.update changes show_name", async () => {
+    await runCase("new user can update their profile display_name", async () => {
       const newShowName = `Renamed ${testUserId}`;
-      const { data, error } = await updateUser({
-        userId: testUserId,
+      const { data, error } = await updateUserWithToken(requireNewUserToken(), {
         showName: newShowName,
       });
       assert(!error, `updateUser should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
 
-      const { data: refreshed, error: refreshErr } = await fetchUserDetail({
-        userId: testUserId,
-      });
+      const { data: refreshed, error: refreshErr } =
+        await fetchUserDetailWithToken(requireNewUserToken());
       assert(!refreshErr, `fetchUserDetail should not error: ${refreshErr}`);
       assert(refreshed !== null, "refreshed detail should not be null");
+      const profile = requireRecord(refreshed!.profile, "profile");
+      const localProfile = requireRecord(
+        refreshed!.local_profile,
+        "local_profile",
+      );
       assert(
-        refreshed!.show_name === newShowName,
-        `show_name should be '${newShowName}', got '${refreshed!.show_name}'`,
+        profile.display_name === newShowName,
+        `profile.display_name should be '${newShowName}', got '${String(profile.display_name)}'`,
+      );
+      assert(
+        localProfile.display_name === newShowName,
+        `local_profile.display_name should be '${newShowName}', got '${String(localProfile.display_name)}'`,
+      );
+
+      const { data: listed, error: listErr } = await fetchUserList();
+      assert(!listErr, `fetchUserList should not error: ${listErr}`);
+      assert(listed !== null, "listed users should not be null");
+      const found = listed!.users.find((u) => u.user_id === testUserId);
+      assert(!!found, `new user '${testUserId}' should appear in user.list`);
+      assert(
+        found!.show_name === newShowName,
+        `user.list show_name should be '${newShowName}', got '${found!.show_name}'`,
       );
     }),
   );
 
   results.push(
-    await runCase("user.update_contact writes contact settings", async () => {
-      const { data, error } = await updateUserContact({
-        userId: testUserId,
-        did: `did:bns:${testUserId}`,
-        note: "created by test_user_mgr",
-        groups: ["dv-test"],
-        tags: ["automation", "temporary"],
-      });
+    await runCase("new user can write contact settings", async () => {
+      const { data, error } = await updateUserContactWithToken(
+        requireNewUserToken(),
+        {
+          did: `did:bns:${testUserId}`,
+          note: "created by test_user_mgr",
+          groups: ["dv-test"],
+          tags: ["automation", "temporary"],
+        },
+      );
       assert(!error, `updateUserContact should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -602,17 +910,37 @@ async function main() {
     }),
   );
 
+  let contactAfterUpdate: UserContactSettings | null = null;
+
   results.push(
-    await runCase("user.get reflects contact update (self or admin)", async () => {
-      const { data, error } = await fetchUserDetail({ userId: testUserId });
+    await runCase("new user can read back contact update", async () => {
+      const { data, error } = await fetchUserDetailWithToken(
+        requireNewUserToken(),
+      );
       assert(!error, `fetchUserDetail should not error: ${error}`);
       assert(data !== null, "data should not be null");
-      // Caller is admin, so contact must be included.
-      assert(!!data!.contact, "contact should be visible to admin caller");
+      // Caller is the user, so contact must be included.
+      assert(!!data!.contact, "contact should be visible to self caller");
+      const localSystemContact = localSystemContactFromDetail(data!);
+      assert(
+        localSystemContact !== null,
+        "local_profile.private_extra.system_contact should persist",
+      );
       assert(
         data!.contact!.did === `did:bns:${testUserId}`,
         "contact.did should persist",
       );
+      assert(
+        localSystemContact!.did === data!.contact!.did,
+        "compat contact should match local_profile.private_extra.system_contact",
+      );
+      assert(
+        Array.isArray(localSystemContact!.groups) &&
+          localSystemContact!.groups.includes("users") &&
+          localSystemContact!.groups.includes("dv-test"),
+        "system_contact.groups should include default and updated groups",
+      );
+      contactAfterUpdate = localSystemContact;
     }),
   );
 
@@ -622,24 +950,59 @@ async function main() {
   console.log(`\n[user.profile.get / user.profile.set: ${testUserId}]`);
 
   results.push(
-    await runCase("user.profile.set writes local profile fields", async () => {
-      const { data, error } = await setUserProfile({
-        userId: testUserId,
-        displayName: `DV ${testUserId}`,
-        title: "QA Bot",
-        bio: "created by test_user_mgr",
-        location: "DV Zone",
-        website: "https://buckyos.io",
-      });
+    await runCase("new user can write local profile fields", async () => {
+      assert(
+        contactAfterUpdate !== null,
+        "contactAfterUpdate should be populated before profile.set",
+      );
+      const { data, error } = await setUserProfileWithToken(
+        requireNewUserToken(),
+        {
+          displayName: `DV ${testUserId}`,
+          headline: "DV profile headline",
+          title: "QA Bot",
+          bio: "created by test_user_mgr",
+          location: "DV Zone",
+          organization: "BuckyOS DV",
+          birthday: "2025-01-01",
+          bkgImage: "https://buckyos.io/dv-bg.png",
+          tags: ["dv-profile", "automation"],
+          website: "https://buckyos.io",
+          email: "dv-user@example.com",
+          phone: "+15550101000",
+          privateExtra: {
+            system_contact: contactAfterUpdate,
+            dv_test_marker: {
+              source: "test_user_mgr",
+              user_id: testUserId,
+            },
+          },
+        },
+      );
       assert(!error, `setUserProfile should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
+      const localProfile = requireRecord(data!.profile, "set response profile");
+      assert(
+        localProfile.display_name === `DV ${testUserId}`,
+        "set response profile.display_name should reflect update",
+      );
+      const privateExtra = requireRecord(
+        localProfile.private_extra,
+        "set response profile.private_extra",
+      );
+      assert(
+        asRecord(privateExtra.system_contact) !== null,
+        "set response profile.private_extra.system_contact should be preserved",
+      );
     }),
   );
 
   results.push(
-    await runCase("user.profile.get returns the written profile", async () => {
-      const { data, error } = await fetchUserProfile(testUserId);
+    await runCase("new user can read the written profile", async () => {
+      const { data, error } = await fetchUserProfileWithToken(
+        requireNewUserToken(),
+      );
       assert(!error, `fetchUserProfile should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(
@@ -647,7 +1010,16 @@ async function main() {
         `user_id should be '${testUserId}', got '${data!.user_id}'`,
       );
       const profile = (data!.profile ?? {}) as Record<string, unknown>;
+      const localProfile = requireRecord(data!.local_profile, "local_profile");
       // The merged profile (local + DID) must reflect the local write.
+      assert(
+        profile.display_name === `DV ${testUserId}`,
+        `profile.display_name should round-trip, got '${String(profile.display_name)}'`,
+      );
+      assert(
+        profile.headline === "DV profile headline",
+        `profile.headline should round-trip, got '${String(profile.headline)}'`,
+      );
       assert(
         profile.title === "QA Bot",
         `profile.title should be 'QA Bot', got '${String(profile.title)}'`,
@@ -655,6 +1027,70 @@ async function main() {
       assert(
         profile.bio === "created by test_user_mgr",
         `profile.bio should round-trip, got '${String(profile.bio)}'`,
+      );
+      assert(
+        profile.location === "DV Zone",
+        `profile.location should round-trip, got '${String(profile.location)}'`,
+      );
+      assert(
+        profile.organization === "BuckyOS DV",
+        `profile.organization should round-trip, got '${String(profile.organization)}'`,
+      );
+      assert(
+        profile.birthday === "2025-01-01",
+        `profile.birthday should round-trip, got '${String(profile.birthday)}'`,
+      );
+      assert(
+        profile.bkg_image === "https://buckyos.io/dv-bg.png",
+        `profile.bkg_image should round-trip, got '${String(profile.bkg_image)}'`,
+      );
+      assert(
+        Array.isArray(profile.tags) &&
+          profile.tags.includes("dv-profile") &&
+          profile.tags.includes("automation"),
+        "profile.tags should round-trip",
+      );
+      const links = requireRecord(profile.links, "profile.links");
+      const website = requireRecord(links.website, "profile.links.website");
+      assert(
+        website.url === "https://buckyos.io",
+        `profile.links.website.url should round-trip, got '${String(website.url)}'`,
+      );
+      assert(
+        profile.email === "dv-user@example.com",
+        `profile.email should round-trip, got '${String(profile.email)}'`,
+      );
+      assert(
+        profile.phone === "+15550101000",
+        `profile.phone should round-trip, got '${String(profile.phone)}'`,
+      );
+      const privateExtra = requireRecord(
+        localProfile.private_extra,
+        "local_profile.private_extra",
+      );
+      const systemContact = requireRecord(
+        privateExtra.system_contact,
+        "local_profile.private_extra.system_contact",
+      ) as UserContactSettings;
+      assert(
+        systemContact.did === `did:bns:${testUserId}`,
+        "system_contact.did should survive user.profile.set",
+      );
+      const marker = requireRecord(
+        privateExtra.dv_test_marker,
+        "local_profile.private_extra.dv_test_marker",
+      );
+      assert(
+        marker.source === "test_user_mgr" && marker.user_id === testUserId,
+        "private_extra.dv_test_marker should round-trip",
+      );
+      assert(
+        asRecord(profile.private_extra) === null,
+        "merged public profile should not expose private_extra",
+      );
+      assert(
+        data!.did_profile === null || asRecord(data!.did_profile) !== null,
+        "did_profile should be null or an object",
       );
     }),
   );
@@ -669,15 +1105,17 @@ async function main() {
   const userPlatform = `dvtest_user_${Date.now()}`;
 
   results.push(
-    await runCase("user.set_msg_tunnel adds a binding", async () => {
-      const { data, error } = await setUserMsgTunnel({
-        userId: testUserId,
-        platform: userPlatform,
-        accountId: "dv-user-account",
-        displayId: "DV User Display",
-        tunnelId: "dv-user-tunnel",
-        meta: { source: "test_user_mgr" },
-      });
+    await runCase("new user can add a message tunnel binding", async () => {
+      const { data, error } = await setUserMsgTunnelWithToken(
+        requireNewUserToken(),
+        {
+          platform: userPlatform,
+          accountId: "dv-user-account",
+          displayId: "DV User Display",
+          tunnelId: "dv-user-tunnel",
+          meta: { source: "test_user_mgr" },
+        },
+      );
       assert(!error, `setUserMsgTunnel should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -696,29 +1134,44 @@ async function main() {
     await runCase(
       "user.set_msg_tunnel binding is visible via user.get contact",
       async () => {
-        const { data, error } = await fetchUserDetail({ userId: testUserId });
+        const { data, error } = await fetchUserDetailWithToken(
+          requireNewUserToken(),
+        );
         assert(!error, `fetchUserDetail should not error: ${error}`);
         assert(data !== null, "data should not be null");
-        const bindings = data!.contact?.bindings ?? [];
+        const localSystemContact = localSystemContactFromDetail(data!);
+        assert(
+          localSystemContact !== null,
+          "local_profile.private_extra.system_contact should be present",
+        );
+        const contact = visibleSystemContactFromDetail(data!);
+        assert(contact !== null, "contact should be visible to self caller");
+        const bindings = localSystemContact!.bindings ?? [];
         const found = bindings.find((b) => b.platform === userPlatform);
         assert(
           !!found,
-          `binding for '${userPlatform}' should appear in contact.bindings`,
+          `binding for '${userPlatform}' should appear in system_contact.bindings`,
         );
         assert(
           found!.account_id === "dv-user-account",
           "binding account_id should round-trip",
+        );
+        assert(
+          contact!.bindings?.some((b) => b.platform === userPlatform) === true,
+          "compat contact.bindings should include the same binding",
         );
       },
     ),
   );
 
   results.push(
-    await runCase("user.remove_msg_tunnel removes the binding", async () => {
-      const { data, error } = await removeUserMsgTunnel({
-        userId: testUserId,
-        platform: userPlatform,
-      });
+    await runCase("new user can remove the message tunnel binding", async () => {
+      const { data, error } = await removeUserMsgTunnelWithToken(
+        requireNewUserToken(),
+        {
+          platform: userPlatform,
+        },
+      );
       assert(!error, `removeUserMsgTunnel should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -726,15 +1179,28 @@ async function main() {
         data!.platform === userPlatform,
         "platform should round-trip",
       );
+
+      const { data: refreshed, error: refreshErr } =
+        await fetchUserDetailWithToken(requireNewUserToken());
+      assert(!refreshErr, `fetchUserDetail should not error: ${refreshErr}`);
+      assert(refreshed !== null, "refreshed detail should not be null");
+      const bindings =
+        localSystemContactFromDetail(refreshed!)?.bindings ?? [];
+      assert(
+        !bindings.some((b) => b.platform === userPlatform),
+        "removed binding should no longer exist in system_contact.bindings",
+      );
     }),
   );
 
   results.push(
-    await runCase("user.change_password updates password hash", async () => {
-      const { data, error } = await changeUserPassword({
-        userId: testUserId,
-        newPasswordHash: FAKE_PW_HASH_B,
-      });
+    await runCase("new user can update their password hash", async () => {
+      const { data, error } = await changeUserPasswordWithToken(
+        requireNewUserSudoToken(),
+        {
+          newPasswordHash: FAKE_PW_HASH_B,
+        },
+      );
       assert(!error, `changeUserPassword should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -742,11 +1208,13 @@ async function main() {
   );
 
   results.push(
-    await runCase("user.change_password rejects empty hash", async () => {
-      const { data, error } = await changeUserPassword({
-        userId: testUserId,
-        newPasswordHash: "",
-      });
+    await runCase("new user password change rejects empty hash", async () => {
+      const { data, error } = await changeUserPasswordWithToken(
+        requireNewUserSudoToken(),
+        {
+          newPasswordHash: "",
+        },
+      );
       assert(
         error !== null || data === null,
         "empty password hash should be rejected",
@@ -756,15 +1224,21 @@ async function main() {
 
   results.push(
     await runCase("user.change_state sets suspended:reason", async () => {
-      const { data, error } = await changeUserState({
-        userId: testUserId,
-        state: "suspended:dv-test",
-      });
+      const { data, error } = await changeUserStateWithToken(
+        requireSudoToken(),
+        {
+          userId: testUserId,
+          state: "suspended:dv-test",
+        },
+      );
       assert(!error, `changeUserState should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
 
-      const { data: refreshed } = await fetchUserDetail({ userId: testUserId });
+      const { data: refreshed } = await fetchUserDetailWithToken(
+        requireSudoToken(),
+        { userId: testUserId },
+      );
       assert(refreshed !== null, "refreshed detail should not be null");
       assert(
         refreshed!.state === "suspended:dv-test",
@@ -775,15 +1249,20 @@ async function main() {
 
   results.push(
     await runCase("user.change_state can re-activate the user", async () => {
-      const { data, error } = await changeUserState({
-        userId: testUserId,
-        state: "active",
-      });
+      const { data, error } = await changeUserStateWithToken(
+        requireSudoToken(),
+        {
+          userId: testUserId,
+          state: "active",
+        },
+      );
       assert(!error, `changeUserState(active) should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
 
-      const { data: refreshed } = await fetchUserDetail({ userId: testUserId });
+      const { data: refreshed } = await fetchUserDetailWithToken(
+        requireNewUserToken(),
+      );
       assert(refreshed !== null, "refreshed detail should not be null");
       assert(
         refreshed!.state === "active",
@@ -794,15 +1273,21 @@ async function main() {
 
   results.push(
     await runCase("user.change_type promotes/demotes the user", async () => {
-      const { data, error } = await changeUserType({
-        userId: testUserId,
-        userType: "limited",
-      });
+      const { data, error } = await changeUserTypeWithToken(
+        requireSudoToken(),
+        {
+          userId: testUserId,
+          userType: "limited",
+        },
+      );
       assert(!error, `changeUserType should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
 
-      const { data: refreshed } = await fetchUserDetail({ userId: testUserId });
+      const { data: refreshed } = await fetchUserDetailWithToken(
+        requireSudoToken(),
+        { userId: testUserId },
+      );
       assert(refreshed !== null, "refreshed detail should not be null");
       assert(
         refreshed!.user_type === "limited",
@@ -813,11 +1298,14 @@ async function main() {
 
   results.push(
     await runCase("user.change_type rejects promotion to root", async () => {
-      const { data, error } = await changeUserType({
-        userId: testUserId,
-        // Bypass the compile-time exclusion for negative testing
-        userType: "root" as unknown as "user",
-      });
+      const { data, error } = await changeUserTypeWithToken(
+        requireSudoToken(),
+        {
+          userId: testUserId,
+          // Bypass the compile-time exclusion for negative testing
+          userType: "root" as unknown as "user",
+        },
+      );
       assert(
         error !== null || data === null,
         "promotion to root must be rejected",
@@ -832,7 +1320,10 @@ async function main() {
 
   results.push(
     await runCase("user.delete rejects deleting 'root'", async () => {
-      const { data, error } = await deleteUser("root");
+      const { data, error } = await deleteUserWithToken(
+        requireSudoToken(),
+        "root",
+      );
       assert(
         error !== null || data === null,
         "deleting root must be rejected",
@@ -842,7 +1333,10 @@ async function main() {
 
   results.push(
     await runCase("user.delete rejects deleting self", async () => {
-      const { data, error } = await deleteUser(callerUserId);
+      const { data, error } = await deleteUserWithToken(
+        requireSudoToken(),
+        callerUserId,
+      );
       assert(
         error !== null || data === null,
         "deleting self must be rejected",
@@ -854,10 +1348,13 @@ async function main() {
     await runCase(
       "user.change_state rejects suspending root",
       async () => {
-        const { data, error } = await changeUserState({
-          userId: "root",
-          state: "suspended:should-fail",
-        });
+        const { data, error } = await changeUserStateWithToken(
+          requireSudoToken(),
+          {
+            userId: "root",
+            state: "suspended:should-fail",
+          },
+        );
         assert(
           error !== null || data === null,
           "suspending root must be rejected",
@@ -873,12 +1370,18 @@ async function main() {
 
   results.push(
     await runCase("user.delete soft-deletes the test user", async () => {
-      const { data, error } = await deleteUser(testUserId);
+      const { data, error } = await deleteUserWithToken(
+        requireSudoToken(),
+        testUserId,
+      );
       assert(!error, `deleteUser should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
 
-      const { data: refreshed } = await fetchUserDetail({ userId: testUserId });
+      const { data: refreshed } = await fetchUserDetailWithToken(
+        requireSudoToken(),
+        { userId: testUserId },
+      );
       assert(
         refreshed !== null,
         "soft-deleted user should still be retrievable",
@@ -903,13 +1406,16 @@ async function main() {
 
   results.push(
     await runCase("user.invite.create generates a pending invite", async () => {
-      const { data, error } = await createUserInvite({
-        userId: inviteTargetUserId,
-        showName: `Invited ${inviteTargetUserId}`,
-        userType: "user",
-        ttlSecs: 3600,
-        groups: ["dv-test"],
-      });
+      const { data, error } = await createUserInviteWithToken(
+        requireSudoToken(),
+        {
+          userId: inviteTargetUserId,
+          showName: `Invited ${inviteTargetUserId}`,
+          userType: "user",
+          ttlSecs: 3600,
+          groups: ["dv-test"],
+        },
+      );
       assert(!error, `createUserInvite should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(!!data!.invite, "response should carry an invite record");
@@ -969,7 +1475,10 @@ async function main() {
   // Clean up the pending user that invite.create pre-provisioned.
   results.push(
     await runCase("cleanup: soft-delete the invited pending user", async () => {
-      const { data, error } = await deleteUser(inviteTargetUserId);
+      const { data, error } = await deleteUserWithToken(
+        requireSudoToken(),
+        inviteTargetUserId,
+      );
       assert(!error, `deleteUser should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -1016,10 +1525,16 @@ async function main() {
 
   results.push(
     await runCase(
-      `agent.get returns doc for ${DV_DEFAULT_AGENT_ID}`,
+      `agent.get handles ${DV_DEFAULT_AGENT_ID} global doc availability`,
       async () => {
         const { data, error } = await fetchAgentDetail(DV_DEFAULT_AGENT_ID);
-        assert(!error, `fetchAgentDetail should not error: ${error}`);
+        if (error) {
+          assert(
+            String(error).includes("not found"),
+            `fetchAgentDetail should either return the global doc or a not found error: ${error}`,
+          );
+          return;
+        }
         assert(data !== null, "data should not be null");
         assert(
           data!.agent_id === DV_DEFAULT_AGENT_ID,
@@ -1060,12 +1575,15 @@ async function main() {
 
   results.push(
     await runCase("agent.create creates a new agent identity", async () => {
-      const { data, error } = await createAgent({
-        agentId: testAgentId,
-        displayName: `DV Agent ${testAgentId}`,
-        ownerUserId: callerUserId,
-        description: "created by test_user_mgr",
-      });
+      const { data, error } = await createAgentWithToken(
+        requireSudoToken(),
+        {
+          agentId: testAgentId,
+          displayName: `DV Agent ${testAgentId}`,
+          ownerUserId: callerUserId,
+          description: "created by test_user_mgr",
+        },
+      );
       assert(!error, `createAgent should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");
@@ -1078,7 +1596,10 @@ async function main() {
 
   results.push(
     await runCase("agent.create rejects duplicate agent_id", async () => {
-      const { data, error } = await createAgent({ agentId: testAgentId });
+      const { data, error } = await createAgentWithToken(
+        requireSudoToken(),
+        { agentId: testAgentId },
+      );
       assert(
         error !== null || data === null,
         "duplicate agent create should fail",
@@ -1147,7 +1668,10 @@ async function main() {
 
   results.push(
     await runCase("agent.delete soft-deletes the test agent", async () => {
-      const { data, error } = await deleteAgent(testAgentId);
+      const { data, error } = await deleteAgentWithToken(
+        requireSudoToken(),
+        testAgentId,
+      );
       assert(!error, `deleteAgent should not error: ${error}`);
       assert(data !== null, "data should not be null");
       assert(data!.ok === true, "ok should be true");

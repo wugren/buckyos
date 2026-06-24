@@ -39,7 +39,7 @@ Control Panel Service 是 Zone 内的**核心资源管理服务**，其本质是
 ### 2.1 User（用户）
 
 * 身份与账号信息，核心结构 `UserSettings`（`user_type` / `state` / 密码哈希 / `is_local` / 是否允许改密 等），来自 `buckyos-api`。
-* 关联结构：`UserPrivateProfile`（用户私有展示资料，保存在独立 profile 路径）、`UserContactSettings`（DID / groups / tags / 消息平台绑定）、`UserTunnelBinding`（消息平台账号绑定）。
+* 关联结构：`UserPrivateProfile`（用户私有展示资料，保存在独立 profile 路径）、`UserContactSettings`（DID / groups / tags / 消息平台绑定，保存在 profile 的私有扩展中）、`UserTunnelBinding`（消息平台账号绑定）。
 * 状态机 `UserState`：`Active`（正常，可签发/使用 session）/ `Pending`（已邀请未激活）/ `Deleted`（软删除，记录保留但禁止登录）。
 * 角色 `UserType`：`Root`（Zone 拥有者，不可删除/不可降级）/ `Admin`（管理员）/ `User`（普通）/ `Limited`（受限，改密受 `allow_password_change` 控制）/ `Guest`。
 * `system_config` 路径：
@@ -127,10 +127,10 @@ Agent 在系统中有**两副面孔**，需要区分：
 | 方法 | 权限 | 说明 |
 |---|---|---|
 | `user.list` | 已登录 | 列出用户（可选 `include_deleted`） |
-| `user.get` | 本人/Admin | 取单用户详情；`contact`/`did_document` 仅本人或 Admin 可见 |
+| `user.get` | 本人/Admin | 取单用户详情；profile 私有扩展中的 `contact` / `did_document` 仅本人或 Admin 可见 |
 | `user.create` | **Admin** | 事务创建 settings+doc+key，追加 RBAC 组；不允许创建 Root |
-| `user.update` | 本人/Admin | 改 `show_name` 等 |
-| `user.update_contact` | 本人/Admin | 改 DID/groups/tags/消息平台绑定 |
+| `user.update` | 本人/Admin | 改 profile 中的显示名等 |
+| `user.update_contact` | 本人/Admin | 改 profile 私有扩展中的 DID/groups/tags/消息平台绑定 |
 | `user.profile.get` / `user.profile.set` | 本人/Admin | `users/{uid}/profile` 中的私有 profile（DID profile 只读，响应中两源合并） |
 | `user.set_msg_tunnel` / `user.remove_msg_tunnel` | 本人/Admin | 增删消息平台账号绑定 |
 | `user.invite.create` | **Admin** | 生成邀请（可预建 Pending 用户或绑定已有 DID），返回 `invite_url` |

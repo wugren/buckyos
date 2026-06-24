@@ -140,8 +140,14 @@ function toContactEntity(value: unknown): ContactEntity {
 function ownerDidFromDetail(detail: UserDetail | null, fallbackUserId?: string): string | undefined {
   const detailRecord = asRecord(detail)
   const didDocument = asRecord(detail?.did_document)
+  const profile = asRecord(detail?.profile)
+  const localProfile = asRecord(detail?.local_profile)
+  const systemContact = asRecord(asRecord(localProfile.private_extra).system_contact)
   return firstString(
+    profile.did,
+    localProfile.did,
     detail?.contact?.did,
+    systemContact.did,
     didDocument.id,
     detailRecord.did,
     fallbackUserId ? `did:bns:${fallbackUserId}` : undefined,

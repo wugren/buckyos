@@ -4,9 +4,9 @@ use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, AiMessage, AiMethodRequest, AiPayload, AiRole, BoxKind,
     Capability, ModelSpec, MsgCenterClient, Requirements, SystemConfigClient,
 };
-use ndn_lib::MsgObjKind;
 use log::info;
 use name_lib::DID;
+use ndn_lib::MsgObjKind;
 use serde::Serialize;
 use serde_json::{json, Value};
 pub(crate) const AICC_SETTINGS_KEY: &str = "services/aicc/settings";

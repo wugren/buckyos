@@ -14,8 +14,9 @@ use crate::service::*;
 use crate::zone_route_builder::{build_forward_plan, DidIpHint, NodeGatewayRouteCandidate};
 use buckyos_api::{
     get_buckyos_api_runtime, AppServiceSpec, KernelServiceSpec, NodeConfig,
-    ServiceInstanceReportInfo, ServiceState, UserSettings, UserState, UserType as ApiUserType,
-    ZoneGatewaySettings, CONTROL_PANEL_SERVICE_PORT,
+    SchedulerRefreshRbacResponse, ServiceInstanceReportInfo, ServiceState, SystemConfigClient,
+    UserSettings, UserState, UserType as ApiUserType, ZoneGatewaySettings,
+    CONTROL_PANEL_SERVICE_PORT,
 };
 use buckyos_kit::*;
 use name_client::*;
@@ -175,7 +176,7 @@ pub fn create_scheduler_by_system_config(
                 }
             } else if key.ends_with("/settings") {
                 let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() >= 3 {
+                if parts.len() == 3 {
                     let user_id = parts[1];
                     let user_settings: UserSettings = serde_json::from_str(value.as_str())
                         .map_err(|e| {
@@ -1257,7 +1258,22 @@ async fn update_rbac(
             crate::scheduler::UserType::User => {
                 info!("add users rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, users", user_id));
-                push_policy_line(&mut rbac_policy, format!("g, su_{}, su_users", user_id));
+                let sudo_user_id = format!("su_{}", user_id);
+                push_policy_line(&mut rbac_policy, format!("g, {}, su_users", sudo_user_id));
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!(
+                        "p, {}, obj://config/users/{}/settings, read|write,allow",
+                        sudo_user_id, user_id
+                    ),
+                );
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!(
+                        "p, {}, obj://config/users/{}/doc, read|write,allow",
+                        sudo_user_id, user_id
+                    ),
+                );
             }
             crate::scheduler::UserType::Limited => {
                 info!("add limited rbac policy for user {}", user_id);
@@ -1330,6 +1346,39 @@ fn collect_tx_action_keys(tx_actions: &HashMap<String, KVAction>) -> Vec<String>
     let mut keys = tx_actions.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     keys
+}
+
+async fn load_scheduler_input_config(
+    system_config_client: &SystemConfigClient,
+) -> Result<HashMap<String, String>> {
+    let input_system_config = system_config_client.dump_configs_for_scheduler().await?;
+    let input_system_config = serde_json::from_value(input_system_config)?;
+    Ok(input_system_config)
+}
+
+pub(crate) async fn refresh_rbac() -> Result<SchedulerRefreshRbacResponse> {
+    let buckyos_api_runtime = get_buckyos_api_runtime()?;
+    let system_config_client = buckyos_api_runtime.get_system_config_client().await?;
+    let input_system_config = load_scheduler_input_config(&system_config_client).await?;
+    let (scheduler_ctx, _) = create_scheduler_by_system_config(&input_system_config)?;
+    let tx_actions = update_rbac(&input_system_config, &scheduler_ctx).await?;
+    let tx_action_count = tx_actions.len();
+
+    if tx_action_count > 0 {
+        let tx_action_keys = collect_tx_action_keys(&tx_actions);
+        system_config_client.exec_tx(tx_actions, None).await?;
+        info!(
+            "refresh_rbac applied {} actions, keys={:?}",
+            tx_action_count, tx_action_keys
+        );
+    } else {
+        info!("refresh_rbac skipped, RBAC policy is already current");
+    }
+
+    Ok(SchedulerRefreshRbacResponse {
+        updated: tx_action_count > 0,
+        tx_action_count,
+    })
 }
 
 pub(crate) async fn build_schedule_plan(
@@ -1453,26 +1502,15 @@ pub async fn schedule_loop(is_boot: bool) -> Result<()> {
                 error!("get_system_config_client failed: {:?}", e);
                 e
             })?;
-        let input_system_config = system_config_client.dump_configs_for_scheduler().await;
+        let input_system_config = load_scheduler_input_config(&system_config_client).await;
         if input_system_config.is_err() {
             error!(
-                "dump_configs_for_scheduler failed: {:?}",
+                "load_scheduler_input_config failed: {:?}",
                 input_system_config.err().unwrap()
             );
             continue;
         }
         let input_system_config = input_system_config.unwrap();
-        //cover value to hashmap
-        let input_system_config: Result<HashMap<String, String>, _> =
-            serde_json::from_value(input_system_config);
-        if input_system_config.is_err() {
-            error!(
-                "serde_json::from_value failed: {:?}",
-                input_system_config.err().unwrap()
-            );
-            continue;
-        }
-        let input_system_config: HashMap<String, String> = input_system_config.unwrap();
         info!(
             "schedule loop step:{} loaded {} config entries",
             loop_step,
@@ -1858,7 +1896,6 @@ mod tests {
             serde_json::to_string(&json!({
                 "type": "admin",
                 "user_id": "alice",
-                "show_name": "alice",
                 "password": "hashed",
                 "state": "active",
                 "res_pool_id": "default",
@@ -1871,7 +1908,6 @@ mod tests {
             serde_json::to_string(&json!({
                 "type": "user",
                 "user_id": "bob",
-                "show_name": "bob",
                 "password": "hashed",
                 "state": "active",
                 "res_pool_id": "default",
@@ -1884,7 +1920,6 @@ mod tests {
             serde_json::to_string(&json!({
                 "type": "limited",
                 "user_id": "carol",
-                "show_name": "carol",
                 "password": "hashed",
                 "state": "active",
                 "res_pool_id": "default",
@@ -1905,6 +1940,8 @@ mod tests {
         assert!(policy.contains("g, su_alice, su_admin"));
         assert!(policy.contains("g, bob, users"));
         assert!(policy.contains("g, su_bob, su_users"));
+        assert!(policy.contains("p, su_bob, obj://config/users/bob/settings, read|write,allow"));
+        assert!(policy.contains("p, su_bob, obj://config/users/bob/doc, read|write,allow"));
         assert!(policy.contains("g, carol, limited"));
         assert!(!policy.contains("zone_users"));
         assert!(!policy.lines().any(|line| line.trim() == "g, bob, user"));
@@ -1930,7 +1967,6 @@ mod tests {
             serde_json::to_string(&json!({
                 "type": "admin",
                 "user_id": "alice",
-                "show_name": "alice",
                 "password": "hashed",
                 "state": "active",
                 "res_pool_id": "default",
@@ -1952,6 +1988,47 @@ mod tests {
         assert_eq!(spec.owner_id, "alice");
         assert_eq!(spec.spec_type, ServiceSpecType::App);
         assert!(spec.need_container);
+    }
+
+    #[test]
+    fn test_create_scheduler_by_system_config_ignores_nested_user_settings() {
+        let zone_config = create_test_zone_config();
+        let device_ood1 = create_test_device_info("ood1", None);
+
+        let mut input_system_config = HashMap::new();
+        input_system_config.insert(
+            "boot/config".to_string(),
+            serde_json::to_string(&zone_config).unwrap(),
+        );
+        input_system_config.insert(
+            "devices/ood1/info".to_string(),
+            serde_json::to_string(&device_ood1).unwrap(),
+        );
+        input_system_config.insert(
+            "users/alice/settings".to_string(),
+            serde_json::to_string(&json!({
+                "type": "admin",
+                "user_id": "alice",
+                "password": "hashed",
+                "state": "active",
+                "res_pool_id": "default",
+                "is_local": true
+            }))
+            .unwrap(),
+        );
+        input_system_config.insert(
+            "users/alice/apps/files/settings".to_string(),
+            serde_json::to_string(&json!({
+                "homepage": "/",
+                "theme": "dark"
+            }))
+            .unwrap(),
+        );
+
+        let (scheduler_ctx, _) = create_scheduler_by_system_config(&input_system_config).unwrap();
+
+        assert!(scheduler_ctx.users.contains_key("alice"));
+        assert_eq!(scheduler_ctx.users.len(), 1);
     }
 
     #[test]

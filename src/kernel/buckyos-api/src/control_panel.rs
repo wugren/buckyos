@@ -103,14 +103,11 @@ pub struct UserSettings {
     //rename to type
     #[serde(rename = "type")]
     pub user_type: UserType,
-    pub show_name: String,
     pub password: String,
     pub state: UserState,
     pub res_pool_id: String,
     #[serde(default)]
     pub is_local: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contact: Option<UserContactSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_password_change: Option<bool>,
 }
@@ -126,7 +123,7 @@ pub struct UserInfo {
 impl UserSettings {
     pub fn to_user_info(&self) -> UserInfo {
         UserInfo {
-            show_name: self.show_name.clone(),
+            show_name: self.user_id.clone(),
             user_id: self.user_id.clone(),
             state: self.state.clone(),
             user_type: self.user_type.clone(),

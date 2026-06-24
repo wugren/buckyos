@@ -67,13 +67,15 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
 所有可上链的资源修改都要su权限，在未上链时可本地修改，否则统一走先更新链再同步的逻辑
 
-### user
+### user 相关
 - obj://config/users/{user}/settings 用户设置(含密码)，需要su_users修改
 - obj://config/users/{user}/doc 用户身份资料，需要su_users修改修改
 - obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链），注意保存的是private profile
 - obj://config/security/{user}/key 用户密钥，local账户才有，需要su_admin修改
 
+### app 相关
 
+### agent 相关
 
  */
 pub const DEFAULT_RBAC_POLICY: &str = r#"
@@ -460,6 +462,53 @@ g, su_alice, su_admin
                 "obj://config/users/alice/profile",
                 "write",
                 None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_users_role_can_write_own_sensitive_user_data() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = r#"
+g, bob, users
+g, su_bob, su_users
+p, su_bob, obj://config/users/bob/settings, read|write, allow
+p, su_bob, obj://config/users/bob/doc, read|write, allow
+"#;
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        assert!(
+            rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/bob/settings",
+                "write",
+                Some(rbac::SudoMode::Sudo("su_bob".to_string())),
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/bob/doc",
+                "write",
+                Some(rbac::SudoMode::Sudo("su_bob".to_string())),
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "buckycli",
+                "obj://config/users/alice/settings",
+                "write",
+                Some(rbac::SudoMode::Sudo("su_bob".to_string())),
             )
             .await
         );

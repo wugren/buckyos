@@ -1,9 +1,9 @@
 use crate::{ControlPanelServer, RpcAuthPrincipal};
-use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
+use ::kRPC::{kRPC, RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use buckyos_api::{
-    get_buckyos_api_runtime, ProfileLink, SystemConfigClient, SystemConfigError,
+    get_buckyos_api_runtime, ProfileLink, SchedulerClient, SystemConfigClient, SystemConfigError,
     UserContactSettings, UserPrivateProfile, UserProfile, UserSettings, UserState,
-    UserTunnelBinding, UserType,
+    UserTunnelBinding, UserType, SCHEDULER_SERVICE_SERVICE_PORT,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, KVAction};
 use jsonwebtoken::jwk::Jwk;
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 const DEFAULT_USERS_GROUP: &str = "users";
 const USER_INVITE_PREFIX: &str = "services/control_panel/user_invites";
+const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct UserInviteRecord {
@@ -218,23 +219,34 @@ fn profile_from_owner_config(owner_config: &OwnerConfig) -> UserPrivateProfile {
     ))
 }
 
-fn profile_from_settings(settings: &UserSettings) -> Result<UserPrivateProfile, RPCErrors> {
-    let did = settings
-        .contact
-        .as_ref()
-        .and_then(|contact| contact.did.as_ref())
-        .map(|did| DID::from_str(did))
-        .transpose()
-        .map_err(|e| RPCErrors::ReasonError(format!("Invalid user DID: {}", e)))?
-        .unwrap_or_else(|| DID::new("bns", &settings.user_id));
-    Ok(UserPrivateProfile::from(public_profile_from_parts(
-        did,
-        Some(settings.user_id.clone()),
-        Some(settings.show_name.clone()),
+fn profile_from_user_id(user_id: &str) -> UserPrivateProfile {
+    UserPrivateProfile::from(public_profile_from_parts(
+        DID::new("bns", user_id),
+        Some(user_id.to_string()),
+        Some(user_id.to_string()),
         None,
         None,
         HashMap::new(),
-    )))
+    ))
+}
+
+fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSettings> {
+    profile
+        .private_extra
+        .get(PROFILE_SYSTEM_CONTACT_KEY)
+        .and_then(|value| serde_json::from_value::<UserContactSettings>(value.clone()).ok())
+}
+
+fn set_profile_system_contact(
+    profile: &mut UserPrivateProfile,
+    contact: &UserContactSettings,
+) -> Result<(), RPCErrors> {
+    profile.private_extra.insert(
+        PROFILE_SYSTEM_CONTACT_KEY.to_string(),
+        serde_json::to_value(contact)
+            .map_err(|e| RPCErrors::ReasonError(format!("Serialize contact error: {}", e)))?,
+    );
+    Ok(())
 }
 
 fn merge_profile_values(local_profile: Option<Value>, did_profile: Option<Value>) -> Value {
@@ -358,21 +370,6 @@ async fn load_user_settings(
         .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))
 }
 
-async fn save_user_settings(
-    client: &SystemConfigClient,
-    user_id: &str,
-    settings: &UserSettings,
-) -> Result<(), RPCErrors> {
-    let settings_path = format!("users/{}/settings", user_id);
-    let updated_json = serde_json::to_string(settings)
-        .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-    client
-        .set(&settings_path, &updated_json)
-        .await
-        .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user settings: {}", e)))?;
-    Ok(())
-}
-
 async fn load_user_profile(
     client: &SystemConfigClient,
     user_id: &str,
@@ -407,23 +404,20 @@ async fn save_user_profile(
     Ok(())
 }
 
-async fn append_user_rbac_groups(user_id: &str, user_type: &UserType) -> Result<(), RPCErrors> {
+async fn refresh_rbac_by_scheduler(reason: &str) -> Result<(), RPCErrors> {
     let runtime = get_buckyos_api_runtime()?;
-    let service_client = runtime.get_system_config_client().await?;
-    let policy_line = match user_type {
-        UserType::Admin => Some(format!("g, {}, admin", user_id)),
-        UserType::User => Some(format!("g, {}, {}", user_id, DEFAULT_USERS_GROUP)),
-        UserType::Limited => Some(format!("g, {}, limited", user_id)),
-        _ => None,
-    };
-    if let Some(policy_line) = policy_line {
-        if let Err(e) = service_client
-            .append("system/rbac/policy", &policy_line)
-            .await
-        {
-            warn!("Failed to add user {} RBAC group: {}", user_id, e);
-        }
-    }
+    let scheduler_url = format!(
+        "http://127.0.0.1:{}/kapi/scheduler",
+        SCHEDULER_SERVICE_SERVICE_PORT
+    );
+    let session_token = runtime.get_session_token().await;
+    let scheduler_client =
+        SchedulerClient::new(kRPC::new(scheduler_url.as_str(), Some(session_token)));
+    let response = scheduler_client.refresh_rbac().await?;
+    info!(
+        "Scheduler RBAC refresh after {}: updated={} tx_action_count={}",
+        reason, response.updated, response.tx_action_count
+    );
     Ok(())
 }
 
@@ -557,7 +551,12 @@ impl ControlPanelServer {
                         if !include_deleted && matches!(settings.state, UserState::Deleted) {
                             continue;
                         }
-                        let info = settings.to_user_info();
+                        let mut info = settings.to_user_info();
+                        if let Ok(Some(profile)) = load_user_profile(&client, uid).await {
+                            if let Some(show_name) = profile.display_name.or(profile.name) {
+                                info.show_name = show_name;
+                            }
+                        }
                         if let Ok(v) = serde_json::to_value(&info) {
                             users.push(v);
                         }
@@ -600,29 +599,28 @@ impl ControlPanelServer {
             .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
         require_self_or_admin(principal, &target)?;
 
-        // Build response – hide password, include contact only for self or admin
+        // Build response – hide password; profile fields live in users/{user}/profile.
         let include_contact =
             is_admin_or_root(&principal.user_type) || principal.username == target;
         let mut result = json!({
             "user_id": settings.user_id,
-            "show_name": settings.show_name,
             "user_type": settings.user_type.clone(),
             "state": settings.state.clone(),
             "res_pool_id": settings.res_pool_id,
             "is_local": settings.is_local,
             "allow_password_change": settings.allow_password_change.unwrap_or(!matches!(settings.user_type, UserType::Limited)),
         });
-        if include_contact {
-            if let Some(contact) = &settings.contact {
-                result["contact"] = serde_json::to_value(contact).unwrap_or(json!(null));
-            }
-        }
 
         let local_profile = load_user_profile(&client, &target).await?;
         if let Some(profile) = local_profile.as_ref() {
             result["local_profile"] = serde_json::to_value(profile).unwrap_or(json!(null));
             result["profile"] =
                 serde_json::to_value(profile.to_public_profile()).unwrap_or(json!(null));
+            if include_contact {
+                if let Some(contact) = profile_system_contact(profile) {
+                    result["contact"] = serde_json::to_value(contact).unwrap_or(json!(null));
+                }
+            }
         } else {
             result["profile"] = json!({});
         }
@@ -696,12 +694,10 @@ impl ControlPanelServer {
         let new_settings = UserSettings {
             user_id: user_id.clone(),
             user_type: user_type.clone(),
-            show_name: show_name.clone(),
             password: password_hash,
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             is_local: true,
-            contact: Some(default_contact_settings(Some(user_did))),
             allow_password_change,
         };
         let settings_json = serde_json::to_string(&new_settings)
@@ -709,7 +705,10 @@ impl ControlPanelServer {
 
         let doc_json = serde_json::to_string(&owner_config)
             .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        let profile = profile_from_owner_config(&owner_config);
+        let mut profile = profile_from_owner_config(&owner_config);
+        let mut contact = default_contact_settings(Some(user_did));
+        ensure_default_users_group(&mut contact);
+        set_profile_system_contact(&mut profile, &contact)?;
         let profile_json = serde_json::to_string(&profile)
             .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
 
@@ -728,7 +727,7 @@ impl ControlPanelServer {
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to create user: {}", e)))?;
 
-        append_user_rbac_groups(&user_id, &user_type).await?;
+        refresh_rbac_by_scheduler("user.create").await?;
 
         info!("User '{}' created by '{}'", user_id, principal.username);
 
@@ -755,26 +754,16 @@ impl ControlPanelServer {
         require_self_or_admin(principal, &target)?;
 
         let client = system_config_client_for_caller(&req).await?;
-
-        let settings_path = format!("users/{}/settings", target);
-        let settings_val = client
-            .get(&settings_path)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("User '{}' not found: {}", target, e)))?;
-        let mut settings: UserSettings = serde_json::from_str(&settings_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
+        let _settings = load_user_settings(&client, &target).await?;
+        let mut profile = load_user_profile(&client, &target)
+            .await?
+            .unwrap_or_else(|| profile_from_user_id(&target));
 
         // Apply updates
         if let Some(show_name) = Self::param_str(&req, "show_name") {
-            settings.show_name = show_name;
+            profile.display_name = Some(show_name);
         }
-
-        let updated_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&settings_path, &updated_json)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to update user: {}", e)))?;
+        save_user_profile(&client, &target, &profile).await?;
 
         info!("User '{}' updated by '{}'", target, principal.username);
 
@@ -788,10 +777,8 @@ impl ControlPanelServer {
     }
 
     // ── user.update_contact ─────────────────────────────────────────────
-    // Updates the user's contact/binding settings (DID, note, groups, tags, bindings).
+    // Updates the user's system-level contact/binding profile data (DID, note, groups, tags, bindings).
     // NOTE: Full contact/friend management lives in MessageCenter.
-    //       This endpoint manages the *system-level* contact settings stored
-    //       alongside the user account (UserSettings.contact).
 
     pub(crate) async fn handle_user_update_contact(
         &self,
@@ -803,16 +790,11 @@ impl ControlPanelServer {
         require_self_or_admin(principal, &target)?;
 
         let client = system_config_client_for_caller(&req).await?;
-
-        let settings_path = format!("users/{}/settings", target);
-        let settings_val = client
-            .get(&settings_path)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("User '{}' not found: {}", target, e)))?;
-        let mut settings: UserSettings = serde_json::from_str(&settings_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
-
-        let mut contact = settings.contact.clone().unwrap_or_default();
+        let _settings = load_user_settings(&client, &target).await?;
+        let mut profile = load_user_profile(&client, &target)
+            .await?
+            .unwrap_or_else(|| profile_from_user_id(&target));
+        let mut contact = profile_system_contact(&profile).unwrap_or_default();
 
         // Apply partial updates
         if let Some(did) = Self::param_str(&req, "did") {
@@ -838,16 +820,8 @@ impl ControlPanelServer {
         }
         ensure_default_users_group(&mut contact);
 
-        settings.contact = Some(contact.clone());
-
-        let updated_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&settings_path, &updated_json)
-            .await
-            .map_err(|e| {
-                RPCErrors::ReasonError(format!("Failed to update contact settings: {}", e))
-            })?;
+        set_profile_system_contact(&mut profile, &contact)?;
+        save_user_profile(&client, &target, &profile).await?;
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -911,10 +885,10 @@ impl ControlPanelServer {
         }
 
         let client = system_config_client_for_caller(&req).await?;
-        let settings = load_user_settings(&client, &target).await?;
+        let _settings = load_user_settings(&client, &target).await?;
         let fallback_profile = match load_user_profile(&client, &target).await? {
             Some(profile) => profile,
-            None => profile_from_settings(&settings)?,
+            None => profile_from_user_id(&target),
         };
         let fallback_did = fallback_profile.did.clone();
         let mut profile = if let Some(value) = req.params.get("profile") {
@@ -1024,11 +998,12 @@ impl ControlPanelServer {
             .unwrap_or_default();
 
         let client = system_config_client_for_caller(&req).await?;
-        let mut settings = load_user_settings(&client, &target).await?;
-        let mut contact = settings
-            .contact
-            .clone()
-            .unwrap_or_else(|| default_contact_settings(None));
+        let _settings = load_user_settings(&client, &target).await?;
+        let mut profile = load_user_profile(&client, &target)
+            .await?
+            .unwrap_or_else(|| profile_from_user_id(&target));
+        let mut contact =
+            profile_system_contact(&profile).unwrap_or_else(|| default_contact_settings(None));
 
         let binding = UserTunnelBinding {
             platform: platform.clone(),
@@ -1049,8 +1024,8 @@ impl ControlPanelServer {
             contact.bindings.push(binding);
         }
         ensure_default_users_group(&mut contact);
-        settings.contact = Some(contact.clone());
-        save_user_settings(&client, &target, &settings).await?;
+        set_profile_system_contact(&mut profile, &contact)?;
+        save_user_profile(&client, &target, &profile).await?;
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1075,10 +1050,11 @@ impl ControlPanelServer {
         let platform = Self::require_param_str(&req, "platform")?;
 
         let client = system_config_client_for_caller(&req).await?;
-        let mut settings = load_user_settings(&client, &target).await?;
-        let mut contact = settings
-            .contact
-            .clone()
+        let _settings = load_user_settings(&client, &target).await?;
+        let mut profile = load_user_profile(&client, &target)
+            .await?
+            .unwrap_or_else(|| profile_from_user_id(&target));
+        let mut contact = profile_system_contact(&profile)
             .ok_or_else(|| RPCErrors::ReasonError("No user contact settings found".to_string()))?;
         let before = contact.bindings.len();
         contact
@@ -1091,8 +1067,8 @@ impl ControlPanelServer {
             )));
         }
         ensure_default_users_group(&mut contact);
-        settings.contact = Some(contact.clone());
-        save_user_settings(&client, &target, &settings).await?;
+        set_profile_system_contact(&mut profile, &contact)?;
+        save_user_profile(&client, &target, &profile).await?;
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1197,23 +1173,45 @@ impl ControlPanelServer {
             let pending_settings = UserSettings {
                 user_id: user_id.clone(),
                 user_type: default_user_type.clone(),
-                show_name: show_name.clone().unwrap_or_else(|| user_id.clone()),
                 password: String::new(),
                 state: UserState::Pending,
                 res_pool_id: "default".to_string(),
                 is_local: false,
-                contact: Some(UserContactSettings {
-                    did: target_did.clone(),
-                    note: None,
-                    groups,
-                    tags: Vec::new(),
-                    bindings: Vec::new(),
-                }),
                 allow_password_change: None,
             };
             let settings_json = serde_json::to_string(&pending_settings)
                 .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
             tx.insert(settings_path, KVAction::Create(settings_json));
+
+            let profile_did = target_did
+                .as_deref()
+                .map(DID::from_str)
+                .transpose()
+                .map_err(|e| RPCErrors::ParseRequestError(format!("Invalid target_did: {}", e)))?
+                .unwrap_or_else(|| DID::new("bns", user_id));
+            let mut profile = UserPrivateProfile::from(public_profile_from_parts(
+                profile_did,
+                Some(user_id.clone()),
+                Some(show_name.clone().unwrap_or_else(|| user_id.clone())),
+                None,
+                None,
+                HashMap::new(),
+            ));
+            let mut contact = UserContactSettings {
+                did: target_did.clone(),
+                note: None,
+                groups: groups.clone(),
+                tags: Vec::new(),
+                bindings: Vec::new(),
+            };
+            ensure_default_users_group(&mut contact);
+            set_profile_system_contact(&mut profile, &contact)?;
+            let profile_json = serde_json::to_string(&profile)
+                .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
+            tx.insert(
+                format!("users/{}/profile", user_id),
+                KVAction::Create(profile_json),
+            );
         }
 
         client
@@ -1322,11 +1320,13 @@ impl ControlPanelServer {
             }
         }
         ensure_default_users_group(&mut contact);
-        let profile = profile_from_owner_config(&owner_config);
+        let mut profile = profile_from_owner_config(&owner_config);
         let show_name = invite
             .show_name
             .clone()
             .unwrap_or_else(|| owner_config.display_name.clone());
+        profile.display_name = Some(show_name.clone());
+        set_profile_system_contact(&mut profile, &contact)?;
 
         let settings_path = format!("users/{}/settings", user_id);
         let mut settings = match client.get(&settings_path).await {
@@ -1341,24 +1341,20 @@ impl ControlPanelServer {
                     )));
                 }
                 settings.user_type = invite.default_user_type.clone();
-                settings.show_name = show_name.clone();
                 if !password_hash.is_empty() {
                     settings.password = password_hash.clone();
                 }
                 settings.state = UserState::Active;
-                settings.contact = Some(contact.clone());
                 settings.is_local = false;
                 settings
             }
             Err(_) => UserSettings {
                 user_id: user_id.clone(),
                 user_type: invite.default_user_type.clone(),
-                show_name: show_name.clone(),
                 password: password_hash.clone(),
                 state: UserState::Active,
                 res_pool_id: "default".to_string(),
                 is_local: false,
-                contact: Some(contact.clone()),
                 allow_password_change: None,
             },
         };
@@ -1395,7 +1391,7 @@ impl ControlPanelServer {
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to update invite: {}", e)))?;
 
-        append_user_rbac_groups(&user_id, &settings.user_type).await?;
+        refresh_rbac_by_scheduler("user.invite_accept").await?;
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1448,6 +1444,8 @@ impl ControlPanelServer {
             .set(&settings_path, &updated_json)
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to delete user: {}", e)))?;
+
+        refresh_rbac_by_scheduler("user.delete").await?;
 
         info!(
             "User '{}' marked as deleted by '{}'",
@@ -1557,6 +1555,8 @@ impl ControlPanelServer {
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to change state: {}", e)))?;
 
+        refresh_rbac_by_scheduler("user.change_state").await?;
+
         info!(
             "User '{}' state changed to '{}' by '{}'",
             target, state_str, principal.username
@@ -1606,9 +1606,6 @@ impl ControlPanelServer {
             ));
         }
 
-        let old_is_admin = matches!(settings.user_type, UserType::Admin);
-        let new_is_admin = matches!(new_type, UserType::Admin);
-
         settings.user_type = new_type;
         let updated_json = serde_json::to_string(&settings)
             .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
@@ -1617,14 +1614,7 @@ impl ControlPanelServer {
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to change type: {}", e)))?;
 
-        // Update RBAC policy if admin status changed.
-        // NOTE: `system/rbac/policy` is writable only by `ood` (per boot.template.toml);
-        // admin has read-only access. Use the service's own session token for the append.
-        if !old_is_admin && new_is_admin {
-            append_user_rbac_groups(&target, &settings.user_type).await?;
-        }
-        // Note: revoking admin from RBAC requires policy rewrite which is
-        // handled by the scheduler on next reconciliation.
+        refresh_rbac_by_scheduler("user.change_type").await?;
 
         info!(
             "User '{}' type changed to '{}' by '{}'",
