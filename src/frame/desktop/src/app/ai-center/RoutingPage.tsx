@@ -21,7 +21,6 @@ import {
   MessageSquare,
   Route,
   Search,
-  SlidersHorizontal,
   Sparkles,
   Zap,
 } from 'lucide-react'
@@ -285,10 +284,6 @@ function RoutingFiltersBar({
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
-        <div className="flex min-h-[54px] items-end gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
-          <SlidersHorizontal size={14} />
-          {t('aiCenter.routing.filters', 'Filters')}
-        </div>
         <MultiSelectFilter label={t('aiCenter.routing.provider', 'Provider')} value={filters.provider} options={options.provider} onChange={(value) => onFilterChange('provider', value)} />
         <MultiSelectFilter label={t('aiCenter.routing.apiType', 'API Type')} value={filters.apiType} options={options.apiType} onChange={(value) => onFilterChange('apiType', value)} />
         <MultiSelectFilter label={t('aiCenter.routing.capability', 'Capability')} value={filters.capability} options={options.capability} onChange={(value) => onFilterChange('capability', value)} />
@@ -436,8 +431,6 @@ function ScenarioCard({
   const status = primary
     ? primary.health.status === 'available' ? 'ok' : primary.health.status === 'degraded' ? 'warning' : 'error'
     : 'warning'
-  const typeLabel = hasChildren ? t('aiCenter.routing.directory', 'Directory') : t('aiCenter.routing.modelLeaf', 'Model')
-
   return (
     <article
       role="button"
@@ -451,44 +444,13 @@ function ScenarioCard({
       }}
       className="w-full rounded-xl p-4 text-left"
       style={{
-        background: hasChildren
-          ? selected ? 'color-mix(in oklch, var(--cp-accent), transparent 88%)' : 'color-mix(in oklch, var(--cp-accent), transparent 94%)'
-          : selected ? 'var(--cp-surface-2)' : 'var(--cp-surface)',
-        border: `1px solid ${selected || hasChildren ? 'var(--cp-accent)' : 'var(--cp-border)'}`,
-        boxShadow: hasChildren ? 'inset 4px 0 0 var(--cp-accent)' : undefined,
+        background: selected ? 'var(--cp-surface-2)' : 'var(--cp-surface)',
+        border: '1px solid var(--cp-border)',
       }}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex items-start gap-3">
           {hasChildren ? (
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--cp-accent)', color: '#fff' }}>
-              <FolderTree size={19} />
-            </div>
-          ) : (
-            <UseCaseIcon kind={scenario.useCase} />
-          )}
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{scenario.title}</h3>
-              <span
-                className="inline-flex min-h-6 items-center gap-1 rounded-md px-2 text-[11px] font-medium"
-                style={{
-                  background: hasChildren ? 'var(--cp-accent)' : 'var(--cp-bg)',
-                  color: hasChildren ? '#fff' : 'var(--cp-muted)',
-                  border: hasChildren ? '1px solid var(--cp-accent)' : '1px solid var(--cp-border)',
-                }}
-              >
-                {hasChildren ? <FolderTree size={12} /> : <Box size={12} />}
-                {typeLabel}
-              </span>
-              <span className="text-xs font-mono" style={{ color: 'var(--cp-muted)' }}>{scenario.node.path}</span>
-            </div>
-            <p className="text-sm mt-1" style={{ color: 'var(--cp-muted)' }}>{scenario.description}</p>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <StatusBadge status={status} label={primary?.health.status ?? t('aiCenter.routing.unresolved', 'unresolved')} />
-          {hasChildren && (
             <button
               type="button"
               onClick={(event) => {
@@ -502,14 +464,38 @@ function ScenarioCard({
                   onOpen()
                 }
               }}
-              className="inline-flex h-9 items-center gap-1 rounded-md px-3 text-xs font-medium"
-              style={{ background: 'var(--cp-accent)', color: '#fff', border: '1px solid var(--cp-accent)' }}
+              className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-shadow hover:shadow-md"
+              style={{
+                background: 'var(--cp-bg)',
+                color: 'var(--cp-accent)',
+                border: '1px solid var(--cp-border)',
+              }}
               aria-label={`Open ${scenario.node.path}`}
             >
-              {t('common.open', 'Open')}
-              <ChevronRight size={16} />
+              <FolderTree size={19} />
+              <span
+                className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full"
+                style={{ background: 'var(--cp-accent)', color: '#fff', border: '2px solid var(--cp-surface)' }}
+                aria-hidden
+              >
+                <ChevronRight size={12} />
+              </span>
             </button>
+          ) : (
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--cp-bg)', color: 'var(--cp-muted)', border: '1px solid var(--cp-border)' }}>
+              <Box size={18} />
+            </div>
           )}
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{scenario.title}</h3>
+              <span className="text-xs font-mono" style={{ color: 'var(--cp-muted)' }}>{scenario.node.path}</span>
+            </div>
+            <p className="text-sm mt-1" style={{ color: 'var(--cp-muted)' }}>{scenario.description}</p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <StatusBadge status={status} label={primary?.health.status ?? t('aiCenter.routing.unresolved', 'unresolved')} />
         </div>
       </div>
 
