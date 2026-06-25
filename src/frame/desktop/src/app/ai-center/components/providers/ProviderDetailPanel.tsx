@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AlertTriangle, ChevronDown, ChevronRight, MoreHorizontal, RefreshCw, Save, Search, ShieldCheck, Trash2 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore } from '../../hooks/use-aicc-store'
@@ -498,6 +498,7 @@ function InventoryToolbar({
 function MultiSelectFilter({ label, value, options, onChange }: { label: string; value: MultiFilter; options: string[]; onChange: (value: MultiFilter) => void }) {
   const selectedCount = value.selected.length
   const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const toggleOption = (option: string) => {
     const selected = value.selected.includes(option)
       ? value.selected.filter((item) => item !== option)
@@ -505,8 +506,28 @@ function MultiSelectFilter({ label, value, options, onChange }: { label: string;
     onChange({ ...value, selected })
   }
 
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
   return (
-    <div className="relative flex flex-col gap-1 min-w-0">
+    <div ref={rootRef} className="relative flex flex-col gap-1 min-w-0">
       <span className="truncate text-[11px]" title={label} style={{ color: 'var(--cp-muted)' }}>{label}</span>
       <div
         className="flex min-h-8 items-center rounded-lg"

@@ -665,6 +665,7 @@ function MultiSelectFilter({
 }) {
   const selectedCount = value.selected.length
   const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const toggleOption = (option: string) => {
     const selected = value.selected.includes(option)
       ? value.selected.filter((item) => item !== option)
@@ -672,8 +673,28 @@ function MultiSelectFilter({
     onChange({ ...value, selected })
   }
 
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
   return (
-    <div className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+    <div ref={rootRef} className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
       <span className="truncate" title={label}>{label}</span>
       <div
         className="flex h-9 items-center rounded-md"
