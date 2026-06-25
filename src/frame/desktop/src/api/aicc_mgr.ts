@@ -119,6 +119,7 @@ interface RawModelDirectory {
 
 interface RawProviderInventory {
   provider_instance_name?: unknown
+  name?: unknown
   provider_type?: unknown
   provider_driver?: unknown
   provider_origin?: unknown
@@ -1075,6 +1076,7 @@ function toProviderInventory(raw: RawProviderInventory): ProviderInventory {
 
   return {
     provider_instance_name: instanceName,
+    name: asOptionalString(raw.name),
     provider_type: runtimeType,
     provider_driver: driver,
     provider_origin: origin,
@@ -1094,7 +1096,7 @@ function toProviderView(inventory: ProviderInventory): ProviderView {
 
   const config: ProviderConfig = {
     id: providerId,
-    name: providerDisplayName(providerType, inventory.provider_instance_name),
+    name: inventory.name ?? providerDisplayName(providerType, inventory.provider_instance_name),
     provider_type: providerType,
     provider_instance_name: inventory.provider_instance_name,
     provider_runtime_type: inventory.provider_type,

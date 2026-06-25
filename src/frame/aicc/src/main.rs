@@ -374,6 +374,69 @@ fn collect_provider_instance_names(settings: &Value) -> HashSet<String> {
     names
 }
 
+fn collect_provider_display_names(settings: &Value) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Some(root) = settings.as_object() else {
+        return names;
+    };
+    for section in PROVIDER_SECTIONS {
+        let Some(instances) = root
+            .get(*section)
+            .and_then(Value::as_object)
+            .and_then(|section| section.get("instances"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for instance in instances {
+            let Some(instance_name) = instance
+                .get("provider_instance_name")
+                .or_else(|| instance.get("instance_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(display_name) = instance
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            names.insert(instance_name.to_string(), display_name.to_string());
+        }
+    }
+    names
+}
+
+fn enrich_provider_display_names(directory: &mut Value, settings: &Value) {
+    let display_names = collect_provider_display_names(settings);
+    if display_names.is_empty() {
+        return;
+    }
+    let Some(providers) = directory.get_mut("providers").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for provider in providers {
+        let Some(provider_obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(provider_instance_name) = provider_obj
+            .get("provider_instance_name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(display_name) = display_names.get(provider_instance_name.as_str()) {
+            provider_obj.insert("name".to_string(), Value::String(display_name.clone()));
+        }
+    }
+}
+
 fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value, RPCErrors> {
     let provider_instance_name = param_string(params, "provider_instance_name")
         .ok_or_else(|| RPCErrors::ReasonError("provider_instance_name is required".to_string()))?;
@@ -686,8 +749,18 @@ impl AiccHttpServer {
         }
     }
 
-    fn handle_models_list(&self, params: &Value) -> std::result::Result<serde_json::Value, RPCErrors> {
-        let directory = self.rpc_handler.0.dump_model_directory()?;
+    async fn handle_models_list(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<serde_json::Value, RPCErrors> {
+        let mut directory = self.rpc_handler.0.dump_model_directory()?;
+        match get_buckyos_api_runtime() {
+            Ok(runtime) => match runtime.get_my_settings().await {
+                Ok(settings) => enrich_provider_display_names(&mut directory, &settings),
+                Err(err) => warn!("load aicc settings failed while listing models: {}", err),
+            },
+            Err(err) => warn!("get runtime failed while listing models: {}", err),
+        }
         let logical_path = params
             .get("logical_path")
             .and_then(Value::as_str)
@@ -1228,7 +1301,7 @@ impl RPCHandler for AiccHttpServer {
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_MODELS_LIST || req.method == METHOD_SERVICE_MODELS_LIST {
-            let result = self.handle_models_list(&req.params)?;
+            let result = self.handle_models_list(&req.params).await?;
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_VALIDATE {

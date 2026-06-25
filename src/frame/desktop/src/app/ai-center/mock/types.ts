@@ -75,6 +75,7 @@ export interface ModelMetadata {
 
 export interface ProviderInventory {
   provider_instance_name: string
+  name?: string
   provider_type: ProviderRuntimeType
   provider_driver: string
   provider_origin: ProviderOrigin
