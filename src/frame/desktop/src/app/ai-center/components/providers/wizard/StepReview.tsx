@@ -62,15 +62,15 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
             <button
               type="button"
               onClick={() => onToggleAutoSync(!draft.auto_sync_models)}
-              className="relative h-5 w-10 rounded-full transition-colors"
+              className="relative h-6 w-11 rounded-full transition-colors"
               style={{
                 background: draft.auto_sync_models ? 'var(--cp-accent)' : 'var(--cp-border)',
               }}
             >
               <span
-                className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+                className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform"
                 style={{
-                  transform: draft.auto_sync_models ? 'translateX(18px)' : 'translateX(2px)',
+                  transform: draft.auto_sync_models ? 'translateX(20px)' : 'translateX(0)',
                 }}
               />
             </button>

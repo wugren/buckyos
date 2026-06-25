@@ -4,6 +4,7 @@ import { useMediaQuery } from '@mui/material'
 import {
   Activity,
   AlertTriangle,
+  Box,
   Braces,
   ChevronDown,
   ChevronRight,
@@ -13,6 +14,7 @@ import {
   Cpu,
   DollarSign,
   FileText,
+  FolderTree,
   GitBranch,
   Image,
   Layers,
@@ -211,7 +213,7 @@ export function RoutingPage() {
               key={scenario.node.path}
               scenario={scenario}
               providerNames={providerNames}
-              hasChildren={!queryActive && childNodesAtPath(routingView.logical_tree, scenario.node.path).length > 0}
+              hasChildren={!queryActive && canNavigateIntoPath(routingView.logical_tree, scenario.node.path)}
               selected={selectedScenario?.node.path === scenario.node.path}
               onSelect={() => setSelectedPath(scenario.node.path)}
               onOpen={() => {
@@ -311,6 +313,7 @@ function MultiSelectFilter({
   onChange: (value: MultiFilter) => void
 }) {
   const selectedCount = value.selected.length
+  const [open, setOpen] = useState(false)
   const toggleOption = (option: string) => {
     const selected = value.selected.includes(option)
       ? value.selected.filter((item) => item !== option)
@@ -319,25 +322,32 @@ function MultiSelectFilter({
   }
 
   return (
-    <div className="flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+    <div className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
       <span className="truncate" title={label}>{label}</span>
-      <input
-        value={value.query}
-        onChange={(event) => onChange({ ...value, query: event.target.value })}
-        placeholder="All"
-        className="min-h-8 w-full min-w-0 rounded-md px-2 text-xs outline-none"
-        style={{ background: 'var(--cp-bg)', color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
-      />
-      <details className="relative">
-        <summary
-          className="flex min-h-8 cursor-pointer list-none items-center justify-between rounded-md px-2 text-xs"
-          style={{ background: 'var(--cp-bg)', color: selectedCount > 0 ? 'var(--cp-text)' : 'var(--cp-muted)', border: '1px solid var(--cp-border)' }}
+      <div
+        className="flex min-h-8 items-center rounded-md"
+        style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)' }}
+      >
+        <input
+          value={value.query}
+          onChange={(event) => onChange({ ...value, query: event.target.value })}
+          placeholder={selectedCount > 0 ? `${selectedCount} selected` : 'All'}
+          className="min-w-0 flex-1 rounded-l-md bg-transparent px-2 text-xs outline-none"
+          style={{ color: 'var(--cp-text)' }}
+        />
+        <button
+          type="button"
+          onClick={() => setOpen((current) => !current)}
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-r-md"
+          style={{ color: selectedCount > 0 ? 'var(--cp-accent)' : 'var(--cp-muted)', borderLeft: '1px solid var(--cp-border)' }}
+          aria-label={`${label} options`}
         >
-          <span className="truncate">{selectedCount > 0 ? `${selectedCount} selected` : 'All'}</span>
-          <span aria-hidden>v</span>
-        </summary>
+          <ChevronDown size={14} />
+        </button>
+      </div>
+      {open && (
         <div
-          className="absolute left-0 top-9 z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
+          className="absolute left-0 top-[3.35rem] z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
           style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
         >
           <button
@@ -359,7 +369,7 @@ function MultiSelectFilter({
             </label>
           ))}
         </div>
-      </details>
+      )}
     </div>
   )
 }
@@ -426,6 +436,7 @@ function ScenarioCard({
   const status = primary
     ? primary.health.status === 'available' ? 'ok' : primary.health.status === 'degraded' ? 'warning' : 'error'
     : 'warning'
+  const typeLabel = hasChildren ? t('aiCenter.routing.directory', 'Directory') : t('aiCenter.routing.modelLeaf', 'Model')
 
   return (
     <article
@@ -440,16 +451,36 @@ function ScenarioCard({
       }}
       className="w-full rounded-xl p-4 text-left"
       style={{
-        background: selected ? 'var(--cp-surface-2)' : 'var(--cp-surface)',
-        border: `1px solid ${selected ? 'var(--cp-accent)' : 'var(--cp-border)'}`,
+        background: hasChildren
+          ? selected ? 'color-mix(in oklch, var(--cp-accent), transparent 88%)' : 'color-mix(in oklch, var(--cp-accent), transparent 94%)'
+          : selected ? 'var(--cp-surface-2)' : 'var(--cp-surface)',
+        border: `1px solid ${selected || hasChildren ? 'var(--cp-accent)' : 'var(--cp-border)'}`,
+        boxShadow: hasChildren ? 'inset 4px 0 0 var(--cp-accent)' : undefined,
       }}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex items-start gap-3">
-          <UseCaseIcon kind={scenario.useCase} />
+          {hasChildren ? (
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--cp-accent)', color: '#fff' }}>
+              <FolderTree size={19} />
+            </div>
+          ) : (
+            <UseCaseIcon kind={scenario.useCase} />
+          )}
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{scenario.title}</h3>
+              <span
+                className="inline-flex min-h-6 items-center gap-1 rounded-md px-2 text-[11px] font-medium"
+                style={{
+                  background: hasChildren ? 'var(--cp-accent)' : 'var(--cp-bg)',
+                  color: hasChildren ? '#fff' : 'var(--cp-muted)',
+                  border: hasChildren ? '1px solid var(--cp-accent)' : '1px solid var(--cp-border)',
+                }}
+              >
+                {hasChildren ? <FolderTree size={12} /> : <Box size={12} />}
+                {typeLabel}
+              </span>
               <span className="text-xs font-mono" style={{ color: 'var(--cp-muted)' }}>{scenario.node.path}</span>
             </div>
             <p className="text-sm mt-1" style={{ color: 'var(--cp-muted)' }}>{scenario.description}</p>
@@ -471,10 +502,11 @@ function ScenarioCard({
                   onOpen()
                 }
               }}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md"
-              style={{ color: 'var(--cp-accent)', border: '1px solid var(--cp-border)' }}
+              className="inline-flex h-9 items-center gap-1 rounded-md px-3 text-xs font-medium"
+              style={{ background: 'var(--cp-accent)', color: '#fff', border: '1px solid var(--cp-accent)' }}
               aria-label={`Open ${scenario.node.path}`}
             >
+              {t('common.open', 'Open')}
               <ChevronRight size={16} />
             </button>
           )}
@@ -959,6 +991,14 @@ function flattenNodes(nodes: LogicalNode[]): LogicalNode[] {
 function childNodesAtPath(nodes: LogicalNode[], path: string | null): LogicalNode[] {
   if (!path) return nodes
   return findNodeByPath(nodes, path)?.children ?? []
+}
+
+function canNavigateIntoPath(nodes: LogicalNode[], path: string): boolean {
+  return childNodesAtPath(nodes, path).some(isLogicalDirectoryNode)
+}
+
+function isLogicalDirectoryNode(node: LogicalNode): boolean {
+  return !node.locked && !node.path.includes('@')
 }
 
 function findNodeByPath(nodes: LogicalNode[], path: string): LogicalNode | undefined {

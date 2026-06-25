@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, CreditCard, DollarSign, HelpCircle, Route, Wallet } from 'lucide-react'
+import { Activity, ChevronDown, CreditCard, DollarSign, HelpCircle, Route, Wallet } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore, useAIStatus, useProviders, useRouteTraces, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
 import { SummaryCard } from '../shared/SummaryCard'
@@ -425,10 +425,22 @@ export function UsageDashboard() {
             </span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
-            <FilterSelect
+            <TimeRangeFilterControl
               label={t('aiCenter.home.filterTimeRange', 'Time Range')}
               value={timeRange}
-              onChange={(value) => updateTimeRange(value as TimeRangeFilter)}
+              onChange={updateTimeRange}
+              customStartDate={customStartDate}
+              customEndDate={customEndDate}
+              customStartLabel={t('aiCenter.home.filterStartDate', 'Start Date')}
+              customEndLabel={t('aiCenter.home.filterEndDate', 'End Date')}
+              onCustomStartDateChange={(value) => {
+                setCustomStartDate(value)
+                resetUsagePaging()
+              }}
+              onCustomEndDateChange={(value) => {
+                setCustomEndDate(value)
+                resetUsagePaging()
+              }}
               options={[
                 ['all', t('aiCenter.home.allTime', 'All time')],
                 ['24h', t('aiCenter.home.last24Hours', 'Last 24 hours')],
@@ -437,26 +449,6 @@ export function UsageDashboard() {
                 ['custom', t('aiCenter.home.customRange', 'Custom range')],
               ]}
             />
-            {timeRange === 'custom' && (
-              <>
-                <DateFilter
-                  label={t('aiCenter.home.filterStartDate', 'Start Date')}
-                  value={customStartDate}
-                  onChange={(value) => {
-                    setCustomStartDate(value)
-                    resetUsagePaging()
-                  }}
-                />
-                <DateFilter
-                  label={t('aiCenter.home.filterEndDate', 'End Date')}
-                  value={customEndDate}
-                  onChange={(value) => {
-                    setCustomEndDate(value)
-                    resetUsagePaging()
-                  }}
-                />
-              </>
-            )}
             <MultiSelectFilter
               label={t('aiCenter.home.filterProvider', 'Provider')}
               value={providerFilter}
@@ -574,37 +566,87 @@ export function UsageDashboard() {
   )
 }
 
-function FilterSelect({
+function TimeRangeFilterControl({
   label,
   value,
   onChange,
   options,
+  customStartDate,
+  customEndDate,
+  customStartLabel,
+  customEndLabel,
+  onCustomStartDateChange,
+  onCustomEndDateChange,
 }: {
   label: string
-  value: string
-  onChange: (value: string) => void
-  options: Array<[string, string]>
+  value: TimeRangeFilter
+  onChange: (value: TimeRangeFilter) => void
+  options: Array<[TimeRangeFilter, string]>
+  customStartDate: string
+  customEndDate: string
+  customStartLabel: string
+  customEndLabel: string
+  onCustomStartDateChange: (value: string) => void
+  onCustomEndDateChange: (value: string) => void
 }) {
+  const activeLabel = options.find(([optionValue]) => optionValue === value)?.[1] ?? label
+
   return (
-    <label className="flex flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
-      <span>{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="h-9 rounded-md px-2 text-xs outline-none"
-        style={{
-          background: 'var(--cp-bg)',
-          border: '1px solid var(--cp-border)',
-          color: 'var(--cp-text)',
-        }}
-      >
-        {options.map(([optionValue, optionLabel]) => (
-          <option key={optionValue} value={optionValue}>
-            {optionLabel}
-          </option>
-        ))}
-      </select>
-    </label>
+    <div className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+      <span className="truncate" title={label}>{label}</span>
+      <details className="relative">
+        <summary
+          className="flex h-9 cursor-pointer list-none items-center justify-between gap-2 rounded-md px-2 text-xs"
+          style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)', color: 'var(--cp-text)' }}
+        >
+          <span className="truncate">{activeLabel}</span>
+          <ChevronDown size={14} style={{ color: 'var(--cp-muted)' }} />
+        </summary>
+        <div
+          className="absolute left-0 top-10 z-20 flex w-full min-w-56 flex-col gap-1 rounded-md p-2 shadow-lg"
+          style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+        >
+          {options.map(([optionValue, optionLabel]) => (
+            <button
+              key={optionValue}
+              type="button"
+              onClick={() => onChange(optionValue)}
+              className="rounded px-2 py-1.5 text-left text-xs"
+              style={{
+                background: optionValue === value ? 'color-mix(in oklch, var(--cp-accent), transparent 86%)' : 'transparent',
+                color: optionValue === value ? 'var(--cp-accent)' : 'var(--cp-text)',
+              }}
+            >
+              {optionLabel}
+            </button>
+          ))}
+          {value === 'custom' && (
+            <div className="grid grid-cols-1 gap-2 pt-2" style={{ borderTop: '1px solid var(--cp-border)' }}>
+              <label className="flex flex-col gap-1">
+                <span style={{ color: 'var(--cp-muted)' }}>{customStartLabel}</span>
+                <input
+                  type="date"
+                  value={customStartDate}
+                  onChange={(event) => onCustomStartDateChange(event.target.value)}
+                  className="h-8 rounded-md px-2 text-xs outline-none"
+                  style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)', color: 'var(--cp-text)' }}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span style={{ color: 'var(--cp-muted)' }}>{customEndLabel}</span>
+                <input
+                  type="date"
+                  value={customEndDate}
+                  onChange={(event) => onCustomEndDateChange(event.target.value)}
+                  className="h-8 rounded-md px-2 text-xs outline-none"
+                  style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)', color: 'var(--cp-text)' }}
+                />
+              </label>
+            </div>
+          )}
+        </div>
+      </details>
+    </div>
   )
 }
 
@@ -622,6 +664,7 @@ function MultiSelectFilter({
   allLabel: string
 }) {
   const selectedCount = value.selected.length
+  const [open, setOpen] = useState(false)
   const toggleOption = (option: string) => {
     const selected = value.selected.includes(option)
       ? value.selected.filter((item) => item !== option)
@@ -630,33 +673,32 @@ function MultiSelectFilter({
   }
 
   return (
-    <div className="flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+    <div className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
       <span className="truncate" title={label}>{label}</span>
-      <input
-        value={value.query}
-        onChange={(event) => onChange({ ...value, query: event.target.value })}
-        placeholder={allLabel}
-        className="h-9 min-w-0 rounded-md px-2 text-xs outline-none"
-        style={{
-          background: 'var(--cp-bg)',
-          border: '1px solid var(--cp-border)',
-          color: 'var(--cp-text)',
-        }}
-      />
-      <details className="relative">
-        <summary
-          className="flex h-8 cursor-pointer list-none items-center justify-between rounded-md px-2 text-xs"
-          style={{
-            background: 'var(--cp-bg)',
-            border: '1px solid var(--cp-border)',
-            color: selectedCount > 0 ? 'var(--cp-text)' : 'var(--cp-muted)',
-          }}
+      <div
+        className="flex h-9 items-center rounded-md"
+        style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)' }}
+      >
+        <input
+          value={value.query}
+          onChange={(event) => onChange({ ...value, query: event.target.value })}
+          placeholder={selectedCount > 0 ? `${selectedCount} selected` : allLabel}
+          className="h-full min-w-0 flex-1 rounded-l-md bg-transparent px-2 text-xs outline-none"
+          style={{ color: 'var(--cp-text)' }}
+        />
+        <button
+          type="button"
+          onClick={() => setOpen((current) => !current)}
+          className="flex h-full w-8 shrink-0 items-center justify-center rounded-r-md"
+          style={{ color: selectedCount > 0 ? 'var(--cp-accent)' : 'var(--cp-muted)', borderLeft: '1px solid var(--cp-border)' }}
+          aria-label={`${label} options`}
         >
-          <span className="truncate">{selectedCount > 0 ? `${selectedCount} selected` : allLabel}</span>
-          <span aria-hidden>v</span>
-        </summary>
+          <ChevronDown size={14} />
+        </button>
+      </div>
+      {open && (
         <div
-          className="absolute left-0 top-9 z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
+          className="absolute left-0 top-[3.75rem] z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
           style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
         >
           <button
@@ -678,35 +720,8 @@ function MultiSelectFilter({
             </label>
           ))}
         </div>
-      </details>
+      )}
     </div>
-  )
-}
-
-function DateFilter({
-  label,
-  value,
-  onChange,
-}: {
-  label: string
-  value: string
-  onChange: (value: string) => void
-}) {
-  return (
-    <label className="flex flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
-      <span>{label}</span>
-      <input
-        type="date"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="h-9 rounded-md px-2 text-xs outline-none"
-        style={{
-          background: 'var(--cp-bg)',
-          border: '1px solid var(--cp-border)',
-          color: 'var(--cp-text)',
-        }}
-      />
-    </label>
   )
 }
 
