@@ -99,13 +99,19 @@ Input:
   - explicit: `start_time_ms` and `end_time_ms`
   - shortcut: `last_1d`, `last_7d`, `last_30d`
 - optional filters
-  - `tenant_id`
-  - `caller_app_id`
-  - `request_model`
-  - `provider_model`
-  - `capability`
-  - `task_id`
-  - `idempotency_key`
+  - `tenant_ids`
+  - `caller_app_ids`
+  - `caller_app_query`
+  - `request_models`
+  - `provider_models`
+  - `provider_model_query`
+  - `provider_instance_names`
+  - `provider_instance_query`
+  - `capabilities`
+  - `task_ids`
+  - `idempotency_keys`
+
+Array filter fields use exact multi-value matching. Empty arrays mean no filter on that dimension. `*_query` fields use case-insensitive fuzzy matching for UI text filters, such as selecting all provider models whose name contains `gpt5`.
 - optional grouping
   - no group: return a total summary
   - one or more dimensions: `provider_model`, `request_model`, `capability`, `caller_app_id`, `tenant_id`
@@ -125,6 +131,7 @@ Output:
 
 - `total_requests`
 - aggregated usage values
+- optional aggregated `finance_amount` when event `finance_snapshot_json.amount` is numeric and comparable
 - grouped rows when grouping is set
 - bucketed rows when a time bucket is set
 - raw events when requested

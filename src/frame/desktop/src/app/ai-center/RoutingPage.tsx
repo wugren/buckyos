@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useMediaQuery } from '@mui/material'
 import {
@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Braces,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Cloud,
   Code2,
@@ -28,13 +29,19 @@ import {
   useProviders,
   useRouteTraces,
   useGlobalRoutingView,
+  useAICCStore,
 } from './hooks/use-aicc-store'
 import { StatusBadge } from './components/shared/StatusBadge'
-import type { ApiType, LogicalNode, ModelMetadata, RouteTrace } from '../../api/aicc_mgr'
+import type { LogicalNode, ModelMetadata, RouteTrace, RoutingDirectoryView } from '../../api/aicc_mgr'
 
 type FilterKey = 'provider' | 'apiType' | 'capability' | 'cost' | 'latency' | 'health' | 'location'
 
-type RoutingFilters = Record<FilterKey, string>
+type MultiFilter = {
+  query: string
+  selected: string[]
+}
+
+type RoutingFilters = Record<FilterKey, MultiFilter>
 
 type ScenarioView = {
   node: LogicalNode
@@ -57,33 +64,75 @@ type ModelGroup = {
 
 type UseCaseKind = 'chat' | 'code' | 'plan' | 'image' | 'embed' | 'vision' | 'audio' | 'other'
 
-const DEFAULT_FILTERS: RoutingFilters = {
-  provider: 'all',
-  apiType: 'all',
-  capability: 'all',
-  cost: 'all',
-  latency: 'all',
-  health: 'all',
-  location: 'all',
+function emptyMultiFilter(): MultiFilter {
+  return { query: '', selected: [] }
+}
+
+function defaultRoutingFilters(): RoutingFilters {
+  return {
+    provider: emptyMultiFilter(),
+    apiType: emptyMultiFilter(),
+    capability: emptyMultiFilter(),
+    cost: emptyMultiFilter(),
+    latency: emptyMultiFilter(),
+    health: emptyMultiFilter(),
+    location: emptyMultiFilter(),
+  }
 }
 
 const USE_CASE_ORDER: UseCaseKind[] = ['chat', 'code', 'plan', 'image', 'embed', 'vision', 'audio', 'other']
 
 export function RoutingPage() {
   const { t } = useI18n()
+  const store = useAICCStore()
   const routingView = useGlobalRoutingView()
   const traces = useRouteTraces()
   const providers = useProviders()
   const localModels = useLocalModels()
   const isMobile = useMediaQuery('(max-width: 767px)')
   const [query, setQuery] = useState('')
-  const [filters, setFilters] = useState<RoutingFilters>(DEFAULT_FILTERS)
+  const [filters, setFilters] = useState<RoutingFilters>(() => defaultRoutingFilters())
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [currentPath, setCurrentPath] = useState<string | null>(null)
 
-  const models = useMemo(() => [
+  const snapshotModels = useMemo(() => [
     ...providers.flatMap((provider) => provider.status.discovered_models),
     ...localModels,
   ], [providers, localModels])
+  const [directoryView, setDirectoryView] = useState<RoutingDirectoryView>(() => ({
+    routingView,
+    models: snapshotModels,
+  }))
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadDirectory() {
+      try {
+        const view = await store.queryRoutingDirectory(currentPath)
+        if (!cancelled) {
+          setDirectoryView(view)
+        }
+      } catch (error) {
+        console.error('aicc.models.list logical_path failed', error)
+        if (!cancelled) {
+          setDirectoryView({
+            routingView: {
+              ...routingView,
+              logical_tree: currentPath ? childNodesAtPath(routingView.logical_tree, currentPath) : routingView.logical_tree,
+            },
+            models: snapshotModels,
+          })
+        }
+      }
+    }
+    void loadDirectory()
+    return () => {
+      cancelled = true
+    }
+  }, [currentPath, routingView, snapshotModels, store])
+
+  const activeRoutingView = directoryView.routingView
+  const models = directoryView.models
 
   const providerNames = useMemo(() => new Map([
     ...providers.map((provider) => [
@@ -93,8 +142,9 @@ export function RoutingPage() {
     ['local', t('aiCenter.routing.localProvider', 'Local runtime')] as const,
   ]), [providers, t])
 
-  const scenarios = useMemo(() => buildScenarios(routingView.logical_tree, models, traces), [
-    routingView.logical_tree,
+  const directoryNodes = activeRoutingView.logical_tree
+  const scenarios = useMemo(() => buildScenarios(directoryNodes, models, traces), [
+    directoryNodes,
     models,
     traces,
   ])
@@ -106,7 +156,14 @@ export function RoutingPage() {
       .filter((scenario) => scenarioMatchesFilters(scenario, filters))
       .sort(compareScenario)
   }, [scenarios, query, filters])
+  const scenarioByPath = useMemo(
+    () => new Map(visibleScenarios.map((scenario) => [scenario.node.path, scenario])),
+    [visibleScenarios],
+  )
+  const queryActive = query.trim().length > 0 || Object.values(filters).some((value) => value.query.trim().length > 0 || value.selected.length > 0)
+  const directoryEntries = visibleScenarios
   const selectedScenario = visibleScenarios.find((scenario) => scenario.node.path === selectedPath)
+    ?? directoryEntries[0]
     ?? visibleScenarios[0]
 
   if (routingView.logical_tree.length === 0) {
@@ -120,13 +177,13 @@ export function RoutingPage() {
     )
   }
 
-  const updateFilter = (key: FilterKey, value: string) => {
+  const updateFilter = (key: FilterKey, value: MultiFilter) => {
     setFilters((current) => ({ ...current, [key]: value }))
   }
 
   return (
     <div className="flex flex-col gap-4">
-      <RoutingHeader revision={routingView.revision} scenarioCount={visibleScenarios.length} />
+      <RoutingHeader revision={activeRoutingView.revision} scenarioCount={visibleScenarios.length} />
 
       <RoutingFiltersBar
         query={query}
@@ -136,15 +193,31 @@ export function RoutingPage() {
         onFilterChange={updateFilter}
       />
 
+      {!queryActive && (
+        <RoutingBreadcrumbs
+          currentPath={currentPath}
+          scenarios={scenarioByPath}
+          onNavigate={(path) => {
+            setCurrentPath(path)
+            setSelectedPath(path)
+          }}
+        />
+      )}
+
       <div className={isMobile ? 'flex flex-col gap-4' : 'grid grid-cols-[minmax(0,1.25fr)_minmax(320px,0.75fr)] gap-5 items-start'}>
         <section className="flex flex-col gap-3">
-          {visibleScenarios.length > 0 ? visibleScenarios.map((scenario) => (
+          {directoryEntries.length > 0 ? directoryEntries.map((scenario) => (
             <ScenarioCard
               key={scenario.node.path}
               scenario={scenario}
               providerNames={providerNames}
+              hasChildren={!queryActive && childNodesAtPath(routingView.logical_tree, scenario.node.path).length > 0}
               selected={selectedScenario?.node.path === scenario.node.path}
               onSelect={() => setSelectedPath(scenario.node.path)}
+              onOpen={() => {
+                setCurrentPath(scenario.node.path)
+                setSelectedPath(scenario.node.path)
+              }}
             />
           )) : (
             <EmptyResults />
@@ -190,7 +263,7 @@ function RoutingFiltersBar({
   filters: RoutingFilters
   options: Record<FilterKey, string[]>
   onQueryChange: (value: string) => void
-  onFilterChange: (key: FilterKey, value: string) => void
+  onFilterChange: (key: FilterKey, value: MultiFilter) => void
 }) {
   const { t } = useI18n()
   return (
@@ -209,62 +282,144 @@ function RoutingFiltersBar({
         />
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="inline-flex items-center gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+        <div className="flex min-h-[54px] items-end gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
           <SlidersHorizontal size={14} />
           {t('aiCenter.routing.filters', 'Filters')}
         </div>
-        <FilterSelect label={t('aiCenter.routing.provider', 'Provider')} value={filters.provider} options={options.provider} onChange={(value) => onFilterChange('provider', value)} />
-        <FilterSelect label={t('aiCenter.routing.apiType', 'API Type')} value={filters.apiType} options={options.apiType} onChange={(value) => onFilterChange('apiType', value)} />
-        <FilterSelect label={t('aiCenter.routing.capability', 'Capability')} value={filters.capability} options={options.capability} onChange={(value) => onFilterChange('capability', value)} />
-        <FilterSelect label={t('aiCenter.routing.cost', 'Cost')} value={filters.cost} options={options.cost} onChange={(value) => onFilterChange('cost', value)} />
-        <FilterSelect label={t('aiCenter.routing.latency', 'Latency')} value={filters.latency} options={options.latency} onChange={(value) => onFilterChange('latency', value)} />
-        <FilterSelect label={t('aiCenter.routing.health', 'Health')} value={filters.health} options={options.health} onChange={(value) => onFilterChange('health', value)} />
-        <FilterSelect label={t('aiCenter.routing.location', 'Local/Cloud')} value={filters.location} options={options.location} onChange={(value) => onFilterChange('location', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.provider', 'Provider')} value={filters.provider} options={options.provider} onChange={(value) => onFilterChange('provider', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.apiType', 'API Type')} value={filters.apiType} options={options.apiType} onChange={(value) => onFilterChange('apiType', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.capability', 'Capability')} value={filters.capability} options={options.capability} onChange={(value) => onFilterChange('capability', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.cost', 'Cost')} value={filters.cost} options={options.cost} onChange={(value) => onFilterChange('cost', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.latency', 'Latency')} value={filters.latency} options={options.latency} onChange={(value) => onFilterChange('latency', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.health', 'Health')} value={filters.health} options={options.health} onChange={(value) => onFilterChange('health', value)} />
+        <MultiSelectFilter label={t('aiCenter.routing.location', 'Local/Cloud')} value={filters.location} options={options.location} onChange={(value) => onFilterChange('location', value)} />
       </div>
     </section>
   )
 }
 
-function FilterSelect({
+function MultiSelectFilter({
   label,
   value,
   options,
   onChange,
 }: {
   label: string
-  value: string
+  value: MultiFilter
   options: string[]
-  onChange: (value: string) => void
+  onChange: (value: MultiFilter) => void
 }) {
+  const selectedCount = value.selected.length
+  const toggleOption = (option: string) => {
+    const selected = value.selected.includes(option)
+      ? value.selected.filter((item) => item !== option)
+      : [...value.selected, option]
+    onChange({ ...value, selected })
+  }
+
   return (
-    <label className="flex items-center gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
-      <span>{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="min-h-8 rounded-md px-2 text-xs outline-none"
+    <div className="flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+      <span className="truncate" title={label}>{label}</span>
+      <input
+        value={value.query}
+        onChange={(event) => onChange({ ...value, query: event.target.value })}
+        placeholder="All"
+        className="min-h-8 w-full min-w-0 rounded-md px-2 text-xs outline-none"
         style={{ background: 'var(--cp-bg)', color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
+      />
+      <details className="relative">
+        <summary
+          className="flex min-h-8 cursor-pointer list-none items-center justify-between rounded-md px-2 text-xs"
+          style={{ background: 'var(--cp-bg)', color: selectedCount > 0 ? 'var(--cp-text)' : 'var(--cp-muted)', border: '1px solid var(--cp-border)' }}
+        >
+          <span className="truncate">{selectedCount > 0 ? `${selectedCount} selected` : 'All'}</span>
+          <span aria-hidden>v</span>
+        </summary>
+        <div
+          className="absolute left-0 top-9 z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
+          style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+        >
+          <button
+            type="button"
+            onClick={() => onChange({ ...value, selected: [] })}
+            className="rounded px-2 py-1 text-left text-xs"
+            style={{ color: 'var(--cp-accent)' }}
+          >
+            All
+          </button>
+          {options.map((option) => (
+            <label key={option} className="flex min-h-7 items-center gap-2 rounded px-2 py-1 text-xs" style={{ color: 'var(--cp-text)' }}>
+              <input
+                type="checkbox"
+                checked={value.selected.includes(option)}
+                onChange={() => toggleOption(option)}
+              />
+              <span className="truncate" title={option}>{option}</span>
+            </label>
+          ))}
+        </div>
+      </details>
+    </div>
+  )
+}
+
+function RoutingBreadcrumbs({
+  currentPath,
+  scenarios,
+  onNavigate,
+}: {
+  currentPath: string | null
+  scenarios: Map<string, ScenarioView>
+  onNavigate: (path: string | null) => void
+}) {
+  const parts = breadcrumbPaths(currentPath)
+  return (
+    <nav
+      className="flex flex-wrap items-center gap-1 rounded-xl px-3 py-2 text-sm"
+      style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+      aria-label="Routing breadcrumb"
+    >
+      <button
+        type="button"
+        onClick={() => onNavigate(null)}
+        className="rounded-md px-2 py-1 text-xs font-medium"
+        style={{ color: currentPath == null ? 'var(--cp-text)' : 'var(--cp-accent)' }}
       >
-        <option value="all">All</option>
-        {options.map((option) => (
-          <option key={option} value={option}>{option}</option>
-        ))}
-      </select>
-    </label>
+        Routing
+      </button>
+      {parts.map((path) => (
+        <span key={path} className="inline-flex items-center gap-1">
+          <ChevronRight size={13} style={{ color: 'var(--cp-muted)' }} />
+          <button
+            type="button"
+            onClick={() => onNavigate(path)}
+            className="max-w-[180px] truncate rounded-md px-2 py-1 text-xs font-medium"
+            title={path}
+            style={{ color: path === currentPath ? 'var(--cp-text)' : 'var(--cp-accent)' }}
+          >
+            {scenarios.get(path)?.title ?? lastPathSegment(path)}
+          </button>
+        </span>
+      ))}
+    </nav>
   )
 }
 
 function ScenarioCard({
   scenario,
   providerNames,
+  hasChildren,
   selected,
   onSelect,
+  onOpen,
 }: {
   scenario: ScenarioView
   providerNames: Map<string, string>
+  hasChildren: boolean
   selected: boolean
   onSelect: () => void
+  onOpen: () => void
 }) {
   const { t } = useI18n()
   const primary = scenario.selectedModel
@@ -273,9 +428,16 @@ function ScenarioCard({
     : 'warning'
 
   return (
-    <button
-      type="button"
+    <article
+      role="button"
+      tabIndex={0}
       onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onSelect()
+        }
+      }}
       className="w-full rounded-xl p-4 text-left"
       style={{
         background: selected ? 'var(--cp-surface-2)' : 'var(--cp-surface)',
@@ -293,7 +455,30 @@ function ScenarioCard({
             <p className="text-sm mt-1" style={{ color: 'var(--cp-muted)' }}>{scenario.description}</p>
           </div>
         </div>
-        <StatusBadge status={status} label={primary?.health.status ?? t('aiCenter.routing.unresolved', 'unresolved')} />
+        <div className="flex shrink-0 items-center gap-2">
+          <StatusBadge status={status} label={primary?.health.status ?? t('aiCenter.routing.unresolved', 'unresolved')} />
+          {hasChildren && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                onOpen()
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  onOpen()
+                }
+              }}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md"
+              style={{ color: 'var(--cp-accent)', border: '1px solid var(--cp-border)' }}
+              aria-label={`Open ${scenario.node.path}`}
+            >
+              <ChevronRight size={16} />
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="mt-4 rounded-lg p-3" style={{ background: 'var(--cp-bg)' }}>
@@ -329,7 +514,7 @@ function ScenarioCard({
         <span>/</span>
         <span>{scenario.groups.reduce((count, group) => count + group.variants.length, 0)} {t('aiCenter.routing.foldedVariants', 'folded variants')}</span>
       </div>
-    </button>
+    </article>
   )
 }
 
@@ -564,9 +749,8 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 function buildScenarios(nodes: LogicalNode[], models: ModelMetadata[], traces: RouteTrace[]): ScenarioView[] {
-  const flattened = flattenNodes(nodes)
   const modelByExact = new Map(models.map((model) => [model.exact_model, model]))
-  const scenarios = flattened
+  const scenarios = nodes
     .filter((node) => node.level !== 'L1')
     .filter((node) => isScenarioNode(node))
     .map((node) => {
@@ -692,16 +876,23 @@ function scenarioMatchesQuery(scenario: ScenarioView, query: string): boolean {
 }
 
 function scenarioMatchesFilters(scenario: ScenarioView, filters: RoutingFilters): boolean {
-  if (Object.values(filters).every((value) => value === 'all')) return true
+  if (Object.values(filters).every((value) => value.query.trim().length === 0 && value.selected.length === 0)) return true
   return scenario.candidates.some((model) =>
-    (filters.provider === 'all' || providerFromExact(model.exact_model) === filters.provider)
-    && (filters.apiType === 'all' || model.api_types.includes(filters.apiType as ApiType))
-    && (filters.capability === 'all' || modelCapabilities(model).includes(filters.capability))
-    && (filters.cost === 'all' || model.attributes.cost_class === filters.cost)
-    && (filters.latency === 'all' || model.attributes.latency_class === filters.latency)
-    && (filters.health === 'all' || model.health.status === filters.health)
-    && (filters.location === 'all' || (filters.location === 'local' ? model.attributes.local : !model.attributes.local)),
+    multiFilterMatches(filters.provider, [providerFromExact(model.exact_model)])
+    && multiFilterMatches(filters.apiType, model.api_types)
+    && multiFilterMatches(filters.capability, modelCapabilities(model))
+    && multiFilterMatches(filters.cost, [model.attributes.cost_class])
+    && multiFilterMatches(filters.latency, [model.attributes.latency_class])
+    && multiFilterMatches(filters.health, [model.health.status])
+    && multiFilterMatches(filters.location, [model.attributes.local ? 'local' : 'cloud']),
   )
+}
+
+function multiFilterMatches(filter: MultiFilter, values: string[]): boolean {
+  if (filter.selected.length > 0 && !values.some((value) => filter.selected.includes(value))) return false
+  const query = filter.query.trim().toLowerCase()
+  if (query && !values.some((value) => value.toLowerCase().includes(query))) return false
+  return true
 }
 
 function compareScenario(left: ScenarioView, right: ScenarioView): number {
@@ -763,6 +954,20 @@ function isScenarioNode(node: LogicalNode): boolean {
 
 function flattenNodes(nodes: LogicalNode[]): LogicalNode[] {
   return nodes.flatMap((node) => [node, ...flattenNodes(node.children ?? [])])
+}
+
+function childNodesAtPath(nodes: LogicalNode[], path: string | null): LogicalNode[] {
+  if (!path) return nodes
+  return findNodeByPath(nodes, path)?.children ?? []
+}
+
+function findNodeByPath(nodes: LogicalNode[], path: string): LogicalNode | undefined {
+  for (const node of nodes) {
+    if (node.path === path) return node
+    const child = findNodeByPath(node.children ?? [], path)
+    if (child) return child
+  }
+  return undefined
 }
 
 function useCaseFromPath(path: string, apiType?: string): UseCaseKind {
@@ -851,6 +1056,17 @@ function versionScore(value: string): number {
 
 function providerFromExact(exactModel: string): string {
   return exactModel.split('@')[1] ?? 'unknown'
+}
+
+function breadcrumbPaths(path: string | null): string[] {
+  if (!path) return []
+  const parts = path.split('.')
+  return parts.map((_, index) => parts.slice(0, index + 1).join('.'))
+}
+
+function lastPathSegment(path: string): string {
+  const parts = path.split('.')
+  return parts[parts.length - 1] || path
 }
 
 function formatQuality(value?: number): string {

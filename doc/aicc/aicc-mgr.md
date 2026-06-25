@@ -118,6 +118,16 @@ services/control_panel/ai_models/provider_secrets
 
 状态：保留并作为 AI Center 首页 snapshot 的主读接口。
 
+Request 可为空；Routing 页面按面包屑目录加载时可传：
+
+```json
+{
+  "logical_path": "llm.plan"
+}
+```
+
+传入 `logical_path` 时，Response 只返回该逻辑路径子树相关的 `directory` / `logical_definitions`，并裁剪 `providers[].models` 到挂载在该路径子树下的模型，避免 Routing 页面为了展示某一层级一次性拉取并组织完整目录。
+
 Request：
 
 ```json
@@ -382,7 +392,8 @@ Response 直接复用 `buckyos_api::QueryUsageResponse`：
     "input_tokens": 1000,
     "output_tokens": 500,
     "total_tokens": 1500,
-    "request_units": 0
+    "request_units": 0,
+    "finance_amount": 0.0123
   },
   "grouped": [],
   "buckets": [],
@@ -394,12 +405,14 @@ Response 直接复用 `buckyos_api::QueryUsageResponse`：
 
 - 从 `AIComputeCenter::usage_log_db()` 获取 DB。
 - DB 未初始化时返回空 aggregate，不报错，避免首页不可用。
-- UI 的 `UsageSummary` 可由前端基于一次 `usage.query` 聚合，也可以后续新增 `usage.summary` 作为快捷接口。
+- UI 的 `UsageSummary` 应优先使用 `usage.query` 的 summary / grouped / bucketed 结果；时间范围由前端按浏览器时区换算成 `explicit` 的 `start_time_ms` / `end_time_ms` 传给后端，避免依赖服务端本地时区。
+- `Usage Detail` 原始事件必须使用 `output_mode=events` + `limit` + `cursor` 分页加载，不应为了前端分页或统计一次性加载全部事件。
+- `Usage Detail` 的 Provider / Model / App 筛选应通过 `provider_instance_names`、`provider_instance_query`、`provider_models`、`provider_model_query`、`caller_app_ids`、`caller_app_query` 下推到后端；数组字段表示多选精确匹配，`*_query` 表示前端输入框的模糊匹配文本。
 
 建议前端调用：
 
-- Summary：`time_range.kind=last30d`, `output_mode=summary`, `group_by=["provider_model"]`。
-- Trend：`time_range.kind=last30d`, `time_bucket=day`, `output_mode=summary`。
+- Summary：`time_range.kind=explicit`, `output_mode=summary`, `group_by=["provider_model"]`。
+- Trend：`time_range.kind=explicit`, `time_bucket=day`, `output_mode=summary`。
 
 ### 4.7 `service.reload_settings`
 

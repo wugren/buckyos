@@ -171,6 +171,7 @@ interface RawUsageAggregate {
   output_tokens?: unknown
   total_tokens?: unknown
   request_units?: unknown
+  finance_amount?: unknown
 }
 
 interface RawUsageGroupedRow {
@@ -205,6 +206,7 @@ interface RawUsageQueryResponse {
   grouped?: RawUsageGroupedRow[]
   buckets?: RawUsageBucketedRow[]
   events?: RawUsageEvent[]
+  next_cursor?: unknown
 }
 
 interface AiccDataProvider {
@@ -217,6 +219,8 @@ interface AiccDataProvider {
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage>
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView>
 }
 
 export interface AICCMgr {
@@ -232,6 +236,38 @@ export interface AICCMgr {
   updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
   setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage>
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView>
+}
+
+export interface UsageTimeRange {
+  startTimeMs: number
+  endTimeMs: number
+}
+
+export interface UsageEventsQuery {
+  timeRange: UsageTimeRange
+  filters?: {
+    providerModels?: string[]
+    providerModelQuery?: string
+    providerInstanceNames?: string[]
+    providerInstanceQuery?: string
+    appIds?: string[]
+    appQuery?: string
+  }
+  cursor?: string
+  limit: number
+}
+
+export interface UsageEventsPage {
+  events: StoreSnapshot['usageEvents']
+  totalRequests: number
+  nextCursor?: string
+}
+
+export interface RoutingDirectoryView {
+  routingView: GlobalRoutingView
+  models: ModelMetadata[]
 }
 
 export class AICCModelStore implements AICCMgr {
@@ -309,6 +345,14 @@ export class AICCModelStore implements AICCMgr {
     return this.provider.validateConnection(draft)
   }
 
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    return this.provider.queryUsageEvents(params)
+  }
+
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    return this.provider.queryRoutingDirectory(path)
+  }
+
   private emit() {
     this.listeners.forEach((listener) => listener())
   }
@@ -346,7 +390,7 @@ class MockAiccProvider implements AiccDataProvider {
     this.store.refreshProviderModels(id)
   }
 
-  async updateProviderKey(provider: ProviderView, _apiKey: string): Promise<void> {
+  async updateProviderKey(provider: ProviderView): Promise<void> {
     this.store.updateProviderKey(provider.config.id)
   }
 
@@ -365,6 +409,36 @@ class MockAiccProvider implements AiccDataProvider {
   getUsageTrend(granularity = 'day'): UsageTrendPoint[] {
     return this.store.getUsageTrend(granularity)
   }
+
+  async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    const events = this.store.getSnapshot().usageEvents
+    const filtered = events.filter((event) => usageEventMatchesQuery(event, params))
+    const cursor = Number(params.cursor ?? 0)
+    const offset = Number.isFinite(cursor) && cursor > 0 ? cursor : 0
+    const page = filtered.slice(offset, offset + params.limit)
+    const nextOffset = offset + page.length
+    return {
+      events: page,
+      totalRequests: filtered.length,
+      nextCursor: nextOffset < filtered.length ? nextOffset.toString() : undefined,
+    }
+  }
+
+  async queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    const snapshot = this.store.getSnapshot()
+    return {
+      routingView: {
+        ...snapshot.routingView,
+        logical_tree: path
+          ? childLogicalNodes(snapshot.routingView.logical_tree, path)
+          : snapshot.routingView.logical_tree,
+      },
+      models: [
+        ...snapshot.providers.flatMap((provider) => provider.status.discovered_models),
+        ...snapshot.localModels,
+      ],
+    }
+  }
 }
 
 class BuckyOSAiccProvider implements AiccDataProvider {
@@ -374,60 +448,56 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   private usageTrend: UsageTrendPoint[] = []
 
   async fetchSnapshot(): Promise<StoreSnapshot> {
-    const [directory, usageByModel, usageByCapability, usageByApp, usageTrend, usageEvents, usageLastDay, usageThisMonth] = await Promise.all([
+    const dashboardRange = localTrailingDaysRange(30)
+    const todayRange = localTodayRange()
+    const monthRange = localCurrentMonthRange()
+    const [directory, usageByModel, usageByCapability, usageByApp, usageTrend, usageToday, usageThisMonth] = await Promise.all([
       this.call<RawModelDirectory>('models.list', {}),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['provider_model'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['capability'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['caller_app_id'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         time_bucket: 'day',
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
-        filters: {},
-        output_mode: 'events',
-      }),
-      this.queryUsage({
-        time_range: { kind: 'last1d' },
+        time_range: toRawTimeRange(todayRange),
         filters: {},
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: currentMonthTimeRange(),
+        time_range: toRawTimeRange(monthRange),
         filters: {},
         output_mode: 'summary',
       }),
     ])
-    const convertedUsageEvents = toUsageEvents(usageEvents)
     this.usageSummary = toUsageSummary({
       byModel: usageByModel,
       byCapability: usageByCapability,
       byApp: usageByApp,
-      lastDay: usageLastDay,
+      today: usageToday,
       thisMonth: usageThisMonth,
-      usageEvents: convertedUsageEvents,
     })
-    this.usageTrend = toUsageTrend(usageTrend, convertedUsageEvents)
+    this.usageTrend = toUsageTrend(usageTrend)
     const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
-    return toStoreSnapshot(directory, rawProviders, convertedUsageEvents)
+    return toStoreSnapshot(directory, rawProviders, [])
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
@@ -508,6 +578,39 @@ class BuckyOSAiccProvider implements AiccDataProvider {
 
   getUsageTrend(): UsageTrendPoint[] {
     return this.usageTrend
+  }
+
+  async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    const response = await this.queryUsage({
+      time_range: toRawTimeRange(params.timeRange),
+      filters: toRawUsageFilters(params.filters),
+      output_mode: 'events',
+      limit: params.limit,
+      cursor: params.cursor,
+    })
+    return {
+      events: toUsageEvents(response),
+      totalRequests: asNumber(response.total?.total_requests, 0),
+      nextCursor: asOptionalString(response.next_cursor),
+    }
+  }
+
+  async queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    const directory = await this.call<RawModelDirectory>('models.list', path ? { logical_path: path } : {})
+    const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
+    const snapshot = toStoreSnapshot(directory, rawProviders, [])
+    return {
+      routingView: path
+        ? {
+          ...snapshot.routingView,
+          logical_tree: childLogicalNodes(snapshot.routingView.logical_tree, path),
+        }
+        : snapshot.routingView,
+      models: [
+        ...snapshot.providers.flatMap((provider) => provider.status.discovered_models),
+        ...snapshot.localModels,
+      ],
+    }
   }
 
   private async call<T>(
@@ -651,10 +754,12 @@ function toAiProviderCard(provider: ProviderView): AiProviderCard {
 function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
   const providerType = draft.provider_type ?? 'custom'
   const endpoint = draft.endpoint.trim() || defaultProviderEndpoint(providerType)
+  const instanceName = draft.provider_instance_name ?? defaultProviderInstanceName(providerType, draft.name)
+  const providerName = draft.name.trim() || providerDisplayName(providerType, instanceName)
   return {
-    provider_instance_name: draft.provider_instance_name,
+    provider_instance_name: instanceName,
     provider_type: providerType,
-    name: draft.name,
+    name: providerName,
     endpoint,
     protocol_type: draft.protocol_type,
     api_key: draft.api_key,
@@ -662,24 +767,12 @@ function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
   }
 }
 
-function currentMonthTimeRange(): Record<string, unknown> {
-  const start = new Date()
-  start.setDate(1)
-  start.setHours(0, 0, 0, 0)
-  return {
-    kind: 'explicit',
-    start_time_ms: start.getTime(),
-    end_time_ms: Date.now(),
-  }
-}
-
 function toUsageSummary(raw: {
   byModel: RawUsageQueryResponse
   byCapability: RawUsageQueryResponse
   byApp: RawUsageQueryResponse
-  lastDay: RawUsageQueryResponse
+  today: RawUsageQueryResponse
   thisMonth: RawUsageQueryResponse
-  usageEvents: StoreSnapshot['usageEvents']
 }): UsageSummary {
   const total = raw.byModel.total ?? {}
   const byModel: Record<string, number> = {}
@@ -713,8 +806,8 @@ function toUsageSummary(raw: {
     by_api_namespace: byApiNamespace,
     total_tokens: aggregateTokens(total),
     total_requests: asNumber(total.total_requests, 0),
-    total_estimated_cost: aggregateUsageFinanceCost(raw.usageEvents),
-    today_tokens: aggregateTokens(raw.lastDay.total),
+    total_estimated_cost: aggregateFinanceAmount(total),
+    today_tokens: aggregateTokens(raw.today.total),
     this_month_tokens: aggregateTokens(raw.thisMonth.total),
     by_provider: byProvider,
     by_model: byModel,
@@ -757,18 +850,12 @@ function providerInstanceFromExactModel(model: string): string | undefined {
   return model.slice(at + 1)
 }
 
-function toUsageTrend(raw: RawUsageQueryResponse, usageEvents: StoreSnapshot['usageEvents']): UsageTrendPoint[] {
+function toUsageTrend(raw: RawUsageQueryResponse): UsageTrendPoint[] {
   const buckets = Array.isArray(raw.buckets) ? raw.buckets : []
-  const costByDate = usageEvents.reduce<Record<string, number>>((acc, event) => {
-    const date = event.timestamp.slice(0, 10)
-    acc[date] = (acc[date] ?? 0) + usageFinanceAmount(event)
-    return acc
-  }, {})
-
   return buckets.map((bucket) => ({
-    timestamp: new Date(asNumber(bucket.bucket_start_ms, 0)).toISOString().slice(0, 10),
+    timestamp: localDateKey(new Date(asNumber(bucket.bucket_start_ms, 0))),
     tokens: aggregateTokens(bucket.aggregate),
-    estimated_cost: Number((costByDate[new Date(asNumber(bucket.bucket_start_ms, 0)).toISOString().slice(0, 10)] ?? 0).toFixed(4)),
+    estimated_cost: aggregateFinanceAmount(bucket.aggregate),
   }))
 }
 
@@ -840,19 +927,111 @@ function toUsageFinanceSnapshot(value: unknown): StoreSnapshot['usageEvents'][nu
   }
 }
 
-function usageFinanceAmount(event: StoreSnapshot['usageEvents'][number]): number {
-  return event.finance_snapshot?.amount ?? 0
-}
-
-function aggregateUsageFinanceCost(events: StoreSnapshot['usageEvents']): number {
-  return Number(events.reduce((sum, event) => sum + usageFinanceAmount(event), 0).toFixed(2))
-}
-
 function aggregateTokens(raw?: RawUsageAggregate): number {
   if (!raw) return 0
   return asNumber(raw.total_tokens, 0)
     || asNumber(raw.input_tokens, 0) + asNumber(raw.output_tokens, 0)
     || asNumber(raw.request_units, 0)
+}
+
+function aggregateFinanceAmount(raw?: RawUsageAggregate): number {
+  return Number(asNumber(raw?.finance_amount, 0).toFixed(6))
+}
+
+function localDayStart(value = new Date()): Date {
+  const result = new Date(value)
+  result.setHours(0, 0, 0, 0)
+  return result
+}
+
+function localMonthStart(value = new Date()): Date {
+  const result = localDayStart(value)
+  result.setDate(1)
+  return result
+}
+
+function localTodayRange(): UsageTimeRange {
+  return { startTimeMs: localDayStart().getTime(), endTimeMs: Date.now() }
+}
+
+function localCurrentMonthRange(): UsageTimeRange {
+  return { startTimeMs: localMonthStart().getTime(), endTimeMs: Date.now() }
+}
+
+function localTrailingDaysRange(days: number): UsageTimeRange {
+  const start = localDayStart()
+  start.setDate(start.getDate() - Math.max(0, days - 1))
+  return { startTimeMs: start.getTime(), endTimeMs: Date.now() }
+}
+
+function toRawTimeRange(range: UsageTimeRange): Record<string, unknown> {
+  return {
+    kind: 'explicit',
+    start_time_ms: range.startTimeMs,
+    end_time_ms: range.endTimeMs,
+  }
+}
+
+function toRawUsageFilters(filters: UsageEventsQuery['filters'] = {}): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  if (filters.providerModels?.length) {
+    result.provider_models = filters.providerModels
+  }
+  if (filters.providerModelQuery?.trim()) {
+    result.provider_model_query = filters.providerModelQuery.trim()
+  }
+  if (filters.providerInstanceNames?.length) {
+    result.provider_instance_names = filters.providerInstanceNames
+  }
+  if (filters.providerInstanceQuery?.trim()) {
+    result.provider_instance_query = filters.providerInstanceQuery.trim()
+  }
+  if (filters.appIds?.length) {
+    result.caller_app_ids = filters.appIds
+  }
+  if (filters.appQuery?.trim()) {
+    result.caller_app_query = filters.appQuery.trim()
+  }
+  return result
+}
+
+function usageEventMatchesQuery(event: StoreSnapshot['usageEvents'][number], params: UsageEventsQuery): boolean {
+  const eventTime = new Date(event.timestamp).getTime()
+  if (!Number.isFinite(eventTime)) return false
+  if (eventTime < params.timeRange.startTimeMs || eventTime >= params.timeRange.endTimeMs) return false
+  const filters = params.filters ?? {}
+  if (filters.providerModels?.length && !filters.providerModels.includes(event.exact_model)) return false
+  if (filters.providerModelQuery?.trim() && !includesFuzzy(event.exact_model, filters.providerModelQuery)) return false
+  if (filters.providerInstanceNames?.length && !filters.providerInstanceNames.includes(event.provider_instance_name)) return false
+  if (filters.providerInstanceQuery?.trim() && !includesFuzzy(event.provider_instance_name, filters.providerInstanceQuery)) return false
+  const appValue = `${event.app_id ?? 'system'} ${event.agent_id ?? ''}`.trim()
+  if (filters.appIds?.length && !filters.appIds.some((id) => id === (event.app_id ?? 'system') || id === event.agent_id)) return false
+  if (filters.appQuery?.trim() && !includesFuzzy(appValue, filters.appQuery)) return false
+  return true
+}
+
+function includesFuzzy(value: string, query: string): boolean {
+  return value.toLowerCase().includes(query.trim().toLowerCase())
+}
+
+function localDateKey(value: Date): string {
+  const year = value.getFullYear()
+  const month = String(value.getMonth() + 1).padStart(2, '0')
+  const day = String(value.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function childLogicalNodes(nodes: LogicalNode[], path: string): LogicalNode[] {
+  return findLogicalNode(nodes, path)?.children ?? []
+}
+
+function findLogicalNode(nodes: LogicalNode[], path: string): LogicalNode | undefined {
+  for (const node of nodes) {
+    if (node.path === path) return node
+    const child = findLogicalNode(node.children ?? [], path)
+    if (child) return child
+  }
+  return undefined
 }
 
 function toStoreSnapshot(

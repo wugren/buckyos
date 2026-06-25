@@ -1,9 +1,9 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, CreditCard, DollarSign, HelpCircle, Route, Wallet } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
-import { useAIStatus, useProviders, useRouteTraces, useUsageEvents, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
+import { useAICCStore, useAIStatus, useProviders, useRouteTraces, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
 import { SummaryCard } from '../shared/SummaryCard'
-import type { RouteTrace, UsageEvent } from '../../../../api/aicc_mgr'
+import type { RouteTrace, UsageEvent, UsageEventsPage, UsageTimeRange } from '../../../../api/aicc_mgr'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -32,25 +32,110 @@ function usageFinanceAmount(event: UsageEvent): number {
   return event.finance_snapshot?.amount ?? 0
 }
 
+function usageTokens(event: UsageEvent): number {
+  return event.token_equivalent ?? (event.tokens_in ?? 0) + (event.tokens_out ?? 0)
+}
+
+function formatUsd(amount: number, compact = false): string {
+  if (amount === 0) return '$0'
+  const abs = Math.abs(amount)
+  if (abs < 0.0001) return amount < 0 ? '>-$0.0001' : '<$0.0001'
+  if (abs < 0.01) return `$${amount.toFixed(4)}`
+  return `$${amount.toFixed(compact ? 2 : 4)}`
+}
+
+function formatLocalTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString(undefined, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function dateInputStart(value: string): number | null {
+  if (!value) return null
+  const date = new Date(`${value}T00:00:00`)
+  return Number.isNaN(date.getTime()) ? null : date.getTime()
+}
+
+function dateInputEnd(value: string): number | null {
+  if (!value) return null
+  const date = new Date(`${value}T23:59:59.999`)
+  return Number.isNaN(date.getTime()) ? null : date.getTime()
+}
+
+function localDayStart(value = new Date()): Date {
+  const result = new Date(value)
+  result.setHours(0, 0, 0, 0)
+  return result
+}
+
+function localTrailingDaysRange(days: number): UsageTimeRange {
+  const start = localDayStart()
+  start.setDate(start.getDate() - Math.max(0, days - 1))
+  return { startTimeMs: start.getTime(), endTimeMs: Date.now() }
+}
+
+function timeRangeToQuery(
+  value: TimeRangeFilter,
+  customStartDate: string,
+  customEndDate: string,
+  nowMs: number,
+): UsageTimeRange {
+  if (value === 'custom') {
+    const start = dateInputStart(customStartDate) ?? localTrailingDaysRange(30).startTimeMs
+    const end = dateInputEnd(customEndDate) ?? nowMs
+    return { startTimeMs: start, endTimeMs: end }
+  }
+  const duration = value === '24h'
+    ? 24 * 60 * 60 * 1000
+    : value === '7d'
+      ? 7 * 24 * 60 * 60 * 1000
+      : value === '30d'
+        ? 30 * 24 * 60 * 60 * 1000
+        : null
+  if (duration != null) {
+    return { startTimeMs: nowMs - duration, endTimeMs: nowMs }
+  }
+  return localTrailingDaysRange(30)
+}
+
 function uniqueSorted(values: Array<string | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value)))).sort((a, b) => a.localeCompare(b))
 }
 
-type TimeRangeFilter = 'all' | '24h' | '7d' | '30d'
+type TimeRangeFilter = 'all' | '24h' | '7d' | '30d' | 'custom'
 type BreakdownFilterTarget = 'provider' | 'model' | 'appAgent'
+type MultiFilter = {
+  query: string
+  selected: string[]
+}
+const PAGE_SIZE = 10
+const EMPTY_MULTI_FILTER: MultiFilter = { query: '', selected: [] }
 
 export function UsageDashboard() {
   const { t } = useI18n()
+  const store = useAICCStore()
   const status = useAIStatus()
   const providers = useProviders()
   const summary = useUsageSummary()
   const trend = useUsageTrend('day')
-  const events = useUsageEvents()
   const traces = useRouteTraces()
   const [timeRange, setTimeRange] = useState<TimeRangeFilter>('all')
-  const [providerFilter, setProviderFilter] = useState('all')
-  const [modelFilter, setModelFilter] = useState('all')
-  const [appAgentFilter, setAppAgentFilter] = useState('all')
+  const [providerFilter, setProviderFilter] = useState<MultiFilter>(EMPTY_MULTI_FILTER)
+  const [modelFilter, setModelFilter] = useState<MultiFilter>(EMPTY_MULTI_FILTER)
+  const [appAgentFilter, setAppAgentFilter] = useState<MultiFilter>(EMPTY_MULTI_FILTER)
+  const [customStartDate, setCustomStartDate] = useState('')
+  const [customEndDate, setCustomEndDate] = useState('')
+  const [detailPage, setDetailPage] = useState(1)
+  const [nowMs] = useState(() => Date.now())
+  const [pageCursors, setPageCursors] = useState<Record<number, string | undefined>>({ 1: undefined })
+  const [usagePage, setUsagePage] = useState<UsageEventsPage>({ events: [], totalRequests: 0 })
+  const [usageLoading, setUsageLoading] = useState(false)
+  const [usageError, setUsageError] = useState<string | null>(null)
   const detailRef = useRef<HTMLElement | null>(null)
 
   const snProvider = providers.find((p) => p.config.provider_type === 'sn_router')
@@ -58,35 +143,90 @@ export function UsageDashboard() {
   const balanceProviders = providers.filter((p) => p.account.balance_supported && p.account.balance_value != null)
   const usageOnlyProviders = providers.filter((p) => p.account.usage_supported && !p.account.balance_supported)
   const maxTrendTokens = Math.max(...trend.map((p) => p.tokens), 1)
-  const sortedEvents = useMemo(
-    () => [...events].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
-    [events],
+  const providerOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_provider)), [summary.by_provider])
+  const modelOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_model)), [summary.by_model])
+  const appAgentOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_app)), [summary.by_app])
+  const usageQueryRange = useMemo(
+    () => timeRangeToQuery(timeRange, customStartDate, customEndDate, nowMs),
+    [customEndDate, customStartDate, nowMs, timeRange],
   )
-  const providerOptions = useMemo(() => uniqueSorted(events.map((event) => event.provider_instance_name)), [events])
-  const modelOptions = useMemo(() => uniqueSorted(events.map((event) => event.exact_model)), [events])
-  const appAgentOptions = useMemo(
-    () => uniqueSorted(events.flatMap((event) => [event.app_id ?? 'system', event.agent_id])),
-    [events],
-  )
-  const filteredEvents = useMemo(() => {
-    const now = Date.now()
-    const minTime = timeRange === '24h'
-      ? now - 24 * 60 * 60 * 1000
-      : timeRange === '7d'
-        ? now - 7 * 24 * 60 * 60 * 1000
-        : timeRange === '30d'
-          ? now - 30 * 24 * 60 * 60 * 1000
-          : null
+  const usageQueryFilters = useMemo(() => ({
+    providerInstanceNames: providerFilter.selected,
+    providerInstanceQuery: providerFilter.query,
+    providerModels: modelFilter.selected,
+    providerModelQuery: modelFilter.query,
+    appIds: appAgentFilter.selected,
+    appQuery: appAgentFilter.query,
+  }), [appAgentFilter, modelFilter, providerFilter])
+  const currentCursor = pageCursors[detailPage]
+  const effectiveDetailPage = detailPage
+  const pageStart = (effectiveDetailPage - 1) * PAGE_SIZE
+  const pagedEvents = usagePage.events
+  const detailPageCount = Math.max(1, Math.ceil(usagePage.totalRequests / PAGE_SIZE))
+  const canGoNext = effectiveDetailPage < detailPageCount && pageCursors[effectiveDetailPage + 1] != null
 
-    return sortedEvents.filter((event) => {
-      const eventTime = new Date(event.timestamp).getTime()
-      if (minTime != null && eventTime < minTime) return false
-      if (providerFilter !== 'all' && event.provider_instance_name !== providerFilter) return false
-      if (modelFilter !== 'all' && event.exact_model !== modelFilter) return false
-      if (appAgentFilter !== 'all' && (event.app_id ?? 'system') !== appAgentFilter && event.agent_id !== appAgentFilter) return false
-      return true
-    })
-  }, [appAgentFilter, modelFilter, providerFilter, sortedEvents, timeRange])
+  useEffect(() => {
+    let cancelled = false
+    async function loadUsagePage() {
+      setUsageLoading(true)
+      setUsageError(null)
+      try {
+        const page = await store.queryUsageEvents({
+          timeRange: usageQueryRange,
+          filters: usageQueryFilters,
+          cursor: currentCursor,
+          limit: PAGE_SIZE,
+        })
+        if (cancelled) return
+        setUsagePage(page)
+        setPageCursors((current) => {
+          if (current[detailPage + 1] === page.nextCursor) return current
+          return {
+            ...current,
+            [detailPage + 1]: page.nextCursor,
+          }
+        })
+      } catch (error) {
+        if (cancelled) return
+        console.error('aicc.usage.query events failed', error)
+        setUsagePage({ events: [], totalRequests: 0 })
+        setUsageError(t('aiCenter.home.usageLoadFailed', 'Could not load usage events.'))
+      } finally {
+        if (!cancelled) {
+          setUsageLoading(false)
+        }
+      }
+    }
+    void loadUsagePage()
+    return () => {
+      cancelled = true
+    }
+  }, [currentCursor, detailPage, store, t, usageQueryFilters, usageQueryRange])
+
+  const resetUsagePaging = () => {
+    setDetailPage(1)
+    setPageCursors({ 1: undefined })
+  }
+
+  const updateTimeRange = (value: TimeRangeFilter) => {
+    setTimeRange(value)
+    resetUsagePaging()
+  }
+
+  const updateProviderFilter = (value: MultiFilter) => {
+    setProviderFilter(value)
+    resetUsagePaging()
+  }
+
+  const updateModelFilter = (value: MultiFilter) => {
+    setModelFilter(value)
+    resetUsagePaging()
+  }
+
+  const updateAppAgentFilter = (value: MultiFilter) => {
+    setAppAgentFilter(value)
+    resetUsagePaging()
+  }
 
   const balanceSubtitle = balanceProviders
     .map((p) => {
@@ -112,9 +252,10 @@ export function UsageDashboard() {
 
   const applyBreakdownFilter = (target: BreakdownFilterTarget, value: string) => {
     setTimeRange('all')
-    setProviderFilter(target === 'provider' ? value : 'all')
-    setModelFilter(target === 'model' ? value : 'all')
-    setAppAgentFilter(target === 'appAgent' ? value : 'all')
+    setProviderFilter(target === 'provider' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
+    setModelFilter(target === 'model' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
+    setAppAgentFilter(target === 'appAgent' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
+    resetUsagePaging()
     window.requestAnimationFrame(() => {
       detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     })
@@ -138,7 +279,7 @@ export function UsageDashboard() {
         <SummaryCard
           icon={<DollarSign size={18} />}
           title={t('aiCenter.home.estimatedCost', 'Est. Cost')}
-          value={`$${summary.total_estimated_cost.toFixed(2)}`}
+          value={formatUsd(summary.total_estimated_cost, true)}
           subtitle={t('aiCenter.home.costEstimated', 'Estimated from usage events')}
         />
         <SummaryCard
@@ -195,12 +336,12 @@ export function UsageDashboard() {
         <h3 className="text-sm font-medium mb-3" style={{ color: 'var(--cp-text)' }}>
           {t('aiCenter.home.usageSummary', 'Usage Summary')}
         </h3>
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4 items-stretch">
           <Stat label={t('aiCenter.home.today', 'Today')} value={`${formatTokens(summary.today_tokens)} tokens`} />
           <Stat label={t('aiCenter.home.thisMonth', 'This Month')} value={`${formatTokens(summary.this_month_tokens)} tokens`} />
           <Stat label={t('aiCenter.home.total', 'Total')} value={`${formatTokens(summary.total_tokens)} tokens`} />
           <Stat label={t('aiCenter.home.requests', 'Requests')} value={summary.total_requests.toString()} />
-          <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={`$${summary.total_estimated_cost.toFixed(2)}`} />
+          <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={formatUsd(summary.total_estimated_cost, true)} />
         </div>
       </section>
 
@@ -209,7 +350,7 @@ export function UsageDashboard() {
           title={t('aiCenter.home.byProvider', 'By Provider Instance')}
           rows={sortedEntries(summary.by_provider)}
           total={summary.total_tokens}
-          activeLabel={providerFilter !== 'all' ? providerFilter : undefined}
+          activeLabel={providerFilter.selected.length === 1 && !providerFilter.query ? providerFilter.selected[0] : undefined}
           onSelect={(label) => applyBreakdownFilter('provider', label)}
           viewAllLabel={t('aiCenter.home.viewAll', 'View all')}
           showLessLabel={t('aiCenter.home.showLess', 'Show less')}
@@ -220,7 +361,7 @@ export function UsageDashboard() {
           title={t('aiCenter.home.byModel', 'By Exact Model')}
           rows={sortedEntries(summary.by_model)}
           total={summary.total_tokens}
-          activeLabel={modelFilter !== 'all' ? modelFilter : undefined}
+          activeLabel={modelFilter.selected.length === 1 && !modelFilter.query ? modelFilter.selected[0] : undefined}
           onSelect={(label) => applyBreakdownFilter('model', label)}
           viewAllLabel={t('aiCenter.home.viewAll', 'View all')}
           showLessLabel={t('aiCenter.home.showLess', 'Show less')}
@@ -231,7 +372,7 @@ export function UsageDashboard() {
           title={t('aiCenter.home.byApp', 'By App / Agent')}
           rows={sortedEntries(summary.by_app)}
           total={summary.total_tokens}
-          activeLabel={appAgentFilter !== 'all' ? appAgentFilter : undefined}
+          activeLabel={appAgentFilter.selected.length === 1 && !appAgentFilter.query ? appAgentFilter.selected[0] : undefined}
           onSelect={(label) => applyBreakdownFilter('appAgent', label)}
           viewAllLabel={t('aiCenter.home.viewAll', 'View all')}
           showLessLabel={t('aiCenter.home.showLess', 'Show less')}
@@ -280,38 +421,62 @@ export function UsageDashboard() {
               {t('aiCenter.home.detailTable', 'Usage Detail')}
             </h3>
             <span className="text-xs" style={{ color: 'var(--cp-muted)' }}>
-              {filteredEvents.length} / {events.length}
+              {usageLoading ? t('common.loading', 'Loading') : usagePage.totalRequests}
             </span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
             <FilterSelect
               label={t('aiCenter.home.filterTimeRange', 'Time Range')}
               value={timeRange}
-              onChange={(value) => setTimeRange(value as TimeRangeFilter)}
+              onChange={(value) => updateTimeRange(value as TimeRangeFilter)}
               options={[
                 ['all', t('aiCenter.home.allTime', 'All time')],
                 ['24h', t('aiCenter.home.last24Hours', 'Last 24 hours')],
                 ['7d', t('aiCenter.home.last7Days', 'Last 7 days')],
                 ['30d', t('aiCenter.home.last30Days', 'Last 30 days')],
+                ['custom', t('aiCenter.home.customRange', 'Custom range')],
               ]}
             />
-            <FilterSelect
+            {timeRange === 'custom' && (
+              <>
+                <DateFilter
+                  label={t('aiCenter.home.filterStartDate', 'Start Date')}
+                  value={customStartDate}
+                  onChange={(value) => {
+                    setCustomStartDate(value)
+                    resetUsagePaging()
+                  }}
+                />
+                <DateFilter
+                  label={t('aiCenter.home.filterEndDate', 'End Date')}
+                  value={customEndDate}
+                  onChange={(value) => {
+                    setCustomEndDate(value)
+                    resetUsagePaging()
+                  }}
+                />
+              </>
+            )}
+            <MultiSelectFilter
               label={t('aiCenter.home.filterProvider', 'Provider')}
               value={providerFilter}
-              onChange={setProviderFilter}
-              options={[['all', t('aiCenter.home.allProviders', 'All providers')], ...providerOptions.map((item) => [item, item] as [string, string])]}
+              onChange={updateProviderFilter}
+              options={providerOptions}
+              allLabel={t('aiCenter.home.allProviders', 'All providers')}
             />
-            <FilterSelect
+            <MultiSelectFilter
               label={t('aiCenter.home.filterModel', 'Model')}
               value={modelFilter}
-              onChange={setModelFilter}
-              options={[['all', t('aiCenter.home.allModels', 'All models')], ...modelOptions.map((item) => [item, item] as [string, string])]}
+              onChange={updateModelFilter}
+              options={modelOptions}
+              allLabel={t('aiCenter.home.allModels', 'All models')}
             />
-            <FilterSelect
+            <MultiSelectFilter
               label={t('aiCenter.home.filterAppAgent', 'App / Agent')}
               value={appAgentFilter}
-              onChange={setAppAgentFilter}
-              options={[['all', t('aiCenter.home.allAppsAgents', 'All apps / agents')], ...appAgentOptions.map((item) => [item, item] as [string, string])]}
+              onChange={updateAppAgentFilter}
+              options={appAgentOptions}
+              allLabel={t('aiCenter.home.allAppsAgents', 'All apps / agents')}
             />
           </div>
         </div>
@@ -337,11 +502,11 @@ export function UsageDashboard() {
               </tr>
             </thead>
             <tbody>
-              {filteredEvents.map((event) => {
-                const tokens = event.token_equivalent ?? (event.tokens_in ?? 0) + (event.tokens_out ?? 0)
+              {pagedEvents.map((event) => {
+                const tokens = usageTokens(event)
                 return (
                   <tr key={event.id} style={{ borderTop: '1px solid var(--cp-border)' }}>
-                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-muted)' }}>{event.timestamp.slice(5, 16).replace('T', ' ')}</td>
+                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp)}</td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>
                       <TruncatedText value={event.provider_instance_name} className="max-w-[160px]" />
                     </td>
@@ -354,12 +519,12 @@ export function UsageDashboard() {
                     </td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-muted)' }}>{event.session_id}</td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>{formatTokens(tokens)}</td>
-                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>${usageFinanceAmount(event).toFixed(4)}</td>
+                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>{formatUsd(usageFinanceAmount(event))}</td>
                     <td className="px-4 py-2 text-xs" style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>{event.status}</td>
                   </tr>
                 )
               })}
-              {filteredEvents.length === 0 && (
+              {!usageLoading && pagedEvents.length === 0 && (
                 <tr style={{ borderTop: '1px solid var(--cp-border)' }}>
                   <td className="px-4 py-8 text-center text-xs" colSpan={9} style={{ color: 'var(--cp-muted)' }}>
                     {t('aiCenter.home.noUsageEvents', 'No usage events match the current filters.')}
@@ -369,6 +534,41 @@ export function UsageDashboard() {
             </tbody>
           </table>
         </div>
+        {usageError && (
+          <div className="px-4 py-3 text-xs" style={{ color: 'var(--cp-danger)', background: 'var(--cp-surface)', borderTop: '1px solid var(--cp-border)' }}>
+            {usageError}
+          </div>
+        )}
+        {usagePage.totalRequests > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3" style={{ background: 'var(--cp-surface)', borderTop: '1px solid var(--cp-border)' }}>
+            <span className="text-xs" style={{ color: 'var(--cp-muted)' }}>
+              {pageStart + 1}-{Math.min(pageStart + pagedEvents.length, usagePage.totalRequests)} / {usagePage.totalRequests}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setDetailPage((page) => Math.max(1, page - 1))}
+                disabled={effectiveDetailPage <= 1}
+                className="h-8 rounded-md px-3 text-xs disabled:opacity-45"
+                style={{ color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
+              >
+                {t('common.prev', 'Prev')}
+              </button>
+              <span className="text-xs tabular-nums" style={{ color: 'var(--cp-muted)' }}>
+                {effectiveDetailPage} / {detailPageCount}
+              </span>
+              <button
+                type="button"
+                onClick={() => setDetailPage((page) => Math.min(detailPageCount, page + 1))}
+                disabled={!canGoNext}
+                className="h-8 rounded-md px-3 text-xs disabled:opacity-45"
+                style={{ color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
+              >
+                {t('common.next', 'Next')}
+              </button>
+            </div>
+          </div>
+        )}
       </section>
     </div>
   )
@@ -408,10 +608,112 @@ function FilterSelect({
   )
 }
 
+function MultiSelectFilter({
+  label,
+  value,
+  onChange,
+  options,
+  allLabel,
+}: {
+  label: string
+  value: MultiFilter
+  onChange: (value: MultiFilter) => void
+  options: string[]
+  allLabel: string
+}) {
+  const selectedCount = value.selected.length
+  const toggleOption = (option: string) => {
+    const selected = value.selected.includes(option)
+      ? value.selected.filter((item) => item !== option)
+      : [...value.selected, option]
+    onChange({ ...value, selected })
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+      <span className="truncate" title={label}>{label}</span>
+      <input
+        value={value.query}
+        onChange={(event) => onChange({ ...value, query: event.target.value })}
+        placeholder={allLabel}
+        className="h-9 min-w-0 rounded-md px-2 text-xs outline-none"
+        style={{
+          background: 'var(--cp-bg)',
+          border: '1px solid var(--cp-border)',
+          color: 'var(--cp-text)',
+        }}
+      />
+      <details className="relative">
+        <summary
+          className="flex h-8 cursor-pointer list-none items-center justify-between rounded-md px-2 text-xs"
+          style={{
+            background: 'var(--cp-bg)',
+            border: '1px solid var(--cp-border)',
+            color: selectedCount > 0 ? 'var(--cp-text)' : 'var(--cp-muted)',
+          }}
+        >
+          <span className="truncate">{selectedCount > 0 ? `${selectedCount} selected` : allLabel}</span>
+          <span aria-hidden>v</span>
+        </summary>
+        <div
+          className="absolute left-0 top-9 z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-md p-2 shadow-lg"
+          style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+        >
+          <button
+            type="button"
+            onClick={() => onChange({ ...value, selected: [] })}
+            className="rounded px-2 py-1 text-left text-xs"
+            style={{ color: 'var(--cp-accent)' }}
+          >
+            {allLabel}
+          </button>
+          {options.map((option) => (
+            <label key={option} className="flex min-h-7 items-center gap-2 rounded px-2 py-1 text-xs" style={{ color: 'var(--cp-text)' }}>
+              <input
+                type="checkbox"
+                checked={value.selected.includes(option)}
+                onChange={() => toggleOption(option)}
+              />
+              <span className="truncate" title={option}>{option}</span>
+            </label>
+          ))}
+        </div>
+      </details>
+    </div>
+  )
+}
+
+function DateFilter({
+  label,
+  value,
+  onChange,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className="flex flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+      <span>{label}</span>
+      <input
+        type="date"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-9 rounded-md px-2 text-xs outline-none"
+        style={{
+          background: 'var(--cp-bg)',
+          border: '1px solid var(--cp-border)',
+          color: 'var(--cp-text)',
+        }}
+      />
+    </label>
+  )
+}
+
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div>
-      <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{label}</div>
+    <div className="flex h-full min-w-0 flex-col">
+      <div className="flex min-h-8 items-end text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
       <div className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{value}</div>
     </div>
   )

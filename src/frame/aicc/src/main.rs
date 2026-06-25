@@ -686,8 +686,17 @@ impl AiccHttpServer {
         }
     }
 
-    fn handle_models_list(&self) -> std::result::Result<serde_json::Value, RPCErrors> {
-        self.rpc_handler.0.dump_model_directory()
+    fn handle_models_list(&self, params: &Value) -> std::result::Result<serde_json::Value, RPCErrors> {
+        let directory = self.rpc_handler.0.dump_model_directory()?;
+        let logical_path = params
+            .get("logical_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        Ok(match logical_path {
+            Some(path) => filter_model_directory_by_path(directory, path),
+            None => directory,
+        })
     }
 
     async fn handle_reload_settings(&self) -> std::result::Result<serde_json::Value, RPCErrors> {
@@ -1128,6 +1137,78 @@ impl AiccHttpServer {
     }
 }
 
+fn filter_model_directory_by_path(mut value: Value, logical_path: &str) -> Value {
+    let mut keep_paths = HashSet::new();
+    if let Some(directory) = value.get("directory").and_then(Value::as_object) {
+        for path in directory.keys() {
+            if logical_path_matches(path, logical_path) {
+                keep_paths.insert(path.clone());
+            }
+        }
+    }
+    if let Some(definitions) = value
+        .get("logical_definitions")
+        .and_then(Value::as_array)
+    {
+        for definition in definitions {
+            if let Some(path) = definition.get("path").and_then(Value::as_str) {
+                if logical_path_matches(path, logical_path) {
+                    keep_paths.insert(path.to_string());
+                }
+            }
+        }
+    }
+    keep_paths.insert(logical_path.to_string());
+
+    if let Some(directory) = value.get_mut("directory").and_then(Value::as_object_mut) {
+        directory.retain(|path, _| keep_paths.contains(path));
+    }
+
+    if let Some(definitions) = value
+        .get_mut("logical_definitions")
+        .and_then(Value::as_array_mut)
+    {
+        definitions.retain(|definition| {
+            definition
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| keep_paths.contains(path))
+                .unwrap_or(false)
+        });
+    }
+
+    if let Some(providers) = value.get_mut("providers").and_then(Value::as_array_mut) {
+        providers.retain_mut(|provider| {
+            let Some(models) = provider.get_mut("models").and_then(Value::as_array_mut) else {
+                return false;
+            };
+            models.retain(|model| model_mounts_under_path(model, logical_path));
+            !models.is_empty()
+        });
+    }
+
+    value
+}
+
+fn logical_path_matches(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{}.", root))
+}
+
+fn model_mounts_under_path(model: &Value, logical_path: &str) -> bool {
+    model
+        .get("logical_mounts")
+        .and_then(Value::as_array)
+        .map(|mounts| {
+            mounts.iter().any(|mount| {
+                mount
+                    .as_str()
+                    .map(|path| logical_path_matches(path, logical_path))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[async_trait::async_trait]
 impl RPCHandler for AiccHttpServer {
     async fn handle_rpc_call(
@@ -1147,7 +1228,7 @@ impl RPCHandler for AiccHttpServer {
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_MODELS_LIST || req.method == METHOD_SERVICE_MODELS_LIST {
-            let result = self.handle_models_list()?;
+            let result = self.handle_models_list(&req.params)?;
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_VALIDATE {

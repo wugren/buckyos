@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, Save, Search, ShieldCheck, Trash2 } from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
+import { AlertTriangle, ChevronDown, ChevronRight, MoreHorizontal, RefreshCw, Save, Search, ShieldCheck, Trash2 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore } from '../../hooks/use-aicc-store'
 import { StatusBadge } from '../shared/StatusBadge'
@@ -8,15 +8,25 @@ import type { AuthStatus, ModelMetadata, ProviderView } from '../../../../api/ai
 
 type TFn = (k: string, f: string) => string
 type FilterKey = 'apiType' | 'logicalMount' | 'health' | 'costClass' | 'latencyClass' | 'tier'
-type InventoryFilters = Record<FilterKey, string>
+type MultiFilter = {
+  query: string
+  selected: string[]
+}
+type InventoryFilters = Record<FilterKey, MultiFilter>
 
-const EMPTY_FILTERS: InventoryFilters = {
-  apiType: 'all',
-  logicalMount: 'all',
-  health: 'all',
-  costClass: 'all',
-  latencyClass: 'all',
-  tier: 'all',
+function emptyMultiFilter(): MultiFilter {
+  return { query: '', selected: [] }
+}
+
+function emptyInventoryFilters(): InventoryFilters {
+  return {
+    apiType: emptyMultiFilter(),
+    logicalMount: emptyMultiFilter(),
+    health: emptyMultiFilter(),
+    costClass: emptyMultiFilter(),
+    latencyClass: emptyMultiFilter(),
+    tier: emptyMultiFilter(),
+  }
 }
 
 function authStatusLabel(s: AuthStatus, t: TFn): string {
@@ -50,6 +60,17 @@ interface ProviderDetailPanelProps {
 }
 
 export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: ProviderDetailPanelProps) {
+  return (
+    <ProviderDetailPanelBody
+      key={provider.config.provider_instance_name}
+      provider={provider}
+      routingWeight={routingWeight}
+      onDeleted={onDeleted}
+    />
+  )
+}
+
+function ProviderDetailPanelBody({ provider, routingWeight, onDeleted }: ProviderDetailPanelProps) {
   const { t } = useI18n()
   const store = useAICCStore()
   const [showModels, setShowModels] = useState(true)
@@ -64,11 +85,12 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [refreshFeedback, setRefreshFeedback] = useState<string | null>(null)
   const [refreshError, setRefreshError] = useState<string | null>(null)
-  const [weightDraft, setWeightDraft] = useState(routingWeight.toString())
+  const [weightDraft, setWeightDraft] = useState(() => formatWeight(routingWeight))
   const [savingWeight, setSavingWeight] = useState(false)
   const [weightError, setWeightError] = useState<string | null>(null)
+  const [actionsOpen, setActionsOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [filters, setFilters] = useState<InventoryFilters>(EMPTY_FILTERS)
+  const [filters, setFilters] = useState<InventoryFilters>(() => emptyInventoryFilters())
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set())
 
   const { config, status, account, inventory } = provider
@@ -80,21 +102,6 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
     [models, searchQuery, filters],
   )
   const filterOptions = useMemo(() => buildInventoryFilterOptions(models), [models])
-
-  useEffect(() => {
-    setWeightDraft(formatWeight(routingWeight))
-    setWeightError(null)
-  }, [config.provider_instance_name, routingWeight])
-
-  useEffect(() => {
-    setSearchQuery('')
-    setFilters(EMPTY_FILTERS)
-    setExpandedGroups(new Set())
-    setKeyFeedback(null)
-    setRefreshFeedback(null)
-    setRefreshError(null)
-    setDeleteError(null)
-  }, [config.provider_instance_name])
 
   const parsedWeight = Number(weightDraft)
   const weightValid = Number.isFinite(parsedWeight) && parsedWeight >= 0
@@ -172,7 +179,7 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
     }
   }
 
-  const setFilter = (key: FilterKey, value: string) => {
+  const setFilter = (key: FilterKey, value: MultiFilter) => {
     setFilters((current) => ({ ...current, [key]: value }))
   }
 
@@ -198,12 +205,61 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1">
-        <h2 className="text-lg font-semibold" style={{ color: 'var(--cp-text)' }}>
-          {config.name}
-        </h2>
-        <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>
-          {config.provider_instance_name} / {config.provider_runtime_type} / {config.provider_origin}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h2 className="truncate text-lg font-semibold" style={{ color: 'var(--cp-text)' }}>
+            {config.name}
+          </h2>
+          <div className="truncate text-xs" style={{ color: 'var(--cp-muted)' }}>
+            {config.provider_instance_name} / {config.provider_runtime_type} / {config.provider_origin}
+          </div>
+        </div>
+        <div className="relative shrink-0">
+          <button
+            type="button"
+            onClick={() => setActionsOpen((value) => !value)}
+            className="flex h-9 w-9 items-center justify-center rounded-lg"
+            style={{ color: 'var(--cp-muted)', border: '1px solid var(--cp-border)' }}
+            aria-label={t('aiCenter.providers.actions', 'Provider actions')}
+          >
+            <MoreHorizontal size={18} />
+          </button>
+          {actionsOpen && (
+            <div
+              className="absolute right-0 top-10 z-10 flex w-48 flex-col rounded-lg p-1 shadow-lg"
+              style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+            >
+              <MenuAction
+                icon={<ShieldCheck size={14} />}
+                label={t('aiCenter.providers.updateKey', 'Update Key')}
+                onClick={() => {
+                  setActionsOpen(false)
+                  setShowKeyDialog(true)
+                  setKeyError(null)
+                  setKeyFeedback(null)
+                }}
+              />
+              <MenuAction
+                icon={<RefreshCw size={14} className={refreshingModels ? 'animate-spin' : ''} />}
+                label={refreshingModels ? t('aiCenter.providers.refreshingModels', 'Refreshing Models') : t('aiCenter.providers.refreshModels', 'Refresh Models')}
+                onClick={() => {
+                  setActionsOpen(false)
+                  void handleRefreshModels()
+                }}
+                disabled={refreshingModels}
+              />
+              <MenuAction
+                icon={<Trash2 size={14} />}
+                label={t('aiCenter.providers.delete', 'Delete')}
+                onClick={() => {
+                  setActionsOpen(false)
+                  setConfirmDelete(true)
+                  setDeleteError(null)
+                }}
+                danger
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -311,33 +367,6 @@ export function ProviderDetailPanel({ provider, routingWeight, onDeleted }: Prov
       )}
       {refreshError && <InlineNotice tone="error">{refreshError}</InlineNotice>}
 
-      <div className="flex flex-wrap gap-2">
-        <ActionButton
-          icon={<ShieldCheck size={14} />}
-          label={t('aiCenter.providers.updateKey', 'Update Key')}
-          onClick={() => {
-            setShowKeyDialog(true)
-            setKeyError(null)
-            setKeyFeedback(null)
-          }}
-        />
-        <ActionButton
-          icon={<RefreshCw size={14} className={refreshingModels ? 'animate-spin' : ''} />}
-          label={refreshingModels ? t('aiCenter.providers.refreshingModels', 'Refreshing Models') : t('aiCenter.providers.refreshModels', 'Refresh Models')}
-          onClick={handleRefreshModels}
-          disabled={refreshingModels}
-        />
-        <ActionButton
-          icon={<Trash2 size={14} />}
-          label={t('aiCenter.providers.delete', 'Delete')}
-          onClick={() => {
-            setConfirmDelete(true)
-            setDeleteError(null)
-          }}
-          danger
-        />
-      </div>
-
       <button
         type="button"
         onClick={() => setShowModels(!showModels)}
@@ -420,8 +449,8 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
       className="rounded-xl p-3 min-h-[92px] h-full flex flex-col justify-between"
       style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
     >
-      <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{label}</div>
-      <div className="text-xl font-semibold leading-tight" style={{ color: 'var(--cp-text)' }}>{value}</div>
+      <div className="flex min-h-8 items-end text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
+      <div className="min-h-7 text-xl font-semibold leading-tight" style={{ color: 'var(--cp-text)' }}>{value}</div>
       <div className="text-[11px] truncate min-h-4" style={{ color: 'var(--cp-muted)' }}>{detail ?? ''}</div>
     </div>
   )
@@ -440,7 +469,7 @@ function InventoryToolbar({
   onSearchChange: (value: string) => void
   filters: InventoryFilters
   filterOptions: Record<FilterKey, string[]>
-  onFilterChange: (key: FilterKey, value: string) => void
+  onFilterChange: (key: FilterKey, value: MultiFilter) => void
 }) {
   return (
     <div className="rounded-xl p-3 flex flex-col gap-3" style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}>
@@ -454,34 +483,70 @@ function InventoryToolbar({
           style={{ background: 'var(--cp-bg)', color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
         />
       </label>
-      <div className="grid grid-cols-2 lg:grid-cols-6 gap-2">
-        <FilterSelect label={t('aiCenter.providers.apiType', 'API Type')} value={filters.apiType} options={filterOptions.apiType} onChange={(value) => onFilterChange('apiType', value)} />
-        <FilterSelect label={t('aiCenter.providers.logicalMount', 'Logical Mount')} value={filters.logicalMount} options={filterOptions.logicalMount} onChange={(value) => onFilterChange('logicalMount', value)} />
-        <FilterSelect label={t('aiCenter.providers.health', 'Health')} value={filters.health} options={filterOptions.health} onChange={(value) => onFilterChange('health', value)} />
-        <FilterSelect label={t('aiCenter.providers.costClass', 'Cost Class')} value={filters.costClass} options={filterOptions.costClass} onChange={(value) => onFilterChange('costClass', value)} />
-        <FilterSelect label={t('aiCenter.providers.latencyClass', 'Latency Class')} value={filters.latencyClass} options={filterOptions.latencyClass} onChange={(value) => onFilterChange('latencyClass', value)} />
-        <FilterSelect label={t('aiCenter.providers.tier', 'Tier')} value={filters.tier} options={filterOptions.tier} onChange={(value) => onFilterChange('tier', value)} />
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-2">
+        <MultiSelectFilter label={t('aiCenter.providers.apiType', 'API Type')} value={filters.apiType} options={filterOptions.apiType} onChange={(value) => onFilterChange('apiType', value)} />
+        <MultiSelectFilter label={t('aiCenter.providers.logicalMount', 'Logical Mount')} value={filters.logicalMount} options={filterOptions.logicalMount} onChange={(value) => onFilterChange('logicalMount', value)} />
+        <MultiSelectFilter label={t('aiCenter.providers.health', 'Health')} value={filters.health} options={filterOptions.health} onChange={(value) => onFilterChange('health', value)} />
+        <MultiSelectFilter label={t('aiCenter.providers.costClass', 'Cost Class')} value={filters.costClass} options={filterOptions.costClass} onChange={(value) => onFilterChange('costClass', value)} />
+        <MultiSelectFilter label={t('aiCenter.providers.latencyClass', 'Latency Class')} value={filters.latencyClass} options={filterOptions.latencyClass} onChange={(value) => onFilterChange('latencyClass', value)} />
+        <MultiSelectFilter label={t('aiCenter.providers.tier', 'Tier')} value={filters.tier} options={filterOptions.tier} onChange={(value) => onFilterChange('tier', value)} />
       </div>
     </div>
   )
 }
 
-function FilterSelect({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
+function MultiSelectFilter({ label, value, options, onChange }: { label: string; value: MultiFilter; options: string[]; onChange: (value: MultiFilter) => void }) {
+  const selectedCount = value.selected.length
+  const toggleOption = (option: string) => {
+    const selected = value.selected.includes(option)
+      ? value.selected.filter((item) => item !== option)
+      : [...value.selected, option]
+    onChange({ ...value, selected })
+  }
+
   return (
-    <label className="flex flex-col gap-1 min-w-0">
-      <span className="text-[11px]" style={{ color: 'var(--cp-muted)' }}>{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="rounded-lg px-2 py-1.5 text-xs min-w-0"
+    <div className="flex flex-col gap-1 min-w-0">
+      <span className="truncate text-[11px]" title={label} style={{ color: 'var(--cp-muted)' }}>{label}</span>
+      <input
+        value={value.query}
+        onChange={(event) => onChange({ ...value, query: event.target.value })}
+        placeholder="All"
+        className="w-full min-w-0 rounded-lg px-2 py-1.5 text-xs"
         style={{ background: 'var(--cp-bg)', color: 'var(--cp-text)', border: '1px solid var(--cp-border)' }}
-      >
-        <option value="all">All</option>
-        {options.map((option) => (
-          <option key={option} value={option}>{option}</option>
-        ))}
-      </select>
-    </label>
+      />
+      <details className="relative">
+        <summary
+          className="flex min-h-8 cursor-pointer list-none items-center justify-between rounded-lg px-2 text-xs"
+          style={{ background: 'var(--cp-bg)', color: selectedCount > 0 ? 'var(--cp-text)' : 'var(--cp-muted)', border: '1px solid var(--cp-border)' }}
+        >
+          <span className="truncate">{selectedCount > 0 ? `${selectedCount} selected` : 'All'}</span>
+          <span aria-hidden>v</span>
+        </summary>
+        <div
+          className="absolute left-0 top-9 z-20 flex max-h-56 w-full min-w-48 flex-col gap-1 overflow-auto rounded-lg p-2 shadow-lg"
+          style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
+        >
+          <button
+            type="button"
+            onClick={() => onChange({ ...value, selected: [] })}
+            className="rounded px-2 py-1 text-left text-xs"
+            style={{ color: 'var(--cp-accent)' }}
+          >
+            All
+          </button>
+          {options.map((option) => (
+            <label key={option} className="flex min-h-7 items-center gap-2 rounded px-2 py-1 text-xs" style={{ color: 'var(--cp-text)' }}>
+              <input
+                type="checkbox"
+                checked={value.selected.includes(option)}
+                onChange={() => toggleOption(option)}
+              />
+              <span className="truncate" title={option}>{option}</span>
+            </label>
+          ))}
+        </div>
+      </details>
+    </div>
   )
 }
 
@@ -637,15 +702,14 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
   )
 }
 
-function ActionButton({ icon, label, onClick, danger, disabled }: { icon: ReactNode; label: string; onClick: () => void; danger?: boolean; disabled?: boolean }) {
+function MenuAction({ icon, label, onClick, danger, disabled }: { icon: ReactNode; label: string; onClick: () => void; danger?: boolean; disabled?: boolean }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-opacity hover:opacity-80 disabled:opacity-50"
+      className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-xs font-medium transition-opacity hover:opacity-80 disabled:opacity-50"
       style={{
-        border: `1px solid ${danger ? 'var(--cp-danger)' : 'var(--cp-border)'}`,
         color: danger ? 'var(--cp-danger)' : 'var(--cp-text)',
       }}
     >
@@ -701,12 +765,19 @@ function modelMatchesQuery(model: ModelMetadata, query: string): boolean {
 }
 
 function modelMatchesFilters(model: ModelMetadata, filters: InventoryFilters): boolean {
-  return (filters.apiType === 'all' || model.api_types.includes(filters.apiType as ModelMetadata['api_types'][number]))
-    && (filters.logicalMount === 'all' || model.logical_mounts.includes(filters.logicalMount))
-    && (filters.health === 'all' || model.health.status === filters.health)
-    && (filters.costClass === 'all' || model.attributes.cost_class === filters.costClass)
-    && (filters.latencyClass === 'all' || model.attributes.latency_class === filters.latencyClass)
-    && (filters.tier === 'all' || (model.attributes.tier ?? '-') === filters.tier)
+  return multiFilterMatches(filters.apiType, model.api_types)
+    && multiFilterMatches(filters.logicalMount, model.logical_mounts)
+    && multiFilterMatches(filters.health, [model.health.status])
+    && multiFilterMatches(filters.costClass, [model.attributes.cost_class])
+    && multiFilterMatches(filters.latencyClass, [model.attributes.latency_class])
+    && multiFilterMatches(filters.tier, [model.attributes.tier ?? '-'])
+}
+
+function multiFilterMatches(filter: MultiFilter, values: string[]): boolean {
+  if (filter.selected.length > 0 && !values.some((value) => filter.selected.includes(value))) return false
+  const query = filter.query.trim().toLowerCase()
+  if (query && !values.some((value) => value.toLowerCase().includes(query))) return false
+  return true
 }
 
 function buildInventoryFilterOptions(models: ModelMetadata[]): Record<FilterKey, string[]> {
