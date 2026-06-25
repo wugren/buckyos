@@ -590,18 +590,42 @@ function TimeRangeFilterControl({
   onCustomEndDateChange: (value: string) => void
 }) {
   const activeLabel = options.find(([optionValue]) => optionValue === value)?.[1] ?? label
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
 
   return (
-    <div className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
+    <div ref={rootRef} className="relative flex min-w-0 flex-col gap-1 text-xs" style={{ color: 'var(--cp-muted)' }}>
       <span className="truncate" title={label}>{label}</span>
-      <details className="relative">
-        <summary
-          className="flex h-9 cursor-pointer list-none items-center justify-between gap-2 rounded-md px-2 text-xs"
-          style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)', color: 'var(--cp-text)' }}
-        >
-          <span className="truncate">{activeLabel}</span>
-          <ChevronDown size={14} style={{ color: 'var(--cp-muted)' }} />
-        </summary>
+      <button
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        className="flex h-9 cursor-pointer items-center justify-between gap-2 rounded-md px-2 text-xs"
+        style={{ background: 'var(--cp-bg)', border: '1px solid var(--cp-border)', color: 'var(--cp-text)' }}
+      >
+        <span className="truncate">{activeLabel}</span>
+        <ChevronDown size={14} style={{ color: 'var(--cp-muted)' }} />
+      </button>
+      {open && (
         <div
           className="absolute left-0 top-10 z-20 flex w-full min-w-56 flex-col gap-1 rounded-md p-2 shadow-lg"
           style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
@@ -610,7 +634,12 @@ function TimeRangeFilterControl({
             <button
               key={optionValue}
               type="button"
-              onClick={() => onChange(optionValue)}
+              onClick={() => {
+                onChange(optionValue)
+                if (optionValue !== 'custom') {
+                  setOpen(false)
+                }
+              }}
               className="rounded px-2 py-1.5 text-left text-xs"
               style={{
                 background: optionValue === value ? 'color-mix(in oklch, var(--cp-accent), transparent 86%)' : 'transparent',
@@ -645,7 +674,7 @@ function TimeRangeFilterControl({
             </div>
           )}
         </div>
-      </details>
+      )}
     </div>
   )
 }
