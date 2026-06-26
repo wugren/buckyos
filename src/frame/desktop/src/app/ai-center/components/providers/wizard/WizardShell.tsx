@@ -32,6 +32,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const [draft, setDraft] = useState<WizardDraft>(INITIAL_DRAFT)
   const [validation, setValidation] = useState<ValidationResult | null>(null)
   const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   const steps = [
     t('aiCenter.wizard.step.chooseType', 'Choose Type'),
@@ -41,6 +42,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   ]
 
   const updateDraft = (partial: Partial<WizardDraft>) => {
+    setCreateError(null)
     setDraft((prev) => ({ ...prev, ...partial }))
   }
 
@@ -59,12 +61,20 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const handleNext = async () => {
     if (step === 3) {
       setCreating(true)
+      setCreateError(null)
       try {
         await new Promise((r) => setTimeout(r, 300))
         await store.addProvider(draft)
         onCreated()
       } catch (error) {
-        console.error('aicc.addProvider failed', error)
+        const message = error instanceof Error ? error.message : ''
+        if (message.includes('provider_validation_required') || message.includes('provider_validation_mismatch')) {
+          setCreateError(t('aiCenter.wizard.validationExpired', 'Provider validation expired. Please validate again.'))
+          setValidation(null)
+          setStep(2)
+        } else {
+          setCreateError(message || t('aiCenter.wizard.createFailed', 'Could not create provider.'))
+        }
       } finally {
         setCreating(false)
       }
@@ -73,6 +83,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     if (step === 1) {
       // Reset validation when moving to step 2
       setValidation(null)
+      setCreateError(null)
     }
     setStep((s) => s + 1)
   }
@@ -138,6 +149,18 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
             validation={validation}
             onToggleAutoSync={(v) => updateDraft({ auto_sync_models: v })}
           />
+        )}
+        {createError && (
+          <div
+            className="mt-4 max-w-lg rounded-lg px-3 py-2 text-sm"
+            style={{
+              background: 'color-mix(in oklch, var(--cp-danger), transparent 90%)',
+              border: '1px solid color-mix(in oklch, var(--cp-danger), transparent 60%)',
+              color: 'var(--cp-danger)',
+            }}
+          >
+            {createError}
+          </div>
         )}
       </div>
 

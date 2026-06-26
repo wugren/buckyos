@@ -18,9 +18,10 @@ const defaultNames: Record<string, string> = {
 }
 
 const defaultEndpoints: Record<string, string> = {
-  openai: 'https://api.openai.com',
-  anthropic: 'https://api.anthropic.com',
-  google: 'https://generativelanguage.googleapis.com',
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com/v1',
+  google: 'https://generativelanguage.googleapis.com/v1beta',
+  openrouter: 'https://openrouter.ai/api/v1',
 }
 
 function InputField({
@@ -53,12 +54,14 @@ function InputField({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
-          className="w-full rounded-lg px-3 py-2.5 text-sm outline-none"
+          autoComplete={isPassword ? 'new-password' : undefined}
+          className={`w-full rounded-lg px-3 py-2.5 text-sm outline-none${isPassword ? ' aicc-password-input' : ''}`}
           style={{
             background: 'var(--cp-bg)',
             border: '1px solid var(--cp-border)',
             color: 'var(--cp-text)',
             height: 44,
+            paddingRight: isPassword ? 44 : 12,
           }}
         />
         {isPassword && (
@@ -119,7 +122,7 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
       )}
 
       {/* Endpoint */}
-      {(providerType === 'openai' || providerType === 'anthropic' || providerType === 'google' || providerType === 'custom') && (
+      {(providerType === 'openai' || providerType === 'anthropic' || providerType === 'google' || providerType === 'openrouter' || providerType === 'custom') && (
         <InputField
           label={t('aiCenter.wizard.endpoint', 'Endpoint')}
           value={draft.endpoint}

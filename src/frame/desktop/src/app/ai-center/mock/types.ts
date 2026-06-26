@@ -35,6 +35,8 @@ export type PricingMode = 'per_token' | 'subscription' | 'free_quota' | 'unknown
 
 export interface ModelMetadata {
   provider_model_id: string
+  provider_actual_model_id?: string
+  provider_options?: unknown
   exact_model: string
   model_driver: string
   parameter_scale?: string
@@ -73,6 +75,7 @@ export interface ModelMetadata {
 
 export interface ProviderInventory {
   provider_instance_name: string
+  name?: string
   provider_type: ProviderRuntimeType
   provider_driver: string
   provider_origin: ProviderOrigin
@@ -130,6 +133,21 @@ export interface ProviderView {
   account: ProviderAccountStatus
 }
 
+export type AiProviderCard = {
+  id: string
+  displayName: string
+  providerType: string
+  status: 'healthy' | 'needs_setup' | 'degraded' | 'planned'
+  endpoint: string
+  authMode: string
+  credentialConfigured?: boolean
+  maskedApiKey?: string
+  availableModels?: string[]
+  capabilities: string[]
+  defaultModel: string
+  note: string
+}
+
 // ========== Usage ==========
 
 export interface UsageEvent {
@@ -147,7 +165,15 @@ export interface UsageEvent {
   tokens_out?: number
   token_equivalent?: number
   estimated_cost?: number
+  finance_snapshot?: UsageFinanceSnapshot
   status: 'success' | 'failed'
+}
+
+export interface UsageFinanceSnapshot {
+  amount?: number
+  currency?: string
+  provider_trace_id?: string
+  billing?: unknown
 }
 
 export interface UsageSummary {
@@ -289,6 +315,14 @@ export interface ValidationResult {
   models_discovered: string[]
   balance_available: boolean
   errors: string[]
+  error_details?: ValidationErrorDetail[]
+  validation_fingerprint?: string
+  validation_ttl_ms?: number
+}
+
+export interface ValidationErrorDetail {
+  kind: 'endpoint' | 'auth' | 'models'
+  message: string
 }
 
 // ========== Store Snapshot ==========

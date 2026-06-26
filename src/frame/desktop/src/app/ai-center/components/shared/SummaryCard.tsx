@@ -25,7 +25,7 @@ export function SummaryCard({
 }: SummaryCardProps) {
   return (
     <div
-      className="rounded-xl p-4 flex flex-col gap-1"
+      className="rounded-xl p-4 min-h-[124px] flex flex-col gap-1"
       style={{
         background: 'var(--cp-surface)',
         border: '1px solid var(--cp-border)',
@@ -34,13 +34,13 @@ export function SummaryCard({
           : '1px solid var(--cp-border)',
       }}
     >
-      <div className="flex items-center gap-2 mb-1">
-        <span style={{ color: 'var(--cp-accent)' }}>{icon}</span>
-        <span className="text-xs font-medium" style={{ color: 'var(--cp-muted)' }}>
+      <div className="flex items-start gap-2 min-h-10 mb-1">
+        <span className="shrink-0" style={{ color: 'var(--cp-accent)' }}>{icon}</span>
+        <span className="text-xs font-medium leading-5" style={{ color: 'var(--cp-muted)' }}>
           {title}
         </span>
       </div>
-      <div className="text-lg font-semibold" style={{ color: 'var(--cp-text)' }}>
+      <div className="text-lg font-semibold leading-7 min-h-7 flex items-center break-words" style={{ color: 'var(--cp-text)' }}>
         {value}
       </div>
       {subtitle && (

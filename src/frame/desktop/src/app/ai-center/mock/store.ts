@@ -37,6 +37,10 @@ function namespaceFromApiType(apiType: string): ApiNamespace {
   return 'llm'
 }
 
+function usageFinanceAmount(event: UsageEvent): number {
+  return event.finance_snapshot?.amount ?? 0
+}
+
 const discoveredModelsByType: Record<string, string[]> = {
   sn_router: ['sn-router-balanced@sn-router', 'sn-router-image@sn-router'],
   openai: ['gpt-5.1@openai-main', 'gpt-5.1-mini@openai-main', 'text-embedding-3-large@openai-main'],
@@ -161,7 +165,7 @@ export class MockDataStore {
   addProvider(draft: WizardDraft): ProviderView {
     const id = `provider-${Date.now()}`
     const providerType = draft.provider_type ?? 'custom'
-    const instanceName = `${providerType}-${Date.now().toString(36)}`
+    const instanceName = draft.provider_instance_name ?? `${providerType}-${Date.now().toString(36)}`
     const models = modelsForDraft(draft, instanceName)
     const isSnRouter = providerType === 'sn_router'
 
@@ -225,6 +229,27 @@ export class MockDataStore {
     this.notify()
   }
 
+  updateProviderKey(id: string): void {
+    const provider = this.providers.get(id)
+    if (!provider) return
+    this.providers.set(id, {
+      ...provider,
+      config: {
+        ...provider.config,
+        auth_mode: 'api_key',
+      },
+      status: {
+        ...provider.status,
+        auth_status: 'ok',
+        is_connected: true,
+        model_sync_status: 'ok',
+        last_verified_at: new Date().toISOString(),
+        last_model_sync_at: new Date().toISOString(),
+      },
+    })
+    this.notify()
+  }
+
   setProviderWeight(providerInstanceName: string, weight: number): void {
     const nextWeights = { ...this.routingView.provider_weights }
     if (weight === 1) {
@@ -241,17 +266,22 @@ export class MockDataStore {
 
   validateConnection(draft: WizardDraft): ValidationResult {
     const errors: string[] = []
+    const errorDetails: ValidationResult['error_details'] = []
     let endpointReachable = true
     let authValid = true
 
     if (draft.provider_type === 'custom' && !draft.endpoint) {
       endpointReachable = false
-      errors.push('Endpoint URL is required for custom providers')
+      const message = 'Endpoint URL is required for custom providers'
+      errors.push(message)
+      errorDetails.push({ kind: 'endpoint', message })
     }
 
     if (draft.provider_type !== 'sn_router' && !draft.api_key) {
       authValid = false
-      errors.push('API Key is required')
+      const message = 'API Key is required'
+      errors.push(message)
+      errorDetails.push({ kind: 'auth', message })
     }
 
     const models =
@@ -265,6 +295,7 @@ export class MockDataStore {
       models_discovered: models,
       balance_available: draft.provider_type !== 'custom' && authValid,
       errors,
+      error_details: errorDetails,
     }
   }
 
@@ -304,7 +335,7 @@ export class MockDataStore {
 
       totalTokens += tokens
       totalRequests++
-      totalCost += evt.estimated_cost ?? 0
+      totalCost += usageFinanceAmount(evt)
 
       if (ts >= todayStart) todayTokens += tokens
       if (ts >= monthStart) monthTokens += tokens
@@ -347,7 +378,7 @@ export class MockDataStore {
         const ts = new Date(evt.timestamp).getTime()
         if (ts >= dayStart && ts < dayEnd) {
           tokens += evt.token_equivalent ?? (evt.tokens_in ?? 0) + (evt.tokens_out ?? 0)
-          cost += evt.estimated_cost ?? 0
+          cost += usageFinanceAmount(evt)
         }
       }
 

@@ -1,7 +1,8 @@
-import { buckyos } from 'buckyos'
+import { buckyos, getActiveSessionToken } from 'buckyos'
 import { isMockRuntime } from '../runtime'
 import { MockDataStore } from '../app/ai-center/mock/store'
 import type {
+  AiProviderCard,
   AIStatus,
   ApiNamespace,
   ApiType,
@@ -104,6 +105,10 @@ interface AiccRpcClient {
   call(method: string, params: Record<string, unknown>): Promise<unknown>
 }
 
+interface AccountInfo {
+  session_token?: unknown
+}
+
 interface RawModelDirectory {
   providers?: RawProviderInventory[]
   directory?: Record<string, Record<string, RawLogicalRouteItem>>
@@ -114,6 +119,7 @@ interface RawModelDirectory {
 
 interface RawProviderInventory {
   provider_instance_name?: unknown
+  name?: unknown
   provider_type?: unknown
   provider_driver?: unknown
   provider_origin?: unknown
@@ -125,6 +131,8 @@ interface RawProviderInventory {
 
 interface RawModelMetadata {
   provider_model_id?: unknown
+  provider_actual_model_id?: unknown
+  provider_options?: unknown
   exact_model?: unknown
   model_driver?: unknown
   parameter_scale?: unknown
@@ -164,6 +172,7 @@ interface RawUsageAggregate {
   output_tokens?: unknown
   total_tokens?: unknown
   request_units?: unknown
+  finance_amount?: unknown
 }
 
 interface RawUsageGroupedRow {
@@ -198,6 +207,7 @@ interface RawUsageQueryResponse {
   grouped?: RawUsageGroupedRow[]
   buckets?: RawUsageBucketedRow[]
   events?: RawUsageEvent[]
+  next_cursor?: unknown
 }
 
 interface AiccDataProvider {
@@ -205,10 +215,13 @@ interface AiccDataProvider {
   addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
   setProviderWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage>
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView>
 }
 
 export interface AICCMgr {
@@ -221,8 +234,41 @@ export interface AICCMgr {
   addProvider(draft: WizardDraft): Promise<ProviderView>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
+  updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
   setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage>
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView>
+}
+
+export interface UsageTimeRange {
+  startTimeMs: number
+  endTimeMs: number
+}
+
+export interface UsageEventsQuery {
+  timeRange: UsageTimeRange
+  filters?: {
+    providerModels?: string[]
+    providerModelQuery?: string
+    providerInstanceNames?: string[]
+    providerInstanceQuery?: string
+    appIds?: string[]
+    appQuery?: string
+  }
+  cursor?: string
+  limit: number
+}
+
+export interface UsageEventsPage {
+  events: StoreSnapshot['usageEvents']
+  totalRequests: number
+  nextCursor?: string
+}
+
+export interface RoutingDirectoryView {
+  routingView: GlobalRoutingView
+  models: ModelMetadata[]
 }
 
 export class AICCModelStore implements AICCMgr {
@@ -262,15 +308,18 @@ export class AICCModelStore implements AICCMgr {
   async addProvider(draft: WizardDraft): Promise<ProviderView> {
     const nextDraft = withProviderInstanceName(draft, this.snapshot)
     await this.provider.addProvider(nextDraft)
-    await this.refresh()
     const providerInstanceName = nextDraft.provider_instance_name
-    const provider = this.snapshot.providers.find((item) =>
-      item.config.provider_instance_name === providerInstanceName,
-    )
-    if (!provider) {
-      throw new Error('aicc.provider_add_not_reflected')
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await this.refresh()
+      const provider = this.snapshot.providers.find((item) =>
+        item.config.provider_instance_name === providerInstanceName,
+      )
+      if (provider) {
+        return provider
+      }
+      await delay(250)
     }
-    return provider
+    throw new Error('aicc.provider_add_not_reflected')
   }
 
   async deleteProvider(id: string): Promise<void> {
@@ -283,6 +332,11 @@ export class AICCModelStore implements AICCMgr {
     await this.refresh()
   }
 
+  async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
+    await this.provider.updateProviderKey(provider, apiKey)
+    await this.refresh()
+  }
+
   async setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void> {
     await this.provider.setProviderWeight(providerInstanceName, weight)
     await this.refresh()
@@ -290,6 +344,14 @@ export class AICCModelStore implements AICCMgr {
 
   validateConnection(draft: WizardDraft): Promise<ValidationResult> {
     return this.provider.validateConnection(draft)
+  }
+
+  queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    return this.provider.queryUsageEvents(params)
+  }
+
+  queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    return this.provider.queryRoutingDirectory(path)
   }
 
   private emit() {
@@ -329,6 +391,10 @@ class MockAiccProvider implements AiccDataProvider {
     this.store.refreshProviderModels(id)
   }
 
+  async updateProviderKey(provider: ProviderView): Promise<void> {
+    this.store.updateProviderKey(provider.config.id)
+  }
+
   async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
     this.store.setProviderWeight(providerInstanceName, weight)
   }
@@ -344,6 +410,36 @@ class MockAiccProvider implements AiccDataProvider {
   getUsageTrend(granularity = 'day'): UsageTrendPoint[] {
     return this.store.getUsageTrend(granularity)
   }
+
+  async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    const events = this.store.getSnapshot().usageEvents
+    const filtered = events.filter((event) => usageEventMatchesQuery(event, params))
+    const cursor = Number(params.cursor ?? 0)
+    const offset = Number.isFinite(cursor) && cursor > 0 ? cursor : 0
+    const page = filtered.slice(offset, offset + params.limit)
+    const nextOffset = offset + page.length
+    return {
+      events: page,
+      totalRequests: filtered.length,
+      nextCursor: nextOffset < filtered.length ? nextOffset.toString() : undefined,
+    }
+  }
+
+  async queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    const snapshot = this.store.getSnapshot()
+    return {
+      routingView: {
+        ...snapshot.routingView,
+        logical_tree: path
+          ? childLogicalNodes(snapshot.routingView.logical_tree, path)
+          : snapshot.routingView.logical_tree,
+      },
+      models: [
+        ...snapshot.providers.flatMap((provider) => provider.status.discovered_models),
+        ...snapshot.localModels,
+      ],
+    }
+  }
 }
 
 class BuckyOSAiccProvider implements AiccDataProvider {
@@ -353,45 +449,42 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   private usageTrend: UsageTrendPoint[] = []
 
   async fetchSnapshot(): Promise<StoreSnapshot> {
-    const [directory, usageByModel, usageByCapability, usageByApp, usageTrend, usageEvents, usageLastDay, usageThisMonth] = await Promise.all([
+    const dashboardRange = localTrailingDaysRange(30)
+    const todayRange = localTodayRange()
+    const monthRange = localCurrentMonthRange()
+    const [directory, usageByModel, usageByCapability, usageByApp, usageTrend, usageToday, usageThisMonth] = await Promise.all([
       this.call<RawModelDirectory>('models.list', {}),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['provider_model'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['capability'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         group_by: ['caller_app_id'],
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
+        time_range: toRawTimeRange(dashboardRange),
         filters: {},
         time_bucket: 'day',
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: { kind: 'last30d' },
-        filters: {},
-        output_mode: 'events',
-        limit: 50,
-      }),
-      this.queryUsage({
-        time_range: { kind: 'last1d' },
+        time_range: toRawTimeRange(todayRange),
         filters: {},
         output_mode: 'summary',
       }),
       this.queryUsage({
-        time_range: currentMonthTimeRange(),
+        time_range: toRawTimeRange(monthRange),
         filters: {},
         output_mode: 'summary',
       }),
@@ -400,29 +493,36 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       byModel: usageByModel,
       byCapability: usageByCapability,
       byApp: usageByApp,
-      lastDay: usageLastDay,
+      today: usageToday,
       thisMonth: usageThisMonth,
     })
     this.usageTrend = toUsageTrend(usageTrend)
     const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
-    return toStoreSnapshot(directory, rawProviders, toUsageEvents(usageEvents))
+    return toStoreSnapshot(directory, rawProviders, [])
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
-    const validation = await this.validateConnection(draft)
-    if (!validation.auth_valid || !validation.endpoint_reachable) {
-      throw new Error(validation.errors[0] ?? 'aicc.provider_validation_failed')
-    }
-    const result = await this.call<{ ok?: unknown }>('provider.add', toProviderWritePayload(draft))
+    const result = await this.call<{
+      ok?: unknown
+      reason?: unknown
+      error?: unknown
+      reload?: { ok?: unknown; error?: unknown; reason?: unknown }
+    }>('provider.add', toProviderWritePayload(draft), { requireSession: true })
     if (result.ok !== true) {
-      throw new Error('aicc.provider_add_failed')
+      throw new Error(asNonEmptyString(result.reason, asNonEmptyString(result.error, 'aicc.provider_add_failed')))
+    }
+    if (result.reload?.ok === false) {
+      throw new Error(asNonEmptyString(
+        result.reload.error,
+        asNonEmptyString(result.reload.reason, 'aicc.provider_reload_failed'),
+      ))
     }
   }
 
   async deleteProvider(id: string): Promise<void> {
     const result = await this.call<{ ok?: unknown; reason?: unknown }>('provider.delete', {
       provider_instance_name: id,
-    })
+    }, { requireSession: true })
     if (result.ok === false) {
       throw new Error(asNonEmptyString(result.reason, 'aicc.provider_delete_failed'))
     }
@@ -431,14 +531,29 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   async refreshProviderModels(id: string): Promise<void> {
     await this.call('provider.refresh_models', {
       provider_instance_name: id,
-    })
+    }, { requireSession: true })
+  }
+
+  async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
+    const result = await this.callControlPanel<{ provider?: unknown; ok?: unknown; reason?: unknown }>('ai.provider.set', {
+      provider: toAiProviderCard(provider),
+      api_key: apiKey.trim(),
+    }, { requireSession: true })
+    if (result.ok === false) {
+      throw new Error(asNonEmptyString(result.reason, 'aicc.provider_key_update_failed'))
+    }
+    const reload = await this.callControlPanel<{ ok?: unknown; result?: { ok?: unknown }; reason?: unknown }>('ai.reload', {}, { requireSession: true })
+    if (reload.ok === false || reload.result?.ok === false) {
+      throw new Error(asNonEmptyString(reload.reason, 'aicc.provider_reload_failed'))
+    }
+    await this.refreshProviderModels(provider.config.id)
   }
 
   async setProviderWeight(providerInstanceName: string, weight: number): Promise<void> {
     const result = await this.callControlPanel<{ ok?: unknown; reason?: unknown }>('ai.provider.weight.set', {
       provider_instance_name: providerInstanceName,
       weight,
-    })
+    }, { requireSession: true })
     if (result.ok !== true) {
       throw new Error(asNonEmptyString(result.reason, 'aicc.provider_weight_set_failed'))
     }
@@ -452,6 +567,9 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       models_discovered: toStringArray(result.models_discovered),
       balance_available: asBoolean(result.balance_available, false),
       errors: toStringArray(result.errors),
+      error_details: toValidationErrorDetails(result.error_details, result.errors),
+      validation_fingerprint: asOptionalString(result.validation_fingerprint),
+      validation_ttl_ms: asOptionalNumber(result.validation_ttl_ms),
     }
   }
 
@@ -463,16 +581,57 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     return this.usageTrend
   }
 
-  private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getClient().call(method, params)
+  async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
+    const response = await this.queryUsage({
+      time_range: toRawTimeRange(params.timeRange),
+      filters: toRawUsageFilters(params.filters),
+      output_mode: 'events',
+      limit: params.limit,
+      cursor: params.cursor,
+    })
+    return {
+      events: toUsageEvents(response),
+      totalRequests: asNumber(response.total?.total_requests, 0),
+      nextCursor: asOptionalString(response.next_cursor),
+    }
+  }
+
+  async queryRoutingDirectory(path: string | null): Promise<RoutingDirectoryView> {
+    const directory = await this.call<RawModelDirectory>('models.list', path ? { logical_path: path } : {})
+    const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
+    const snapshot = toStoreSnapshot(directory, rawProviders, [])
+    return {
+      routingView: path
+        ? {
+          ...snapshot.routingView,
+          logical_tree: childLogicalNodes(snapshot.routingView.logical_tree, path),
+        }
+        : snapshot.routingView,
+      models: [
+        ...snapshot.providers.flatMap((provider) => provider.status.discovered_models),
+        ...snapshot.localModels,
+      ],
+    }
+  }
+
+  private async call<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options: { requireSession?: boolean } = {},
+  ): Promise<T> {
+    const result = await this.getClient().call(method, await prepareSessionToken(params, options.requireSession === true))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
     return result as T
   }
 
-  private async callControlPanel<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const result = await this.getControlPanelClient().call(method, params)
+  private async callControlPanel<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options: { requireSession?: boolean } = {},
+  ): Promise<T> {
+    const result = await this.getControlPanelClient().call(method, await prepareSessionToken(params, options.requireSession === true))
     if (!isRecord(result)) {
       throw new Error(`Invalid ${method} response`)
     }
@@ -503,6 +662,24 @@ class BuckyOSAiccProvider implements AiccDataProvider {
   }
 }
 
+async function prepareSessionToken(params: Record<string, unknown>, requireSession: boolean): Promise<Record<string, unknown>> {
+  if (typeof params.session_token === 'string' && params.session_token.trim()) {
+    return params
+  }
+  const accountInfo = await buckyos.getAccountInfo() as AccountInfo | null
+  let sessionToken = typeof accountInfo?.session_token === 'string'
+    ? accountInfo.session_token.trim()
+    : ''
+  if (!sessionToken) {
+    const refreshedToken = await getActiveSessionToken()
+    sessionToken = typeof refreshedToken === 'string' ? refreshedToken.trim() : ''
+  }
+  if (!sessionToken && requireSession) {
+    throw new Error('Current login session expired. Please sign in again.')
+  }
+  return sessionToken ? { ...params, session_token: sessionToken } : params
+}
+
 function withProviderInstanceName(draft: WizardDraft, snapshot: StoreSnapshot): WizardDraft {
   if (draft.provider_instance_name?.trim()) return draft
   const providerType = draft.provider_type ?? 'custom'
@@ -515,6 +692,10 @@ function withProviderInstanceName(draft: WizardDraft, snapshot: StoreSnapshot): 
     suffix += 1
   }
   return { ...draft, provider_instance_name: candidate }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function defaultProviderInstanceName(providerType: ProviderType, name: string): string {
@@ -542,20 +723,44 @@ function defaultProviderEndpoint(providerType: ProviderType | null): string {
   switch (providerType) {
     case 'sn_router': return 'https://sn.buckyos.ai/api/v1/ai/'
     case 'openai': return 'https://api.openai.com/v1'
-    case 'anthropic': return 'https://api.anthropic.com'
+    case 'anthropic': return 'https://api.anthropic.com/v1'
     case 'google': return 'https://generativelanguage.googleapis.com/v1beta'
     case 'openrouter': return 'https://openrouter.ai/api/v1'
     default: return ''
   }
 }
 
+function toAiProviderCard(provider: ProviderView): AiProviderCard {
+  const { config, status } = provider
+  const defaultModel = status.discovered_models[0]?.provider_model_id ?? ''
+  return {
+    id: config.provider_instance_name,
+    displayName: config.name,
+    providerType: config.provider_type,
+    status: status.auth_status === 'invalid'
+      ? 'needs_setup'
+      : status.model_sync_status === 'failed' || status.auth_status === 'expired'
+        ? 'degraded'
+        : 'healthy',
+    endpoint: config.endpoint ?? '',
+    authMode: config.auth_mode ?? 'api_key',
+    credentialConfigured: true,
+    availableModels: status.discovered_models.map((model) => model.provider_model_id),
+    capabilities: Array.from(new Set(status.discovered_models.flatMap((model) => model.api_types))),
+    defaultModel,
+    note: '',
+  }
+}
+
 function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
   const providerType = draft.provider_type ?? 'custom'
   const endpoint = draft.endpoint.trim() || defaultProviderEndpoint(providerType)
+  const instanceName = draft.provider_instance_name ?? defaultProviderInstanceName(providerType, draft.name)
+  const providerName = draft.name.trim() || providerDisplayName(providerType, instanceName)
   return {
-    provider_instance_name: draft.provider_instance_name,
+    provider_instance_name: instanceName,
     provider_type: providerType,
-    name: draft.name,
+    name: providerName,
     endpoint,
     protocol_type: draft.protocol_type,
     api_key: draft.api_key,
@@ -563,22 +768,11 @@ function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
   }
 }
 
-function currentMonthTimeRange(): Record<string, unknown> {
-  const start = new Date()
-  start.setDate(1)
-  start.setHours(0, 0, 0, 0)
-  return {
-    kind: 'explicit',
-    start_time_ms: start.getTime(),
-    end_time_ms: Date.now(),
-  }
-}
-
 function toUsageSummary(raw: {
   byModel: RawUsageQueryResponse
   byCapability: RawUsageQueryResponse
   byApp: RawUsageQueryResponse
-  lastDay: RawUsageQueryResponse
+  today: RawUsageQueryResponse
   thisMonth: RawUsageQueryResponse
 }): UsageSummary {
   const total = raw.byModel.total ?? {}
@@ -613,7 +807,8 @@ function toUsageSummary(raw: {
     by_api_namespace: byApiNamespace,
     total_tokens: aggregateTokens(total),
     total_requests: asNumber(total.total_requests, 0),
-    today_tokens: aggregateTokens(raw.lastDay.total),
+    total_estimated_cost: aggregateFinanceAmount(total),
+    today_tokens: aggregateTokens(raw.today.total),
     this_month_tokens: aggregateTokens(raw.thisMonth.total),
     by_provider: byProvider,
     by_model: byModel,
@@ -659,9 +854,9 @@ function providerInstanceFromExactModel(model: string): string | undefined {
 function toUsageTrend(raw: RawUsageQueryResponse): UsageTrendPoint[] {
   const buckets = Array.isArray(raw.buckets) ? raw.buckets : []
   return buckets.map((bucket) => ({
-    timestamp: new Date(asNumber(bucket.bucket_start_ms, 0)).toISOString().slice(0, 10),
+    timestamp: localDateKey(new Date(asNumber(bucket.bucket_start_ms, 0))),
     tokens: aggregateTokens(bucket.aggregate),
-    estimated_cost: 0,
+    estimated_cost: aggregateFinanceAmount(bucket.aggregate),
   }))
 }
 
@@ -689,6 +884,7 @@ function toUsageEvents(raw: RawUsageQueryResponse): StoreSnapshot['usageEvents']
       tokens_out: tokensOut,
       token_equivalent: tokenEquivalent,
       estimated_cost: estimatedCost(event.finance_snapshot_json),
+      finance_snapshot: toUsageFinanceSnapshot(event.finance_snapshot_json),
       status: 'success',
     }
   })
@@ -711,8 +907,25 @@ function capabilityToApiType(value: string): ApiType {
 }
 
 function estimatedCost(value: unknown): number | undefined {
+  return toUsageFinanceSnapshot(value)?.amount
+}
+
+function toUsageFinanceSnapshot(value: unknown): StoreSnapshot['usageEvents'][number]['finance_snapshot'] {
   const snapshot = asRecord(value)
-  return asOptionalNumber(snapshot.amount)
+  const amount = asOptionalNumber(snapshot.amount)
+  const currency = asOptionalString(snapshot.currency)
+  const providerTraceId = asOptionalString(snapshot.provider_trace_id)
+
+  if (amount == null && currency == null && providerTraceId == null && snapshot.billing == null) {
+    return undefined
+  }
+
+  return {
+    amount,
+    currency,
+    provider_trace_id: providerTraceId,
+    billing: snapshot.billing,
+  }
 }
 
 function aggregateTokens(raw?: RawUsageAggregate): number {
@@ -720,6 +933,106 @@ function aggregateTokens(raw?: RawUsageAggregate): number {
   return asNumber(raw.total_tokens, 0)
     || asNumber(raw.input_tokens, 0) + asNumber(raw.output_tokens, 0)
     || asNumber(raw.request_units, 0)
+}
+
+function aggregateFinanceAmount(raw?: RawUsageAggregate): number {
+  return asNumber(raw?.finance_amount, 0)
+}
+
+function localDayStart(value = new Date()): Date {
+  const result = new Date(value)
+  result.setHours(0, 0, 0, 0)
+  return result
+}
+
+function localMonthStart(value = new Date()): Date {
+  const result = localDayStart(value)
+  result.setDate(1)
+  return result
+}
+
+function localTodayRange(): UsageTimeRange {
+  return { startTimeMs: localDayStart().getTime(), endTimeMs: Date.now() }
+}
+
+function localCurrentMonthRange(): UsageTimeRange {
+  return { startTimeMs: localMonthStart().getTime(), endTimeMs: Date.now() }
+}
+
+function localTrailingDaysRange(days: number): UsageTimeRange {
+  const start = localDayStart()
+  start.setDate(start.getDate() - Math.max(0, days - 1))
+  return { startTimeMs: start.getTime(), endTimeMs: Date.now() }
+}
+
+function toRawTimeRange(range: UsageTimeRange): Record<string, unknown> {
+  return {
+    kind: 'explicit',
+    start_time_ms: range.startTimeMs,
+    end_time_ms: range.endTimeMs,
+  }
+}
+
+function toRawUsageFilters(filters: UsageEventsQuery['filters'] = {}): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  if (filters.providerModels?.length) {
+    result.provider_models = filters.providerModels
+  }
+  if (filters.providerModelQuery?.trim()) {
+    result.provider_model_query = filters.providerModelQuery.trim()
+  }
+  if (filters.providerInstanceNames?.length) {
+    result.provider_instance_names = filters.providerInstanceNames
+  }
+  if (filters.providerInstanceQuery?.trim()) {
+    result.provider_instance_query = filters.providerInstanceQuery.trim()
+  }
+  if (filters.appIds?.length) {
+    result.caller_app_ids = filters.appIds
+  }
+  if (filters.appQuery?.trim()) {
+    result.caller_app_query = filters.appQuery.trim()
+  }
+  return result
+}
+
+function usageEventMatchesQuery(event: StoreSnapshot['usageEvents'][number], params: UsageEventsQuery): boolean {
+  const eventTime = new Date(event.timestamp).getTime()
+  if (!Number.isFinite(eventTime)) return false
+  if (eventTime < params.timeRange.startTimeMs || eventTime >= params.timeRange.endTimeMs) return false
+  const filters = params.filters ?? {}
+  if (filters.providerModels?.length && !filters.providerModels.includes(event.exact_model)) return false
+  if (filters.providerModelQuery?.trim() && !includesFuzzy(event.exact_model, filters.providerModelQuery)) return false
+  if (filters.providerInstanceNames?.length && !filters.providerInstanceNames.includes(event.provider_instance_name)) return false
+  if (filters.providerInstanceQuery?.trim() && !includesFuzzy(event.provider_instance_name, filters.providerInstanceQuery)) return false
+  const appValue = `${event.app_id ?? 'system'} ${event.agent_id ?? ''}`.trim()
+  if (filters.appIds?.length && !filters.appIds.some((id) => id === (event.app_id ?? 'system') || id === event.agent_id)) return false
+  if (filters.appQuery?.trim() && !includesFuzzy(appValue, filters.appQuery)) return false
+  return true
+}
+
+function includesFuzzy(value: string, query: string): boolean {
+  return value.toLowerCase().includes(query.trim().toLowerCase())
+}
+
+function localDateKey(value: Date): string {
+  const year = value.getFullYear()
+  const month = String(value.getMonth() + 1).padStart(2, '0')
+  const day = String(value.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function childLogicalNodes(nodes: LogicalNode[], path: string): LogicalNode[] {
+  return findLogicalNode(nodes, path)?.children ?? []
+}
+
+function findLogicalNode(nodes: LogicalNode[], path: string): LogicalNode | undefined {
+  for (const node of nodes) {
+    if (node.path === path) return node
+    const child = findLogicalNode(node.children ?? [], path)
+    if (child) return child
+  }
+  return undefined
 }
 
 function toStoreSnapshot(
@@ -763,6 +1076,7 @@ function toProviderInventory(raw: RawProviderInventory): ProviderInventory {
 
   return {
     provider_instance_name: instanceName,
+    name: asOptionalString(raw.name),
     provider_type: runtimeType,
     provider_driver: driver,
     provider_origin: origin,
@@ -782,7 +1096,7 @@ function toProviderView(inventory: ProviderInventory): ProviderView {
 
   const config: ProviderConfig = {
     id: providerId,
-    name: providerDisplayName(providerType, inventory.provider_instance_name),
+    name: inventory.name ?? providerDisplayName(providerType, inventory.provider_instance_name),
     provider_type: providerType,
     provider_instance_name: inventory.provider_instance_name,
     provider_runtime_type: inventory.provider_type,
@@ -847,6 +1161,8 @@ function toModelMetadata(
 
   return {
     provider_model_id: providerModelId,
+    provider_actual_model_id: asOptionalString(raw.provider_actual_model_id),
+    provider_options: raw.provider_options,
     exact_model: exactModel,
     model_driver: asNonEmptyString(raw.model_driver, providerDriver),
     parameter_scale: asOptionalString(raw.parameter_scale),
@@ -1368,6 +1684,39 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : []
+}
+
+function toValidationErrorDetails(
+  value: unknown,
+  fallbackErrors: unknown,
+): ValidationResult['error_details'] {
+  if (Array.isArray(value)) {
+    const details = value
+      .map((item) => {
+        const record = asRecord(item)
+        const kind = asOptionalString(record.kind)
+        const message = asOptionalString(record.message)
+        if (
+          !message ||
+          (kind !== 'endpoint' && kind !== 'auth' && kind !== 'models')
+        ) {
+          return null
+        }
+        return { kind, message }
+      })
+      .filter((item): item is NonNullable<ValidationResult['error_details']>[number] => item !== null)
+    if (details.length > 0) return details
+  }
+
+  return toStringArray(fallbackErrors).map((message) => {
+    const lower = message.toLowerCase()
+    const kind = lower.includes('api_key') || lower.includes('auth') || lower.includes('token')
+      ? 'auth'
+      : lower.includes('endpoint') || lower.includes('url') || lower.includes('connect')
+        ? 'endpoint'
+        : 'models'
+    return { kind, message }
+  })
 }
 
 function asNumberRecord(value: unknown): Record<string, number> {

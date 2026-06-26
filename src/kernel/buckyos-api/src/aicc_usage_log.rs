@@ -173,20 +173,28 @@ pub enum UsageQueryTimeRange {
 /// "no filter on this dimension".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageQueryFilters {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tenant_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_app_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_id: Option<String>,
+    pub caller_app_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller_app_id: Option<String>,
+    pub provider_model_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_instance_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
+    pub provider_instance_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub idempotency_keys: Vec<String>,
 }
 
 /// Group dimensions supported by `query_usage`. Multiple values produce a
@@ -262,18 +270,20 @@ pub struct QueryUsageRequest {
 }
 
 /// Aggregated counts / totals. Units beyond tokens go into `request_units`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageAggregate {
     pub total_requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub request_units: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finance_amount: Option<f64>,
 }
 
 /// One row of a grouped query result. `group` holds `dimension → value`
 /// pairs, e.g. `{"provider_model": "gpt4.openai"}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageGroupedRow {
     pub group: HashMap<String, String>,
     pub aggregate: UsageAggregate,
@@ -281,7 +291,7 @@ pub struct UsageGroupedRow {
 
 /// One row of a time-bucketed result. When a grouping is also set, the same
 /// dimension map appears on every bucket row.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageBucketedRow {
     pub bucket_start_ms: i64,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

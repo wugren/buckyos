@@ -8,14 +8,24 @@ interface StepReviewProps {
   onToggleAutoSync: (value: boolean) => void
 }
 
+const defaultNames: Record<string, string> = {
+  sn_router: 'SN Router',
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  google: 'Google AI',
+  openrouter: 'OpenRouter',
+  custom: '',
+}
+
 export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewProps) {
   const { t } = useI18n()
+  const providerName = draft.name || defaultNames[draft.provider_type ?? ''] || draft.provider_instance_name || '-'
 
   const rows = [
-    { label: t('aiCenter.providers.type', 'Type'), value: draft.provider_type ?? '—' },
-    { label: t('aiCenter.wizard.providerName', 'Provider Name'), value: draft.name || '—' },
+    { label: t('aiCenter.providers.type', 'Type'), value: draft.provider_type ?? '-' },
+    { label: t('aiCenter.wizard.providerName', 'Provider Name'), value: providerName },
     { label: t('aiCenter.providers.endpoint', 'Endpoint'), value: draft.endpoint || t('aiCenter.providers.default', 'Default') },
-    { label: t('aiCenter.providers.auth', 'Authentication'), value: draft.api_key ? 'API Key' : '—' },
+    { label: t('aiCenter.providers.auth', 'Authentication'), value: draft.api_key ? 'API Key' : '-' },
     {
       label: 'Connection',
       value: (
@@ -39,28 +49,28 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
       >
         <div className="flex flex-col gap-3">
           {rows.map((row) => (
-            <div key={row.label} className="flex justify-between text-sm">
-              <span style={{ color: 'var(--cp-muted)' }}>{row.label}</span>
-              <span className="font-medium" style={{ color: 'var(--cp-text)' }}>{row.value}</span>
+            <div key={row.label} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)] gap-4 text-sm">
+              <span className="min-w-0 truncate" style={{ color: 'var(--cp-muted)' }}>{row.label}</span>
+              <span className="min-w-0 text-right font-medium break-words" style={{ color: 'var(--cp-text)' }}>{row.value}</span>
             </div>
           ))}
 
-          <div className="flex justify-between items-center text-sm pt-2" style={{ borderTop: '1px solid var(--cp-border)' }}>
-            <span style={{ color: 'var(--cp-muted)' }}>
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 items-center text-sm pt-2" style={{ borderTop: '1px solid var(--cp-border)' }}>
+            <span className="min-w-0 truncate" style={{ color: 'var(--cp-muted)' }}>
               {t('aiCenter.wizard.autoSync', 'Auto-sync model list')}
             </span>
             <button
               type="button"
               onClick={() => onToggleAutoSync(!draft.auto_sync_models)}
-              className="relative w-10 h-5 rounded-full transition-colors"
+              className="relative h-6 w-11 rounded-full transition-colors"
               style={{
                 background: draft.auto_sync_models ? 'var(--cp-accent)' : 'var(--cp-border)',
               }}
             >
               <span
-                className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+                className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform"
                 style={{
-                  transform: draft.auto_sync_models ? 'translateX(22px)' : 'translateX(2px)',
+                  transform: draft.auto_sync_models ? 'translateX(20px)' : 'translateX(0)',
                 }}
               />
             </button>

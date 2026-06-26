@@ -249,42 +249,64 @@ WHERE created_at_ms >= ? AND created_at_ms < ?
         );
         let mut string_binds: Vec<String> = vec![];
 
-        push_eq_filter(
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "tenant_id",
-            &req.filters.tenant_id,
+            &req.filters.tenant_ids,
         );
-        push_eq_filter(
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "caller_app_id",
-            &req.filters.caller_app_id,
+            &req.filters.caller_app_ids,
         );
-        push_eq_filter(
+        push_like_filter(
+            &mut sql,
+            &mut string_binds,
+            "caller_app_id",
+            &req.filters.caller_app_query,
+        );
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "request_model",
-            &req.filters.request_model,
+            &req.filters.request_models,
         );
-        push_eq_filter(
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "provider_model",
-            &req.filters.provider_model,
+            &req.filters.provider_models,
         );
-        push_eq_filter(
+        push_like_filter(
+            &mut sql,
+            &mut string_binds,
+            "provider_model",
+            &req.filters.provider_model_query,
+        );
+        push_provider_instance_in_filter(
+            &mut sql,
+            &mut string_binds,
+            &req.filters.provider_instance_names,
+        );
+        push_provider_instance_query_filter(
+            &mut sql,
+            &mut string_binds,
+            &req.filters.provider_instance_query,
+        );
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "capability",
-            &req.filters.capability,
+            &req.filters.capabilities,
         );
-        push_eq_filter(&mut sql, &mut string_binds, "task_id", &req.filters.task_id);
-        push_eq_filter(
+        push_in_filter(&mut sql, &mut string_binds, "task_id", &req.filters.task_ids);
+        push_in_filter(
             &mut sql,
             &mut string_binds,
             "idempotency_key",
-            &req.filters.idempotency_key,
+            &req.filters.idempotency_keys,
         );
 
         sql.push_str("\nORDER BY created_at_ms ASC, event_id ASC\n");
@@ -350,11 +372,46 @@ fn resolve_time_window(range: &UsageQueryTimeRange, now_ms: i64) -> (i64, i64) {
     }
 }
 
-fn push_eq_filter(sql: &mut String, binds: &mut Vec<String>, column: &str, value: &Option<String>) {
-    if let Some(val) = value {
-        sql.push_str(&format!(" AND {} = ?", column));
-        binds.push(val.clone());
+fn push_in_filter(sql: &mut String, binds: &mut Vec<String>, column: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
     }
+    let placeholders = std::iter::repeat("?")
+        .take(values.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(" AND {} IN ({})", column, placeholders));
+    binds.extend(values.iter().cloned());
+}
+
+fn push_like_filter(sql: &mut String, binds: &mut Vec<String>, column: &str, value: &Option<String>) {
+    if let Some(val) = value.as_deref().map(str::trim).filter(|val| !val.is_empty()) {
+        sql.push_str(&format!(" AND LOWER(COALESCE({}, '')) LIKE LOWER(?) ESCAPE '\\'", column));
+        binds.push(format!("%{}%", escape_like_value(val)));
+    }
+}
+
+fn push_provider_instance_in_filter(sql: &mut String, binds: &mut Vec<String>, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    let clauses = std::iter::repeat("provider_model LIKE ? ESCAPE '\\'")
+        .take(values.len())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    sql.push_str(&format!(" AND ({})", clauses));
+    binds.extend(values.iter().map(|value| format!("%@{}", escape_like_value(value))));
+}
+
+fn push_provider_instance_query_filter(sql: &mut String, binds: &mut Vec<String>, value: &Option<String>) {
+    if let Some(val) = value.as_deref().map(str::trim).filter(|val| !val.is_empty()) {
+        sql.push_str(" AND LOWER(provider_model) LIKE LOWER(?) ESCAPE '\\'");
+        binds.push(format!("%{}%", escape_like_value(val)));
+    }
+}
+
+fn escape_like_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 fn decode_row(row: &AnyRow) -> Result<AiccUsageEvent, RPCErrors> {
@@ -463,6 +520,18 @@ fn accumulate(agg: &mut UsageAggregate, event: &AiccUsageEvent) {
     agg.request_units = agg
         .request_units
         .saturating_add(event.request_units.unwrap_or(0));
+    if let Some(amount) = finance_amount(event) {
+        agg.finance_amount = Some(agg.finance_amount.unwrap_or(0.0) + amount);
+    }
+}
+
+fn finance_amount(event: &AiccUsageEvent) -> Option<f64> {
+    event
+        .finance_snapshot_json
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("amount"))
+        .and_then(Value::as_f64)
+        .filter(|amount| amount.is_finite())
 }
 
 fn group_events(events: &[AiccUsageEvent], group_by: &[UsageQueryGroup]) -> Vec<UsageGroupedRow> {
