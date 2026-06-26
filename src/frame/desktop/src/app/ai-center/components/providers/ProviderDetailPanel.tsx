@@ -446,12 +446,12 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted }: Provide
 function Metric({ label, value, detail }: { label: string; value: string; detail?: string }) {
   return (
     <div
-      className="rounded-xl p-3 min-h-[92px] h-full flex flex-col justify-between"
+      className="rounded-xl p-3 min-h-[92px] h-full grid grid-rows-[2rem_1.75rem_1rem] gap-1 content-start"
       style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
     >
-      <div className="flex min-h-8 items-end text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
-      <div className="min-h-7 text-xl font-semibold leading-tight" style={{ color: 'var(--cp-text)' }}>{value}</div>
-      <div className="text-[11px] truncate min-h-4" style={{ color: 'var(--cp-muted)' }}>{detail ?? ''}</div>
+      <div className="text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
+      <div className="text-xl font-semibold leading-tight" style={{ color: 'var(--cp-text)' }}>{value}</div>
+      <div className="text-[11px] truncate" style={{ color: 'var(--cp-muted)' }}>{detail ?? ''}</div>
     </div>
   )
 }
