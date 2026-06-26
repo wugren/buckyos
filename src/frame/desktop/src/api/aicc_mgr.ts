@@ -936,7 +936,7 @@ function aggregateTokens(raw?: RawUsageAggregate): number {
 }
 
 function aggregateFinanceAmount(raw?: RawUsageAggregate): number {
-  return Number(asNumber(raw?.finance_amount, 0).toFixed(6))
+  return asNumber(raw?.finance_amount, 0)
 }
 
 function localDayStart(value = new Date()): Date {
