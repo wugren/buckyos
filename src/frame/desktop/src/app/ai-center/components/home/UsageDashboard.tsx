@@ -36,6 +36,25 @@ function usageTokens(event: UsageEvent): number {
   return event.token_equivalent ?? (event.tokens_in ?? 0) + (event.tokens_out ?? 0)
 }
 
+function providerInstanceFromExactModel(model: string): string | undefined {
+  const at = model.lastIndexOf('@')
+  if (at < 0 || at === model.length - 1) return undefined
+  return model.slice(at + 1)
+}
+
+function readableUsageProviderIdentifier(event: UsageEvent): string {
+  const providerInstanceName = event.provider_instance_name.trim()
+  if (providerInstanceName && providerInstanceName !== 'unknown-provider') return providerInstanceName
+  const exactModelProvider = providerInstanceFromExactModel(event.exact_model)
+  if (exactModelProvider) return exactModelProvider
+  return event.exact_model || event.requested_model || providerInstanceName || 'unknown-provider'
+}
+
+function usageProviderDisplayName(event: UsageEvent, providerNames: Map<string, string>): string {
+  const identifier = readableUsageProviderIdentifier(event)
+  return providerNames.get(identifier) ?? identifier
+}
+
 function formatUsd(amount: number, compact = false): string {
   if (amount === 0) return '$0'
   const abs = Math.abs(amount)
@@ -143,6 +162,17 @@ export function UsageDashboard() {
   const balanceProviders = providers.filter((p) => p.account.balance_supported && p.account.balance_value != null)
   const usageOnlyProviders = providers.filter((p) => p.account.usage_supported && !p.account.balance_supported)
   const maxTrendTokens = Math.max(...trend.map((p) => p.tokens), 1)
+  const providerNames = useMemo(() => {
+    const names = new Map<string, string>()
+    for (const provider of providers) {
+      const instanceName = provider.config.provider_instance_name.trim()
+      const displayName = provider.config.name.trim()
+      if (instanceName) {
+        names.set(instanceName, displayName || instanceName)
+      }
+    }
+    return names
+  }, [providers])
   const providerOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_provider)), [summary.by_provider])
   const modelOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_model)), [summary.by_model])
   const appAgentOptions = useMemo(() => uniqueSorted(Object.keys(summary.by_app)), [summary.by_app])
@@ -496,11 +526,17 @@ export function UsageDashboard() {
             <tbody>
               {pagedEvents.map((event) => {
                 const tokens = usageTokens(event)
+                const providerIdentifier = readableUsageProviderIdentifier(event)
+                const providerDisplayName = usageProviderDisplayName(event, providerNames)
                 return (
                   <tr key={event.id} style={{ borderTop: '1px solid var(--cp-border)' }}>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp)}</td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>
-                      <TruncatedText value={event.provider_instance_name} className="max-w-[160px]" />
+                      <TruncatedText
+                        value={providerDisplayName}
+                        title={providerDisplayName === providerIdentifier ? providerDisplayName : `${providerDisplayName} (${providerIdentifier})`}
+                        className="max-w-[160px]"
+                      />
                     </td>
                     <td className="px-4 py-2 text-xs font-mono" style={{ color: 'var(--cp-text)' }}>
                       <TruncatedText value={event.exact_model} className="max-w-[220px]" />
@@ -903,9 +939,9 @@ function Breakdown({
   )
 }
 
-function TruncatedText({ value, className = '' }: { value: string; className?: string }) {
+function TruncatedText({ value, title, className = '' }: { value: string; title?: string; className?: string }) {
   return (
-    <span title={value} className={`block min-w-0 truncate ${className}`} style={{ color: 'var(--cp-text)' }}>
+    <span title={title ?? value} className={`block min-w-0 truncate ${className}`} style={{ color: 'var(--cp-text)' }}>
       {value}
     </span>
   )
