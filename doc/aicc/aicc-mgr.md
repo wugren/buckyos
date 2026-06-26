@@ -43,7 +43,7 @@ Provider 注册流程：
 
 1. AICC 启动或 reload 时读取 `services/aicc/settings`。
 2. `apply_provider_settings()` 清空 registry 和 route。
-3. 依次调用 `register_openai_llm_providers`、`register_sn_ai_provider`、`register_google_gimini_providers`、`register_claude_providers`、`register_minimax_providers`、`register_fal_providers`。
+3. 依次调用 `register_openai_llm_providers`、`register_sn_ai_provider`、`register_google_gemini_providers`、`register_claude_providers`、`register_minimax_providers`、`register_fal_providers`。
 4. 应用默认 logical tree。
 
 ### 2.2 settings key
@@ -533,7 +533,7 @@ let next = config_client.get("services/aicc/settings").await?;
 - `src/frame/aicc/src/aicc.rs`
   - 在 `Provider` trait 暴露 `refresh_inventory`，并在 registry / model_registry 中提供按 `provider_instance_name` 刷新并 apply inventory 的方法。
   - 暴露 usage query helper，如不方便可先放在 `main.rs` 调用 `usage_log_db()`。
-- `src/frame/aicc/src/openai.rs`、`src/frame/aicc/src/claude.rs`、`src/frame/aicc/src/gimini.rs`、`src/frame/aicc/src/minimax.rs`、`src/frame/aicc/src/fal.rs`、`src/frame/aicc/src/sn_ai_provider.rs`
+- `src/frame/aicc/src/openai.rs`、`src/frame/aicc/src/claude.rs`、`src/frame/aicc/src/gemini.rs`、`src/frame/aicc/src/minimax.rs`、`src/frame/aicc/src/fal.rs`、`src/frame/aicc/src/sn_ai_provider.rs`
   - settings parser 改为从每个 instance 读取 `api_token` / `api_key`。
   - 旧 section 级 token 只用于一次性迁移到 instance 级。
   - 实现 `Provider::refresh_inventory`，复用现有 `refresh_inventory_once` 逻辑。

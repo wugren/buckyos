@@ -2730,10 +2730,7 @@ fn provider_driver_mount_segment(provider_driver: &str) -> String {
     let stripped = normalized
         .strip_prefix("google-")
         .unwrap_or(normalized.as_str());
-    match stripped {
-        "gimini" => "gemini".to_string(),
-        _ => logical_mount_segment(stripped),
-    }
+    logical_mount_segment(stripped)
 }
 
 #[allow(dead_code)]
@@ -2748,7 +2745,7 @@ pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> V
         mounts.push("image.txt2img.gpt_image".to_string());
     } else if lowered.contains("dall-e") {
         mounts.push("image.txt2img.dalle".to_string());
-    } else if lowered.contains("gemini") || lowered.contains("gimini") {
+    } else if lowered.contains("gemini") {
         mounts.push("image.txt2img.gemini".to_string());
     }
     mounts

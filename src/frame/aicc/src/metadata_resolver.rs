@@ -383,9 +383,7 @@ fn load_builtin_driver_metadata(provider_driver: &str) -> Option<DriverMetadataD
     let raw = match normalized.as_str() {
         "openai" | "sn-ai-provider" => include_str!("../driver_metadata/openai.json"),
         "claude" | "anthropic" => include_str!("../driver_metadata/claude.json"),
-        "google-gemini" | "google-gimini" | "gemini" | "gimini" => {
-            include_str!("../driver_metadata/gemini.json")
-        }
+        "google-gemini" | "gemini" => include_str!("../driver_metadata/gemini.json"),
         "fal" => include_str!("../driver_metadata/fal.json"),
         "minimax" => include_str!("../driver_metadata/minimax.json"),
         _ => return None,

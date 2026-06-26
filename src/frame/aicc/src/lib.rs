@@ -5,7 +5,7 @@ pub mod claude_protocol;
 pub mod complete_request_queue;
 pub mod default_logical_tree;
 pub mod fal;
-pub mod gimini;
+pub mod gemini;
 pub mod metadata_resolver;
 pub mod minimax;
 pub mod model_registry;

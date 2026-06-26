@@ -1547,7 +1547,7 @@ function inferProviderType(driver: string, instanceName: string): ProviderType {
   if (value.includes('sn')) return 'sn_router'
   if (value.includes('openai')) return 'openai'
   if (value.includes('anthropic') || value.includes('claude')) return 'anthropic'
-  if (value.includes('google') || value.includes('gimini') || value.includes('gemini')) return 'google'
+  if (value.includes('google') || value.includes('gemini')) return 'google'
   if (value.includes('openrouter')) return 'openrouter'
   return 'custom'
 }
