@@ -813,9 +813,9 @@ function MultiSelectFilter({
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex h-full min-w-0 flex-col">
-      <div className="flex min-h-8 items-end text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
-      <div className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{value}</div>
+    <div className="grid h-full min-w-0 grid-rows-[2rem_auto] gap-1 content-start">
+      <div className="text-xs leading-4" style={{ color: 'var(--cp-muted)' }}>{label}</div>
+      <div className="text-base font-semibold leading-tight" style={{ color: 'var(--cp-text)' }}>{value}</div>
     </div>
   )
 }
