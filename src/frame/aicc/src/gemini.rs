@@ -25,18 +25,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time;
 
-const DEFAULT_GIMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_GIMINI_TIMEOUT_MS: u64 = 60_000;
-const DEFAULT_GIMINI_MODELS: &str = "gemini-2.5-flash,gemini-2.5-pro";
-const DEFAULT_GIMINI_IMAGE_MODELS: &str =
+const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_GEMINI_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_GEMINI_MODELS: &str = "gemini-2.5-flash,gemini-2.5-pro";
+const DEFAULT_GEMINI_IMAGE_MODELS: &str =
     "gemini-2.0-flash-exp-image-generation,gemini-2.5-flash-image-preview";
-const DEFAULT_GIMINI_EMBEDDING_MODELS: &str = "gemini-embedding-001";
-const DEFAULT_GIMINI_TTS_MODELS: &str = "gemini-2.5-flash-preview-tts";
-const DEFAULT_GIMINI_MUSIC_MODELS: &str = "lyria-002";
-const DEFAULT_GIMINI_VIDEO_MODELS: &str = "veo-3.1-generate-preview";
-const DEFAULT_GIMINI_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
-const GIMINI_MODELS_PAGE_SIZE: u32 = 1000;
-const GIMINI_IMAGE_INPUT_ALLOWLIST: &[&str] = &[
+const DEFAULT_GEMINI_EMBEDDING_MODELS: &str = "gemini-embedding-001";
+const DEFAULT_GEMINI_TTS_MODELS: &str = "gemini-2.5-flash-preview-tts";
+const DEFAULT_GEMINI_MUSIC_MODELS: &str = "lyria-002";
+const DEFAULT_GEMINI_VIDEO_MODELS: &str = "veo-3.1-generate-preview";
+const DEFAULT_GEMINI_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const GEMINI_MODELS_PAGE_SIZE: u32 = 1000;
+const GEMINI_IMAGE_INPUT_ALLOWLIST: &[&str] = &[
     "candidate_count",
     "max_output_tokens",
     "n",
@@ -49,7 +49,7 @@ const GIMINI_IMAGE_INPUT_ALLOWLIST: &[&str] = &[
     "top_k",
     "top_p",
 ];
-const GIMINI_IMAGE_OPTION_ALLOWLIST: &[&str] = &[
+const GEMINI_IMAGE_OPTION_ALLOWLIST: &[&str] = &[
     "candidate_count",
     "max_output_tokens",
     "n",
@@ -66,7 +66,7 @@ const GIMINI_IMAGE_OPTION_ALLOWLIST: &[&str] = &[
     "top_p",
     "user",
 ];
-const GIMINI_VIDEO_PARAMETER_ALLOWLIST: &[&str] = &[
+const GEMINI_VIDEO_PARAMETER_ALLOWLIST: &[&str] = &[
     "aspect_ratio",
     "duration_seconds",
     "negative_prompt",
@@ -76,7 +76,7 @@ const GIMINI_VIDEO_PARAMETER_ALLOWLIST: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
-pub struct GoogleGiminiInstanceConfig {
+pub struct GoogleGeminiInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
     pub provider_driver: String,
@@ -95,7 +95,7 @@ pub struct GoogleGiminiInstanceConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct GoogleGiminiProvider {
+pub struct GoogleGeminiProvider {
     instance: ProviderInstance,
     inventory: Arc<RwLock<ProviderInventory>>,
     client: Client,
@@ -108,7 +108,7 @@ pub struct GoogleGiminiProvider {
 }
 
 #[derive(Debug, Default)]
-struct GiminiModelBuckets {
+struct GeminiModelBuckets {
     llm: Vec<String>,
     image: Vec<String>,
     embedding: Vec<String>,
@@ -117,7 +117,7 @@ struct GiminiModelBuckets {
     video: Vec<String>,
 }
 
-impl GiminiModelBuckets {
+impl GeminiModelBuckets {
     fn is_empty(&self) -> bool {
         self.llm.is_empty()
             && self.image.is_empty()
@@ -136,7 +136,7 @@ impl GiminiModelBuckets {
         self.music.hash(&mut hasher);
         self.video.hash(&mut hasher);
         format!(
-            "gimini-models-{}-{}-{}-{}-{}-{}-{:x}",
+            "gemini-models-{}-{}-{}-{}-{}-{}-{:x}",
             self.llm.len(),
             self.image.len(),
             self.embedding.len(),
@@ -149,15 +149,15 @@ impl GiminiModelBuckets {
 }
 
 #[derive(Debug, Deserialize)]
-struct GiminiModelsResponse {
+struct GeminiModelsResponse {
     #[serde(default)]
-    models: Vec<GiminiModelEntry>,
+    models: Vec<GeminiModelEntry>,
     #[serde(default, alias = "nextPageToken")]
     next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GiminiModelEntry {
+struct GeminiModelEntry {
     #[serde(default)]
     name: String,
     #[serde(default, alias = "supportedGenerationMethods")]
@@ -171,10 +171,10 @@ struct GiminiModelEntry {
     description: String,
 }
 
-impl GoogleGiminiProvider {
-    pub fn new(cfg: GoogleGiminiInstanceConfig, api_token: String) -> Result<Self> {
+impl GoogleGeminiProvider {
+    pub fn new(cfg: GoogleGeminiInstanceConfig, api_token: String) -> Result<Self> {
         let timeout_ms = if cfg.timeout_ms == 0 {
-            DEFAULT_GIMINI_TIMEOUT_MS
+            DEFAULT_GEMINI_TIMEOUT_MS
         } else {
             cfg.timeout_ms
         };
@@ -182,7 +182,7 @@ impl GoogleGiminiProvider {
         let client = Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
-            .context("failed to build reqwest client for google gimini provider")?;
+            .context("failed to build reqwest client for google gemini provider")?;
 
         let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
         let provider_instance_name = cfg.provider_instance_name.clone();
@@ -206,7 +206,7 @@ impl GoogleGiminiProvider {
             endpoint: Some(cfg.base_url.clone()),
             plugin_key: None,
         };
-        let buckets = GiminiModelBuckets {
+        let buckets = GeminiModelBuckets {
             llm: cfg
                 .models
                 .iter()
@@ -214,10 +214,10 @@ impl GoogleGiminiProvider {
                 .cloned()
                 .collect(),
             image: cfg.image_models.clone(),
-            embedding: parse_csv_list(DEFAULT_GIMINI_EMBEDDING_MODELS),
-            tts: parse_csv_list(DEFAULT_GIMINI_TTS_MODELS),
-            music: parse_csv_list(DEFAULT_GIMINI_MUSIC_MODELS),
-            video: parse_csv_list(DEFAULT_GIMINI_VIDEO_MODELS),
+            embedding: parse_csv_list(DEFAULT_GEMINI_EMBEDDING_MODELS),
+            tts: parse_csv_list(DEFAULT_GEMINI_TTS_MODELS),
+            music: parse_csv_list(DEFAULT_GEMINI_MUSIC_MODELS),
+            video: parse_csv_list(DEFAULT_GEMINI_VIDEO_MODELS),
         };
         let inventory = Self::build_inventory_from_buckets(
             provider_instance_name.as_str(),
@@ -245,7 +245,7 @@ impl GoogleGiminiProvider {
         provider_instance_name: &str,
         provider_type: ProviderType,
         provider_driver: &str,
-        buckets: &GiminiModelBuckets,
+        buckets: &GeminiModelBuckets,
         _features: &[Feature],
         inventory_revision: Option<String>,
     ) -> ProviderInventory {
@@ -315,18 +315,18 @@ impl GoogleGiminiProvider {
         tokio::spawn(async move {
             if let Err(err) = self.refresh_inventory_once().await {
                 warn!(
-                    "aicc.gimini.inventory.initial_refresh_failed provider_instance_name={} err={}",
+                    "aicc.gemini.inventory.initial_refresh_failed provider_instance_name={} err={}",
                     self.provider_instance_name, err
                 );
             }
 
-            let mut interval = time::interval(DEFAULT_GIMINI_INVENTORY_REFRESH_INTERVAL);
+            let mut interval = time::interval(DEFAULT_GEMINI_INVENTORY_REFRESH_INTERVAL);
             interval.tick().await;
             loop {
                 interval.tick().await;
                 if let Err(err) = self.refresh_inventory_once().await {
                     warn!(
-                        "aicc.gimini.inventory.refresh_failed provider_instance_name={} err={}",
+                        "aicc.gemini.inventory.refresh_failed provider_instance_name={} err={}",
                         self.provider_instance_name, err
                     );
                 }
@@ -335,7 +335,7 @@ impl GoogleGiminiProvider {
     }
 
     async fn refresh_inventory_once(&self) -> Result<ProviderInventory> {
-        let mut buckets = GiminiModelBuckets::default();
+        let mut buckets = GeminiModelBuckets::default();
         let mut llm_seen = HashSet::<String>::new();
         let mut image_seen = HashSet::<String>::new();
         let mut embedding_seen = HashSet::<String>::new();
@@ -345,7 +345,7 @@ impl GoogleGiminiProvider {
         let mut page_token: Option<String> = None;
 
         let endpoint = format!("{}/models", self.base_url);
-        let page_size = GIMINI_MODELS_PAGE_SIZE.to_string();
+        let page_size = GEMINI_MODELS_PAGE_SIZE.to_string();
         loop {
             let mut request = self
                 .client
@@ -359,31 +359,31 @@ impl GoogleGiminiProvider {
             let response = request
                 .send()
                 .await
-                .context("gimini inventory refresh request failed")?;
+                .context("gemini inventory refresh request failed")?;
 
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 return Err(anyhow!(
-                    "gimini inventory refresh failed status={} body={}",
+                    "gemini inventory refresh failed status={} body={}",
                     status,
                     body
                 ));
             }
 
             let parsed = response
-                .json::<GiminiModelsResponse>()
+                .json::<GeminiModelsResponse>()
                 .await
-                .context("failed to parse gimini models response")?;
+                .context("failed to parse gemini models response")?;
 
             for entry in parsed.models.iter() {
-                let id = strip_gimini_model_prefix(entry.name.as_str()).trim();
+                let id = strip_gemini_model_prefix(entry.name.as_str()).trim();
                 if id.is_empty() {
                     continue;
                 }
-                if is_deprecated_gimini_entry(id, &entry.display_name, &entry.description) {
+                if is_deprecated_gemini_entry(id, &entry.display_name, &entry.description) {
                     log::debug!(
-                        "aicc.gimini.inventory.skip_deprecated id={} display_name={:?} description={:?}",
+                        "aicc.gemini.inventory.skip_deprecated id={} display_name={:?} description={:?}",
                         id,
                         entry.display_name,
                         entry.description
@@ -396,33 +396,33 @@ impl GoogleGiminiProvider {
                     .map(|method| method.to_ascii_lowercase())
                     .collect::<HashSet<_>>();
                 let key = id.to_ascii_lowercase();
-                match classify_gimini_model(id, &methods) {
-                    Some(GiminiModelKind::Llm) => {
+                match classify_gemini_model(id, &methods) {
+                    Some(GeminiModelKind::Llm) => {
                         if llm_seen.insert(key) {
                             buckets.llm.push(id.to_string());
                         }
                     }
-                    Some(GiminiModelKind::Image) => {
+                    Some(GeminiModelKind::Image) => {
                         if image_seen.insert(key) {
                             buckets.image.push(id.to_string());
                         }
                     }
-                    Some(GiminiModelKind::Embedding) => {
+                    Some(GeminiModelKind::Embedding) => {
                         if embedding_seen.insert(key) {
                             buckets.embedding.push(id.to_string());
                         }
                     }
-                    Some(GiminiModelKind::Tts) => {
+                    Some(GeminiModelKind::Tts) => {
                         if tts_seen.insert(key) {
                             buckets.tts.push(id.to_string());
                         }
                     }
-                    Some(GiminiModelKind::Music) => {
+                    Some(GeminiModelKind::Music) => {
                         if music_seen.insert(key) {
                             buckets.music.push(id.to_string());
                         }
                     }
-                    Some(GiminiModelKind::Video) => {
+                    Some(GeminiModelKind::Video) => {
                         if video_seen.insert(key) {
                             buckets.video.push(id.to_string());
                         }
@@ -439,7 +439,7 @@ impl GoogleGiminiProvider {
 
         if buckets.is_empty() {
             return Err(anyhow!(
-                "gimini inventory refresh returned no supported models"
+                "gemini inventory refresh returned no supported models"
             ));
         }
 
@@ -470,16 +470,16 @@ impl GoogleGiminiProvider {
         // Categories that the API never returns (lyria/veo are typically not
         // listed) fall back to defaults so we don't drop them on refresh.
         if buckets.embedding.is_empty() {
-            buckets.embedding = parse_csv_list(DEFAULT_GIMINI_EMBEDDING_MODELS);
+            buckets.embedding = parse_csv_list(DEFAULT_GEMINI_EMBEDDING_MODELS);
         }
         if buckets.tts.is_empty() {
-            buckets.tts = parse_csv_list(DEFAULT_GIMINI_TTS_MODELS);
+            buckets.tts = parse_csv_list(DEFAULT_GEMINI_TTS_MODELS);
         }
         if buckets.music.is_empty() {
-            buckets.music = parse_csv_list(DEFAULT_GIMINI_MUSIC_MODELS);
+            buckets.music = parse_csv_list(DEFAULT_GEMINI_MUSIC_MODELS);
         }
         if buckets.video.is_empty() {
-            buckets.video = parse_csv_list(DEFAULT_GIMINI_VIDEO_MODELS);
+            buckets.video = parse_csv_list(DEFAULT_GEMINI_VIDEO_MODELS);
         }
 
         let revision = Some(buckets.fingerprint());
@@ -496,11 +496,11 @@ impl GoogleGiminiProvider {
             let mut current = self
                 .inventory
                 .write()
-                .map_err(|_| anyhow!("gimini inventory lock poisoned"))?;
+                .map_err(|_| anyhow!("gemini inventory lock poisoned"))?;
             *current = inventory.clone();
         }
         info!(
-            "aicc.gimini.inventory.refreshed provider_instance_name={} llm={} image={} embedding={} tts={} music={} video={}",
+            "aicc.gemini.inventory.refreshed provider_instance_name={} llm={} image={} embedding={} tts={} music={} video={}",
             self.provider_instance_name,
             buckets.llm.len(),
             buckets.image.len(),
@@ -651,7 +651,7 @@ impl GoogleGiminiProvider {
         })
     }
 
-    fn role_to_gimini(role: &str) -> &'static str {
+    fn role_to_gemini(role: &str) -> &'static str {
         match role.trim().to_ascii_lowercase().as_str() {
             "assistant" => "model",
             _ => "user",
@@ -663,7 +663,7 @@ impl GoogleGiminiProvider {
             ResourceRef::Url { url, .. } => Ok(format!("resource_url: {}", url)),
             ResourceRef::NamedObject { obj_id } => Ok(format!("named_object: {}", obj_id)),
             ResourceRef::Base64 { .. } => Err(ProviderError::fatal(
-                "google gimini provider does not support base64 resources in this version",
+                "google gemini provider does not support base64 resources in this version",
             )),
         }
     }
@@ -781,7 +781,7 @@ impl GoogleGiminiProvider {
         if contents.is_empty() {
             for (role, content) in Self::canonical_message_texts(req)? {
                 contents.push(json!({
-                    "role": Self::role_to_gimini(role.as_str()),
+                    "role": Self::role_to_gemini(role.as_str()),
                     "parts": [
                         {
                             "text": content
@@ -834,7 +834,7 @@ impl GoogleGiminiProvider {
     /// Lower a single `AiMessage` to Gemini `Content` shape. Tool results
     /// land in a separate `role: "user"` content with a `functionResponse`
     /// part (Gemini's tool-result convention). System/Developer are folded
-    /// into the `user` role — mirroring the legacy `role_to_gimini` default —
+    /// into the `user` role — mirroring the legacy `role_to_gemini` default —
     /// because this provider doesn't currently surface `systemInstruction`.
     fn lower_message_to_gemini(
         msg: &AiMessage,
@@ -1211,7 +1211,7 @@ impl GoogleGiminiProvider {
         };
 
         for (key, value) in input_map.iter() {
-            if !GIMINI_IMAGE_INPUT_ALLOWLIST.contains(&key.as_str()) {
+            if !GEMINI_IMAGE_INPUT_ALLOWLIST.contains(&key.as_str()) {
                 continue;
             }
             match key.as_str() {
@@ -1279,7 +1279,7 @@ impl GoogleGiminiProvider {
                 ignored.push(key.clone());
                 continue;
             }
-            if !GIMINI_IMAGE_OPTION_ALLOWLIST.contains(&key.as_str()) && key != "prompt" {
+            if !GEMINI_IMAGE_OPTION_ALLOWLIST.contains(&key.as_str()) && key != "prompt" {
                 ignored.push(key.clone());
                 continue;
             }
@@ -1353,7 +1353,7 @@ impl GoogleGiminiProvider {
 
         let mut ignored = vec![];
         for (key, item) in map.iter() {
-            if !GIMINI_VIDEO_PARAMETER_ALLOWLIST.contains(&key.as_str())
+            if !GEMINI_VIDEO_PARAMETER_ALLOWLIST.contains(&key.as_str())
                 && Self::normalize_video_parameter_key(key.as_str()).is_none()
             {
                 ignored.push(key.clone());
@@ -1371,7 +1371,7 @@ impl GoogleGiminiProvider {
     ) -> Result<(Vec<AiArtifact>, Option<String>), ProviderError> {
         let Some(candidates) = body.get("candidates").and_then(|value| value.as_array()) else {
             return Err(ProviderError::fatal(
-                "google gimini image response is missing candidates array",
+                "google gemini image response is missing candidates array",
             ));
         };
 
@@ -1421,7 +1421,7 @@ impl GoogleGiminiProvider {
                             .unwrap_or("image/png");
                         if general_purpose::STANDARD.decode(data_base64).is_err() {
                             warn!(
-                                "aicc.gimini received invalid inlineData base64 in image response"
+                                "aicc.gemini received invalid inlineData base64 in image response"
                             );
                             continue;
                         }
@@ -1450,7 +1450,7 @@ impl GoogleGiminiProvider {
 
         if artifacts.is_empty() {
             return Err(ProviderError::fatal(
-                "google gimini image response has no usable image outputs",
+                "google gemini image response has no usable image outputs",
             ));
         }
 
@@ -1481,9 +1481,9 @@ impl GoogleGiminiProvider {
             .await
             .map_err(|err| {
                 if err.is_timeout() || err.is_connect() {
-                    ProviderError::retryable(format!("google gimini request failed: {}", err))
+                    ProviderError::retryable(format!("google gemini request failed: {}", err))
                 } else {
-                    ProviderError::fatal(format!("google gimini request failed: {}", err))
+                    ProviderError::fatal(format!("google gemini request failed: {}", err))
                 }
             })?;
         let latency_ms = started_at.elapsed().as_millis() as u64;
@@ -1492,12 +1492,12 @@ impl GoogleGiminiProvider {
         let body: Value = response.json().await.map_err(|err| {
             if status.as_u16() == 429 || status.is_server_error() {
                 ProviderError::retryable(format!(
-                    "failed to parse google gimini response body: {}",
+                    "failed to parse google gemini response body: {}",
                     err
                 ))
             } else {
                 ProviderError::fatal(format!(
-                    "failed to parse google gimini response body: {}",
+                    "failed to parse google gemini response body: {}",
                     err
                 ))
             }
@@ -1523,9 +1523,9 @@ impl GoogleGiminiProvider {
             .await
             .map_err(|err| {
                 if err.is_timeout() || err.is_connect() {
-                    ProviderError::retryable(format!("google gimini request failed: {}", err))
+                    ProviderError::retryable(format!("google gemini request failed: {}", err))
                 } else {
-                    ProviderError::fatal(format!("google gimini request failed: {}", err))
+                    ProviderError::fatal(format!("google gemini request failed: {}", err))
                 }
             })?;
         let latency_ms = started_at.elapsed().as_millis() as u64;
@@ -1533,7 +1533,7 @@ impl GoogleGiminiProvider {
         let body: Value = response.json().await.map_err(|err| {
             Self::classify_api_error(
                 status,
-                format!("failed to parse google gimini response body: {}", err),
+                format!("failed to parse google gemini response body: {}", err),
             )
         })?;
         Ok((status, body, latency_ms))
@@ -1566,7 +1566,7 @@ impl GoogleGiminiProvider {
                 }
             })),
             ResourceRef::NamedObject { obj_id } => Err(ProviderError::fatal(format!(
-                "google gimini provider cannot resolve named object resource {} without resolver bytes",
+                "google gemini provider cannot resolve named object resource {} without resolver bytes",
                 obj_id
             ))),
         }
@@ -1674,14 +1674,14 @@ impl GoogleGiminiProvider {
 
         if !ignored_options.is_empty() {
             warn!(
-                "aicc.gimini ignored unsupported llm options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                "aicc.gemini ignored unsupported llm options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
                 self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_options
             );
         }
 
         let request_log = redacted_json_log(&Value::Object(request_obj.clone()));
         info!(
-            "aicc.gimini.llm.input provider_instance_name={} model={} trace_id={:?} request={}",
+            "aicc.gemini.llm.input provider_instance_name={} model={} trace_id={:?} request={}",
             self.instance.provider_instance_name, provider_model, ctx.trace_id, request_log
         );
 
@@ -1692,7 +1692,7 @@ impl GoogleGiminiProvider {
 
         if !status.is_success() {
             warn!(
-                "aicc.gimini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+                "aicc.gemini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
                 self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
@@ -1702,7 +1702,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini api returned non-success status")
+                .unwrap_or("google gemini api returned non-success status")
                 .to_string();
             let code = body
                 .pointer("/error/status")
@@ -1710,12 +1710,12 @@ impl GoogleGiminiProvider {
                 .unwrap_or("unknown");
             return Err(Self::classify_api_error(
                 status,
-                format!("google gimini api error [{}]: {}", code, message),
+                format!("google gemini api error [{}]: {}", code, message),
             ));
         }
 
         info!(
-            "aicc.gimini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+            "aicc.gemini.llm.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
             self.instance.provider_instance_name,
             provider_model,
             ctx.trace_id,
@@ -1799,7 +1799,7 @@ impl GoogleGiminiProvider {
         }
         if !ignored_options.is_empty() {
             warn!(
-                "aicc.gimini ignored unsupported text2image options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                "aicc.gemini ignored unsupported text2image options: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
                 self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_options
             );
         }
@@ -1829,7 +1829,7 @@ impl GoogleGiminiProvider {
 
         let request_log = redacted_json_log(&Value::Object(request_obj.clone()));
         info!(
-            "aicc.gimini.text2image.input provider_instance_name={} model={} trace_id={:?} request={}",
+            "aicc.gemini.text2image.input provider_instance_name={} model={} trace_id={:?} request={}",
             self.instance.provider_instance_name, provider_model, ctx.trace_id, request_log
         );
 
@@ -1840,7 +1840,7 @@ impl GoogleGiminiProvider {
 
         if !status.is_success() {
             warn!(
-                "aicc.gimini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+                "aicc.gemini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
                 self.instance.provider_instance_name,
                 provider_model,
                 ctx.trace_id,
@@ -1850,7 +1850,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini api returned non-success status")
+                .unwrap_or("google gemini api returned non-success status")
                 .to_string();
             let code = body
                 .pointer("/error/status")
@@ -1858,12 +1858,12 @@ impl GoogleGiminiProvider {
                 .unwrap_or("unknown");
             return Err(Self::classify_api_error(
                 status,
-                format!("google gimini api error [{}]: {}", code, message),
+                format!("google gemini api error [{}]: {}", code, message),
             ));
         }
 
         info!(
-            "aicc.gimini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
+            "aicc.gemini.text2image.output provider_instance_name={} model={} trace_id={:?} status={} response={}",
             self.instance.provider_instance_name,
             provider_model,
             ctx.trace_id,
@@ -1947,7 +1947,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini image edit returned non-success status");
+                .unwrap_or("google gemini image edit returned non-success status");
             return Err(Self::classify_api_error(status, message.to_string()));
         }
         let (artifacts, text) = Self::parse_text2image_result(&body)?;
@@ -2026,7 +2026,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini embedding returned non-success status");
+                .unwrap_or("google gemini embedding returned non-success status");
             return Err(Self::classify_api_error(status, message.to_string()));
         }
         let dimensions = body
@@ -2093,7 +2093,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini vision returned non-success status");
+                .unwrap_or("google gemini vision returned non-success status");
             return Err(Self::classify_api_error(status, message.to_string()));
         }
         let text = Self::extract_text_content(&body);
@@ -2167,7 +2167,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini audio returned non-success status");
+                .unwrap_or("google gemini audio returned non-success status");
             return Err(Self::classify_api_error(status, message.to_string()));
         }
         let artifacts = Self::parse_media_artifacts(&body, "audio/mpeg");
@@ -2233,7 +2233,7 @@ impl GoogleGiminiProvider {
         }
         if !ignored_parameters.is_empty() {
             warn!(
-                "aicc.gimini ignored unsupported video parameters: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
+                "aicc.gemini ignored unsupported video parameters: provider_instance_name={} model={} trace_id={:?} ignored={:?}",
                 self.instance.provider_instance_name, provider_model, ctx.trace_id, ignored_parameters
             );
         }
@@ -2244,7 +2244,7 @@ impl GoogleGiminiProvider {
             let message = body
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("google gimini video returned non-success status");
+                .unwrap_or("google gemini video returned non-success status");
             return Err(Self::classify_api_error(status, message.to_string()));
         }
         let mut extra = Map::new();
@@ -2281,7 +2281,7 @@ impl GoogleGiminiProvider {
 }
 
 #[async_trait]
-impl Provider for GoogleGiminiProvider {
+impl Provider for GoogleGeminiProvider {
     fn inventory(&self) -> ProviderInventory {
         self.inventory
             .read()
@@ -2291,7 +2291,7 @@ impl Provider for GoogleGiminiProvider {
                     self.provider_instance_name.as_str(),
                     self.provider_type.clone(),
                     self.provider_driver.as_str(),
-                    &GiminiModelBuckets::default(),
+                    &GeminiModelBuckets::default(),
                     self.features.as_slice(),
                     Some("inventory-lock-poisoned".to_string()),
                 )
@@ -2403,7 +2403,7 @@ impl Provider for GoogleGiminiProvider {
                 .await
             }
             method => Err(ProviderError::fatal(format!(
-                "google gimini provider does not support method '{}'",
+                "google gemini provider does not support method '{}'",
                 method
             ))),
         }
@@ -2437,8 +2437,8 @@ fn json_text_len(value: &Value) -> usize {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct GiminiSettings {
-    #[serde(default = "default_gimini_enabled")]
+struct GeminiSettings {
+    #[serde(default = "default_gemini_enabled")]
     enabled: bool,
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
@@ -2446,11 +2446,11 @@ struct GiminiSettings {
     #[allow(dead_code)]
     alias_map: HashMap<String, String>,
     #[serde(default)]
-    instances: Vec<SettingsGoogleGiminiInstanceConfig>,
+    instances: Vec<SettingsGoogleGeminiInstanceConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct SettingsGoogleGiminiInstanceConfig {
+struct SettingsGoogleGeminiInstanceConfig {
     #[serde(default = "default_instance_id")]
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
@@ -2477,7 +2477,7 @@ struct SettingsGoogleGiminiInstanceConfig {
     alias_map: HashMap<String, String>,
 }
 
-fn default_gimini_enabled() -> bool {
+fn default_gemini_enabled() -> bool {
     true
 }
 
@@ -2494,11 +2494,11 @@ fn default_provider_driver() -> String {
 }
 
 fn default_base_url() -> String {
-    DEFAULT_GIMINI_BASE_URL.to_string()
+    DEFAULT_GEMINI_BASE_URL.to_string()
 }
 
 fn default_timeout_ms() -> u64 {
-    DEFAULT_GIMINI_TIMEOUT_MS
+    DEFAULT_GEMINI_TIMEOUT_MS
 }
 
 fn default_features() -> Vec<String> {
@@ -2514,7 +2514,7 @@ fn is_text2image_model_name(model: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum GiminiModelKind {
+enum GeminiModelKind {
     Llm,
     Image,
     Embedding,
@@ -2523,7 +2523,7 @@ enum GiminiModelKind {
     Video,
 }
 
-fn strip_gimini_model_prefix(name: &str) -> &str {
+fn strip_gemini_model_prefix(name: &str) -> &str {
     name.strip_prefix("models/")
         .or_else(|| name.strip_prefix("tunedModels/"))
         .unwrap_or(name)
@@ -2623,7 +2623,7 @@ fn strip_numeric_version_suffix(name: &str) -> Option<&str> {
 ///
 /// 这只是描述文字层面的过滤；如果 Google 哪天没在文案里写明就停服，最终还是要
 /// 由运行期 health 反馈再降级一次（属于另外一条独立的链路）。
-fn is_deprecated_gimini_entry(id: &str, display_name: &str, description: &str) -> bool {
+fn is_deprecated_gemini_entry(id: &str, display_name: &str, description: &str) -> bool {
     const SIGNALS: &[&str] = &[
         "deprecat",   // deprecated / deprecation
         "discontinu", // discontinued / discontinuation
@@ -2638,27 +2638,27 @@ fn is_deprecated_gimini_entry(id: &str, display_name: &str, description: &str) -
     SIGNALS.iter().any(|signal| haystack.contains(signal))
 }
 
-fn classify_gimini_model(id: &str, methods: &HashSet<String>) -> Option<GiminiModelKind> {
+fn classify_gemini_model(id: &str, methods: &HashSet<String>) -> Option<GeminiModelKind> {
     let lowered = id.to_ascii_lowercase();
 
     if lowered.contains("embedding") || methods.contains("embedcontent") {
-        return Some(GiminiModelKind::Embedding);
+        return Some(GeminiModelKind::Embedding);
     }
     if lowered.contains("tts") {
-        return Some(GiminiModelKind::Tts);
+        return Some(GeminiModelKind::Tts);
     }
     if lowered.contains("lyria") {
-        return Some(GiminiModelKind::Music);
+        return Some(GeminiModelKind::Music);
     }
     if lowered.contains("veo") {
-        return Some(GiminiModelKind::Video);
+        return Some(GeminiModelKind::Video);
     }
     if is_text2image_model_name(id) {
-        return Some(GiminiModelKind::Image);
+        return Some(GeminiModelKind::Image);
     }
     if lowered.starts_with("gemini") && (methods.contains("generatecontent") || methods.is_empty())
     {
-        return Some(GiminiModelKind::Llm);
+        return Some(GeminiModelKind::Llm);
     }
     None
 }
@@ -2688,12 +2688,10 @@ fn parse_csv_list(value: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn parse_gimini_settings(settings: &Value) -> Result<Option<GiminiSettings>> {
+fn parse_gemini_settings(settings: &Value) -> Result<Option<GeminiSettings>> {
     let raw = settings
         .get("gemini")
         .or_else(|| settings.get("google_gemini"))
-        .or_else(|| settings.get("gimini"))
-        .or_else(|| settings.get("google_gimini"))
         .or_else(|| settings.get("google"));
     let Some(raw_settings) = raw else {
         return Ok(None);
@@ -2702,34 +2700,18 @@ fn parse_gimini_settings(settings: &Value) -> Result<Option<GiminiSettings>> {
         return Ok(None);
     }
 
-    let gimini_settings = serde_json::from_value::<GiminiSettings>(raw_settings.clone())
-        .map_err(|err| anyhow!("failed to parse gimini settings: {}", err))?;
-    if !gimini_settings.enabled {
+    let gemini_settings = serde_json::from_value::<GeminiSettings>(raw_settings.clone())
+        .map_err(|err| anyhow!("failed to parse gemini settings: {}", err))?;
+    if !gemini_settings.enabled {
         return Ok(None);
     }
 
-    Ok(Some(gimini_settings))
+    Ok(Some(gemini_settings))
 }
 
-fn normalize_legacy_gemini_instance_name(value: String) -> String {
-    if value == "google-gimini-default" {
-        "google-gemini-default".to_string()
-    } else {
-        value
-    }
-}
-
-fn normalize_legacy_gemini_driver(value: String) -> String {
-    if value == "google-gimini" {
-        "google-gemini".to_string()
-    } else {
-        value
-    }
-}
-
-fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiInstanceConfig>> {
+fn build_gemini_instances(settings: &GeminiSettings) -> Result<Vec<GoogleGeminiInstanceConfig>> {
     let raw_instances = if settings.instances.is_empty() {
-        vec![SettingsGoogleGiminiInstanceConfig {
+        vec![SettingsGoogleGeminiInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
             provider_driver: default_provider_driver(),
@@ -2751,11 +2733,11 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
     for raw_instance in raw_instances.into_iter() {
         let mut models = normalize_model_list(raw_instance.models);
         if models.is_empty() {
-            models = normalize_model_list(parse_csv_list(DEFAULT_GIMINI_MODELS));
+            models = normalize_model_list(parse_csv_list(DEFAULT_GEMINI_MODELS));
         }
         if models.is_empty() {
             return Err(anyhow!(
-                "gimini instance {} has no models configured",
+                "gemini instance {} has no models configured",
                 raw_instance.provider_instance_name
             ));
         }
@@ -2778,7 +2760,7 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
                 .collect::<Vec<_>>();
         }
         if image_models.is_empty() {
-            image_models = normalize_model_list(parse_csv_list(DEFAULT_GIMINI_IMAGE_MODELS));
+            image_models = normalize_model_list(parse_csv_list(DEFAULT_GEMINI_IMAGE_MODELS));
         }
         let default_image_model = raw_instance
             .default_image_model
@@ -2789,12 +2771,10 @@ fn build_gimini_instances(settings: &GiminiSettings) -> Result<Vec<GoogleGiminiI
             raw_instance.features
         };
 
-        instances.push(GoogleGiminiInstanceConfig {
-            provider_instance_name: normalize_legacy_gemini_instance_name(
-                raw_instance.provider_instance_name,
-            ),
+        instances.push(GoogleGeminiInstanceConfig {
+            provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
-            provider_driver: normalize_legacy_gemini_driver(raw_instance.provider_driver),
+            provider_driver: raw_instance.provider_driver,
             api_token: if raw_instance.api_token.trim().is_empty() {
                 settings.api_token.clone()
             } else {
@@ -2919,24 +2899,24 @@ fn register_custom_aliases(
     }
 }
 
-pub fn register_google_gimini_providers(
+pub fn register_google_gemini_providers(
     center: &AIComputeCenter,
     settings: &Value,
 ) -> Result<usize> {
-    let Some(gimini_settings) = parse_gimini_settings(settings)? else {
-        info!("aicc google gimini provider is disabled (gimini settings missing or disabled)");
+    let Some(gemini_settings) = parse_gemini_settings(settings)? else {
+        info!("aicc google gemini provider is disabled (gemini settings missing or disabled)");
         return Ok(0);
     };
-    let instances = build_gimini_instances(&gimini_settings)?;
-    let mut prepared = Vec::<(GoogleGiminiInstanceConfig, Arc<GoogleGiminiProvider>)>::new();
+    let instances = build_gemini_instances(&gemini_settings)?;
+    let mut prepared = Vec::<(GoogleGeminiInstanceConfig, Arc<GoogleGeminiProvider>)>::new();
     for config in instances.iter() {
         if config.api_token.trim().is_empty() {
             return Err(anyhow!(
-                "gimini instance {} api_token (or api_key) is required",
+                "gemini instance {} api_token (or api_key) is required",
                 config.provider_instance_name
             ));
         }
-        let provider = Arc::new(GoogleGiminiProvider::new(
+        let provider = Arc::new(GoogleGeminiProvider::new(
             config.clone(),
             config.api_token.clone(),
         )?);
@@ -2947,7 +2927,7 @@ pub fn register_google_gimini_providers(
     for (config, provider) in prepared.into_iter() {
         let inventory = center.registry().add_provider(provider);
         info!(
-            "registered google gimini base_url={} inventory={:?}",
+            "registered google gemini base_url={} inventory={:?}",
             config.base_url, inventory
         );
         center
@@ -2955,7 +2935,7 @@ pub fn register_google_gimini_providers(
             .write()
             .map_err(|_| anyhow!("model registry lock poisoned"))?
             .apply_inventory(inventory)
-            .map_err(|err| anyhow!("failed to apply gimini inventory: {}", err))?;
+            .map_err(|err| anyhow!("failed to apply gemini inventory: {}", err))?;
     }
 
     Ok(instances.len())
@@ -3153,36 +3133,36 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_gimini_entries_are_filtered() {
+    fn deprecated_gemini_entries_are_filtered() {
         // 描述里出现 deprecation 信号 → 必须过滤
-        assert!(is_deprecated_gimini_entry(
+        assert!(is_deprecated_gemini_entry(
             "gemini-2.0-flash-001",
             "Gemini 2.0 Flash (Discontinued)",
             "Stable version of Gemini 2.0 Flash."
         ));
-        assert!(is_deprecated_gimini_entry(
+        assert!(is_deprecated_gemini_entry(
             "gemini-1.5-pro-002",
             "Gemini 1.5 Pro",
             "This model is deprecated. Please migrate to gemini-2.5-pro."
         ));
-        assert!(is_deprecated_gimini_entry(
+        assert!(is_deprecated_gemini_entry(
             "gemini-1.0-pro",
             "Gemini 1.0 Pro",
             "Legacy: gemini-1.0-pro is no longer available to new users.",
         ));
-        assert!(is_deprecated_gimini_entry(
+        assert!(is_deprecated_gemini_entry(
             "gemini-2.0-flash-lite",
             "Gemini 2.0 Flash-Lite",
             "Will be retired on 2026-01-01."
         ));
 
         // 健康的当前模型不能误伤
-        assert!(!is_deprecated_gimini_entry(
+        assert!(!is_deprecated_gemini_entry(
             "gemini-2.5-flash",
             "Gemini 2.5 Flash",
             "Fast and versatile multimodal model."
         ));
-        assert!(!is_deprecated_gimini_entry(
+        assert!(!is_deprecated_gemini_entry(
             "gemini-2.5-pro",
             "Gemini 2.5 Pro",
             "Most capable Gemini model for complex reasoning tasks."
@@ -3190,15 +3170,15 @@ mod tests {
     }
 
     #[test]
-    fn build_gimini_instances_infers_image_models() {
-        let settings = GiminiSettings {
+    fn build_gemini_instances_infers_image_models() {
+        let settings = GeminiSettings {
             enabled: true,
             api_token: "token".to_string(),
             alias_map: HashMap::new(),
-            instances: vec![SettingsGoogleGiminiInstanceConfig {
-                provider_instance_name: "gimini-1".to_string(),
+            instances: vec![SettingsGoogleGeminiInstanceConfig {
+                provider_instance_name: "gemini-1".to_string(),
                 provider_type: "cloud_api".to_string(),
-                provider_driver: "google-gimini".to_string(),
+                provider_driver: "google-gemini".to_string(),
                 api_token: String::new(),
                 base_url: default_base_url(),
                 timeout_ms: default_timeout_ms(),
@@ -3214,7 +3194,7 @@ mod tests {
             }],
         };
 
-        let instances = build_gimini_instances(&settings).expect("instances should be built");
+        let instances = build_gemini_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].provider_driver, "google-gemini");
         assert_eq!(
@@ -3228,22 +3208,22 @@ mod tests {
     }
 
     #[test]
-    fn build_gimini_instances_uses_gemini_default_names() {
-        let settings = GiminiSettings {
+    fn build_gemini_instances_uses_gemini_default_names() {
+        let settings = GeminiSettings {
             enabled: true,
             api_token: "token".to_string(),
             alias_map: HashMap::new(),
             instances: vec![],
         };
 
-        let instances = build_gimini_instances(&settings).expect("instances should be built");
+        let instances = build_gemini_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].provider_instance_name, "google-gemini-default");
         assert_eq!(instances[0].provider_driver, "google-gemini");
     }
 
     #[test]
-    fn register_gimini_inventory_exposes_stable_gemini_mounts() {
+    fn register_gemini_inventory_exposes_stable_gemini_mounts() {
         let center = AIComputeCenter::default();
         let settings = json!({
             "gemini": {
@@ -3251,9 +3231,9 @@ mod tests {
                 "api_token": "token",
                 "instances": [
                     {
-                        "provider_instance_name": "google-gimini-default",
+                        "provider_instance_name": "google-gemini-default",
                         "provider_type": "cloud_api",
-                        "provider_driver": "google-gimini",
+                        "provider_driver": "google-gemini",
                         "base_url": "https://generativelanguage.googleapis.com/v1beta",
                         "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
                         "image_models": ["gemini-2.5-flash-image-preview"]
@@ -3263,7 +3243,7 @@ mod tests {
         });
 
         let count =
-            register_google_gimini_providers(&center, &settings).expect("register should work");
+            register_google_gemini_providers(&center, &settings).expect("register should work");
         assert_eq!(count, 1);
 
         let registry = center.model_registry().read().expect("model registry lock");
@@ -3275,8 +3255,6 @@ mod tests {
         assert!(pro_items
             .values()
             .any(|item| item.target == "gemini-2.5-pro@google-gemini-default"));
-        let legacy_items = registry.default_items_for_path("llm.gimini");
-        assert!(legacy_items.is_empty());
         let image_items = registry.default_items_for_path("image.txt2img.gemini");
         assert!(image_items
             .values()
@@ -3354,7 +3332,7 @@ mod tests {
     fn estimate_text2image_cost_covers_current_image_models() {
         let preview = build_text2image_request(Some(json!({ "n": 2 })));
         assert_eq!(
-            GoogleGiminiProvider::estimate_text2image_cost(
+            GoogleGeminiProvider::estimate_text2image_cost(
                 &preview,
                 "gemini-2.5-flash-image-preview"
             ),
@@ -3363,7 +3341,7 @@ mod tests {
 
         let legacy = build_text2image_request(None);
         assert_eq!(
-            GoogleGiminiProvider::estimate_text2image_cost(
+            GoogleGeminiProvider::estimate_text2image_cost(
                 &legacy,
                 "gemini-2.0-flash-exp-image-generation"
             ),
@@ -3391,7 +3369,7 @@ mod tests {
         });
 
         let (artifacts, text) =
-            GoogleGiminiProvider::parse_text2image_result(&body).expect("artifacts should parse");
+            GoogleGeminiProvider::parse_text2image_result(&body).expect("artifacts should parse");
         assert_eq!(artifacts.len(), 1);
         assert!(text.is_none());
         match &artifacts[0].resource {

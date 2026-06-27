@@ -108,7 +108,7 @@ verify-hub 的私钥不在 `services/verify-hub/settings`，而在 `security/ver
 | --- | --- | --- | --- |
 | `services/aicc/settings` | AICC provider 和路由配置。包含 provider 实例、模型、默认模型、alias、feature、image model、`routing_config` 等。 | scheduler 初始化；aicc 管理接口；control-panel AI provider 管理 | aicc 启动和 reload 时读取；Control Panel AI 设置页读取和更新。 |
 
-当前 AICC 代码识别的 provider section 包括 `sn-ai-provider`、`openai`、`google`、`gemini`、`google_gemini`、`google_gimini`、`claude`、`anthropic`、`minimax`、`fal`。
+当前 AICC 代码识别的 provider section 包括 `sn-ai-provider`、`openai`、`google`、`gemini`、`google_gemini`、`google_gemini`、`claude`、`anthropic`、`minimax`、`fal`。
 
 ### msg-center
 

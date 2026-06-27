@@ -1,7 +1,7 @@
 mod common;
 
 use aicc::claude::{ClaudeInstanceConfig, ClaudeProvider};
-use aicc::gimini::{GoogleGiminiInstanceConfig, GoogleGiminiProvider};
+use aicc::gemini::{GoogleGeminiInstanceConfig, GoogleGeminiProvider};
 use aicc::openai::{OpenAIInstanceConfig, OpenAIProvider};
 use aicc::{InvokeCtx, Provider, ProviderStartResult, ResolvedRequest};
 use buckyos_api::Capability;
@@ -24,10 +24,10 @@ fn openai_provider(base_url: String, timeout_ms: u64) -> OpenAIProvider {
     .expect("openai provider")
 }
 
-fn gimini_provider(base_url: String, timeout_ms: u64) -> GoogleGiminiProvider {
-    GoogleGiminiProvider::new(
-        GoogleGiminiInstanceConfig {
-            provider_instance_name: "gimini-test".to_string(),
+fn gemini_provider(base_url: String, timeout_ms: u64) -> GoogleGeminiProvider {
+    GoogleGeminiProvider::new(
+        GoogleGeminiInstanceConfig {
+            provider_instance_name: "gemini-test".to_string(),
             provider_type: "cloud_api".to_string(),
             provider_driver: "google-gemini".to_string(),
             api_token: "token".to_string(),
@@ -42,7 +42,7 @@ fn gimini_provider(base_url: String, timeout_ms: u64) -> GoogleGiminiProvider {
         },
         "token".to_string(),
     )
-    .expect("gimini provider")
+    .expect("gemini provider")
 }
 
 fn claude_provider(base_url: String, timeout_ms: u64) -> ClaudeProvider {
@@ -227,11 +227,11 @@ async fn adapter_openai_06_timeout_or_network_error_classified() {
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_01_http_200_success` 鐢ㄤ緥锛岃鐩栧嚱鏁板悕瀵瑰簲鐨勪笟鍔¤矾寰勩€?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_01_http_200_success` 鐢ㄤ緥锛岃鐩栧嚱鏁板悕瀵瑰簲鐨勪笟鍔¤矾寰勩€?
 // - 杈撳叆鍙傛暟锛氶€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氳繑鍥炴垚鍔熺粨鏋滐紝鍏抽敭瀛楁涓庢柇瑷€涓€鑷淬€?
-async fn adapter_gimini_01_http_200_success() {
+async fn adapter_gemini_01_http_200_success() {
     let base_url = spawn_fake_http_server(vec![MockHttpReply {
         status_code: 200,
         body: r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#.to_string(),
@@ -239,7 +239,7 @@ async fn adapter_gimini_01_http_200_success() {
         delay_ms: 0,
     }])
     .await;
-    let provider = gimini_provider(base_url, 500);
+    let provider = gemini_provider(base_url, 500);
     let result = provider
         .start(
             InvokeCtx::default(),
@@ -248,7 +248,7 @@ async fn adapter_gimini_01_http_200_success() {
             Arc::new(NoopSink),
         )
         .await
-        .expect("gimini 200 should succeed");
+        .expect("gemini 200 should succeed");
     match result {
         ProviderStartResult::Immediate(summary) => {
             assert_eq!(summary.text_content(), "ok");
@@ -260,11 +260,11 @@ async fn adapter_gimini_01_http_200_success() {
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_02_http_429_retryable` 鐢ㄤ緥锛岃鐩栧彲閲嶈瘯閿欒鍒嗘敮銆侀檺娴侀敊璇垎绫汇€?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_02_http_429_retryable` 鐢ㄤ緥锛岃鐩栧彲閲嶈瘯閿欒鍒嗘敮銆侀檺娴侀敊璇垎绫汇€?
 // - 杈撳叆鍙傛暟锛氭瀯閫犲涓?provider 鍊欓€夛紝骞舵敞鍏?Started/Queued/澶辫触缁撴灉锛涢€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氶敊璇褰掔被涓哄彲閲嶈瘯骞惰Е鍙戝搴旂瓥鐣ャ€?
-async fn adapter_gimini_02_http_429_retryable() {
+async fn adapter_gemini_02_http_429_retryable() {
     let base_url = spawn_fake_http_server(vec![MockHttpReply {
         status_code: 429,
         body: r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"too many requests"}}"#
@@ -273,7 +273,7 @@ async fn adapter_gimini_02_http_429_retryable() {
         delay_ms: 0,
     }])
     .await;
-    let provider = gimini_provider(base_url, 500);
+    let provider = gemini_provider(base_url, 500);
     let err = provider
         .start(
             InvokeCtx::default(),
@@ -283,7 +283,7 @@ async fn adapter_gimini_02_http_429_retryable() {
         )
         .await
         .expect_err("must fail");
-    assert!(err.is_retryable(), "assert failed in adapter_gimini_02_http_429_retryable: condition is false; check preconditions and expected branch outcome.");
+    assert!(err.is_retryable(), "assert failed in adapter_gemini_02_http_429_retryable: condition is false; check preconditions and expected branch outcome.");
 }
 
 #[tokio::test]
@@ -399,11 +399,11 @@ async fn adapter_claude_04_timeout_or_network_error_classified() {
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_03_http_503_retryable` 鐢ㄤ緥锛岃鐩栧彲閲嶈瘯閿欒鍒嗘敮銆佹湇鍔′笉鍙敤閿欒鍒嗙被銆?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_03_http_503_retryable` 鐢ㄤ緥锛岃鐩栧彲閲嶈瘯閿欒鍒嗘敮銆佹湇鍔′笉鍙敤閿欒鍒嗙被銆?
 // - 杈撳叆鍙傛暟锛氭瀯閫犲涓?provider 鍊欓€夛紝骞舵敞鍏?Started/Queued/澶辫触缁撴灉锛涢€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氶敊璇褰掔被涓哄彲閲嶈瘯骞惰Е鍙戝搴旂瓥鐣ャ€?
-async fn adapter_gimini_03_http_503_retryable() {
+async fn adapter_gemini_03_http_503_retryable() {
     let base_url = spawn_fake_http_server(vec![MockHttpReply {
         status_code: 503,
         body: r#"{"error":{"status":"UNAVAILABLE","message":"service unavailable"}}"#.to_string(),
@@ -411,7 +411,7 @@ async fn adapter_gimini_03_http_503_retryable() {
         delay_ms: 0,
     }])
     .await;
-    let provider = gimini_provider(base_url, 500);
+    let provider = gemini_provider(base_url, 500);
     let err = provider
         .start(
             InvokeCtx::default(),
@@ -421,16 +421,16 @@ async fn adapter_gimini_03_http_503_retryable() {
         )
         .await
         .expect_err("must fail");
-    assert!(err.is_retryable(), "assert failed in adapter_gimini_03_http_503_retryable: condition is false; check preconditions and expected branch outcome.");
+    assert!(err.is_retryable(), "assert failed in adapter_gemini_03_http_503_retryable: condition is false; check preconditions and expected branch outcome.");
 }
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_04_http_400_fatal` 鐢ㄤ緥锛岃鐩栬嚧鍛介敊璇垎鏀€佸弬鏁伴敊璇垎绫汇€?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_04_http_400_fatal` 鐢ㄤ緥锛岃鐩栬嚧鍛介敊璇垎鏀€佸弬鏁伴敊璇垎绫汇€?
 // - 杈撳叆鍙傛暟锛氭瀯閫犲涓?provider 鍊欓€夛紝骞舵敞鍏?Started/Queued/澶辫触缁撴灉锛涢€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氳繑鍥炴嫆缁濇垨鑷村懡閿欒锛岄敊璇爜/閿欒娑堟伅绗﹀悎棰勬湡銆?
-async fn adapter_gimini_04_http_400_fatal() {
+async fn adapter_gemini_04_http_400_fatal() {
     let base_url = spawn_fake_http_server(vec![MockHttpReply {
         status_code: 400,
         body: r#"{"error":{"status":"INVALID_ARGUMENT","message":"bad request"}}"#.to_string(),
@@ -438,7 +438,7 @@ async fn adapter_gimini_04_http_400_fatal() {
         delay_ms: 0,
     }])
     .await;
-    let provider = gimini_provider(base_url, 500);
+    let provider = gemini_provider(base_url, 500);
     let err = provider
         .start(
             InvokeCtx::default(),
@@ -448,16 +448,16 @@ async fn adapter_gimini_04_http_400_fatal() {
         )
         .await
         .expect_err("must fail");
-    assert!(!err.is_retryable(), "assert failed in adapter_gimini_04_http_400_fatal: condition is false; check preconditions and expected branch outcome.");
+    assert!(!err.is_retryable(), "assert failed in adapter_gemini_04_http_400_fatal: condition is false; check preconditions and expected branch outcome.");
 }
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_05_invalid_json_fatal` 鐢ㄤ緥锛岃鐩栬嚧鍛介敊璇垎鏀€侀潪娉?JSON 鍝嶅簲鍒嗙被銆?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_05_invalid_json_fatal` 鐢ㄤ緥锛岃鐩栬嚧鍛介敊璇垎鏀€侀潪娉?JSON 鍝嶅簲鍒嗙被銆?
 // - 杈撳叆鍙傛暟锛氭瀯閫犲涓?provider 鍊欓€夛紝骞舵敞鍏?Started/Queued/澶辫触缁撴灉锛涢€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氳繑鍥炴垚鍔熺粨鏋滐紝鍏抽敭瀛楁涓庢柇瑷€涓€鑷达紱杩斿洖鎷掔粷鎴栬嚧鍛介敊璇紝閿欒鐮?閿欒娑堟伅绗﹀悎棰勬湡銆?
-async fn adapter_gimini_05_invalid_json_fatal() {
+async fn adapter_gemini_05_invalid_json_fatal() {
     let base_url = spawn_fake_http_server(vec![MockHttpReply {
         status_code: 200,
         body: "not-json".to_string(),
@@ -465,7 +465,7 @@ async fn adapter_gimini_05_invalid_json_fatal() {
         delay_ms: 0,
     }])
     .await;
-    let provider = gimini_provider(base_url, 500);
+    let provider = gemini_provider(base_url, 500);
     let err = provider
         .start(
             InvokeCtx::default(),
@@ -475,17 +475,17 @@ async fn adapter_gimini_05_invalid_json_fatal() {
         )
         .await
         .expect_err("must fail");
-    assert!(!err.is_retryable(), "assert failed in adapter_gimini_05_invalid_json_fatal: condition is false; check preconditions and expected branch outcome.");
+    assert!(!err.is_retryable(), "assert failed in adapter_gemini_05_invalid_json_fatal: condition is false; check preconditions and expected branch outcome.");
 }
 
 #[tokio::test]
 // 鐢ㄤ緥璇存槑锛?
-// - 楠岃瘉鍦烘櫙锛歚adapter_gimini_06_timeout_or_network_error_classified` 鐢ㄤ緥锛岃鐩栬秴鏃?缃戠粶寮傚父鍒嗙被銆?
+// - 楠岃瘉鍦烘櫙锛歚adapter_gemini_06_timeout_or_network_error_classified` 鐢ㄤ緥锛岃鐩栬秴鏃?缃戠粶寮傚父鍒嗙被銆?
 // - 杈撳叆鍙傛暟锛氶€氳繃 mock HTTP 鏈嶅姟鏋勯€犵姸鎬佺爜/鍝嶅簲浣?瓒呮椂銆?
 // - 澶勭悊娴佺▼锛氳皟鐢ㄥ叿浣?provider adapter锛岃姹?mock 鏈嶅姟骞舵墽琛屽搷搴旇В鏋愪笌閿欒鍒嗙被銆?
 // - 棰勬湡杈撳嚭锛氭柇瑷€涓殑鐘舵€併€侀敊璇爜銆佽矾鐢遍€夋嫨鎴栦簨浠跺瓧娈靛叏閮ㄦ弧瓒抽鏈熴€?
-async fn adapter_gimini_06_timeout_or_network_error_classified() {
-    let provider = gimini_provider("http://127.0.0.1:9".to_string(), 80);
+async fn adapter_gemini_06_timeout_or_network_error_classified() {
+    let provider = gemini_provider("http://127.0.0.1:9".to_string(), 80);
     let err = provider
         .start(
             InvokeCtx::default(),
@@ -495,7 +495,7 @@ async fn adapter_gimini_06_timeout_or_network_error_classified() {
         )
         .await
         .expect_err("must fail");
-    assert!(err.is_retryable(), "assert failed in adapter_gimini_06_timeout_or_network_error_classified: condition is false; check preconditions and expected branch outcome.");
+    assert!(err.is_retryable(), "assert failed in adapter_gemini_06_timeout_or_network_error_classified: condition is false; check preconditions and expected branch outcome.");
 }
 
 #[tokio::test]

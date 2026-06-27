@@ -5,7 +5,7 @@ mod claude_protocol;
 mod complete_request_queue;
 mod default_logical_tree;
 mod fal;
-mod gimini;
+mod gemini;
 mod metadata_resolver;
 mod minimax;
 mod model_registry;
@@ -46,7 +46,7 @@ use crate::aicc::{AIComputeCenter, NamedStoreResourceResolver};
 use crate::aicc_usage_log_db::AiccUsageLogDb;
 use crate::claude::register_claude_providers;
 use crate::fal::register_fal_providers;
-use crate::gimini::register_google_gimini_providers;
+use crate::gemini::register_google_gemini_providers;
 use crate::minimax::register_minimax_providers;
 use crate::openai::register_openai_llm_providers;
 use crate::sn_ai_provider::register_sn_ai_provider;
@@ -71,9 +71,7 @@ const PROVIDER_SECTIONS: &[&str] = &[
     "openai",
     "google",
     "gemini",
-    "gimini",
     "google_gemini",
-    "google_gimini",
     "claude",
     "anthropic",
     "minimax",
@@ -124,12 +122,12 @@ fn apply_provider_settings(
         }
     }
 
-    match register_google_gimini_providers(center, settings) {
+    match register_google_gemini_providers(center, settings) {
         Ok(count) => {
             registered_total = registered_total.saturating_add(count);
         }
         Err(err) => {
-            errors.push(format!("gimini: {}", err));
+            errors.push(format!("gemini: {}", err));
         }
     }
 

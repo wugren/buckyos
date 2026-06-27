@@ -66,7 +66,7 @@
   - 排查入口：
     - `src/frame/aicc/src/openai.rs`
     - `src/frame/aicc/src/claude.rs`
-    - `src/frame/aicc/src/gimini.rs`
+    - `src/frame/aicc/src/gemini.rs`
     - `src/frame/aicc/src/minimax.rs`
     - `src/frame/aicc/src/fal.rs`
   - 注意：不要一次性删除所有 role mounts，应先补测试确认用途目录仍可通过家族目录路由。

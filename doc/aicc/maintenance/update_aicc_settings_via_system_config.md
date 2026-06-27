@@ -245,7 +245,7 @@ POST /kapi/aicc
 - `src/frame/aicc/src/model_types.rs`
 - `src/frame/aicc/src/openai.rs`
 - `src/frame/aicc/src/claude.rs`
-- `src/frame/aicc/src/gimini.rs`
+- `src/frame/aicc/src/gemini.rs`
 - `src/frame/aicc/src/minimax.rs`
 - `src/kernel/buckyos-api/src/aicc_client.rs`
 - `src/kernel/buckyos-api/src/system_config.rs`

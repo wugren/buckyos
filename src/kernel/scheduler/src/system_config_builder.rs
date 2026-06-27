@@ -829,8 +829,8 @@ fn build_aicc_settings_with_sn_models(
                 },
                 "instances": [
                     {
-                        "instance_id": "google-gimini-default",
-                        "provider_type": "google-gimini",
+                        "instance_id": "google-gemini-default",
+                        "provider_type": "google-gemini",
                         "base_url": "https://generativelanguage.googleapis.com/v1beta",
                         "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
                         "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
@@ -1368,7 +1368,7 @@ mod tests {
         );
         assert_eq!(
             settings["google"]["instances"][0]["provider_type"],
-            "google-gimini"
+            "google-gemini"
         );
         assert_eq!(settings["google"]["instances"][0]["timeout_ms"], 600000);
         assert_eq!(settings["claude"]["api_token"], "claude-token");

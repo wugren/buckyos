@@ -48,7 +48,7 @@ claude-sonnet-4.5@claude-main
 
 ### 步骤 1：定义 settings 与 Provider 结构
 
-建议参考 `openai.rs`、`claude.rs`、`gimini.rs`、`minimax.rs`、`fal.rs`。
+建议参考 `openai.rs`、`claude.rs`、`gemini.rs`、`minimax.rs`、`fal.rs`。
 
 实例配置建议包含：
 
@@ -115,7 +115,7 @@ provider_model_metadata(
 
 AICC 会把多个 Provider 的 inventory 汇入 `ModelRegistry`，同一个逻辑模型名可以产生多个候选。
 
-> **能力 metadata 优先走 driver metadata resolver，而不是 Provider 自声明。** Provider 自发现只需负责发现 `provider_model_id`（例如 OpenAI 通过 `/models` 报告模型列表）；`metadata_resolver.rs` 再按 driver metadata（`openai.json` / `claude.json` / `gimini.json` 对应的 gemini / `fal.json` / `minimax.json`）把 model id 转成最终 `ModelMetadata` 的 `capabilities` / `logical_mounts` / `variants`。匹配优先级：exact `models` → `patterns` → `defaults` → conservative fallback；override 链：builtin → remote cache → local override → system-config override。unknown model 保守对待，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 见 `doc/aicc/driver_metadata_schema.md`。新接入 Provider 应把按模型名细分能力的规则收编到 driver metadata（参考 `claude.rs` 的 classifier 收编路径），而不是写死在 adapter 里，也不再依赖 legacy `ProviderInstance.features`。
+> **能力 metadata 优先走 driver metadata resolver，而不是 Provider 自声明。** Provider 自发现只需负责发现 `provider_model_id`（例如 OpenAI 通过 `/models` 报告模型列表）；`metadata_resolver.rs` 再按 driver metadata（`openai.json` / `claude.json` / `gemini.json` 对应的 gemini / `fal.json` / `minimax.json`）把 model id 转成最终 `ModelMetadata` 的 `capabilities` / `logical_mounts` / `variants`。匹配优先级：exact `models` → `patterns` → `defaults` → conservative fallback；override 链：builtin → remote cache → local override → system-config override。unknown model 保守对待，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 见 `doc/aicc/driver_metadata_schema.md`。新接入 Provider 应把按模型名细分能力的规则收编到 driver metadata（参考 `claude.rs` 的 classifier 收编路径），而不是写死在 adapter 里，也不再依赖 legacy `ProviderInstance.features`。
 >
 > reasoning effort 等档位用 driver metadata 的 `variants` 表达（展开成 `gpt-5.1:reasoning-high@instance` 这类带 variant 的精确模型 + 预置 `provider_options`），不要做成普通请求参数。
 

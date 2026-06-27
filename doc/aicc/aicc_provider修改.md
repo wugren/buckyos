@@ -88,7 +88,7 @@ pub struct ProviderInstance {
 
 ### 3.3 provider 注册仍在写 ModelCatalog alias
 
-`openai.rs`、`claude.rs`、`gimini.rs`、`minimax.rs` 都有 `register_default_aliases()` 和 `register_custom_aliases()`，直接写：
+`openai.rs`、`claude.rs`、`gemini.rs`、`minimax.rs` 都有 `register_default_aliases()` 和 `register_custom_aliases()`，直接写：
 
 ```rust
 center.model_catalog().set_mapping(...)
@@ -177,7 +177,7 @@ pub struct ProviderInstance {
 
 - `provider_instance_name`：provider instance 唯一名，精确模型名后缀使用它。
 - `provider_type`：使用 `model_types::ProviderType`，只表达 `local_inference`、`cloud_api`、`proxy_unknown` 这类可信部署类型。
-- `provider_driver`：字符串，表达 OpenAI、Claude、Gemini、MiniMax、Ollama 等具体 provider 实现或厂商类型。旧 settings 里的 `"openai"`、`"claude"`、`"google-gimini"`、`"minimax"` 应迁移到这个字段。
+- `provider_driver`：字符串，表达 OpenAI、Claude、Gemini、MiniMax、Ollama 等具体 provider 实现或厂商类型。旧 settings 里的 `"openai"`、`"claude"`、`"google-gemini"`、`"minimax"` 应迁移到这个字段。
 - `provider_origin` 枚举建议至少区分 `SystemConfig`、`UserConfig`、`BuiltIn`、`ProviderClaimed`、`Unknown`。
 - `provider_type_trusted_source` 用于 trace 和 `local_only` 硬过滤，例如 `system_config`、`admin_override`、`provider_inventory`、`default_unknown`。
 
@@ -296,7 +296,7 @@ pub struct CostEstimateOutput {
 1. 在 `AIComputeCenter` 接入新版 `ModelRegistry`，并从运行路径移除 `ModelCatalog`。
 2. 直接改 `Provider` trait：删除 `instance()` 和旧 `estimate_cost()`，新增 `inventory()` 与 `CostEstimateOutput` 版本成本估算。
 3. 直接改 `ProviderInstance`/inventory 相关字段：`instance_id` 改为 `provider_instance_name`，`provider_type` 改为可信部署类型 enum，新增 `provider_driver`、`provider_origin`、`provider_type_trusted_source`。
-4. 改 OpenAI/Claude/Gimini/MiniMax provider：注册时只 add provider + apply inventory，不写 alias。
+4. 改 OpenAI/Claude/Gemini/MiniMax provider：注册时只 add provider + apply inventory，不写 alias。
 5. 修掉 OpenAI 注册内部 clear，把全量 clear 收敛到 `apply_provider_settings()`。
 6. 把实际 route 路径切到 `ModelRouter + ModelScheduler`，旧 `ModelCatalog.resolve()` 路径删除。
 7. 用 global `SessionConfig` 表达默认角色目录和默认模型策略，替代 provider `default_model`/`alias_map` 副作用。
@@ -344,7 +344,7 @@ review 后进入实现阶段时，建议至少验证：
 - `src/frame/aicc/src/main.rs`
 - `src/frame/aicc/src/openai.rs`
 - `src/frame/aicc/src/claude.rs`
-- `src/frame/aicc/src/gimini.rs`
+- `src/frame/aicc/src/gemini.rs`
 - `src/frame/aicc/src/minimax.rs`
 - `src/frame/aicc/src/model_types.rs`
 - `src/frame/aicc/src/model_registry.rs`

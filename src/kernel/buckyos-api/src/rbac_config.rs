@@ -116,6 +116,7 @@ p, admin,obj://config/users/{admin}/*,read,allow
 p, admin,obj://config/users/{admin}/profile,read|write,allow
 p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
 p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
+p, admin,obj://config/services/aicc/settings,read|write,allow
 p, admin,obj://config/services/*,read,allow
 
 p, users,obj://config/boot/*, read,allow
@@ -460,6 +461,51 @@ g, su_alice, su_admin
                 "bob",
                 "buckycli",
                 "obj://config/users/alice/profile",
+                "write",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_write_aicc_settings() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = r#"
+g, alice, admin
+g, bob, users
+"#;
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        assert!(
+            rbac::enforce(
+                "alice",
+                "control-panel",
+                "obj://config/services/aicc/settings",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "control-panel",
+                "obj://config/services/aicc/settings",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "alice",
+                "control-panel",
+                "obj://config/services/msg-center/settings",
                 "write",
                 None,
             )

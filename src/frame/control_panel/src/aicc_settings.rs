@@ -285,7 +285,6 @@ impl ControlPanelServer {
         const AICC_PROVIDER_SECTIONS: &[&str] = &[
             "openai",
             "google",
-            "gimini",
             "gemini",
             "claude",
             "anthropic",
@@ -458,7 +457,6 @@ impl ControlPanelServer {
     fn ai_google_provider_card(settings: &Value) -> Value {
         let google = settings
             .get("google")
-            .or_else(|| settings.get("gimini"))
             .or_else(|| settings.get("gemini"))
             .cloned()
             .unwrap_or_else(|| json!({}));
@@ -689,7 +687,6 @@ impl ControlPanelServer {
         let openai = settings.get("openai").cloned().unwrap_or_else(|| json!({}));
         let google = settings
             .get("google")
-            .or_else(|| settings.get("gimini"))
             .or_else(|| settings.get("gemini"))
             .cloned()
             .unwrap_or_else(|| json!({}));
@@ -844,9 +841,7 @@ impl ControlPanelServer {
             "openai",
             "google",
             "gemini",
-            "gimini",
             "google_gemini",
-            "google_gimini",
             "claude",
             "anthropic",
             "minimax",
