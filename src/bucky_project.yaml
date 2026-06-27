@@ -20,7 +20,7 @@ modules:
     name: workflow
   task_manager:
     type: rust
-    name: task-manager
+    name: task_manager
   kmsg:
     type: rust
     name: kmsg
