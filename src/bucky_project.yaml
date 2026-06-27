@@ -51,7 +51,7 @@ modules:
     name: opendan
   agent_tool:
     type: rust
-    name: agent_tool
+    name: agent_tool_cli_dev
   # control_panel_web:
   #   type: web
   #   name: control_panel
