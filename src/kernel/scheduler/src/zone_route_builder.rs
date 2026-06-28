@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use buckyos_api::network_observation::{
     NetworkObservation, ProbeInfo, DEFAULT_RTCP_PORT, NETWORK_OBSERVATION_KEY,
 };
-use name_lib::{DeviceInfo, ZoneConfig};
+use name_lib::{DeviceInfo, OODDescriptionString, ZoneConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -225,6 +225,19 @@ fn is_publicly_reachable_net_id(net_id: Option<&String>) -> bool {
         return false;
     };
     net_id.starts_with("wan") || net_id == "portmap"
+}
+
+fn can_use_as_zone_gateway_relay(ood: &OODDescriptionString) -> bool {
+    ood.node_type.is_gateway()
+        && (ood.ip.is_some() || is_publicly_reachable_net_id(ood.net_id.as_ref()))
+}
+
+fn get_default_zone_gateway_relay(zone_config: &ZoneConfig) -> Option<String> {
+    zone_config
+        .oods
+        .iter()
+        .find(|ood| can_use_as_zone_gateway_relay(ood))
+        .map(|ood| ood.name.clone())
 }
 
 fn net_id_for_planning(device_info: &DeviceInfo) -> &str {
@@ -668,7 +681,7 @@ pub(crate) fn build_forward_plan(
         })
         .collect();
     let source_obs = network_observations.get(this_node_id);
-    let zone_gateway_node = zone_config.get_default_zone_gateway();
+    let zone_gateway_node = get_default_zone_gateway_relay(zone_config);
 
     for (target_node_id, target_device) in device_list.iter() {
         if target_node_id == this_node_id {
@@ -1177,6 +1190,74 @@ mod tests {
             ood2_routes[0].evidence.as_ref().unwrap().evidence_type,
             "same_net_id"
         );
+    }
+
+    #[test]
+    fn test_build_forward_plan_skips_zone_gateway_relay_for_unmarked_ood() {
+        let mut zone_config = create_test_zone_config();
+        zone_config.oods.push(OODDescriptionString::new(
+            "ood3".to_string(),
+            DeviceNodeType::OOD,
+            None,
+            None,
+        ));
+        let zone_host = zone_config.id.to_host_name();
+        let device_ood1 = create_test_device_info_with_net_id("ood1", None);
+        let device_ood2 = create_test_device_info_with_net_id("ood2", None);
+        let device_ood3 = create_test_device_info_with_net_id("ood3", None);
+        let device_list = HashMap::from([
+            ("ood1".to_string(), device_ood1),
+            ("ood2".to_string(), device_ood2),
+            ("ood3".to_string(), device_ood3),
+        ]);
+
+        let plan = build_forward_plan("ood2", &zone_config, &zone_host, &device_list);
+        let ood3_routes = plan.routes.get("ood3").unwrap();
+
+        assert_eq!(ood3_routes.len(), 1);
+        assert_eq!(ood3_routes[0].id, "direct");
+        assert!(ood3_routes
+            .iter()
+            .all(|candidate| !candidate.id.starts_with("via-zone-gateway-")));
+        assert!(ood3_routes
+            .iter()
+            .all(|candidate| !candidate.url.contains("rtcp%3A%2F%2Food1")));
+    }
+
+    #[test]
+    fn test_build_forward_plan_uses_explicit_public_zone_gateway_relay() {
+        let mut zone_config = create_test_zone_config();
+        zone_config.oods = vec![
+            OODDescriptionString::new(
+                "ood1".to_string(),
+                DeviceNodeType::OOD,
+                Some("wan_dyn".to_string()),
+                None,
+            ),
+            OODDescriptionString::new("ood2".to_string(), DeviceNodeType::OOD, None, None),
+            OODDescriptionString::new("ood3".to_string(), DeviceNodeType::OOD, None, None),
+        ];
+        let zone_host = zone_config.id.to_host_name();
+        let device_ood1 = create_test_device_info_with_net_id("ood1", Some("wan_dyn"));
+        let device_ood2 = create_test_device_info_with_net_id("ood2", None);
+        let device_ood3 = create_test_device_info_with_net_id("ood3", None);
+        let device_list = HashMap::from([
+            ("ood1".to_string(), device_ood1),
+            ("ood2".to_string(), device_ood2),
+            ("ood3".to_string(), device_ood3),
+        ]);
+
+        let plan = build_forward_plan("ood2", &zone_config, &zone_host, &device_list);
+        let ood3_routes = plan.routes.get("ood3").unwrap();
+        let via_gateway = ood3_routes
+            .iter()
+            .find(|candidate| candidate.id == "via-zone-gateway-ood1")
+            .expect("explicit public gateway should produce relay candidate");
+
+        assert!(via_gateway.backup);
+        assert_eq!(via_gateway.kind, "rtcp_relay");
+        assert_eq!(via_gateway.relay_node.as_deref(), Some("ood1"));
+        assert!(via_gateway.url.starts_with("rtcp://rtcp%3A%2F%2Food1."));
     }
 
     #[test]
