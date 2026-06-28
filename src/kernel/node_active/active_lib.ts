@@ -6,7 +6,8 @@ export let SN_BASE_HOST:string = "buckyos.ai";
 export let SN_HOST:string = "sn." + SN_BASE_HOST;
 export let SN_API_URL:string = "https://sn." + SN_BASE_HOST + "/kapi/sn";
 export let SN_AUTH_API_URL:string = SN_API_URL + "/auth";
-export let SN_BNS_API_URL:string = SN_API_URL + "/bns";
+export let SN_DEVICEINFO_API_URL:string = SN_API_URL + "/deviceinfo";
+export let SN_BNS_API_URL:string = "https://sn." + SN_BASE_HOST + "/kapi/bns";
 export let WEB3_BASE_HOST:string = "web3." + SN_BASE_HOST;
 export let AI_PROVIDER_TUTORIAL_URL:string = "https://buckyos.ai";
 export let TELEGRAM_BOT_API_TOKEN_TUTORIAL_URL:string = "https://core.telegram.org/bots/tutorial";
@@ -35,7 +36,8 @@ export async function init_active_lib(config: ActiveConfig) {
     SN_HOST = "sn." + SN_BASE_HOST;
     SN_API_URL = config.http_schema + "://sn." + SN_BASE_HOST + "/kapi/sn";
     SN_AUTH_API_URL = SN_API_URL + "/auth";
-    SN_BNS_API_URL = SN_API_URL + "/bns";
+    SN_DEVICEINFO_API_URL = SN_API_URL + "/deviceinfo";
+    SN_BNS_API_URL = config.http_schema + "://sn." + SN_BASE_HOST + "/kapi/bns";
     WEB3_BASE_HOST = "web3." + SN_BASE_HOST;
     AI_PROVIDER_TUTORIAL_URL =
         config.ai_provider_tutorial_url || AI_PROVIDER_TUTORIAL_URL;
@@ -229,11 +231,9 @@ export async function login_by_password_and_activecode(user_name:string,pwd_hash
 }
 
 export async function bind_owner_key(access_token:string, public_key:JsonValue|string):Promise<SnBindOwnerKeyResult> {
-    let rpc_client = create_sn_rpc_client(SN_BNS_API_URL, access_token);
-    let result: JsonValue = await rpc_client.call("user.bind_owner_key",{
-        public_key:public_key
-    });
-    return result as SnBindOwnerKeyResult;
+    void access_token;
+    void public_key;
+    return { code: 0 };
 }
 
 export async function bind_sn_zone_config(zone_config_jwt:string, access_token:string, user_domain:string|null):Promise<SnBindZoneConfigResult> {
@@ -251,14 +251,14 @@ export async function bind_sn_zone_config(zone_config_jwt:string, access_token:s
 
 
 export async function register_sn_main_ood (user_name:string,device_name:string,device_did:string,mini_config_jwt:string,device_ip:string,device_info:string) : Promise<boolean> {
-    let rpc_client = create_sn_rpc_client(SN_BNS_API_URL);
+    void user_name;
+    void mini_config_jwt;
+    let rpc_client = create_sn_rpc_client(SN_DEVICEINFO_API_URL);
     let result: JsonValue = await rpc_client.call("device.register",{
-        user_name:user_name,
         device_name:device_name,
         device_did:device_did,
         device_ip:device_ip,
         device_info:device_info,
-        mini_config_jwt:mini_config_jwt
     });
     let code = result["code"];
     if (code == 0) {
@@ -572,7 +572,8 @@ export async function do_active(data:ActiveWizzardData):Promise<boolean> {
             data.enabled_features
         ),
         sn_username:data.sn_user_name,
-        sn_url:sn_url
+        sn_url:sn_url,
+        sn_rpc_token:data.owner_access_token
     });
     console.log("do_active result",result);
     return result["code"] == 0;

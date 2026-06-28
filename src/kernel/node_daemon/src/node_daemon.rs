@@ -766,6 +766,16 @@ async fn publish_device_info_kevent(device_info: &DeviceInfo) {
     }
 }
 
+fn device_info_report_ip(device_info: &DeviceInfo) -> String {
+    if let Some(ip) = device_info.all_ip.first() {
+        return ip.to_string();
+    }
+    if let Some(ip) = device_info.ips.first() {
+        return ip.to_string();
+    }
+    "127.0.0.1".to_string()
+}
+
 //if register OK then return sn's real URL for this user
 async fn report_ood_info_to_sn(
     device_info: &DeviceInfo,
@@ -804,14 +814,24 @@ async fn report_ood_info_to_sn(
         return Err(String::from("zone config owner_did is not set!"));
     }
 
-    sn_update_device_info(
+    let device_info_value = serde_json::to_value(device_info)
+        .map_err(|err| format!("serialize device info failed: {}", err))?;
+    let req = SnDeviceOnlineReportReq {
+        device_name: device_info.name.clone(),
+        device_did: Some(device_info.device_doc.id.to_string()),
+        device_ip: device_info_report_ip(device_info),
+        device_info: device_info_value,
+        endpoints: Vec::new(),
+        report_seq: None,
+        ttl: None,
+    };
+    sn_update_device_online(
         sn_url.as_str(),
-        Some(device_token_jwt.to_string()),
-        &owner_did.id,
-        device_info.name.as_str(),
-        &device_info,
+        device_token_jwt.to_string(),
+        req,
     )
-    .await;
+    .await
+    .map_err(|err| format!("update device online info to sn failed: {}", err))?;
 
     info!(
         "update {}'s info to sn {} success!",

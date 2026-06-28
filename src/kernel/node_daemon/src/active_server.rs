@@ -125,6 +125,35 @@ impl ActiveServer {
         }
     }
 
+    fn device_info_report_ip(device_info: &DeviceInfo) -> String {
+        if let Some(ip) = device_info.all_ip.first() {
+            return ip.to_string();
+        }
+        if let Some(ip) = device_info.ips.first() {
+            return ip.to_string();
+        }
+        "127.0.0.1".to_string()
+    }
+
+    fn build_sn_device_online_report(
+        device_name: &str,
+        device_did: &DID,
+        device_info: &DeviceInfo,
+    ) -> Result<SnDeviceOnlineReportReq, RPCErrors> {
+        let device_info_value = serde_json::to_value(device_info).map_err(|e| {
+            RPCErrors::ReasonError(format!("Failed to serialize device info: {}", e))
+        })?;
+        Ok(SnDeviceOnlineReportReq {
+            device_name: device_name.to_string(),
+            device_did: Some(device_did.to_string()),
+            device_ip: Self::device_info_report_ip(device_info),
+            device_info: device_info_value,
+            endpoints: Vec::new(),
+            report_seq: None,
+            ttl: None,
+        })
+    }
+
     async fn handle_active_by_wallet(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         // Required parameters: only JWT tokens and essential data
         let boot_config_jwt = req.params.get("boot_config_jwt");
@@ -135,14 +164,12 @@ impl ActiveServer {
 
         let user_name = req.params.get("user_name");
         let zone_name = req.params.get("zone_name");
-        let is_self_domain_param = req.params.get("is_self_domain");
         let owner_public_key_param = req.params.get("public_key");
         let admin_password_hash = req.params.get("admin_password_hash");
         let guest_access = req.params.get("guest_access");
         let friend_passcode = req.params.get("friend_passcode");
 
         let sn_url_param = req.params.get("sn_url");
-        let sn_username = req.params.get("sn_username");
         let sn_rpc_token = req.params.get("sn_rpc_token");
 
         if owner_public_key_param.is_none()
@@ -161,11 +188,6 @@ impl ActiveServer {
 
         let boot_config_jwt = boot_config_jwt.unwrap().as_str().unwrap();
         let zone_name = zone_name.unwrap().as_str().unwrap();
-        let is_self_domain = if is_self_domain_param.is_some() {
-            is_self_domain_param.unwrap().as_bool().unwrap()
-        } else {
-            false
-        };
         let zone_did = DID::from_str(zone_name)
             .map_err(|_| RPCErrors::ReasonError("Invalid zone name".to_string()))?;
         let user_name = user_name.unwrap().as_str().unwrap();
@@ -266,40 +288,6 @@ impl ActiveServer {
                 ));
             };
 
-            let sn_username = if sn_username.is_some() {
-                sn_username.unwrap().as_str().unwrap()
-            } else {
-                return Err(RPCErrors::ParseRequestError(
-                    "sn_username is required for SN registration".to_string(),
-                ));
-            };
-
-            info!(
-                "Bind new zone boot config to sn: {}, boot_config_jwt_len={}",
-                sn_url,
-                boot_config_jwt.len()
-            );
-            let user_domain = if is_self_domain {
-                Some(zone_name.to_string())
-            } else {
-                None
-            };
-
-            let sn_result = sn_bind_zone_config(
-                sn_url.as_str(),
-                Some(sn_rpc_token.to_string()),
-                sn_username,
-                boot_config_jwt,
-                user_domain,
-            )
-            .await; //todo: user_domain?
-            if sn_result.is_err() {
-                return Err(RPCErrors::ReasonError(format!(
-                    "Failed to bind zone config to sn: {}",
-                    sn_result.err().unwrap()
-                )));
-            }
-
             info!("Register {}(zone-gateway) to sn: {}", device_name, sn_url);
             // device_info can be either a JSON string or a JSON object
             let mut device_info: DeviceInfo = if device_info_param.is_some() {
@@ -320,25 +308,12 @@ impl ActiveServer {
                 info
             };
 
-            let device_info_json_final = serde_json::to_string(&device_info).unwrap();
-
-            let mut device_ip = "127.0.0.1".to_string();
-            if device_info.ips.len() > 0 {
-                device_ip = device_info.ips[0].clone().to_string();
-            }
-            if device_info.all_ip.len() > 0 {
-                device_ip = device_info.all_ip[0].clone().to_string();
-            }
-
-            let sn_result = sn_register_device(
+            let sn_req =
+                Self::build_sn_device_online_report(&device_name, &device_did, &device_info)?;
+            let sn_result = sn_register_device_online(
                 sn_url.as_str(),
-                Some(sn_rpc_token.to_string()),
-                sn_username,
-                &device_name,
-                &device_did.to_string(),
-                &device_ip,
-                device_info_json_final.as_str(),
-                device_mini_doc_jwt,
+                sn_rpc_token.to_string(),
+                sn_req,
             )
             .await;
             if sn_result.is_err() {
@@ -577,6 +552,7 @@ impl ActiveServer {
         let support_container = req.params.get("support_container");
         let sn_url_param = req.params.get("sn_url");
         let sn_username = req.params.get("sn_username");
+        let sn_rpc_token = req.params.get("sn_rpc_token");
         let mut sn_url: Option<String> = None;
         if sn_url_param.is_some() {
             sn_url = Some(sn_url_param.unwrap().as_str().unwrap().to_string());
@@ -657,8 +633,6 @@ impl ActiveServer {
             .encode(Some(&owner_private_key_pem))
             .map_err(|_| RPCErrors::ReasonError("Failed to encode device config".to_string()))?;
 
-        let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
-        let device_mini_config_jwt = device_mini_config.to_jwt(&owner_private_key_pem).unwrap();
         if sn_url.is_some() {
             if sn_url.as_ref().unwrap().len() > 5 {
                 need_sn = true;
@@ -668,48 +642,43 @@ impl ActiveServer {
         if need_sn {
             //call sn_register_device by owner's token
             let sn_url = sn_url.clone().unwrap();
-            let sn_username = sn_username.unwrap().as_str().unwrap().to_lowercase();
-            let rpc_token = ::kRPC::RPCSessionToken {
-                token_type: ::kRPC::RPCSessionTokenType::Normal,
-                appid: Some("active_service".to_string()),
-                jti: None,
-                sub: Some(sn_username.to_string()),
-                aud: Some("sn".to_string()),
-                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
-                iss: Some(sn_username.to_string()),
-                token: None,
-                sudo: false,
-                extra: HashMap::new(),
-            };
+            let user_rpc_token = if let Some(token) = sn_rpc_token
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+            {
+                token.to_string()
+            } else {
+                let sn_username = sn_username.unwrap().as_str().unwrap().to_lowercase();
+                let rpc_token = ::kRPC::RPCSessionToken {
+                    token_type: ::kRPC::RPCSessionTokenType::Normal,
+                    appid: Some("active_service".to_string()),
+                    jti: None,
+                    sub: Some(sn_username.to_string()),
+                    aud: Some("sn".to_string()),
+                    exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
+                    iss: Some(sn_username.to_string()),
+                    token: None,
+                    sudo: false,
+                    extra: HashMap::new(),
+                };
 
-            let user_rpc_token = rpc_token
-                .generate_jwt(None, &owner_private_key_pem)
-                .map_err(|_| {
-                    warn!("Failed to generate user rpc token");
-                    RPCErrors::ReasonError("Failed to generate user rpc token".to_string())
-                })?;
+                rpc_token
+                    .generate_jwt(None, &owner_private_key_pem)
+                    .map_err(|_| {
+                        warn!("Failed to generate user rpc token");
+                        RPCErrors::ReasonError("Failed to generate user rpc token".to_string())
+                    })?
+            };
 
             let mut device_info = DeviceInfo::from_device_doc(&device_config);
             device_info.auto_fill_by_system_info().await.unwrap();
-            let device_info_json = serde_json::to_string(&device_info).unwrap();
-            let mut device_ip = "127.0.0.1".to_string();
-            if device_info.ips.len() > 0 {
-                device_ip = device_info.ips[0].clone().to_string();
-            }
-            if device_info.all_ip.len() > 0 {
-                device_ip = device_info.all_ip[0].clone().to_string();
-            }
             info!("Register device ood1(zone-gateway) to sn: {}", sn_url);
 
-            let sn_result = sn_register_device(
+            let sn_req = Self::build_sn_device_online_report("ood1", &device_did, &device_info)?;
+            let sn_result = sn_register_device_online(
                 sn_url.as_str(),
-                Some(user_rpc_token),
-                sn_username.as_str(),
-                "ood1",
-                &device_did.to_string(),
-                &device_ip,
-                device_info_json.as_str(),
-                &device_mini_config_jwt,
+                user_rpc_token,
+                sn_req,
             )
             .await;
             if sn_result.is_err() {

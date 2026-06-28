@@ -21,7 +21,6 @@ import { buckyos } from "buckyos";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  bind_owner_key,
   check_bucky_username,
   check_sn_active_code,
   login_by_password_and_activecode,
@@ -266,16 +265,6 @@ const SecurityStep = ({
           return;
         }
 
-        const bindOwnerResult = await bind_owner_key(
-          authAccessToken,
-          wizardData.owner_public_key,
-        );
-        if (bindOwnerResult.code !== 0) {
-          setError(
-            t("error_activation_failed") || "Failed to bind owner key",
-          );
-          return;
-        }
       }
 
       onUpdate({
