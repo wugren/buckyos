@@ -225,8 +225,6 @@ const SecurityStep = ({
     setLoading(true);
     try {
       const hash = await buckyos.hashPassword(normalizedUsername, password);
-      let nextOwnerAccessToken: string | null = wizardData.owner_access_token;
-      let authAccessToken = "";
       if (!isWalletRuntime) {
         const isUsernameAvailable =
           nameStatus === "ok"
@@ -240,9 +238,7 @@ const SecurityStep = ({
             hash,
             normalizedCode,
           );
-          authAccessToken = registerResult.access_token || "";
-          nextOwnerAccessToken = authAccessToken || null;
-          if (!authAccessToken) {
+          if (registerResult.code !== undefined && registerResult.code !== 0) {
             setError(
               t("error_activation_failed") || "Failed to register SN user",
             );
@@ -254,15 +250,12 @@ const SecurityStep = ({
             hash,
             normalizedCode,
           );
-          authAccessToken = loginResult.access_token || "";
-          nextOwnerAccessToken = authAccessToken || null;
-        }
-
-        if (!authAccessToken) {
-          setError(
-            t("error_activation_failed") || "Failed to authenticate SN user",
-          );
-          return;
+          if (loginResult.code !== undefined && loginResult.code !== 0) {
+            setError(
+              t("error_activation_failed") || "Failed to authenticate SN user",
+            );
+            return;
+          }
         }
 
       }
@@ -276,7 +269,6 @@ const SecurityStep = ({
           wizardData.enabled_features,
         ),
         admin_password_hash: hash,
-        owner_access_token: nextOwnerAccessToken,
         friend_passcode: "",
         enable_guest_access: false,
       });

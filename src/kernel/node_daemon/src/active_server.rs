@@ -1,5 +1,13 @@
 use ::kRPC::*;
 use async_trait::async_trait;
+use bns_client::{
+    BnsApplyMutationsReq, BnsClientError, BnsEvmClientConfig, BnsEvmControllerClient,
+    BnsEvmRawTxSubmitter, BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient, BnsRegisterNameReq,
+};
+use bns_indexer::{
+    default_document_update, CallAuthority, DocumentRef, MutationGuard, Principal, RegisterOptions,
+    ZERO_HASH,
+};
 use buckyos_api::*;
 use buckyos_http_server::*;
 use buckyos_http_server::{
@@ -29,6 +37,16 @@ const START_CONFIG_OPTIONAL_FIELDS: &[&str] = &[
     "enabled_features",
 ];
 
+const BNS_DOC_ZONE: &str = "zone";
+const BNS_DOC_BOOT: &str = "boot";
+const BNS_DOC_DEVICE_MINI: &str = "device_mini_doc";
+
+struct BnsPublishConfig {
+    server_url: String,
+    evm_config: BnsEvmClientConfig,
+    private_key: String,
+}
+
 #[derive(Clone)]
 struct ActiveServer {
     device_mini_info: DeviceMiniInfo,
@@ -50,8 +68,8 @@ impl ActiveServer {
                 | "device_doc_jwt"
                 | "device_mini_doc_jwt"
                 | "ood_jwt"
-                | "sn_rpc_token"
-                | "access_token"
+                | "sn_device_proof"
+                | "bns_evm_private_key"
                 | "admin_password_hash"
                 | "friend_passcode"
         )
@@ -125,6 +143,12 @@ impl ActiveServer {
         }
     }
 
+    fn remove_activation_only_start_config_fields(start_params: &mut Map<String, Value>) {
+        start_params.remove("private_key");
+        start_params.remove("bns_evm_private_key");
+        start_params.remove("sn_device_proof");
+    }
+
     fn device_info_report_ip(device_info: &DeviceInfo) -> String {
         if let Some(ip) = device_info.all_ip.first() {
             return ip.to_string();
@@ -154,6 +178,439 @@ impl ActiveServer {
         })
     }
 
+    fn generate_sn_device_proof(
+        sn_username: &str,
+        device_did: &DID,
+        device_private_key: &EncodingKey,
+    ) -> Result<String, RPCErrors> {
+        let now = buckyos_get_unix_timestamp();
+        let mut extra = HashMap::new();
+        extra.insert("device_did".to_string(), json!(device_did.to_string()));
+        let proof_token = ::kRPC::RPCSessionToken {
+            token_type: ::kRPC::RPCSessionTokenType::Normal,
+            appid: Some("node-daemon".to_string()),
+            jti: Some(now.to_string()),
+            sub: Some(sn_username.to_lowercase()),
+            aud: Some("sn".to_string()),
+            exp: Some(now + 60 * 10),
+            iss: Some(device_did.to_string()),
+            token: None,
+            sudo: false,
+            extra,
+        };
+        proof_token
+            .generate_jwt(Some(device_did.to_string()), device_private_key)
+            .map_err(|e| {
+                warn!("Failed to generate SN device proof: {}", e);
+                RPCErrors::ReasonError("Failed to generate SN device proof".to_string())
+            })
+    }
+
+    fn bns_error(context: &str, error: impl std::fmt::Display) -> RPCErrors {
+        RPCErrors::ReasonError(format!("{}: {}", context, error))
+    }
+
+    fn string_param(req_params: &Value, key: &str) -> Option<String> {
+        req_params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn bns_evm_param<'a>(req_params: &'a Value, key: &str) -> Option<&'a Value> {
+        if let Some(value) = req_params
+            .get("bns_evm")
+            .and_then(Value::as_object)
+            .and_then(|evm| evm.get(key))
+        {
+            return Some(value);
+        }
+
+        let flat_key = format!("bns_evm_{}", key);
+        req_params.get(flat_key.as_str())
+    }
+
+    fn bns_evm_string_param(
+        req_params: &Value,
+        key: &str,
+        env_key: Option<&str>,
+    ) -> Option<String> {
+        Self::bns_evm_param(req_params, key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                env_key
+                    .and_then(|key| std::env::var(key).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    }
+
+    fn bns_evm_private_key(req_params: &Value) -> Option<String> {
+        Self::string_param(req_params, "bns_evm_private_key")
+            .or_else(|| Self::bns_evm_string_param(req_params, "private_key", None))
+            .or_else(|| {
+                std::env::var("BNS_PRIVATE_KEY")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    }
+
+    fn parse_optional_u64(
+        value: Option<&Value>,
+        env_key: Option<&str>,
+        field: &str,
+    ) -> Result<Option<u64>, RPCErrors> {
+        if let Some(value) = value {
+            if let Some(number) = value.as_u64() {
+                return Ok(Some(number));
+            }
+            if let Some(text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+                return text.parse::<u64>().map(Some).map_err(|e| {
+                    RPCErrors::ParseRequestError(format!("Invalid {}: {}", field, e))
+                });
+            }
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Invalid {}, expected u64 or string",
+                field
+            )));
+        }
+
+        if let Some(env_key) = env_key {
+            if let Ok(value) = std::env::var(env_key) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return value.parse::<u64>().map(Some).map_err(|e| {
+                        RPCErrors::ParseRequestError(format!("Invalid {}: {}", field, e))
+                    });
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn parse_optional_u128(
+        value: Option<&Value>,
+        env_key: Option<&str>,
+        field: &str,
+    ) -> Result<Option<u128>, RPCErrors> {
+        if let Some(value) = value {
+            if let Some(number) = value.as_u64() {
+                return Ok(Some(number as u128));
+            }
+            if let Some(text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+                return text.parse::<u128>().map(Some).map_err(|e| {
+                    RPCErrors::ParseRequestError(format!("Invalid {}: {}", field, e))
+                });
+            }
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Invalid {}, expected u128 or string",
+                field
+            )));
+        }
+
+        if let Some(env_key) = env_key {
+            if let Ok(value) = std::env::var(env_key) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return value.parse::<u128>().map(Some).map_err(|e| {
+                        RPCErrors::ParseRequestError(format!("Invalid {}: {}", field, e))
+                    });
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn derive_bns_url_from_sn_url(sn_url: &str) -> Option<String> {
+        let trimmed = sn_url.trim().trim_end_matches('/');
+        if trimmed.ends_with("/kapi/sn") {
+            return Some(format!(
+                "{}/kapi/bns",
+                trimmed.trim_end_matches("/kapi/sn")
+            ));
+        }
+        None
+    }
+
+    fn bns_server_url(req_params: &Value) -> Option<String> {
+        Self::string_param(req_params, "bns_url")
+            .or_else(|| {
+                Self::string_param(req_params, "sn_url")
+                    .and_then(|url| Self::derive_bns_url_from_sn_url(url.as_str()))
+            })
+            .or_else(|| {
+                std::env::var("BNS_SERVER_URL")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    }
+
+    fn parse_bns_publish_config(
+        req_params: &Value,
+    ) -> Result<Option<BnsPublishConfig>, RPCErrors> {
+        let Some(private_key) = Self::bns_evm_private_key(req_params) else {
+            return Ok(None);
+        };
+
+        let server_url = Self::bns_server_url(req_params).ok_or_else(|| {
+            RPCErrors::ParseRequestError(
+                "bns_url or BNS_SERVER_URL is required when bns_evm_private_key is set"
+                    .to_string(),
+            )
+        })?;
+        let rpc_endpoint =
+            Self::bns_evm_string_param(req_params, "rpc_endpoint", Some("BNS_RPC_URL"))
+                .ok_or_else(|| {
+                    RPCErrors::ParseRequestError(
+                        "bns_evm.rpc_endpoint or BNS_RPC_URL is required when bns_evm_private_key is set"
+                            .to_string(),
+                    )
+                })?;
+        let contract_address = Self::bns_evm_string_param(
+            req_params,
+            "contract_address",
+            Some("BNS_CONTRACT_ADDRESS"),
+        )
+        .ok_or_else(|| {
+            RPCErrors::ParseRequestError(
+                "bns_evm.contract_address or BNS_CONTRACT_ADDRESS is required when bns_evm_private_key is set"
+                    .to_string(),
+            )
+        })?;
+        let chain_id = Self::parse_optional_u64(
+            Self::bns_evm_param(req_params, "chain_id"),
+            Some("BNS_CHAIN_ID"),
+            "bns_evm.chain_id",
+        )?
+        .ok_or_else(|| {
+            RPCErrors::ParseRequestError(
+                "bns_evm.chain_id or BNS_CHAIN_ID is required when bns_evm_private_key is set"
+                    .to_string(),
+            )
+        })?;
+
+        let mut evm_config = BnsEvmClientConfig::anvil(rpc_endpoint, contract_address, chain_id);
+        if let Some(gas_limit) = Self::parse_optional_u64(
+            Self::bns_evm_param(req_params, "gas_limit"),
+            Some("BNS_GAS_LIMIT"),
+            "bns_evm.gas_limit",
+        )? {
+            evm_config.gas_limit = gas_limit;
+        }
+        if let Some(max_fee_per_gas) = Self::parse_optional_u128(
+            Self::bns_evm_param(req_params, "max_fee_per_gas"),
+            Some("BNS_MAX_FEE_PER_GAS"),
+            "bns_evm.max_fee_per_gas",
+        )? {
+            evm_config.max_fee_per_gas = max_fee_per_gas;
+        }
+        if let Some(max_priority_fee_per_gas) = Self::parse_optional_u128(
+            Self::bns_evm_param(req_params, "max_priority_fee_per_gas"),
+            Some("BNS_MAX_PRIORITY_FEE_PER_GAS"),
+            "bns_evm.max_priority_fee_per_gas",
+        )? {
+            evm_config.max_priority_fee_per_gas = max_priority_fee_per_gas;
+        }
+
+        Ok(Some(BnsPublishConfig {
+            server_url,
+            evm_config,
+            private_key,
+        }))
+    }
+
+    fn bns_zone_document(
+        zone_name: &str,
+        owner_name: &str,
+        device_name: &str,
+        device_did: &DID,
+        boot_config_jwt: &str,
+        device_mini_doc_jwt: &str,
+    ) -> Value {
+        json!({
+            "id": format!("did:bns:{}", zone_name),
+            "name": zone_name,
+            "owner": format!("did:bns:{}", owner_name),
+            "gateway": {
+                "device_name": device_name,
+            },
+            "gateway_device_name": device_name,
+            "boot_jwt": boot_config_jwt,
+            "devices": {
+                device_name: {
+                    "did": device_did.to_string(),
+                    "mini_config_jwt": device_mini_doc_jwt,
+                    "role": "gateway",
+                }
+            }
+        })
+    }
+
+    fn bns_boot_document(boot_config_jwt: &str) -> Value {
+        json!({ "boot": boot_config_jwt })
+    }
+
+    fn bns_device_mini_document(
+        device_name: &str,
+        device_did: &DID,
+        device_mini_doc_jwt: &str,
+    ) -> Value {
+        json!({
+            "devices": {
+                device_name: {
+                    "did": device_did.to_string(),
+                    "mini_config_jwt": device_mini_doc_jwt,
+                    "role": "gateway",
+                }
+            }
+        })
+    }
+
+    fn bns_inline_json_update(
+        doc_type: &str,
+        expected_version: u64,
+        document: &Value,
+    ) -> Result<bns_indexer::DocumentUpdate, RPCErrors> {
+        let bytes = serde_json::to_vec(document).map_err(|e| {
+            RPCErrors::ReasonError(format!("Failed to serialize BNS document: {}", e))
+        })?;
+        default_document_update(doc_type, expected_version, DocumentRef::inline(bytes))
+            .map_err(|e| Self::bns_error("Failed to build BNS document update", e))
+    }
+
+    async fn bns_document_version(
+        client: &dyn BnsIndexerApi,
+        name: &str,
+        doc_type: &str,
+    ) -> Result<u64, RPCErrors> {
+        match client.resolve_document(name, doc_type).await {
+            Ok(result) => Ok(result.document_state.version),
+            Err(error) if error.is_registry_code("DOCUMENT_NOT_FOUND") => Ok(0),
+            Err(error) => Err(Self::bns_error("Failed to query BNS document", error)),
+        }
+    }
+
+    async fn publish_bns_zone_documents(
+        &self,
+        req_params: &Value,
+        zone_name: &str,
+        owner_name: &str,
+        device_name: &str,
+        device_did: &DID,
+        boot_config_jwt: &str,
+        device_mini_doc_jwt: &str,
+    ) -> Result<Option<BnsEvmTxSubmission>, RPCErrors> {
+        let Some(config) = Self::parse_bns_publish_config(req_params)? else {
+            info!("BNS EVM publish skipped: bns_evm_private_key is not provided");
+            return Ok(None);
+        };
+
+        let bns_client: Arc<dyn BnsIndexerApi> =
+            Arc::new(BnsIndexerClient::new_bns_server_url(&config.server_url, None));
+        let evm_controller = BnsEvmControllerClient::new(config.evm_config, &config.private_key)
+            .map_err(|e| Self::bns_error("Failed to create BNS EVM controller", e))?
+            .with_raw_tx_submitter(BnsEvmRawTxSubmitter::BnsServer(bns_client.clone()));
+        let signer_address = evm_controller
+            .default_signer_address()
+            .ok_or_else(|| RPCErrors::ReasonError("BNS EVM signer address is missing".to_string()))?;
+        let signer_principal = Principal::chain_account(format!("{signer_address:#x}"));
+
+        let zone_document = Self::bns_zone_document(
+            zone_name,
+            owner_name,
+            device_name,
+            device_did,
+            boot_config_jwt,
+            device_mini_doc_jwt,
+        );
+        let boot_document = Self::bns_boot_document(boot_config_jwt);
+        let device_mini_document =
+            Self::bns_device_mini_document(device_name, device_did, device_mini_doc_jwt);
+
+        let submission = match bns_client.query_name_state(zone_name).await {
+            Ok(Some(name_state)) => {
+                let zone_version =
+                    Self::bns_document_version(bns_client.as_ref(), zone_name, BNS_DOC_ZONE)
+                        .await?;
+                let boot_version =
+                    Self::bns_document_version(bns_client.as_ref(), zone_name, BNS_DOC_BOOT)
+                        .await?;
+                let device_mini_version = Self::bns_document_version(
+                    bns_client.as_ref(),
+                    zone_name,
+                    BNS_DOC_DEVICE_MINI,
+                )
+                .await?;
+                let updates = vec![
+                    Self::bns_inline_json_update(BNS_DOC_ZONE, zone_version, &zone_document)?,
+                    Self::bns_inline_json_update(BNS_DOC_BOOT, boot_version, &boot_document)?,
+                    Self::bns_inline_json_update(
+                        BNS_DOC_DEVICE_MINI,
+                        device_mini_version,
+                        &device_mini_document,
+                    )?,
+                ];
+                evm_controller
+                    .apply_mutations(&BnsApplyMutationsReq {
+                        name: zone_name.to_string(),
+                        authority_key_updates: Vec::new(),
+                        documents: updates,
+                        authority: CallAuthority::owner(signer_principal, ""),
+                        guard: MutationGuard {
+                            expected_name_seq: name_state.name_seq,
+                            expected_parent_name_seq: 0,
+                        },
+                    })
+                    .await
+                    .map_err(|e| Self::bns_error("Failed to publish BNS zone documents", e))?
+            }
+            Ok(None) => {
+                let initial_documents = vec![
+                    Self::bns_inline_json_update(BNS_DOC_ZONE, 0, &zone_document)?,
+                    Self::bns_inline_json_update(BNS_DOC_BOOT, 0, &boot_document)?,
+                    Self::bns_inline_json_update(BNS_DOC_DEVICE_MINI, 0, &device_mini_document)?,
+                ];
+                evm_controller
+                    .register_name(&BnsRegisterNameReq {
+                        name: zone_name.to_string(),
+                        asset_owner: format!("{signer_address:#x}"),
+                        options: RegisterOptions::default(),
+                        authority_key_updates: Vec::new(),
+                        semantic_owner_after_authority: None,
+                        controller_policy: Vec::new(),
+                        controller_policy_hash: ZERO_HASH.to_string(),
+                        initial_documents,
+                        authority: CallAuthority::public(),
+                        guard: MutationGuard {
+                            expected_name_seq: 0,
+                            expected_parent_name_seq: 0,
+                        },
+                    })
+                    .await
+                    .map_err(|e| Self::bns_error("Failed to register BNS zone name", e))?
+            }
+            Err(error) if matches!(error, BnsClientError::Registry(_)) => {
+                return Err(Self::bns_error("Failed to query BNS name state", error));
+            }
+            Err(error) => return Err(Self::bns_error("Failed to query BNS name state", error)),
+        };
+
+        info!(
+            "BNS zone documents submitted, zone={}, tx={}, nonce={}",
+            zone_name, submission.tx_hash, submission.nonce
+        );
+        Ok(Some(submission))
+    }
+
     async fn handle_active_by_wallet(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         // Required parameters: only JWT tokens and essential data
         let boot_config_jwt = req.params.get("boot_config_jwt");
@@ -170,15 +627,17 @@ impl ActiveServer {
         let friend_passcode = req.params.get("friend_passcode");
 
         let sn_url_param = req.params.get("sn_url");
-        let sn_rpc_token = req.params.get("sn_rpc_token");
+        let sn_username_param = req.params.get("sn_username");
+        let sn_device_proof_param = req.params.get("sn_device_proof");
 
         if owner_public_key_param.is_none()
+            || boot_config_jwt.is_none()
             || device_doc_jwt.is_none()
             || device_mini_doc_jwt.is_none()
             || device_private_key.is_none()
             || zone_name.is_none()
         {
-            return Err(RPCErrors::ParseRequestError("Invalid params, missing required fields: owner_public_key_param, device_doc_jwt, device_mini_doc_jwt, device_private_key, zone_name".to_string()));
+            return Err(RPCErrors::ParseRequestError("Invalid params, missing required fields: owner_public_key_param, boot_config_jwt, device_doc_jwt, device_mini_doc_jwt, device_private_key, zone_name".to_string()));
         }
 
         info!(
@@ -259,7 +718,7 @@ impl ActiveServer {
                 RPCErrors::ParseRequestError(format!("Failed to verify device_doc_jwt: {}", e))
             })?;
 
-        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|e| {
                 warn!("Invalid device private key: {}", e);
                 RPCErrors::ReasonError("Invalid device private key".to_string())
@@ -268,24 +727,30 @@ impl ActiveServer {
         info!("device documents decoded success");
 
         // Determine if SN registration is needed
-        let mut sn_url: Option<String> = None;
-        let mut need_sn = false;
-        if sn_url_param.is_some() {
-            sn_url = Some(sn_url_param.unwrap().as_str().unwrap().to_string());
-            if sn_url.as_ref().unwrap().len() > 5 {
-                need_sn = true;
-            }
-        }
+        let sn_url = sn_url_param
+            .and_then(Value::as_str)
+            .filter(|url| url.len() > 5)
+            .map(ToString::to_string);
+        let need_sn = sn_url.is_some();
 
         // Register device to SN if needed
         if need_sn {
             let sn_url = sn_url.unwrap();
-            let sn_rpc_token = if sn_rpc_token.is_some() {
-                sn_rpc_token.unwrap().as_str().unwrap()
+            let sn_username = sn_username_param
+                .and_then(Value::as_str)
+                .unwrap_or(user_name.as_str())
+                .to_lowercase();
+            let sn_device_proof = if let Some(proof) = sn_device_proof_param
+                .and_then(Value::as_str)
+                .filter(|proof| !proof.is_empty())
+            {
+                proof.to_string()
             } else {
-                return Err(RPCErrors::ParseRequestError(
-                    "sn_rpc_token is required for SN registration".to_string(),
-                ));
+                Self::generate_sn_device_proof(
+                    sn_username.as_str(),
+                    &device_did,
+                    &device_private_key_pem,
+                )?
             };
 
             info!("Register {}(zone-gateway) to sn: {}", device_name, sn_url);
@@ -312,7 +777,7 @@ impl ActiveServer {
                 Self::build_sn_device_online_report(&device_name, &device_did, &device_info)?;
             let sn_result = sn_register_device_online(
                 sn_url.as_str(),
-                sn_rpc_token.to_string(),
+                sn_device_proof,
                 sn_req,
             )
             .await;
@@ -330,6 +795,18 @@ impl ActiveServer {
             //     .map_err(|e|RPCErrors::ReasonError(format!("Failed to decode zone boot config: {}", e)))?;
             info!("verify zone boot config success");
         }
+
+        let bns_submission = self
+            .publish_bns_zone_documents(
+                &req.params,
+                zone_name,
+                user_name.as_str(),
+                device_name.as_str(),
+                &device_did,
+                boot_config_jwt,
+                device_mini_doc_jwt,
+            )
+            .await?;
 
         let write_dir = get_buckyos_system_etc_dir();
         let owner_did = DID::from_str(&user_name).unwrap_or_else(|_| DID::new("bns", &user_name));
@@ -358,6 +835,7 @@ impl ActiveServer {
             "ood_jwt".to_string(),
             Value::String(device_doc_jwt.to_string()),
         );
+        Self::remove_activation_only_start_config_fields(real_start_params);
         Self::append_optional_start_config_fields(&req.params, real_start_params);
         let start_params_str = serde_json::to_string(&real_start_params).map_err(|e| {
             RPCErrors::ReasonError(format!("Failed to serialize start params: {}", e))
@@ -392,12 +870,18 @@ impl ActiveServer {
             exit(0);
         });
 
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
+        let result = if let Some(bns_submission) = bns_submission {
+            json!({
+                "code":0,
+                "bns": bns_submission
+            })
+        } else {
+            json!({
                 "code":0
-            })),
-            req.seq,
-        ))
+            })
+        };
+
+        Ok(RPCResponse::new(RPCResult::Success(result), req.seq))
     }
 
     async fn handle_prepare_params_for_active_by_wallet(
@@ -414,10 +898,10 @@ impl ActiveServer {
         let support_container = req.params.get("support_container");
         let sn_username = req.params.get("sn_username");
         let sn_url_param = req.params.get("sn_url");
-        let mut sn_url: Option<String> = None;
-        if sn_url_param.is_some() {
-            sn_url = Some(sn_url_param.unwrap().as_str().unwrap().to_string());
-        }
+        let sn_url = sn_url_param
+            .and_then(Value::as_str)
+            .filter(|url| url.len() > 5)
+            .map(ToString::to_string);
 
         if user_name.is_none()
             || zone_name.is_none()
@@ -451,12 +935,12 @@ impl ActiveServer {
             }
         }
 
-        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid device private key".to_string()))?;
         let device_public_jwk: Jwk = serde_json::from_value(device_public_key.clone())
             .map_err(|_| RPCErrors::ReasonError("Invalid device public key format".to_string()))?;
 
-        let mut need_sn = false;
+        let need_sn = sn_url.is_some();
         let mut is_support_container = true;
         if support_container.is_some() {
             is_support_container = support_container.unwrap().as_str().unwrap() == "true";
@@ -497,31 +981,21 @@ impl ActiveServer {
             RPCErrors::ReasonError(format!("Failed to serialize device info: {}", e))
         })?;
 
-        // Check if SN registration is needed
-        if sn_url.is_some() {
-            if sn_url.as_ref().unwrap().len() > 5 {
-                need_sn = true;
-            }
-        }
-
-        let sn_username = sn_username.unwrap().as_str().unwrap().to_lowercase();
-        // Prepare RPC token for SN registration (if needed)
-        let rpc_token_json = if need_sn {
-            let rpc_token = ::kRPC::RPCSessionToken {
-                token_type: ::kRPC::RPCSessionTokenType::Normal,
-                appid: Some("active_service".to_string()),
-                jti: None,
-                sub: Some(sn_username.clone()),
-                aud: Some("sn".to_string()), //sudo token MUST have aud filed
-                exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
-                iss: Some(sn_username),
-                token: None,
-                sudo: false,
-                extra: HashMap::new(),
-            };
-            Some(serde_json::to_value(&rpc_token).map_err(|e| {
-                RPCErrors::ReasonError(format!("Failed to serialize rpc token: {}", e))
-            })?)
+        let sn_device_proof = if need_sn {
+            let sn_username = sn_username
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RPCErrors::ParseRequestError(
+                        "sn_username is required for SN device report".to_string(),
+                    )
+                })?
+                .to_lowercase();
+            Some(Self::generate_sn_device_proof(
+                sn_username.as_str(),
+                &device_did,
+                &device_private_key_pem,
+            )?)
         } else {
             None
         };
@@ -529,7 +1003,7 @@ impl ActiveServer {
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
                 "device_config": device_config_json,
-                "rpc_token": rpc_token_json,
+                "sn_device_proof": sn_device_proof,
                 "device_info": device_info_json,
             })),
             req.seq,
@@ -552,11 +1026,10 @@ impl ActiveServer {
         let support_container = req.params.get("support_container");
         let sn_url_param = req.params.get("sn_url");
         let sn_username = req.params.get("sn_username");
-        let sn_rpc_token = req.params.get("sn_rpc_token");
-        let mut sn_url: Option<String> = None;
-        if sn_url_param.is_some() {
-            sn_url = Some(sn_url_param.unwrap().as_str().unwrap().to_string());
-        }
+        let sn_url = sn_url_param
+            .and_then(Value::as_str)
+            .filter(|url| url.len() > 5)
+            .map(ToString::to_string);
         //let device_info = req.params.get("device_info");
         if user_name.is_none()
             || zone_name.is_none()
@@ -595,13 +1068,13 @@ impl ActiveServer {
 
         let owner_private_key_pem = EncodingKey::from_ed_pem(owner_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid owner private key".to_string()))?;
-        let _device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
+        let device_private_key_pem = EncodingKey::from_ed_pem(device_private_key.as_bytes())
             .map_err(|_| RPCErrors::ReasonError("Invalid device private key".to_string()))?;
         let device_public_jwk: Jwk = serde_json::from_value(device_public_key.clone()).unwrap();
 
         //let device_ip:Option<IpAddr> = None;
         let mut ddns_sn_url: Option<String> = None;
-        let mut need_sn = true;
+        let need_sn = sn_url.is_some();
         if net_id.is_some() {
             let real_net_id = net_id.as_ref().unwrap();
             if real_net_id == "wan_dyn" {
@@ -633,42 +1106,22 @@ impl ActiveServer {
             .encode(Some(&owner_private_key_pem))
             .map_err(|_| RPCErrors::ReasonError("Failed to encode device config".to_string()))?;
 
-        if sn_url.is_some() {
-            if sn_url.as_ref().unwrap().len() > 5 {
-                need_sn = true;
-            }
-        }
-
         if need_sn {
-            //call sn_register_device by owner's token
             let sn_url = sn_url.clone().unwrap();
-            let user_rpc_token = if let Some(token) = sn_rpc_token
+            let sn_username = sn_username
                 .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())
-            {
-                token.to_string()
-            } else {
-                let sn_username = sn_username.unwrap().as_str().unwrap().to_lowercase();
-                let rpc_token = ::kRPC::RPCSessionToken {
-                    token_type: ::kRPC::RPCSessionTokenType::Normal,
-                    appid: Some("active_service".to_string()),
-                    jti: None,
-                    sub: Some(sn_username.to_string()),
-                    aud: Some("sn".to_string()),
-                    exp: Some(buckyos_get_unix_timestamp() + 60 * 10),
-                    iss: Some(sn_username.to_string()),
-                    token: None,
-                    sudo: false,
-                    extra: HashMap::new(),
-                };
-
-                rpc_token
-                    .generate_jwt(None, &owner_private_key_pem)
-                    .map_err(|_| {
-                        warn!("Failed to generate user rpc token");
-                        RPCErrors::ReasonError("Failed to generate user rpc token".to_string())
-                    })?
-            };
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RPCErrors::ParseRequestError(
+                        "sn_username is required for SN device report".to_string(),
+                    )
+                })?
+                .to_lowercase();
+            let sn_device_proof = Self::generate_sn_device_proof(
+                sn_username.as_str(),
+                &device_did,
+                &device_private_key_pem,
+            )?;
 
             let mut device_info = DeviceInfo::from_device_doc(&device_config);
             device_info.auto_fill_by_system_info().await.unwrap();
@@ -677,7 +1130,7 @@ impl ActiveServer {
             let sn_req = Self::build_sn_device_online_report("ood1", &device_did, &device_info)?;
             let sn_result = sn_register_device_online(
                 sn_url.as_str(),
-                user_rpc_token,
+                sn_device_proof,
                 sn_req,
             )
             .await;
@@ -695,43 +1148,6 @@ impl ActiveServer {
 
         //TODO: call resolve_did to check self domain config is correct?
         //  check in ui is more smoothly
-
-        let write_dir = get_buckyos_system_etc_dir();
-        let owner_public_key: Jwk = serde_json::from_value(owner_public_key.clone()).unwrap();
-
-        let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
-        let device_mini_doc_jwt = device_mini_config.to_jwt(&owner_private_key_pem).unwrap();
-        let node_identity = LocalNodeIdentityConfig::new(
-            zone_did.clone(),
-            DID::new("bns", user_name.as_str()),
-            owner_public_key,
-            device_config.name.clone(),
-            device_did.clone(),
-            buckyos_get_unix_timestamp() as u32 - 3600,
-        );
-        save_local_device_identity(
-            write_dir.as_path(),
-            &node_identity,
-            &device_config,
-            device_doc_jwt.to_string().as_str(),
-            device_mini_doc_jwt.as_str(),
-            device_private_key,
-        )
-        .map_err(RPCErrors::ReasonError)?;
-
-        //write start config ,TODO
-        let mut real_start_parms = req.params.clone();
-        let mut real_start_params = real_start_parms.as_object_mut().unwrap();
-        real_start_params.insert(
-            "ood_jwt".to_string(),
-            Value::String(device_doc_jwt.to_string()),
-        );
-        Self::append_optional_start_config_fields(&req.params, real_start_params);
-        let start_params_str = serde_json::to_string(&real_start_params).unwrap();
-        let start_params_file = write_dir.join("start_config.json");
-        tokio::fs::write(start_params_file, start_params_str.as_bytes())
-            .await
-            .map_err(|_| RPCErrors::ReasonError("Failed to write start params".to_string()))?;
 
         let ood = if let Some(net_id) = device_config.net_id.as_ref() {
             if net_id != "nat" {
@@ -763,6 +1179,62 @@ impl ActiveServer {
             owner_key: None,
             extra_info: HashMap::new(),
         };
+        let zone_boot_config_jwt = zone_boot_config
+            .encode(Some(&owner_private_key_pem))
+            .map_err(|e| {
+                RPCErrors::ReasonError(format!("Failed to encode zone boot config: {}", e))
+            })?;
+        let zone_boot_config_jwt = zone_boot_config_jwt.to_string();
+
+        let write_dir = get_buckyos_system_etc_dir();
+        let owner_public_key: Jwk = serde_json::from_value(owner_public_key.clone()).unwrap();
+
+        let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
+        let device_mini_doc_jwt = device_mini_config.to_jwt(&owner_private_key_pem).unwrap();
+        let bns_submission = self
+            .publish_bns_zone_documents(
+                &req.params,
+                zone_name,
+                user_name.as_str(),
+                "ood1",
+                &device_did,
+                zone_boot_config_jwt.as_str(),
+                device_mini_doc_jwt.as_str(),
+            )
+            .await?;
+        let node_identity = LocalNodeIdentityConfig::new(
+            zone_did.clone(),
+            DID::new("bns", user_name.as_str()),
+            owner_public_key,
+            device_config.name.clone(),
+            device_did.clone(),
+            buckyos_get_unix_timestamp() as u32 - 3600,
+        );
+        save_local_device_identity(
+            write_dir.as_path(),
+            &node_identity,
+            &device_config,
+            device_doc_jwt.to_string().as_str(),
+            device_mini_doc_jwt.as_str(),
+            device_private_key,
+        )
+        .map_err(RPCErrors::ReasonError)?;
+
+        //write start config ,TODO
+        let mut real_start_parms = req.params.clone();
+        let mut real_start_params = real_start_parms.as_object_mut().unwrap();
+        real_start_params.insert(
+            "ood_jwt".to_string(),
+            Value::String(device_doc_jwt.to_string()),
+        );
+        Self::remove_activation_only_start_config_fields(real_start_params);
+        Self::append_optional_start_config_fields(&req.params, real_start_params);
+        let start_params_str = serde_json::to_string(&real_start_params).unwrap();
+        let start_params_file = write_dir.join("start_config.json");
+        tokio::fs::write(start_params_file, start_params_str.as_bytes())
+            .await
+            .map_err(|_| RPCErrors::ReasonError("Failed to write start params".to_string()))?;
+
         Self::update_zone_boot_cache(&zone_did, &zone_boot_config).await;
 
         info!("DoAction wrote device identity files to node_identity.json, identity root and security root");
@@ -772,50 +1244,26 @@ impl ActiveServer {
             exit(0);
         });
 
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
+        let result = if let Some(bns_submission) = bns_submission {
+            json!({
+                "code":0,
+                "bns": bns_submission
+            })
+        } else {
+            json!({
                 "code":0
-            })),
-            req.seq,
-        ))
+            })
+        };
+
+        Ok(RPCResponse::new(RPCResult::Success(result), req.seq))
     }
 
     async fn handle_generate_key_pair(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         let (private_key, public_key) = generate_ed25519_key_pair();
-        let public_key_str = public_key.to_string();
-        let private_key_pem = EncodingKey::from_ed_pem(private_key.as_bytes()).map_err(|e| {
-            warn!("Failed to parse generated private key: {}", e);
-            RPCErrors::ReasonError("Failed to parse generated private key".to_string())
-        })?;
-        let now = buckyos_get_unix_timestamp();
-        let key_id = public_key
-            .get("x")
-            .and_then(Value::as_str)
-            .unwrap_or(public_key_str.as_str())
-            .to_string();
-        let rpc_token = ::kRPC::RPCSessionToken {
-            token_type: ::kRPC::RPCSessionTokenType::Normal,
-            appid: Some("active_service".to_string()),
-            jti: Some(now.to_string()),
-            sub: Some("$owner".to_string()),
-            aud: None,
-            exp: Some(now + 60 * 15),
-            iss: None,
-            token: None,
-            sudo: false,
-            extra: HashMap::new(),
-        };
-        let access_token = rpc_token
-            .generate_jwt(None, &private_key_pem)
-            .map_err(|e| {
-                warn!("Failed to generate access token for key pair: {}", e);
-                RPCErrors::ReasonError("Failed to generate access token".to_string())
-            })?;
         return Ok(RPCResponse::new(
             RPCResult::Success(json!({
                 "private_key":private_key,
-                "public_key":public_key,
-                "access_token":access_token
+                "public_key":public_key
             })),
             req.seq,
         ));

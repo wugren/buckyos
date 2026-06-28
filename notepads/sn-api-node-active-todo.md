@@ -49,6 +49,24 @@
 - `node_daemon` 激活和运行期上报只向 `/kapi/sn/deviceinfo` 上报设备在线态。
 - `node_active` 里旧 `/kapi/sn/bns` 路径已改成 `/kapi/bns`，并跳过已移除的 `user.bind_owner_key`。
 
+## 2026-06-28 本次落地
+
+- `node_active` 不再保存 `auth.register` / `auth.login` 返回的 access token，也不再把它传给 active RPC。
+- 删除 `node_active` 中临时 no-op 的 `bind_owner_key()` 和旧 `bind_sn_zone_config()` 调用链。
+- `node_active` 网页激活不再用 access token 调 `/kapi/bns zone.bind_config`；`node_daemon` 已接入 `bns-client` / `bns-indexer`，在 `bns_url`、`bns_evm` 和 `bns_evm_private_key` 齐备时通过 EVM TX 发布 BNS 文档。
+- `active_server` 的激活期 SN deviceinfo 上报改为 `sn_device_proof` 字段，由当前设备私钥签出短期 JWT；钱包激活只要求钱包签 Owner DID/boot/device doc，不再要求钱包签 SN RPC token。
+- `generate_key_pair` 只返回 key pair，不再顺手生成本地 access token。
+- `WAN + 自有域名` 无 SN 路线修正为空 SN URL 时不触发 SN 上报。
+- 文档同步更新 `doc/arch/gateway/SN.md`，明确 `/kapi/sn/auth`、`/kapi/sn/deviceinfo`、`/kapi/bns` 的职责边界。
+
+## 2026-06-28 继续落地：BNS EVM 依赖接入
+
+- `src/Cargo.toml` 新增 `bns-client`、`bns-indexer` workspace 依赖，`node_daemon` 使用它们构造 BNS EVM 写入请求。
+- `active_server` 新增 BNS 发布链路：BNS name 不存在时尝试 `name.register` 并带初始 `zone` / `boot` / `device_mini_doc` 文档；已存在时用 `mutation.apply` 更新这些文档。
+- BNS 写入使用 `/kapi/bns` 匿名读查询当前 name/document 状态，使用 EVM 私钥签名并提交 raw TX，不依赖网页登录 access token。
+- `node_active` 支持从 `active_config.json` 透传 `bns_evm`，并支持激活期传入 `bns_evm_private_key`；这些私钥不会写入 `start_config.json`。
+- 当前仓库内钱包 bridge 只有 `walletSignWithActiveDid`，还没有 EVM raw TX 签名接口；钱包模式的 EVM 签名仍需钱包运行时补充 bridge 后接入。
+
 ## 实现意图与后续处理
 
 - 排查并移除 BuckyOS 侧对上游登录 Access Token 的依赖，特别是 `node_active` 中访问 `/kapi/bns` 或 SN API 的路径。

@@ -29,6 +29,8 @@ chrono = { workspace = true, features = ["serde"] }
 if-addrs = { workspace = true }
 buckyos-http-server = { workspace = true }
 cyfs-gateway-api = { workspace = true }
+bns-client = { workspace = true }
+bns-indexer = { workspace = true }
 kRPC = { workspace = true }
 buckyos-kit = { workspace = true }
 name-lib = { workspace = true }

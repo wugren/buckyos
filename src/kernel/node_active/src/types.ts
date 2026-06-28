@@ -30,6 +30,7 @@ export type JsonValue = Record<string, any>;
 export type ActiveConfig = {
 sn_base_host: string;
 http_schema: "http" | "https";
+bns_evm?: JsonValue;
 ai_provider_tutorial_url?: string;
 telegram_bot_api_token_tutorial_url?: string;
 telegram_account_id_tutorial_url?: string;
@@ -72,7 +73,7 @@ export type ActiveWizzardData = {
 
   owner_public_key: JsonValue;
   owner_private_key: string | null;//钱包模式为null
-  owner_access_token: string | null;//钱包模式为null
+  bns_evm_private_key?: string | null;
   
   device_public_key: JsonValue;
   device_private_key: string;
