@@ -10,32 +10,36 @@
 //          [--rootfs <dir>] [--ca <dir>] [--sn_ip <ip>]
 //          [--sn_base_host <host>] [--env_root <dir>] [--no-preregister]
 //
-// Output layout (matches make_config.py sn group):
+// Output layout:
 //   <rootfs>/sn_device_config.json    SN server device config
 //   <rootfs>/sn_private_key.pem       device private key (rtcp stack)
 //   <rootfs>/params.json              SN service parameters (incl. sn_ip)
-//   <rootfs>/sn_db.sqlite3            SN database with pre-registered users
-//   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, *.web3.$base
+//   <rootfs>/sn.sqlite3               SN sqlite database with pre-registered users
+//   <rootfs>/sn_token_key/            server JWT signing key directory
+//   <rootfs>/fullchain.cert/.pem      TLS cert+key for sn.$base, web3.$base, *.web3.$base
 //   <rootfs>/ca/                      dev CA cert+key (client trust install)
 //   <rootfs>/sn_server/.buckycli/     sn admin owner config
-// Still created manually by the operator: dns_zone, website.yaml.
+//   <rootfs>/web3_gateway.yaml        patched when present to load sn.sqlite3
+// Still created manually/by app template: website.yaml, local_dns.toml.
 //
 // User pre-registration: alice.ood1 / bob.ood1 / charlie.ood1 dev zones are
-// registered into sn_db. Their user envs are reused from <env_root> when
+// registered into sn.sqlite3. Their user envs are reused from <env_root> when
 // present (so JWTs match rootfs built by make_config.ts) and generated there
 // otherwise (DEV_TEST_KEYS are deterministic, so devices still verify).
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { isIP } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 import {
   assertProvisionRuntime,
+  createCertFromCa,
   createSnConfigs,
+  ensureCa,
   registerDeviceToSn,
   registerUserToSn,
-  ensureCa,
-  createCertFromCa,
 } from "buckyos/provision";
 import {
   buildUserEnv,
@@ -47,6 +51,14 @@ import {
 const DEFAULT_SN_BASE_HOST = "devtests.org";
 const DEFAULT_CA_NAME = "buckyos_test_ca";
 const PREREGISTER_GROUPS = ["alice.ood1", "bob.ood1", "charlie.ood1"];
+const LEGACY_SN_DB_FILE = "sn_db.sqlite3";
+const SN_DB_FILE = "sn.sqlite3";
+const SN_AUTH_DATA_DIR = "sn_token_key";
+const WEB3_GATEWAY_CONFIG_FILE = "web3_gateway.yaml";
+const PROVISIONED_DEVICE_EXPIRES_AT = 2058838939;
+
+type SqliteValue = string | number | bigint | null;
+type SqliteRow = Record<string, SqliteValue>;
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
   log(
@@ -72,6 +84,653 @@ function getLocalIp(): string {
     }
   }
   return "127.0.0.1";
+}
+
+function writeJson(file: string, data: unknown): void {
+  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
+  console.log(`# Write file: ${file}`);
+}
+
+function readJson(file: string): Record<string, unknown> {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function sqliteRows(db: DatabaseSync, sql: string): SqliteRow[] {
+  return db.prepare(sql).all() as SqliteRow[];
+}
+
+function ensureColumn(
+  db: DatabaseSync,
+  table: string,
+  column: string,
+  definition: string,
+): void {
+  const rows = sqliteRows(db, `PRAGMA table_info(${table})`);
+  const exists = rows.some((row) => row.name === column);
+  if (!exists) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+function tableExists(db: DatabaseSync, table: string): boolean {
+  const rows = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).all(table) as SqliteRow[];
+  return rows.length > 0;
+}
+
+function migrateLegacyUserAuthTable(db: DatabaseSync): void {
+  if (!tableExists(db, "user_auth_v2")) {
+    return;
+  }
+  db.exec(`
+    INSERT OR IGNORE INTO user_auth
+      (username, password_hash, password_salt, password_algo,
+       created_at, updated_at, last_login_at)
+    SELECT
+      username, password_hash, password_salt, password_algo,
+      created_at, updated_at, last_login_at
+    FROM user_auth_v2;
+
+    DROP TABLE user_auth_v2;
+  `);
+}
+
+function initializeSnDatabaseSchema(db: DatabaseSync): void {
+  db.exec(`
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS activation_codes (
+      code TEXT PRIMARY KEY,
+      used INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      username TEXT PRIMARY KEY,
+      state TEXT NOT NULL DEFAULT 'active',
+      bns_name TEXT,
+      public_key TEXT NOT NULL DEFAULT '',
+      activation_code TEXT,
+      owner_key_ref TEXT,
+      zone_config TEXT NOT NULL DEFAULT '',
+      self_cert INTEGER NOT NULL DEFAULT 0,
+      user_domain TEXT,
+      sn_ips TEXT,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      last_login_at INTEGER NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_auth (
+      username TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      password_algo TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_login_at INTEGER NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_domain_history (
+      domain TEXT PRIMARY KEY,
+      owner TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_domain_bindings (
+      domain TEXT PRIMARY KEY,
+      owner TEXT NOT NULL,
+      state TEXT NOT NULL,
+      pkx TEXT NOT NULL,
+      pkx_record_name TEXT NOT NULL,
+      verified_at INTEGER NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_domain_bindings_owner_state
+      ON user_domain_bindings (owner, state);
+
+    CREATE TABLE IF NOT EXISTS zone_info (
+      username TEXT PRIMARY KEY,
+      bns_name TEXT NOT NULL,
+      zone TEXT NULL,
+      relay_sn TEXT NULL,
+      self_cert INTEGER NOT NULL DEFAULT 0,
+      cert_checked_at INTEGER NULL,
+      cert_expires_at INTEGER NULL,
+      sn_ips TEXT NULL,
+      source_version TEXT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS account_sessions (
+      session_id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      token_aud TEXT NOT NULL,
+      state TEXT NOT NULL,
+      issued_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked_at INTEGER NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_account_sessions_username_state
+      ON account_sessions (username, state);
+
+    CREATE TABLE IF NOT EXISTS devices (
+      owner TEXT NOT NULL,
+      device_name TEXT NOT NULL,
+      did TEXT PRIMARY KEY,
+      ip TEXT NOT NULL,
+      description TEXT NOT NULL,
+      mini_config_jwt TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(owner, device_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_dns_records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      record_type TEXT NOT NULL,
+      record TEXT NOT NULL,
+      ttl INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type
+      ON user_dns_records (owner, domain, record_type);
+
+    CREATE INDEX IF NOT EXISTS user_dns_records_domain_index
+      ON user_dns_records (domain, id);
+
+    CREATE TABLE IF NOT EXISTS did_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      obj_id TEXT NOT NULL,
+      owner_user TEXT NOT NULL,
+      obj_name TEXT NOT NULL,
+      did_document TEXT NOT NULL,
+      doc_type TEXT NULL,
+      update_time INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj
+      ON did_documents (owner_user, obj_name, update_time);
+
+    CREATE TABLE IF NOT EXISTS device_indexes (
+      did TEXT PRIMARY KEY,
+      zone TEXT NOT NULL,
+      device_name TEXT NOT NULL,
+      device_role TEXT NOT NULL DEFAULT 'unknown',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(zone, device_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS device_runtime_states (
+      did TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      reported_ip TEXT NULL,
+      reported_ips TEXT NULL,
+      from_ip TEXT NULL,
+      wan_ip TEXT NULL,
+      lan_ips TEXT NULL,
+      nat_type TEXT NOT NULL DEFAULT 'unknown',
+      is_wan_device INTEGER NOT NULL DEFAULT 0,
+      last_seen_at INTEGER NULL,
+      last_report_at INTEGER NULL,
+      expires_at INTEGER NULL,
+      report_seq INTEGER NULL,
+      raw_report TEXT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(did) REFERENCES device_indexes(did)
+    );
+
+    CREATE TABLE IF NOT EXISTS device_endpoints (
+      did TEXT NOT NULL,
+      endpoint_id TEXT NOT NULL,
+      protocol TEXT NOT NULL,
+      host TEXT NOT NULL,
+      port INTEGER NULL,
+      scope TEXT NOT NULL DEFAULT 'unknown',
+      priority INTEGER NOT NULL DEFAULT 100,
+      source TEXT NOT NULL,
+      state TEXT NOT NULL,
+      last_seen_at INTEGER NULL,
+      expires_at INTEGER NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(did, endpoint_id),
+      FOREIGN KEY(did) REFERENCES device_indexes(did)
+    );
+
+    CREATE TABLE IF NOT EXISTS device_state_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      did TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      old_state TEXT NULL,
+      new_state TEXT NULL,
+      reason TEXT NULL,
+      event_at INTEGER NOT NULL,
+      detail TEXT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_device_indexes_zone_name
+      ON device_indexes(zone, device_name);
+
+    CREATE INDEX IF NOT EXISTS idx_device_runtime_state_expires
+      ON device_runtime_states(state, expires_at);
+
+    CREATE INDEX IF NOT EXISTS idx_device_endpoints_did_state_priority
+      ON device_endpoints(did, state, priority);
+
+    CREATE INDEX IF NOT EXISTS idx_device_state_events_did_time
+      ON device_state_events(did, event_at);
+
+    CREATE TABLE IF NOT EXISTS relay_nodes (
+      relay_id TEXT PRIMARY KEY,
+      relay_sn TEXT NOT NULL UNIQUE,
+      public_host TEXT NOT NULL,
+      http_endpoint TEXT NULL,
+      rtcp_endpoint TEXT NULL,
+      region TEXT NULL,
+      isp TEXT NULL,
+      tags TEXT NULL,
+      capabilities TEXT NOT NULL,
+      status TEXT NOT NULL,
+      capacity_score INTEGER NOT NULL DEFAULT 100,
+      current_load INTEGER NOT NULL DEFAULT 0,
+      last_heartbeat_at INTEGER NULL,
+      drain_until INTEGER NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS relay_assignments (
+      zone TEXT PRIMARY KEY,
+      relay_id TEXT NOT NULL,
+      relay_sn TEXT NOT NULL,
+      state TEXT NOT NULL,
+      source TEXT NOT NULL,
+      reason TEXT NULL,
+      generation INTEGER NOT NULL,
+      backup_relay_id TEXT NULL,
+      sticky_until INTEGER NULL,
+      lease_expires_at INTEGER NULL,
+      migrated_from TEXT NULL,
+      migration_deadline INTEGER NULL,
+      source_version TEXT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_relay_assignments_relay
+      ON relay_assignments(relay_id, state);
+
+    CREATE TABLE IF NOT EXISTS relay_admission_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NULL,
+      relay_id TEXT NOT NULL,
+      zone TEXT NOT NULL,
+      device_name TEXT NULL,
+      did TEXT NULL,
+      decision TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      expected_relay_sn TEXT NULL,
+      assignment_generation INTEGER NULL,
+      observed_ip TEXT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_relay_admission_events_zone_time
+      ON relay_admission_events(zone, created_at);
+  `);
+
+  ensureColumn(db, "users", "bns_name", "TEXT");
+  ensureColumn(db, "users", "owner_key_ref", "TEXT");
+  ensureColumn(db, "users", "created_at", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "updated_at", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "last_login_at", "INTEGER NULL");
+  migrateLegacyUserAuthTable(db);
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part))) {
+    return false;
+  }
+  const [a, b] = parts;
+  return a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+}
+
+function isPublicIp(ip: string): boolean {
+  if (isIP(ip) === 4) {
+    return !isPrivateIpv4(ip);
+  }
+  if (isIP(ip) === 6) {
+    const normalized = ip.toLowerCase();
+    return !normalized.startsWith("fe80:") && normalized !== "::1";
+  }
+  return false;
+}
+
+function addValidIp(result: string[], value: unknown): void {
+  if (typeof value !== "string") {
+    return;
+  }
+  const ip = value.trim();
+  if (isIP(ip) !== 0 && !result.includes(ip)) {
+    result.push(ip);
+  }
+}
+
+function collectProvisionedDeviceIps(
+  ip: string,
+  description: string,
+): string[] {
+  const result: string[] = [];
+  addValidIp(result, ip);
+  try {
+    const value = JSON.parse(description) as Record<string, unknown>;
+    for (const key of ["ip", "ips", "all_ip", "addresses"]) {
+      const candidate = value[key];
+      if (Array.isArray(candidate)) {
+        for (const item of candidate) {
+          addValidIp(result, item);
+        }
+      } else {
+        addValidIp(result, candidate);
+      }
+    }
+  } catch {}
+  return result;
+}
+
+function backfillSnDerivedTables(db: DatabaseSync): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(`
+    INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at)
+    SELECT lower(trim(user_domain)), username, ?
+    FROM users
+    WHERE user_domain IS NOT NULL AND trim(user_domain) != ''
+  `).run(now);
+
+  db.prepare(`
+    INSERT OR IGNORE INTO zone_info
+      (username, bns_name, zone, relay_sn, self_cert, cert_checked_at,
+       cert_expires_at, sn_ips, source_version, updated_at)
+    SELECT
+      username,
+      COALESCE(NULLIF(bns_name, ''), username),
+      CASE WHEN trim(COALESCE(zone_config, '')) = '' THEN NULL ELSE zone_config END,
+      NULL,
+      COALESCE(self_cert, 0),
+      NULL,
+      NULL,
+      sn_ips,
+      NULL,
+      CASE WHEN COALESCE(updated_at, 0) > 0 THEN updated_at ELSE ? END
+    FROM users
+  `).run(now);
+
+  const devices = sqliteRows(
+    db,
+    "SELECT owner, device_name, did, ip, description, created_at, updated_at FROM devices",
+  );
+  const insertIndex = db.prepare(`
+    INSERT INTO device_indexes
+      (did, zone, device_name, device_role, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(did) DO UPDATE SET
+      zone = excluded.zone,
+      device_name = excluded.device_name,
+      device_role = excluded.device_role,
+      updated_at = excluded.updated_at
+  `);
+  const insertState = db.prepare(`
+    INSERT INTO device_runtime_states
+      (did, state, reported_ip, reported_ips, from_ip, wan_ip, lan_ips, nat_type,
+       is_wan_device, last_seen_at, last_report_at, expires_at, report_seq,
+       raw_report, created_at, updated_at)
+    VALUES (?, 'online', ?, ?, NULL, ?, ?, 'unknown', ?, ?, ?, ?, NULL, ?, ?, ?)
+    ON CONFLICT(did) DO UPDATE SET
+      state = 'online',
+      reported_ip = excluded.reported_ip,
+      reported_ips = excluded.reported_ips,
+      wan_ip = excluded.wan_ip,
+      lan_ips = excluded.lan_ips,
+      is_wan_device = excluded.is_wan_device,
+      last_seen_at = excluded.last_seen_at,
+      last_report_at = excluded.last_report_at,
+      expires_at = excluded.expires_at,
+      raw_report = excluded.raw_report,
+      updated_at = excluded.updated_at
+  `);
+  const insertEndpoint = db.prepare(`
+    INSERT INTO device_endpoints
+      (did, endpoint_id, protocol, host, port, scope, priority, source, state,
+       last_seen_at, expires_at, created_at, updated_at)
+    VALUES (?, 'provisioned', 'tcp', ?, NULL, ?, 100, 'admin', 'active', ?, ?, ?, ?)
+    ON CONFLICT(did, endpoint_id) DO UPDATE SET
+      host = excluded.host,
+      scope = excluded.scope,
+      state = 'active',
+      last_seen_at = excluded.last_seen_at,
+      expires_at = excluded.expires_at,
+      updated_at = excluded.updated_at
+  `);
+
+  for (const device of devices) {
+    const did = String(device.did ?? "");
+    const owner = String(device.owner ?? "");
+    const deviceName = String(device.device_name ?? "");
+    if (!did || !owner || !deviceName) {
+      continue;
+    }
+    const createdAt = Number(device.created_at ?? 0) || now;
+    const updatedAt = Number(device.updated_at ?? 0) || now;
+    const role = deviceName === "ood1" ? "ood" : "normal";
+    const ip = String(device.ip ?? "");
+    const description = String(device.description ?? "");
+    const ips = collectProvisionedDeviceIps(ip, description);
+    const reportedIp = ips[0] ?? null;
+    const reportedIps = ips.slice(1);
+    const publicIp = ips.find(isPublicIp) ?? null;
+    const lanIps = ips.filter((candidate) => !isPublicIp(candidate));
+    const rawReport = (() => {
+      try {
+        JSON.parse(description);
+        return description;
+      } catch {
+        return null;
+      }
+    })();
+
+    insertIndex.run(did, owner, deviceName, role, createdAt, updatedAt);
+    insertState.run(
+      did,
+      reportedIp,
+      JSON.stringify(reportedIps),
+      publicIp,
+      JSON.stringify(lanIps),
+      publicIp ? 1 : 0,
+      now,
+      now,
+      PROVISIONED_DEVICE_EXPIRES_AT,
+      rawReport,
+      createdAt,
+      updatedAt,
+    );
+    if (reportedIp) {
+      insertEndpoint.run(
+        did,
+        reportedIp,
+        isPublicIp(reportedIp) ? "public" : "private",
+        now,
+        PROVISIONED_DEVICE_EXPIRES_AT,
+        createdAt,
+        updatedAt,
+      );
+    }
+  }
+}
+
+function syncSnDatabase(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    initializeSnDatabaseSchema(db);
+    backfillSnDerivedTables(db);
+  } finally {
+    db.close();
+  }
+}
+
+function replaceGeneratedSnDb(targetDir: string): string {
+  const legacyDbPath = path.join(targetDir, LEGACY_SN_DB_FILE);
+  const snDbPath = path.join(targetDir, SN_DB_FILE);
+  if (!fs.existsSync(legacyDbPath)) {
+    throw new Error(`generated SN database not found: ${legacyDbPath}`);
+  }
+  for (const suffix of ["", "-shm", "-wal"]) {
+    fs.rmSync(`${snDbPath}${suffix}`, { force: true });
+  }
+  fs.renameSync(legacyDbPath, snDbPath);
+  for (const suffix of ["-shm", "-wal"]) {
+    const legacySidecar = `${legacyDbPath}${suffix}`;
+    if (fs.existsSync(legacySidecar)) {
+      fs.renameSync(legacySidecar, `${snDbPath}${suffix}`);
+    }
+  }
+  console.log(`Move database: ${LEGACY_SN_DB_FILE} -> ${SN_DB_FILE}`);
+  syncSnDatabase(snDbPath);
+  return snDbPath;
+}
+
+function updateParamsJson(
+  targetDir: string,
+  snDbPath: string,
+  authDataDir: string,
+): void {
+  const paramsPath = path.join(targetDir, "params.json");
+  const json = readJson(paramsPath);
+  const params = (json.params && typeof json.params === "object")
+    ? json.params as Record<string, unknown>
+    : {};
+  params.sn_db_path = snDbPath;
+  delete params.sn_v2_auth_data_dir;
+  params.sn_auth_data_dir = authDataDir;
+  json.params = params;
+  writeJson(paramsPath, json);
+}
+
+function leadingSpaces(line: string): number {
+  const match = line.match(/^ */);
+  return match ? match[0].length : 0;
+}
+
+function patchWeb3GatewayConfigText(text: string): string | null {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "web3_sn:");
+  if (start < 0) {
+    return null;
+  }
+
+  const indent = leadingSpaces(lines[start]);
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (
+      line.trim() !== "" &&
+      !line.trimStart().startsWith("#") &&
+      leadingSpaces(line) <= indent
+    ) {
+      break;
+    }
+    end++;
+  }
+
+  const childIndent = indent + 2;
+  const nestedIndent = childIndent + 2;
+  const block = lines.slice(start + 1, end);
+  const filtered: string[] = [];
+  for (let i = 0; i < block.length; i++) {
+    const line = block[i];
+    const trim = line.trim();
+    const lineIndent = leadingSpaces(line);
+    if (
+      lineIndent === childIndent &&
+      (trim.startsWith("v2_auth_data_dir:") ||
+        trim.startsWith("auth_data_dir:") ||
+        trim.startsWith("db_type:") ||
+        trim.startsWith("db_path:"))
+    ) {
+      continue;
+    }
+    if (lineIndent === childIndent && trim === "db_params:") {
+      i++;
+      while (i < block.length && leadingSpaces(block[i]) > childIndent) {
+        i++;
+      }
+      i--;
+      continue;
+    }
+    filtered.push(line);
+  }
+
+  const insertLines = [
+    `${" ".repeat(childIndent)}auth_data_dir: "{{sn_auth_data_dir}}"`,
+    `${" ".repeat(childIndent)}db_type: sqlite`,
+    `${" ".repeat(childIndent)}db_params:`,
+    `${" ".repeat(nestedIndent)}db_path: "{{sn_db_path}}"`,
+  ];
+  const ipLine = filtered.findIndex((line) =>
+    leadingSpaces(line) === childIndent && line.trim().startsWith("ip:")
+  );
+  const insertAt = ipLine >= 0 ? ipLine + 1 : filtered.length;
+  const patchedBlock = [
+    ...filtered.slice(0, insertAt),
+    ...insertLines,
+    ...filtered.slice(insertAt),
+  ];
+
+  const patchedLines = [
+    ...lines.slice(0, start + 1),
+    ...patchedBlock,
+    ...lines.slice(end),
+  ];
+  return patchedLines.join("\n");
+}
+
+function patchWeb3GatewayConfig(targetDir: string): void {
+  const configPath = path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE);
+  if (!fs.existsSync(configPath)) {
+    console.log(
+      `skip ${WEB3_GATEWAY_CONFIG_FILE} patch: file not found in ${targetDir}`,
+    );
+    return;
+  }
+
+  const original = fs.readFileSync(configPath, "utf8");
+  const patched = patchWeb3GatewayConfigText(original);
+  if (patched === null) {
+    console.log(
+      `skip ${WEB3_GATEWAY_CONFIG_FILE} patch: web3_sn server block not found`,
+    );
+    return;
+  }
+  if (patched !== original) {
+    fs.writeFileSync(configPath, patched);
+    console.log(`Patched ${configPath} to use ${SN_DB_FILE}`);
+  } else {
+    console.log(`${configPath} already uses ${SN_DB_FILE}`);
+  }
 }
 
 async function makeSnConfigs(
@@ -105,6 +764,11 @@ async function makeSnConfigs(
     }
   }
 
+  const snDbPath = replaceGeneratedSnDb(targetDir);
+  const authDataDir = ensureDir(path.join(targetDir, SN_AUTH_DATA_DIR));
+  updateParamsJson(targetDir, snDbPath, authDataDir);
+  patchWeb3GatewayConfig(targetDir);
+
   // 2. TLS certificates for sn.$base and *.web3.$base
   console.log("# Step 2: Generate TLS certificates...");
   await ensureCa(caDir, caName);
@@ -115,6 +779,7 @@ async function makeSnConfigs(
     targetDir,
     [
       snHostname,
+      `web3.${snBaseHost}`,
       `*.web3.${snBaseHost}`,
     ],
   );
@@ -155,6 +820,7 @@ async function preregisterDevUsers(
       params.node_name,
       snDbPath,
     );
+    syncSnDatabase(snDbPath);
   }
 }
 
@@ -232,20 +898,23 @@ async function main(): Promise<void> {
   const caDir = values.ca ?? ensureDir(path.join(ENV_ROOT_DIR, "ca"));
 
   await makeSnConfigs(targetDir, snBaseHost, snIp, caDir, DEFAULT_CA_NAME);
+  const snDbPath = path.join(targetDir, SN_DB_FILE);
 
   if (!values["no-preregister"]) {
-    await preregisterDevUsers(envRoot, path.join(targetDir, "sn_db.sqlite3"));
+    await preregisterDevUsers(envRoot, snDbPath);
   }
+  syncSnDatabase(snDbPath);
 
   console.log("\n[OK] SN configuration files generation completed!");
   console.log(`  Output directory: ${targetDir}`);
-  console.log("Files that need to be manually created:");
+  console.log(`  SN database: ${snDbPath}`);
   console.log(
-    `  - ${path.join(targetDir, "dns_zone")} (DNS Zone configuration)`,
+    `  SN token key dir: ${path.join(targetDir, SN_AUTH_DATA_DIR)}`,
   );
-  console.log(
-    `  - ${path.join(targetDir, "website.yaml")} (website configuration)`,
-  );
+  console.log("Template/operator files that should be present:");
+  console.log(`  - ${path.join(targetDir, WEB3_GATEWAY_CONFIG_FILE)}`);
+  console.log(`  - ${path.join(targetDir, "website.yaml")}`);
+  console.log(`  - ${path.join(targetDir, "local_dns.toml")}`);
   console.log("Other notes:");
   console.log(
     "  - Test environment needs to install the CA certificate into the client trust list",
