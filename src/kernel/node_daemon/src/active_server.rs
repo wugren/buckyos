@@ -1,12 +1,10 @@
 use ::kRPC::*;
 use async_trait::async_trait;
 use bns_client::{
-    BnsApplyMutationsReq, BnsClientError, BnsEvmClientConfig, BnsEvmControllerClient,
-    BnsEvmRawTxSubmitter, BnsEvmTxSubmission, BnsIndexerApi, BnsIndexerClient, BnsRegisterNameReq,
-};
-use bns_indexer::{
-    default_document_update, CallAuthority, DocumentRef, MutationGuard, Principal, RegisterOptions,
-    ZERO_HASH,
+    default_document_update, BnsApplyMutationsReq, BnsClientError, BnsEvmClientConfig,
+    BnsEvmControllerClient, BnsEvmRawTxSubmitter, BnsEvmTxSubmission, BnsIndexerApi,
+    BnsIndexerClient, BnsRegisterNameReq, CallAuthority, DocumentRef, DocumentUpdate,
+    MutationGuard, Principal, RegisterOptions, ZERO_HASH,
 };
 use buckyos_api::*;
 use buckyos_http_server::*;
@@ -479,7 +477,7 @@ impl ActiveServer {
         doc_type: &str,
         expected_version: u64,
         document: &Value,
-    ) -> Result<bns_indexer::DocumentUpdate, RPCErrors> {
+    ) -> Result<DocumentUpdate, RPCErrors> {
         let bytes = serde_json::to_vec(document).map_err(|e| {
             RPCErrors::ReasonError(format!("Failed to serialize BNS document: {}", e))
         })?;

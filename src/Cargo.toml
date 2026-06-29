@@ -58,7 +58,6 @@ package-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "pack
 cyfs-gateway = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs_gateway", branch = "beta2.2" }
 cyfs-gateway-api = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs-gateway-api", branch = "beta2.2" }
 bns-client = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "bns-client", branch = "beta2.2" }
-bns-indexer = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "bns-indexer", branch = "beta2.2" }
 
 # Common async runtime and utilities
 tokio = { version = "1.49.0", features = ["full"] }

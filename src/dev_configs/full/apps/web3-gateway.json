@@ -4,8 +4,8 @@
   "directories": {
       "source": "/opt/web3-gateway",
       "target": "/opt/web3-gateway",
-      "source_bin": "/opt/web3-gateway/web3_gateway",
-      "target_bin": "/opt/web3-gateway/web3_gateway"
+      "source_bin": "/opt/web3-gateway",
+      "target_bin": "/opt/web3-gateway"
   },
   "commands": {
     "build": [
@@ -20,7 +20,7 @@
     "install": [
       "sudo chmod +x /opt/web3-gateway/web3_gateway"
     ],
-    "start": ["sudo python3 /opt/web3-gateway/start.py"],
+    "start": ["sudo mkdir -p /opt/buckyos/etc && sudo cp /opt/web3-gateway/etc/machine.json /opt/buckyos/etc/machine.json && sudo python3 /opt/web3-gateway/start.py"],
     "stop": ["sudo python3 /opt/web3-gateway/stop.py"]
   }
 }

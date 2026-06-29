@@ -43,9 +43,11 @@ import {
 } from "buckyos/provision";
 import {
   buildUserEnv,
+  DEFAULT_TRUST_DID,
   ensureDir,
   ENV_ROOT_DIR,
   getParamsFromGroupName,
+  makeMachineConfig,
 } from "./make_config.ts";
 
 const DEFAULT_SN_BASE_HOST = "devtests.org";
@@ -745,8 +747,11 @@ async function makeSnConfigs(
   console.log(`  SN IP address: ${snIp}`);
   ensureDir(targetDir);
 
-  // 1. SN device identity configuration (written under <targetDir>/sn_server)
-  console.log("# Step 1: Create SN device identity configuration...");
+  console.log("# Step 1: Create SN machine configuration...");
+  makeMachineConfig(targetDir, `web3.${snBaseHost}`, DEFAULT_TRUST_DID, false);
+
+  // 2. SN device identity configuration (written under <targetDir>/sn_server)
+  console.log("# Step 2: Create SN device identity configuration...");
   await createSnConfigs({ outputDir: targetDir, snIp, snBaseHost });
 
   // move generated files up to targetDir; .buckycli stays in sn_server
@@ -769,8 +774,8 @@ async function makeSnConfigs(
   updateParamsJson(targetDir, snDbPath, authDataDir);
   patchWeb3GatewayConfig(targetDir);
 
-  // 2. TLS certificates for sn.$base and *.web3.$base
-  console.log("# Step 2: Generate TLS certificates...");
+  // 3. TLS certificates for sn.$base and *.web3.$base
+  console.log("# Step 3: Generate TLS certificates...");
   await ensureCa(caDir, caName);
   const snHostname = `sn.${snBaseHost}`;
   const { certPath, keyPath } = await createCertFromCa(
@@ -801,7 +806,7 @@ async function preregisterDevUsers(
   envRoot: string,
   snDbPath: string,
 ): Promise<void> {
-  console.log("# Step 3: Pre-register dev users to SN database...");
+  console.log("# Step 4: Pre-register dev users to SN database...");
   for (const groupName of PREREGISTER_GROUPS) {
     const params = getParamsFromGroupName(groupName);
     const userDir = path.join(envRoot, params.zone_id);

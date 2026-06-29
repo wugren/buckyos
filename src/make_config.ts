@@ -213,7 +213,7 @@ export interface OODGroupParams {
   ca_name: string;
 }
 
-const DEFAULT_TRUST_DID = [
+export const DEFAULT_TRUST_DID = [
   "did:web:buckyos.org",
   "did:web:buckyos.ai",
   "did:web:buckyos.io",
@@ -336,19 +336,27 @@ function getZoneHostNames(zoneId: string, web3Bridge: string): string[] {
   return uniqueStrings([zoneId, didHostToRealHost(zoneId, web3Bridge)]);
 }
 
-function makeGlobalEnvConfig(
+export function makeMachineConfig(
   targetDir: string,
   web3Bns: string,
   trustDid: string[],
   forceHttps: boolean,
 ): void {
   const etcDir = ensureDir(path.join(targetDir, "etc"));
-
   writeJson(path.join(etcDir, "machine.json"), {
     web3_bridge: { bns: web3Bns },
     force_https: forceHttps,
     trust_did: trustDid,
   });
+}
+
+function makeGlobalEnvConfig(
+  targetDir: string,
+  web3Bns: string,
+  trustDid: string[],
+  forceHttps: boolean,
+): void {
+  makeMachineConfig(targetDir, web3Bns, trustDid, forceHttps);
 
   const activeConfigPath = path.join(
     targetDir,
